@@ -1,4 +1,4 @@
-"""Renders a preview of the ECP Lite panel.
+"""Renders a preview of the Endfield Info Windhawk panel.
 
 Geometry follows the mod's defaults, so the image and the C++ layout agree:
 
@@ -11,6 +11,7 @@ The backdrop is a checkerboard so the panel's alpha is visible.
 """
 
 import math
+import os
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -190,6 +191,8 @@ for index, (text, rings, inline) in enumerate(ROWS):
         centre_x -= ((RING_SIZE / 2) + 4) * SCALE
 
 canvas.alpha_composite(layer)
-canvas.convert("RGB").save("windhawk-poc/assets/panel-preview.png")
-print(f"wrote windhawk-poc/assets/panel-preview.png  {W}x{H}  ({len(ROWS)} rows, "
+out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "assets", "panel-preview.png")
+canvas.convert("RGB").save(out_path)
+print(f"wrote {out_path}  {W}x{H}  ({len(ROWS)} rows, "
       f"{sum(len(r[1]) for r in ROWS)} rings)")

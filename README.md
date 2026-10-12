@@ -1,4 +1,4 @@
-# Endfield Charge Plus Lite
+# Endfield Info Windhawk
 
 一个轻量、可配置、**始终置顶**的状态面板，为 [Windhawk](https://windhawk.net/) 编写。
 它把 CPU、内存、网络、GPU、时间等数据画成一条圆角面板，常驻在屏幕顶部中央。
@@ -35,7 +35,7 @@
 
 1. 安装 [Windhawk](https://windhawk.net/)（1.7.3 或更高）。
 2. 打开 Windhawk → **Mods** → **Create new mod**。
-3. 把 `endfield-charge-plus-lite.wh.cpp` 的全部内容粘贴进去，替换掉模板。
+3. 把 `endfield-info-windhawk.wh.cpp` 的全部内容粘贴进去，替换掉模板。
 4. 点 **Compile mod**，成功后点 **Install**。
 5. 打开该 mod 的 **Settings** 页调整内容与外观，保存后立即生效。
 
@@ -438,6 +438,6 @@ mod 会用三重手段强制置顶，并每 100 ms 重申一次。如果日志�
 
 ## 致谢
 
-设计与视觉语言来自 [Endfield Charge Plus](https://github.com/GlacierGlimmer/EndfieldChargePlus)
+设计与视觉语言来自 [Endfield Charge Plus](https://github.com/GlacierGlimmer/zmd-charge-plus)
 （Avalonia 实现）。本 mod 是它的轻量重写：保留视觉风格与配置自由度，
 改用原生 Win32 + GDI+ 绘制，并且不需要注入任何进程。

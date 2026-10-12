@@ -24,8 +24,8 @@
 ## 1. 项目结构
 
 ```
-windhawk-poc/
-├── endfield-charge-plus-lite.wh.cpp   唯一的交付物（约 183 KB）
+endfield-info-windhawk/
+├── endfield-info-windhawk.wh.cpp      唯一的交付物（约 190 KB）
 ├── README.md                          用户文档
 ├── AGENTS.md                          本文
 │
@@ -71,7 +71,7 @@ windhawk-poc/
 ### 编译 mod
 
 ```powershell
-pwsh -File windhawk-poc\build.ps1
+pwsh -File build.ps1
 ```
 
 脚本读取 Windhawk 自己的 `compile_flags.txt`，用它的 clang 20 工具链（MinGW x86_64 +
@@ -91,7 +91,7 @@ libc++）编译，并打印导出符号表。
 ### 设置块校验（改过设置项就跑）
 
 ```powershell
-python windhawk-poc\_settings.py
+python _settings.py
 ```
 
 检查设置块结构并统一 `$name` / `$description` 的引号。期望输出含
@@ -108,14 +108,14 @@ $wc = 'D:\Program Files\Windhawk\Compiler'
 & "$wc\bin\clang++.exe" -target x86_64-w64-mingw32 -std=c++23 -O0 -DUNICODE -D_UNICODE `
   -DWINVER=0x0A00 -D_WIN32_WINNT=0x0A00 -DNTDDI_VERSION=0x0A000008 -Wno-pragma-pack `
   -luser32 -lgdi32 -lpdh -liphlpapi -lpsapi -ladvapi32 `
-  -o "$env:TEMP\layouttest.exe" windhawk-poc\test-layout.cpp
+  -o "$env:TEMP\layouttest.exe" test-layout.cpp
 & "$env:TEMP\layouttest.exe"
 ```
 
 期望最后一行 `PASSED (0 failure(s))`。
 
 **宿主原理**：`test-layout.cpp` 把 Windhawk API（`Wh_GetIntSetting` / `Wh_GetStringSetting` /
-`Wh_Log` / `Wh_SetFunctionHook`）打桩，然后 `#include "endfield-charge-plus-lite.wh.cpp"`。
+`Wh_Log` / `Wh_SetFunctionHook`）打桩，然后 `#include "endfield-info-windhawk.wh.cpp"`。
 因此它能直接调用 mod 的**内部静态函数**——这是本测试的价值所在，
 也是为什么布局计算要**抽成独立纯函数**（见 §4）。
 
@@ -135,7 +135,7 @@ $wc = 'D:\Program Files\Windhawk\Compiler'
 ### 预览图
 
 ```powershell
-python windhawk-poc\_preview.py
+python _preview.py
 ```
 
 `_preview.py` 是 GDI+ 绘制逻辑的**独立 Python 复刻**（PIL）。
@@ -147,7 +147,7 @@ python windhawk-poc\_preview.py
 
 ```powershell
 & "$wc\bin\clang++.exe" -target x86_64-w64-mingw32 -std=c++23 -O0 -DUNICODE -D_UNICODE `
-  -luser32 -lgdi32 -o "$env:TEMP\gdiplus-probe.exe" windhawk-poc\test-gdiplus-scale.cpp
+  -luser32 -lgdi32 -o "$env:TEMP\gdiplus-probe.exe" test-gdiplus-scale.cpp
 & "$env:TEMP\gdiplus-probe.exe" <图片路径>
 ```
 
@@ -420,7 +420,7 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
    **`$name` / `$description` 用单引号**；数值项**不加引号**。
 2. 在 `ModSettings` 结构体加字段（给默认值）。
 3. 在 `ReadSettings()` 里读取并 `ClampInt` / 校验。
-4. 跑 `python windhawk-poc\_settings.py`，确认 `no structural problems found`。
+4. 跑 `python _settings.py`，确认 `no structural problems found`。
 5. 更新 README 的「全部设置项」表。
 
 ### 新增一个变量

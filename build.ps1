@@ -1,6 +1,6 @@
 # Compiles the mod with Windhawk's own toolchain and flags, outside the GUI.
 #
-# Usage:  pwsh -File windhawk-poc\build.ps1
+# Usage:  pwsh -File build.ps1
 #
 # This exists because iterating through Windhawk's editor means a click per
 # attempt. It uses the exact flags Windhawk itself passes (read from
@@ -9,10 +9,9 @@ $ErrorActionPreference = 'Stop'
 
 $compiler = 'D:\Program Files\Windhawk\Compiler'
 $windhawkData = 'C:\ProgramData\Windhawk'
-$root = Split-Path -Parent $PSScriptRoot
-$source = Join-Path $PSScriptRoot 'endfield-charge-plus-lite.wh.cpp'
+$source = Join-Path $PSScriptRoot 'endfield-info-windhawk.wh.cpp'
 $flagsFile = Join-Path $windhawkData 'EditorWorkspace\compile_flags.txt'
-$output = Join-Path $env:TEMP 'endfield-charge-plus-lite.dll'
+$output = Join-Path $env:TEMP 'endfield-info-windhawk.dll'
 
 foreach ($p in @($compiler, $source)) {
     if (-not (Test-Path -LiteralPath $p)) { throw "not found: $p" }

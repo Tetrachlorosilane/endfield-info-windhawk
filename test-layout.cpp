@@ -58,7 +58,7 @@ static void Wh_Log(const WCHAR *fmt, ...) {
 }
 static bool Wh_SetFunctionHook(void *, void *, void **) { return true; }
 
-#include "endfield-charge-plus-lite.wh.cpp"
+#include "endfield-info-windhawk.wh.cpp"
 
 static int g_failures = 0;
 

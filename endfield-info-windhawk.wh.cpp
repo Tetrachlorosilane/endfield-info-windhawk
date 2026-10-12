@@ -1,17 +1,17 @@
 // ==WindhawkMod==
-// @id              endfield-charge-plus-lite
-// @name            Endfield Charge Plus Lite
+// @id              endfield-info-windhawk
+// @name            Endfield Info Windhawk
 // @description     A configurable always-on-top status capsule: user-defined rows, on-demand collectors (CPU / memory / network / GPU), top-of-the-topmost-monitor anchoring, and proximity-or-always display with click-to-toggle.
 // @version         0.2.0
-// @author          PoC
-// @github          https://github.com/GlacierGlimmer/zmd-charge-plus
+// @author          Silicon Dioxide
+// @github          https://github.com/Tetrachlorosilane/zmd-info-windhawk
 // @include         windhawk.exe
 // @compilerOptions -lgdi32 -lpdh -liphlpapi -lpsapi -ladvapi32
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
 /*
-# Endfield Charge Plus Lite
+# Endfield Info Windhawk
 
 A lightweight always-on-top status capsule, built as a Windhawk **tool mod**: it
 runs in its own dedicated `windhawk.exe` process and never injects into, or hooks
@@ -4013,7 +4013,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 // HUD thread
 // ---------------------------------------------------------------------------
 static DWORD WINAPI HudThreadProc(LPVOID) {
-    static const WCHAR kClassName[] = L"ECP.Lite.Hud.2";
+    static const WCHAR kClassName[] = L"Endfield.Info.Hud.2";
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WindowProc;
@@ -4034,7 +4034,7 @@ static DWORD WINAPI HudThreadProc(LPVOID) {
     LONG_PTR exStyle = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST;
 
     ComputeGeometry();
-    HWND hwnd = CreateWindowExW(exStyle, kClassName, L"ECP Lite", WS_POPUP,
+    HWND hwnd = CreateWindowExW(exStyle, kClassName, L"Endfield Info Windhawk", WS_POPUP,
                                 0, 0, g_settings.panelWidth, g_displayHeight,
                                 nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!hwnd) {

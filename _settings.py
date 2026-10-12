@@ -13,10 +13,14 @@ Run:  python _settings.py            # check only
       python _settings.py --write    # normalise the display strings
 """
 
+import os
 import re
 import sys
 
-SOURCE = "windhawk-poc/endfield-charge-plus-lite.wh.cpp"
+# Resolve the source next to this script so the tool works from any directory.
+SOURCE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "endfield-info-windhawk.wh.cpp"
+)
 BEGIN = "// ==WindhawkModSettings=="
 END = "// ==/WindhawkModSettings=="
 
