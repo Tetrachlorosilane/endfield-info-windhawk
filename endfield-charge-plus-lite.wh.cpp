@@ -1,0 +1,4433 @@
+// ==WindhawkMod==
+// @id              endfield-charge-plus-lite
+// @name            Endfield Charge Plus Lite
+// @description     A configurable always-on-top status capsule: user-defined rows, on-demand collectors (CPU / memory / network / GPU), top-of-the-topmost-monitor anchoring, and proximity-or-always display with click-to-toggle.
+// @version         0.2.0
+// @author          PoC
+// @github          https://github.com/GlacierGlimmer/zmd-charge-plus
+// @include         windhawk.exe
+// @compilerOptions -lgdi32 -lpdh -liphlpapi -lpsapi -ladvapi32
+// ==/WindhawkMod==
+
+// ==WindhawkModReadme==
+/*
+# Endfield Charge Plus Lite
+
+A lightweight always-on-top status capsule, built as a Windhawk **tool mod**: it
+runs in its own dedicated `windhawk.exe` process and never injects into, or hooks
+anything in, another process.
+
+## Rows and variables
+
+Each row is free text with `{variable}` tokens. Write whatever you want; the
+collectors for the groups you reference are the only ones that start.
+
+| Token | Meaning |
+| :-- | :-- |
+| `{cpu}` | CPU total usage % |
+| `{cpu.user}` `{cpu.kernel}` | CPU split |
+| `{cpu.ghz}` `{cpu.ghz.max}` | Effective / base clock (GHz) |
+| `{cpu.name}` `{cpu.cores}` `{cpu.threads}` | CPU identity |
+| `{mem}` | Memory usage % |
+| `{mem.used}` `{mem.total}` `{mem.free}` | Memory in GB |
+| `{mem.commit}` | Commit usage % |
+| `{net.down}` `{net.up}` | Current rates, auto-scaled |
+| `{net.down.bps}` `{net.up.bps}` | Raw bytes/s |
+| `{net.total}` | Total transferred, auto-scaled |
+| `{gpu}` `{gpu.mem}` | GPU core / memory utilisation % |
+| `{gpu.temp}` | GPU temperature (C) |
+| `{gpu.vram.used}` `{gpu.vram.total}` | VRAM in GB |
+| `{gpu.name}` `{gpu.fan}` `{gpu.power}` | GPU identity / fan % / watts |
+| `{time}` `{date}` `{uptime}` | Clock and uptime |
+| `{mod.ws}` `{mod.cpu}` | This mod's own footprint |
+
+A `{variable|spec}` suffix formats the value: `0` `1` `2` decimals, `gb`, `mb`,
+`pct`, `int`, `time`.
+
+## Collectors start on demand
+
+Nothing is collected until a row actually references it. If no row mentions
+`{gpu...}`, neither NVML nor the PDH GPU counters are ever loaded - which matters,
+because those two are by far the most expensive things this mod can do:
+
+| Stage | Working set |
+| :-- | :-- |
+| Baseline, CPU + memory + network only | **~7 MB** |
+| `+ nvml.dll` for `{gpu}` / `{gpu.temp}` | ~28 MB |
+| `+` PDH GPU counters (non-NVIDIA fallback) | ~35 MB |
+
+Measured on the development machine. `PdhCloseQuery` does not give the memory
+back, so a collector that has started stays started until the mod is reloaded.
+
+## Display
+
+* Anchored to the **top-centre of the topmost monitor** (the one highest in the
+  virtual desktop, not necessarily the primary one).
+* Always topmost.
+* **Mouse proximity** - hidden until the pointer reaches the top edge, then it
+  slides in and hides again shortly after the pointer leaves.
+* **Always shown** - stays up; clicking the capsule toggles it, and the border
+  colour dims when collapsed so the current state is visible at a glance.
+
+## A note on the cost of GPU collectors
+
+`{gpu.temp}` and `{gpu}` read a real sensor, and reading one is not free: on the
+development machine NVML costs ~1.9 ms per sample and ~22 MB resident. That is a
+deliberate trade - it is still far cheaper, and far more accurate, than going
+through WMI.
+*/
+// ==/WindhawkModReadme==
+
+// ==WindhawkModSettings==
+/*
+- Row1: "{cpu|0|w3}%  CPU   {mem|0|w3}%  RAM   [[ring:{mem}]]"
+  $name: 'Row 1'
+  $description: 'Text with {variable} tokens. Format specs chain with a bar: {cpu|2} decimals, |w4 pad to 4, |pad0 pad with zeros. [[ring:VALUE:MAX:THICK:COLOR]] draws a gauge, and one placed after text sits inline.'
+- Row2: "GPU {gpu|0|w3}%  {gpu.temp|0|w3}C   NET {net.down}"
+  $name: 'Row 2'
+  $description: 'Same syntax as row 1. Speed and byte totals are pre-formatted, so only the digit spec applies to them.'
+- Row3: ""
+  $name: 'Row 3'
+  $description: 'Same syntax as row 1.'
+- Row4: ""
+  $name: 'Row 4'
+  $description: 'Same syntax as row 1.'
+- Theme: Endfield
+  $name: 'Theme'
+  $description: 'A colour preset. A named theme is used as-is. Pick Custom to make the colour fields below take effect.'
+  $options:
+    - Endfield: Endfield yellow-green on warm near-black
+    - Midnight: Cool blue on blue-black
+    - Mono: Neutral grey on black
+    - Custom: Use the colour fields below
+- ClickAction: Proximity
+  $name: 'What a click does'
+  $description: 'Proximity switches between mouse-activated and always shown. Toggle shows and hides the panel.'
+  $options:
+    - Proximity: Switch between mouse-activated and always shown
+    - Toggle: Show or hide the panel
+- Monitor: Topmost
+  $name: 'Target monitor'
+  $description: 'Which monitor to anchor the panel to.'
+  $options:
+    - Topmost: The monitor highest on the virtual desktop
+    - Primary: The Windows primary monitor
+- PanelWidth: 420
+  $name: 'Panel width (px)'
+  $description: '200-1600.'
+- RowHeight: 30
+  $name: 'Row height (px)'
+  $description: '18-80.'
+- CornerRadius: 22
+  $name: 'Corner radius (px)'
+  $description: '0-60. Set to half the panel height for a full capsule.'
+- BorderThickness: 1
+  $name: 'Border thickness (px)'
+  $description: '0-8. Zero removes the border.'
+- FontSize: 15
+  $name: 'Font size (px)'
+  $description: '9-48.'
+- FontFamily: Segoe UI
+  $name: 'Font family'
+  $description: 'Any installed family name, for example Segoe UI, Consolas, Microsoft YaHei UI or JetBrains Mono. A name that is not installed falls back to Segoe UI and is reported in the log.'
+- TextColor: ""
+  $name: 'Text colour (Custom theme only)'
+  $description: 'AARRGGBB. Used only when Theme is Custom; otherwise the theme decides. Leave empty for the Endfield default.'
+- AccentColor: ""
+  $name: 'Accent colour (Custom theme only)'
+  $description: 'AARRGGBB. Default ring and border colour. Used only when Theme is Custom.'
+- BackgroundColor: ""
+  $name: 'Background (Custom theme only)'
+  $description: 'AARRGGBB, alpha first. Used only when Theme is Custom.'
+- BorderColor: ""
+  $name: 'Border colour (Custom theme only)'
+  $description: 'AARRGGBB. Shown while the panel is expanded. Used only when Theme is Custom.'
+- BorderCollapsedColor: ""
+  $name: 'Collapsed border (Custom theme only)'
+  $description: 'AARRGGBB. Shown while collapsed. Used only when Theme is Custom.'
+- RingSize: 26
+  $name: 'Ring size (px)'
+  $description: '12-64. Outer diameter of a default [[ring:...]] gauge.'
+- RingThickness: 4
+  $name: 'Ring thickness (px)'
+  $description: '1-16. Stroke width of a default [[ring:...]] gauge.'
+- RingRightOffset: 12
+  $name: 'Ring right offset (px)'
+  $description: '0-200. Distance from the right edge to the last ring.'
+- RingColor: ""
+  $name: 'Ring colour (Custom theme only)'
+  $description: 'AARRGGBB. Colour of a ring gauge that has no :COLOR field of its own, for example [[ring:{cpu}]]. Leave empty to use the border colour. Used only when Theme is Custom.'
+- Icon1: Memory
+  $name: 'Row 1 icon'
+  $description: 'The plate drawn at the left of row 1. Rows with no icon of their own inherit the first configured one, so setting only this gives every row the same glyph. None leaves the space empty.'
+  $options:
+    - None: No icon
+    - CPU: Processor
+    - Memory: Memory module
+    - Disk: Storage drive
+    - Network: Network link
+    - GPU: Graphics adapter
+- Icon2: ""
+  $name: 'Row 2 icon'
+  $description: 'Icon for row 2. Empty inherits the first configured icon.'
+  $options:
+    - "": Inherit
+    - None: No icon
+    - CPU: Processor
+    - Memory: Memory module
+    - Disk: Storage drive
+    - Network: Network link
+    - GPU: Graphics adapter
+- Icon3: ""
+  $name: 'Row 3 icon'
+  $description: 'Icon for row 3. Empty inherits the first configured icon.'
+  $options:
+    - "": Inherit
+    - None: No icon
+    - CPU: Processor
+    - Memory: Memory module
+    - Disk: Storage drive
+    - Network: Network link
+    - GPU: Graphics adapter
+- Icon4: ""
+  $name: 'Row 4 icon'
+  $description: 'Icon for row 4. Empty inherits the first configured icon.'
+  $options:
+    - "": Inherit
+    - None: No icon
+    - CPU: Processor
+    - Memory: Memory module
+    - Disk: Storage drive
+    - Network: Network link
+    - GPU: Graphics adapter
+- Icon1Path: ""
+  $name: 'Row 1 icon file'
+  $description: 'Full path to a PNG, JPEG, BMP, GIF or TIFF for row 1, drawn centred on the plate. Overrides the built-in glyph. SVG is not supported because GDI+ has no SVG decoder.'
+- Icon2Path: ""
+  $name: 'Row 2 icon file'
+  $description: 'Image file for row 2. Empty inherits nothing; the built-in glyph is used.'
+- Icon3Path: ""
+  $name: 'Row 3 icon file'
+  $description: 'Image file for row 3. Empty inherits nothing; the built-in glyph is used.'
+- Icon4Path: ""
+  $name: 'Row 4 icon file'
+  $description: 'Image file for row 4. Empty inherits nothing; the built-in glyph is used.'
+- IntroStyle: Slide
+  $name: 'Intro animation'
+  $description: 'How the panel arrives. Slide uses the original overshoot-and-settle curve; Fade is a plain fade; None appears instantly.'
+  $options:
+    - Slide: Overshoot and settle, as in the original
+    - Fade: Plain fade in
+    - None: Appear instantly
+- IntroMs: 1200
+  $name: 'Intro duration (ms)'
+  $description: '200-4000. Duration of the arrival; collapsing takes half of it, since there is nothing to read on the way out.'
+- RippleCount: 2
+  $name: 'Intro ripples'
+  $description: '0-3. Concentric rings expanding from the icon while the panel arrives, as in the original.'
+- IconPath: ""
+  $name: 'Custom icon file'
+  $description: 'Full path to a PNG, JPEG, BMP, GIF or TIFF. Overrides the built-in glyph above and is drawn centred on the plate. SVG is not supported because GDI+ has no SVG decoder. Leave empty to use the built-in glyph.'
+- UpdateMs: 1000
+  $name: 'Update interval (ms)'
+  $description: '200-10000. Clocks refresh every second regardless.'
+- HotZoneDepth: 8
+  $name: 'Mouse hot-zone depth (px)'
+  $description: '2-64. How far down from the top edge counts as near the mouse.'
+- HideDelayMs: 700
+  $name: 'Hide delay (ms)'
+  $description: '0-10000. Grace period after the pointer leaves before hiding.'
+*/
+// ==/WindhawkModSettings==
+
+#include <winsock2.h>
+#include <netioapi.h>
+#include <iphlpapi.h>
+#include <windows.h>
+#include <pdh.h>
+#include <psapi.h>
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+#include <wchar.h>
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+static const UINT_PTR kTimerTick = 1;      // cursor polling (HUD thread)
+static const UINT_PTR kTimerPerf = 2;      // self-measurement
+static const UINT kMsgRatesReady = WM_APP + 1;
+static const UINT kMsgApplySettings = WM_APP + 2;
+static const UINT kMsgQuit = WM_APP + 3;
+
+static const int kMaxRows = 4;
+static const int kMaxRingsPerRow = 4;
+static const int kCursorPollMs = 40;       // proximity responsiveness vs. cost
+static const int kMaxMonitors = 8;
+
+// PixelFormat32bppPARGB
+static const INT kPixelFormat32bppPARGB = 0x000E200B;
+
+// PDH status values used below. Windhawk's MinGW pdh.h declares the functions
+// and structs but none of the PDH_* status constants, so they are repeated here
+// with their documented values.
+#ifndef PDH_MORE_DATA
+#define PDH_MORE_DATA ((PDH_STATUS)0x800007D2L)
+#endif
+#ifndef PDH_CSTATUS_VALID_DATA
+#define PDH_CSTATUS_VALID_DATA ((PDH_STATUS)0x00000000L)
+#endif
+#ifndef PDH_CSTATUS_NEW_DATA
+#define PDH_CSTATUS_NEW_DATA ((PDH_STATUS)0x00000001L)
+#endif
+
+// ---------------------------------------------------------------------------
+// Small helpers. min/max macros are an MSVC convenience that this toolchain does
+// not provide, so they are spelled out here.
+// ---------------------------------------------------------------------------
+static int ClampInt(int value, int low, int high) {
+    if (value < low) return low;
+    if (value > high) return high;
+    return value;
+}
+static double MinDouble(double a, double b) { return a < b ? a : b; }
+static int MinInt(int a, int b) { return a < b ? a : b; }
+static int MaxInt(int a, int b) { return a > b ? a : b; }
+
+// ---------------------------------------------------------------------------
+// Ring gauges
+//
+// A row may carry inline gauges:  [[ring:VALUE]]  [[ring:VALUE:MAX:THICK:COLOUR]]
+//
+// VALUE and MAX take either a literal number or a {variable} token, so
+// [[ring:{cpu}]] tracks CPU usage live. Anything omitted falls back to the
+// RingSize / RingThickness settings and the border colour.
+//
+// GDI+ has no arc primitive, so each ring is stroked as a polyline around the
+// circle. At these diameters 48 segments are indistinguishable from a true arc.
+// ---------------------------------------------------------------------------
+static const int kRingSegments = 48;
+
+struct RingSpec {
+    double value = 0;
+    double max = 100;
+    int thickness = 4;
+    DWORD color = 0;
+    bool hasColor = false;
+};
+
+// Defined with the other ring helpers; forward-declared because the row expander
+// needs it to turn a ring token into a gauge. Values and ModSettings are likewise
+// defined later, so they are named here rather than included.
+struct Values;
+struct ModSettings;
+static bool ParseRing(const WCHAR *body, int bodyLen, const Values &v,
+                      const ModSettings &settings, RingSpec &out);
+
+// ---------------------------------------------------------------------------
+// Minimal GDI+ surface, resolved at runtime.
+//
+// gdiplus.h is deliberately not included: its API is all static inline
+// Gdiplus::* wrappers (not link-visible), and its RectF would collide with the
+// one below.
+// ---------------------------------------------------------------------------
+extern "C" {
+typedef struct GpGraphics GpGraphics;
+typedef struct GpBrush GpBrush;
+typedef struct GpSolidFill GpSolidFill;
+typedef struct GpPath GpPath;
+typedef struct GpPen GpPen;
+typedef struct GpFont GpFont;
+typedef struct GpFontFamily GpFontFamily;
+typedef struct GpStringFormat GpStringFormat;
+typedef struct GpImage GpImage;
+typedef struct GpBitmap GpBitmap;
+}
+
+typedef struct GdiplusStartupInput {
+    UINT32 GdiplusVersion;
+    void *DebugEventCallback;
+    BOOL SuppressBackgroundThread;
+    BOOL SuppressExternalCodecs;
+    GdiplusStartupInput() {
+        GdiplusVersion = 1;
+        DebugEventCallback = nullptr;
+        SuppressBackgroundThread = FALSE;
+        SuppressExternalCodecs = FALSE;
+    }
+} GdiplusStartupInput;
+typedef struct GdiplusStartupOutput { void *NotificationHook; void *NotificationUnhook; } GdiplusStartupOutput;
+
+struct RectF { float X, Y, Width, Height; };
+
+// GDI+ affine matrix, same layout as its GpMatrix.
+struct GpMatrix { float m11, m12, m21, m22, dx, dy; };
+
+static const int kSmoothingAntiAlias = 4;
+static const int kTextHintAntiAliasGridFit = 4;
+static const int kAlignNear = 0;
+static const int kAlignCenter = 1;
+// StringFormatFlagsNoWrap. Without it GDI+ wraps a run that is wider than the
+// layout box, and because the line alignment is centred (kAlignCenter) a wrapped
+// run pushes its FIRST line upward -- so one row of segments, each drawn in its
+// own box, ends up with the segments on visibly different baselines. That is the
+// "the first row's text is not on one straight line" symptom. A status row has no
+// business wrapping: it is one line of readings, and a second line is not where the
+// extra text is supposed to go.
+static const int kStringFormatNoWrap = 0x00001000;
+// Never hand DrawString a degenerate layout box: a zero-width one makes GDI+ clip the
+// run away entirely, which is what made every row after the first disappear. Matches
+// the floor FitTextToWidth is given, so the box and the fit agree on the budget.
+static const float kMinLayoutWidth = 1.0f;
+// InterpolationModeHighQualityBicubic. Used for the one-off downscale at load time;
+// the per-frame path never resamples at all.
+static const int kInterpolationHighQualityBicubic = 7;
+
+struct GdiPlusApi {
+    HMODULE module = nullptr;
+    int(WINAPI *Startup)(ULONG_PTR *, const GdiplusStartupInput *, GdiplusStartupOutput *) = nullptr;
+    void(WINAPI *Shutdown)(ULONG_PTR) = nullptr;
+    int(WINAPI *CreateBitmapFromScan0)(INT, INT, INT, INT, BYTE *, GpBitmap **) = nullptr;
+    int(WINAPI *LoadImageFromFile)(const WCHAR *, GpImage **) = nullptr;
+    int(WINAPI *GetImageWidth)(GpImage *, UINT *) = nullptr;
+    int(WINAPI *GetImageHeight)(GpImage *, UINT *) = nullptr;
+    int(WINAPI *DrawImageRect)(GpGraphics *, GpImage *, float, float, float, float) = nullptr;
+    int(WINAPI *SetInterpolationMode)(GpGraphics *, int) = nullptr;
+    int(WINAPI *BitmapGetPixel)(GpBitmap *, INT, INT, DWORD *) = nullptr;
+    int(WINAPI *GetImageGraphicsContext)(GpImage *, GpGraphics **) = nullptr;
+    int(WINAPI *DisposeImage)(GpImage *) = nullptr;
+    int(WINAPI *SetSmoothingMode)(GpGraphics *, int) = nullptr;
+    int(WINAPI *SetTextRenderingHint)(GpGraphics *, int) = nullptr;
+    int(WINAPI *CreateSolidFill)(DWORD, GpSolidFill **) = nullptr;
+    int(WINAPI *SetSolidFillColor)(GpSolidFill *, DWORD) = nullptr;
+    int(WINAPI *DeleteBrush)(GpBrush *) = nullptr;
+    int(WINAPI *FillPath)(GpGraphics *, GpBrush *, GpPath *) = nullptr;
+    int(WINAPI *DrawPath)(GpGraphics *, GpPen *, GpPath *) = nullptr;
+    int(WINAPI *DrawEllipse)(GpGraphics *, GpPen *, float, float, float, float) = nullptr;
+    int(WINAPI *FillRectangle)(GpGraphics *, GpBrush *, float, float, float, float) = nullptr;
+    int(WINAPI *MultiplyWorldTransform)(GpGraphics *, const GpMatrix *, int) = nullptr;
+    // One call per arc instead of per segment. The exported signature takes a
+    // count and a PointF array.
+    int(WINAPI *DrawLines)(GpGraphics *, GpPen *, const POINTF *, int) = nullptr;
+    int(WINAPI *CreatePen1)(DWORD, float, int, GpPen **) = nullptr;
+    int(WINAPI *DeletePen)(GpPen *) = nullptr;
+    int(WINAPI *CreatePath)(int, GpPath **) = nullptr;
+    int(WINAPI *DeletePath)(GpPath *) = nullptr;
+    int(WINAPI *AddPathArc)(GpPath *, float, float, float, float, float, float) = nullptr;
+    int(WINAPI *ClosePathFigure)(GpPath *) = nullptr;
+    int(WINAPI *CreateFontFamilyFromName)(const WCHAR *, void *, GpFontFamily **) = nullptr;
+    int(WINAPI *DeleteFontFamily)(GpFontFamily *) = nullptr;
+    int(WINAPI *CreateFont)(GpFontFamily *, float, int, int, GpFont **) = nullptr;
+    int(WINAPI *DeleteFont)(GpFont *) = nullptr;
+    int(WINAPI *CreateStringFormat)(int, WORD, GpStringFormat **) = nullptr;
+    int(WINAPI *DeleteStringFormat)(GpStringFormat *) = nullptr;
+    int(WINAPI *SetStringFormatAlign)(GpStringFormat *, int) = nullptr;
+    int(WINAPI *SetStringFormatLineAlign)(GpStringFormat *, int) = nullptr;
+    int(WINAPI *DrawString)(GpGraphics *, const WCHAR *, int, GpFont *, const RectF *, GpStringFormat *, GpBrush *) = nullptr;
+    int(WINAPI *MeasureString)(GpGraphics *, const WCHAR *, int, GpFont *, const RectF *, GpStringFormat *, RectF *, INT *, INT *) = nullptr;
+    int(WINAPI *DeleteGraphics)(GpGraphics *) = nullptr;
+
+    bool Load() {
+        module = ((HMODULE(WINAPI *)(LPCWSTR))LoadLibraryW)(L"gdiplus.dll");
+        if (!module) return false;
+#define RESOLVE(field, name)                                   \
+        field = (decltype(field))GetProcAddress(module, name); \
+        if (!field) { Wh_Log(L"gdiplus export missing"); return false; }
+        RESOLVE(Startup, "GdiplusStartup")
+        RESOLVE(Shutdown, "GdiplusShutdown")
+        RESOLVE(CreateBitmapFromScan0, "GdipCreateBitmapFromScan0")
+        RESOLVE(LoadImageFromFile, "GdipLoadImageFromFile")
+        RESOLVE(GetImageWidth, "GdipGetImageWidth")
+        RESOLVE(GetImageHeight, "GdipGetImageHeight")
+        RESOLVE(DrawImageRect, "GdipDrawImageRect")
+        RESOLVE(SetInterpolationMode, "GdipSetInterpolationMode")
+        RESOLVE(BitmapGetPixel, "GdipBitmapGetPixel")
+        RESOLVE(GetImageGraphicsContext, "GdipGetImageGraphicsContext")
+        RESOLVE(DisposeImage, "GdipDisposeImage")
+        RESOLVE(SetSmoothingMode, "GdipSetSmoothingMode")
+        RESOLVE(SetTextRenderingHint, "GdipSetTextRenderingHint")
+        RESOLVE(CreateSolidFill, "GdipCreateSolidFill")
+        RESOLVE(SetSolidFillColor, "GdipSetSolidFillColor")
+        RESOLVE(DeleteBrush, "GdipDeleteBrush")
+        RESOLVE(FillPath, "GdipFillPath")
+        RESOLVE(DrawPath, "GdipDrawPath")
+        RESOLVE(DrawEllipse, "GdipDrawEllipse")
+        RESOLVE(FillRectangle, "GdipFillRectangle")
+        RESOLVE(MultiplyWorldTransform, "GdipMultiplyWorldTransform")
+        RESOLVE(DrawLines, "GdipDrawLines")
+        RESOLVE(CreatePen1, "GdipCreatePen1")
+        RESOLVE(DeletePen, "GdipDeletePen")
+        RESOLVE(CreatePath, "GdipCreatePath")
+        RESOLVE(DeletePath, "GdipDeletePath")
+        RESOLVE(AddPathArc, "GdipAddPathArc")
+        RESOLVE(ClosePathFigure, "GdipClosePathFigure")
+        RESOLVE(CreateFontFamilyFromName, "GdipCreateFontFamilyFromName")
+        RESOLVE(DeleteFontFamily, "GdipDeleteFontFamily")
+        RESOLVE(CreateFont, "GdipCreateFont")
+        RESOLVE(DeleteFont, "GdipDeleteFont")
+        RESOLVE(CreateStringFormat, "GdipCreateStringFormat")
+        RESOLVE(DeleteStringFormat, "GdipDeleteStringFormat")
+        RESOLVE(SetStringFormatAlign, "GdipSetStringFormatAlign")
+        RESOLVE(SetStringFormatLineAlign, "GdipSetStringFormatLineAlign")
+        RESOLVE(DrawString, "GdipDrawString")
+        RESOLVE(MeasureString, "GdipMeasureString")
+        RESOLVE(DeleteGraphics, "GdipDeleteGraphics")
+#undef RESOLVE
+        return true;
+    }
+};
+
+// The single resolved GDI+ entry-point table. Declared here so every drawing
+// helper below can reach it.
+static GdiPlusApi g_gdiplus;
+
+// ---------------------------------------------------------------------------
+// Installed fonts
+//
+// GDI+ accepts a font family name that is not in \Windows\Fonts as long as the
+// font is installed for the session, so this enumerates the two registry keys
+// that record installed families and turns them into a settings dropdown.
+// ---------------------------------------------------------------------------
+static WCHAR g_fontList[4096];
+
+// True when the list already holds this family. The list is ';'-separated.
+static bool FontListContains(const WCHAR *name, int length) {
+    if (!name || length <= 0) return false;
+    const WCHAR *p = g_fontList;
+    while (*p) {
+        const WCHAR *end = wcschr(p, L';');
+        int entryLength = end ? (int)(end - p) : (int)wcslen(p);
+        if (entryLength == length && _wcsnicmp(p, name, length) == 0) return true;
+        if (!end) break;
+        p = end + 1;
+    }
+    return false;
+}
+
+static void AppendFontName(const WCHAR *name, int length) {
+    if (!name || length <= 0 || length > 120) return;
+    // Skip the hidden families Windows installs but does not expose.
+    if (name[0] == L'@') return;
+    // The registry lists one value per style, so the same family repeats.
+    if (FontListContains(name, length)) return;
+
+    size_t used = wcslen(g_fontList);
+    if (used + (size_t)length + 2 >= 4096) return;
+    if (used > 0) g_fontList[used++] = L';';
+    wcsncpy(g_fontList + used, name, length);
+    g_fontList[used + length] = L'\0';
+}
+
+static void EnumerateFonts() {
+    if (g_fontList[0]) return;
+
+    HKEY key = nullptr;
+    static const WCHAR *keys[] = {
+        L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts",
+        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Fonts",
+    };
+
+    for (const WCHAR *subKey : keys) {
+        for (int hive = 0; hive < 2; hive++) {
+            HKEY root = hive == 0 ? HKEY_LOCAL_MACHINE : HKEY_CURRENT_USER;
+            if (RegOpenKeyExW(root, subKey, 0, KEY_READ, &key) != ERROR_SUCCESS) continue;
+
+            DWORD index = 0;
+            WCHAR valueName[128];
+            DWORD nameLength = 128;
+            while (RegEnumValueW(key, index, valueName, &nameLength, nullptr, nullptr,
+                                 nullptr, nullptr) == ERROR_SUCCESS) {
+                // A value name is either "Arial (TrueType)" or "Arial Bold".
+                WCHAR *paren = wcsstr(valueName, L" (");
+                if (paren) *paren = L'\0';
+                // Trim a trailing style word so only the family remains.
+                static const WCHAR *styles[] = {
+                    L" Bold Italic", L" Bold Oblique", L" Bold", L" Italic", L" Oblique",
+                    L" Light Italic", L" Light", L" Regular", L" Black", L" Medium",
+                };
+                for (const WCHAR *style : styles) {
+                    size_t nameLen = wcslen(valueName);
+                    size_t styleLen = wcslen(style);
+                    if (nameLen > styleLen &&
+                        _wcsicmp(valueName + nameLen - styleLen, style) == 0) {
+                        valueName[nameLen - styleLen] = L'\0';
+                        break;
+                    }
+                }
+                AppendFontName(valueName, (int)wcslen(valueName));
+                index++;
+                nameLength = 128;
+            }
+            RegCloseKey(key);
+        }
+    }
+}
+
+// True when the family appears in the enumerated installed-font list.
+static bool FontIsInstalled(const WCHAR *family) {
+    if (!family || !*family) return false;
+    size_t length = wcslen(family);
+    if (length > 120) return false;
+    return FontListContains(family, (int)length);
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Design tokens, taken from the ECP Avalonia theme so the mod can look like the
+// project it came from.
+//
+// The original expresses depth as a ladder of near-black surfaces with a single
+// yellow-green accent. Reproducing the exact steps matters more than the hues:
+// adjacent surfaces are only a few levels apart, which is what reads as
+// "layered" rather than "flat". Surfaces the mod does not draw are recorded here
+// rather than declared as unused constants:
+//
+//   surface.raised   #242426   settings card
+//   surface.sunken   #1E1E20   option group nested inside a card / tray menu body
+//   surface.pill     #312F30   the HUD capsule itself   -> kThemes[Endfield]
+//   surface.badge    #262425   the progress ring plate  -> WithOpacity(track)
+//   plate.light      #E9E7E4   icon plate under the glyph
+//   glyph.dark       #141313   glyph drawn on that plate
+//
+//   text.primary     #FFFFFF   full opacity               -> theme text
+//   text.secondary   #FFFFFF   at 0.55                    -> kTextSecondaryOpacity
+//   text.tertiary    #FFFFFF   at 0.40                    -> kTextTertiaryOpacity
+//   text.label       #85858B   muted grey field labels
+//   accent           #C6CA4C   yellow-green                -> kAccent / theme
+//   accent.onDark    #171719   text on an accent-filled button
+//
+// The accent-filled button is the one high-contrast element in the whole UI, and
+// the mod's border plays that role here.
+// ---------------------------------------------------------------------------
+static const DWORD kAccent = 0xFFC6CA4C;
+
+// Opacity tiers from HudTheme.axaml (Hud.TextSecondaryOpacity / TertiaryOpacity).
+// Using them instead of hard-coded alphas keeps the ring track, the collapsed
+// grip and any secondary text visibly related to the same scale.
+static const double kTextSecondaryOpacity = 0.55;
+static const double kTextTertiaryOpacity = 0.40;
+
+// Applies an opacity tier to a colour's alpha channel.
+static DWORD WithOpacity(DWORD color, double opacity) {
+    if (opacity < 0.0) opacity = 0.0;
+    if (opacity > 1.0) opacity = 1.0;
+    DWORD baseAlpha = (color >> 24) & 0xFF;
+    DWORD alpha = (DWORD)(baseAlpha * opacity + 0.5);
+    return (color & 0x00FFFFFF) | (alpha << 24);
+}
+
+// ---------------------------------------------------------------------------
+// Intro animation, translated from HudAnimations.cs.
+//
+// The original is a 6-second timeline of 17 parallel animations. A 260 ms panel
+// cannot host all of it, so the parts that read at this size are kept and the
+// rest is dropped:
+//
+//   kept     panel scale with KS_BackOut overshoot, panel height 60 -> 90 -> 60,
+//            icon pop 0.4 -> 1.12 -> 1.0, content fade, optional ripples
+//   dropped  the copyright/title crossfade, the number-slide, the square/circle
+//            form morph, and the retract half of the timeline
+//
+// Easing. Avalonia takes KeySpline control points directly, so the same two
+// control points reproduce a curve exactly as a cubic bezier evaluated on y for a
+// given x:
+//
+//   KS_In      (0.42, 0,     1,    1)
+//   KS_Out     (0,    0,     0.58, 1)
+//   KS_InOut   (0.42, 0,     0.58, 1)
+//   KS_Smooth  (0.65, 0,     0.35, 1)
+//   KS_BackOut (0.175, 0.885, 0.32, 1 + BounceStrength)
+//
+// KS_BackOut is the overshoot that gives the HUD its character.
+//
+// Cues are fractions of the intro. The intro is stretched so the shape-settle
+// moment always lands at kIntroEndCue of the configured duration, which is what
+// keeps the pacing right whether the user picks 3 s or 10 s.
+// ---------------------------------------------------------------------------
+// Reference values from the original, kept for the record. The implementation
+// derives its own equivalents, so these are documentation rather than inputs.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-const-variable"
+static const double kIntroEndCue = 0.42;              // TNumReady, the settle point
+static const double kBounceStrengthDefault = 0.275;   // original user-facing default
+#pragma clang diagnostic pop
+static const double kCueStart = 0.04;      // TStart
+static const double kCueAppear = 0.07;     // TAppear
+static const double kCueIconPop = 0.10;    // TBoltPop
+// Growth gets a larger share of the timeline than the original's TExpand = 0.12.
+// The original spends 6 s end to end, so a 0.12 cue is a leisurely 720 ms there;
+// on a 1.2 s panel the same cue would be 144 ms, which reads as a snap rather than
+// a grow. Every later cue is correspondingly later so the ordering is preserved.
+static const double kCueGrow = 0.16;       // TExpand
+static const double kCueSettle = 0.30;     // THoldB
+// TContract is kept for the record: the port does not implement the original's
+// retract-then-reopen step, because that step exists to hand over to the
+// copyright/title crossfade, which this port dropped. See EvaluateIntro.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-const-variable"
+static const double kCueContract = 0.36;   // TContract
+#pragma clang diagnostic pop
+static const double kCueContentIn = 0.38;  // TNumIn
+static const double kCueContentReady = 0.66;  // text fully surfaced
+
+// Opacity stages between kCueContentIn and kCueContentReady, as fractions of the
+// whole intro. With kCueContentReady this gives the text fade five steps rising
+// 0 -> 15 -> 40 -> 65 -> 85 -> 100 %, spread over ~0.28 of the intro (about 340 ms
+// on the 1200 ms default) instead of one 48 ms move.
+static const double kCueTextFade1 = 0.44;
+static const double kCueTextFade2 = 0.51;
+static const double kCueTextFade3 = 0.57;
+static const double kCueTextFade4 = 0.62;
+
+// Collapsing runs at half the arriving duration. The two directions are not
+// symmetric in the first place (arriving needs a hold at full height for the
+// content to surface; leaving does not), and matching durations made the collapse
+// feel sluggish: there is nothing to read on the way out, so it only needs to be
+// long enough to look deliberate.
+static const double kCollapseDurationRatio = 0.5;
+
+// Icon geometry, matching the bolt's animated footprint. The original icon is
+// scaled by GlobalScale exactly like the text, so it is sized from FontSize.
+static const double kIconScaleStart = 0.4;    // BoltIcon start scale
+static const double kIconScalePeak = 1.12;    // BoltIcon peak scale
+static const double kIconPlateRatio = 1.55;   // plate diameter / glyph size
+static const double kIconLeftMargin = 10.0;
+static const double kIconContentGap = 8.0;
+
+// Ripples: three concentric rings expanding from the icon. Radii, peak opacity
+// and the host's downward offset are the original's numbers.
+static const double kRippleScaleEnd[3] = {1.5, 2.0, 2.5};
+static const double kRipplePeakOpacity[3] = {0.50, 0.50, 0.60};
+static const double kRippleOffsetY = 16.0;    // RippleRise start
+
+// The icon plate: a light disc with a dark glyph, from HudTheme.axaml
+// (Hud.IconPlate #E9E7E4 / Hud.BoltDark #141313).
+static const DWORD kPlateLight = 0xFFE9E7E4;
+static const DWORD kGlyphDark = 0xFF141313;
+
+// ---------------------------------------------------------------------------
+// Icons are per-row: every row carries its own plate, its own built-in glyph
+// choice and its own optional image file, and each plate emits its own ripples.
+//
+// The layout is row-aligned on purpose. Rows already form a fixed list (Row1..Row4)
+// with per-row text, so a matching Icon1..Icon4 list is the least surprising way to
+// configure them: the Nth icon belongs to the Nth row, and no separate capacity
+// setting is needed because kMaxRows already bounds it.
+// ---------------------------------------------------------------------------
+struct IconSpec {
+    int style = 0;                  // 0 none, 1 cpu, 2 memory, 3 disk, 4 network, 5 gpu
+    WCHAR path[MAX_PATH] = L"";     // empty = use the built-in glyph
+};
+
+// Copies a user-supplied path, stripping the quoting and padding people naturally
+// add. "C:\x\y.png", 'C:\x\y.png' and a trailing space all mean the same file, and
+// passing the quotes through made GdipLoadImageFromFile fail on a path that looks
+// correct in the settings box.
+static void CopyUserPath(WCHAR *dest, size_t destCount, const WCHAR *source) {
+    dest[0] = L'\0';
+    if (!source) return;
+    while (*source == L' ' || *source == L'\t') source++;
+
+    WCHAR quote = 0;
+    if (*source == L'"') { quote = L'"'; source++; }
+    else if (*source == L'\'') { quote = L'\''; source++; }
+
+    size_t written = 0;
+    while (*source && written + 1 < destCount) {
+        // A matching closing quote ends the path; anything after it is ignored.
+        if (quote && *source == quote) break;
+        dest[written++] = *source++;
+    }
+    // Trim trailing whitespace, which a careless copy/paste leaves behind.
+    while (written > 0 && (dest[written - 1] == L' ' || dest[written - 1] == L'\t')) written--;
+    dest[written] = L'\0';
+}
+
+// Names accepted by the IconN settings, indexed by style.
+static const WCHAR *const kIconStyleNames[] = {
+    L"None", L"CPU", L"Memory", L"Disk", L"Network", L"GPU",
+};
+static const int kIconStyleCount = (int)(sizeof(kIconStyleNames) / sizeof(kIconStyleNames[0]));
+
+// Position of an icon by name. Returns 0 ("None") for anything unrecognised, which
+// is also what an empty setting resolves to.
+static int IconStyleFromName(const WCHAR *name) {
+    if (!name || !name[0]) return 0;
+    for (int i = 0; i < kIconStyleCount; i++) {
+        if (_wcsicmp(name, kIconStyleNames[i]) == 0) return i;
+    }
+    return 0;
+}
+
+// Glyphs with no image file of their own fall back to the first configured glyph,
+// so setting only Icon1 still produces a plate on every row.
+static int ResolveIconStyle(const ModSettings &settings, int index);
+static const WCHAR *ResolveIconPath(const ModSettings &settings, int index);
+
+
+// Colour presets. The alpha on the background matches the mod's 90% default.
+struct ThemePreset {
+    const WCHAR *name;
+    DWORD background;
+    DWORD border;
+    DWORD borderCollapsed;
+    DWORD text;
+    DWORD accent;
+};
+
+static const ThemePreset kThemes[] = {
+    // Faithful to Styles/HudTheme.axaml: warm near-black pill, yellow-green accent.
+    {L"Endfield", 0xE6312F30, 0xFFC6CA4C, 0xFF6A6C3A, 0xFFFFFFFF, 0xFFC6CA4C},
+    // Same structure, cool cast.
+    {L"Midnight", 0xE61A1D24, 0xFF5AA9E6, 0xFF2F5878, 0xFFEDF3FA, 0xFF5AA9E6},
+    // No hue at all, for people who want the numbers only.
+    {L"Mono", 0xE61C1C1E, 0xFFB8B8BC, 0xFF5A5A5E, 0xFFF2F2F2, 0xFFB8B8BC},
+};
+static const int kThemeCount = (int)(sizeof(kThemes) / sizeof(kThemes[0]));
+
+// ---- Intro animation state ---------------------------------------------------
+struct IntroState {
+    bool active = false;
+    DWORD startedAt = 0;
+    double durationMs = 0;
+    double fromHeight = 0;
+    double toHeight = 0;
+    int style = 0;        // 0 slide, 1 fade, 2 none
+    int rippleCount = 0;
+};
+
+static IntroState g_intro;
+
+// Amplitude of the panel's BackOut overshoot. Much smaller than the original's
+// 0.275, for two reasons: the original animates a fixed 560x60 capsule, and more
+// importantly 0.275 is a ~6% overshoot, which on a 250 px tall panel means it
+// springs 14 px past the target and visibly settles back. At 0.04 the overshoot is
+// about 3 px, which reads as a soft landing instead of a retract.
+static const double kPanelBounceStrength = 0.04;
+
+static double Lerp(double a, double b, double t) { return a + (b - a) * t; }
+
+// Evaluates a two-keyframe segment: holds `from` until cue1, eases to `to` by
+// cue2 using the given spline, then keeps `to`. This mirrors how the Avalonia
+// KeyFrames behave with FillMode.Forward, so the original cues map over directly.
+static double Segment(double cue, double cue1, double cue2,
+                      double from, double to,
+                      double (*ease)(double)) {
+    if (cue <= cue1) return from;
+    if (cue2 <= cue1) return to;
+    double t = (cue - cue1) / (cue2 - cue1);
+    if (t > 1.0) t = 1.0;
+    return Lerp(from, to, ease(t));
+}
+
+// One edge in a keyframe chain: reach `value` at `cue`, easing into it.
+struct IntroKey { double cue; double value; double (*ease)(double); };
+
+static double EvaluateKeys(double cue, const IntroKey *keys, int count) {
+    if (count <= 0) return 0.0;
+    if (cue <= keys[0].cue) return keys[0].value;
+    for (int i = 1; i < count; i++) {
+        if (cue <= keys[i].cue) {
+            double t = (cue - keys[i - 1].cue) / (keys[i].cue - keys[i - 1].cue);
+            if (t < 0.0) t = 0.0;
+            if (t > 1.0) t = 1.0;
+            double eased = keys[i].ease ? keys[i].ease(t) : t;
+            return Lerp(keys[i - 1].value, keys[i].value, eased);
+        }
+    }
+    return keys[count - 1].value;
+}
+
+// The four KeySplines, plus the curves the panel needs that are plain names.
+static double Clamp01(double x) { return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x); }
+
+static double CubicBezierY(double x, double x1, double y1, double x2, double y2) {
+    x = Clamp01(x);
+    if (x <= 0.0) return 0.0;
+    if (x >= 1.0) return 1.0;
+    auto sample = [](double t, double c1, double c2) {
+        double u = 1.0 - t;
+        return 3.0 * u * u * t * c1 + 3.0 * u * t * t * c2 + t * t * t;
+    };
+    double lo = 0.0, hi = 1.0, t = x;
+    for (int i = 0; i < 20; i++) {
+        t = (lo + hi) / 2.0;
+        if (sample(t, x1, x2) < x) lo = t;
+        else hi = t;
+    }
+    return sample(t, y1, y2);
+}
+
+static double EaseIn(double t) { return CubicBezierY(t, 0.42, 0.0, 1.0, 1.0); }
+static double EaseOut(double t) { return CubicBezierY(t, 0.0, 0.0, 0.58, 1.0); }
+static double EaseInOut(double t) { return CubicBezierY(t, 0.42, 0.0, 0.58, 1.0); }
+static double EaseSmooth(double t) { return CubicBezierY(t, 0.65, 0.0, 0.35, 1.0); }
+static double EaseBackOut(double t) {
+    return CubicBezierY(t, 0.175, 0.885, 0.32, 1.0 + kPanelBounceStrength);
+}
+
+// Progress through the intro, 0..1. Returns 1 when there is no intro running.
+//
+// Callers must not re-derive progress with a second call: GetTickCount advances
+// between them, so two calls can disagree about whether the intro has finished and
+// the value would jump backwards. g_intro.active is the single source of truth
+// once EvaluateIntro has run for this frame.
+static double IntroCue() {
+    if (!g_intro.active) return 1.0;
+    DWORD now = GetTickCount();
+    double elapsed = (double)(now - g_intro.startedAt);
+    if (g_intro.durationMs <= 0.0 || elapsed >= g_intro.durationMs) return 1.0;
+    return elapsed / g_intro.durationMs;
+}
+
+// Derived animation values for the current frame.
+struct IntroFrame {
+    double cue;
+    double scale;         // panel scale about its centre
+    double height;        // panel height, meaningful only while cue < 1
+    double contentAlpha;  // text and rings
+    double iconScale;
+    double iconAlpha;
+    bool expanding;       // true = arriving, false = collapsing
+    double rippleProgress;  // 0 until the ripples start, then 0..1
+    double rippleRise;      // host vertical offset
+};
+
+// Note: this deliberately does not consult g_displayHeight. That variable holds
+// the resting window geometry and lives further down the file; the caller owns the
+// resting height and substitutes it when no intro is running.
+// Eases the intro out of its finishing frame. The cue inside f is the only timing
+// sample taken for this frame; re-deriving it here could disagree about whether
+// the intro has ended, which made the painted height jump backwards on the last
+// frame.
+static IntroFrame EvaluateIntro() {
+    IntroFrame f = {};
+    f.cue = IntroCue();
+    f.height = 0.0;   // only meaningful while an intro is running; see note above
+    f.scale = 1.0;
+    f.contentAlpha = 1.0;
+    f.iconScale = 1.0;
+    f.iconAlpha = 1.0;
+    f.expanding = true;
+
+    if (!g_intro.active) return f;
+    if (f.cue >= 1.0) {
+        g_intro.active = false;
+        f.height = g_intro.toHeight;
+        f.contentAlpha = 1.0;
+        f.iconScale = 1.0;
+        f.iconAlpha = 1.0;
+        return f;
+    }
+
+    const double cue = f.cue;
+    const bool expanding = g_intro.toHeight >= g_intro.fromHeight;
+    f.expanding = expanding;
+    // The move is always from where the panel is to where it is going. Expanding
+    // means toHeight is the larger value, so this single pair covers both
+    // directions; deriving them per-direction is what previously made the collapse
+    // animate *upwards* from the tab to the expanded height.
+    const double start = g_intro.fromHeight;
+    const double end = g_intro.toHeight;
+
+    if (g_intro.style == 2) {   // None: appear instantly
+        f.height = end;
+        f.contentAlpha = 1.0;
+        return f;
+    }
+    if (g_intro.style == 1) {   // Fade: opacity only, height already at rest
+        f.height = end;
+        f.contentAlpha = expanding ? EaseOut(Clamp01(cue / kCueContentReady))
+                                   : 1.0 - EaseIn(Clamp01(cue));
+        f.iconAlpha = f.contentAlpha;
+        return f;
+    }
+
+    // Panel height.
+    //
+    // Expanding and collapsing are deliberately NOT symmetric. Arriving holds at
+    // full height while the content surfaces, so the growth is a short move and
+    // the rest of the intro is the fade. Leaving has no such hold: the shrink has
+    // to run across the whole duration, because compressing it into the grow cue
+    // left the panel sitting at tab height for most of the animation with only a
+    // fade left to watch.
+    if (expanding) {
+        const IntroKey growKeys[] = {
+            {0.0, start, nullptr},
+            {kCueGrow, end, EaseBackOut},
+        };
+        f.height = EvaluateKeys(cue, growKeys, 2);
+    } else {
+        // The shrink finishes at kCollapseDurationRatio, which on a collapse is
+        // cue 1.0 by construction (IntroCue measures against the halved duration).
+        // The content fade is keyed to the same point.
+        const IntroKey shrinkKeys[] = {
+            {0.0, start, nullptr},
+            {kCollapseDurationRatio, end, EaseInOut},
+        };
+        f.height = EvaluateKeys(cue, shrinkKeys, 2);
+    }
+    // Panel scale carries the overshoot as it opens, and a matching shrink as it
+    // closes. The shrink is essential: on the way out the panel fills the resting
+    // rectangle, so the scale is what visually reduces it to the tab.
+    if (expanding) {
+        const IntroKey scaleKeys[] = {
+            {0.0, 0.94, nullptr},
+            {kCueAppear, 1.0, EaseBackOut},
+        };
+        f.scale = EvaluateKeys(cue, scaleKeys, 2);
+    } else {
+        const IntroKey shrinkScale[] = {
+            {0.0, 1.0, nullptr},
+            {kCueSettle, 0.88, EaseInOut},
+        };
+        f.scale = EvaluateKeys(cue, shrinkScale, 2);
+    }
+
+    // Icon: opacity 0 -> 1 with a 0.4 -> 1.12 -> 1.0 pop.
+    const IntroKey iconAlphaKeys[] = {
+        {kCueStart, 0.0, nullptr},
+        {kCueIconPop, 1.0, EaseIn},
+    };
+    f.iconAlpha = expanding ? EvaluateKeys(cue, iconAlphaKeys, 2)
+                            : 1.0 - EaseIn(Clamp01(cue));
+    if (expanding) {
+        const IntroKey iconScaleKeys[] = {
+            {0.0, kIconScaleStart, nullptr},
+            {kCueStart, kIconScaleStart, EaseIn},
+            {kCueIconPop, kIconScalePeak, EaseBackOut},
+            {kCueGrow, 1.0, EaseOut},
+        };
+        f.iconScale = EvaluateKeys(cue, iconScaleKeys, 4);
+    } else {
+        f.iconScale = Lerp(1.0, kIconScaleStart, EaseIn(Clamp01(cue)));
+    }
+
+    // Content fades in after the shape has settled, so the arrival reads as
+    // "panel grows, then the numbers surface".
+    //
+    // The fade is deliberately long and stepped rather than one move: at the
+    // original cue spacing it was 0.38 -> 0.42, which on a 1200 ms intro is 48 ms
+    // and reads as the text simply appearing. Four stages at 0 / 25 / 60 / 100 %
+    // over kCueContentReady - kCueContentIn (= 0.28, so ~340 ms) give the numbers
+    // a visible rise instead of a switch.
+    //
+    // Every stage eases with KS_InOut, which is slow at both ends, so no stage
+    // snaps: they chain into a continuous curve.
+    if (expanding) {
+        const IntroKey contentKeys[] = {
+            {kCueContentIn, 0.0, nullptr},
+            {kCueTextFade1, 0.15, EaseInOut},
+            {kCueTextFade2, 0.40, EaseInOut},
+            {kCueTextFade3, 0.65, EaseInOut},
+            {kCueTextFade4, 0.85, EaseInOut},
+            // nullptr easing on the last stage: it lands exactly on full opacity
+            // instead of approaching it asymptotically.
+            {kCueContentReady, 1.0, nullptr},
+        };
+        f.contentAlpha = EvaluateKeys(cue, contentKeys, 6);
+    } else {
+        f.contentAlpha = 1.0 - EaseIn(Clamp01(cue / kCueSettle));
+    }
+
+    // Ripples run from the grow cue to the settle cue, rising meanwhile. The
+    // rise uses KS_Smooth, matching RippleRise in the original.
+    if (expanding && g_intro.rippleCount > 0 && cue > kCueGrow) {
+        f.rippleProgress = EaseOut(Clamp01((cue - kCueGrow) / (kCueSettle - kCueGrow)));
+        f.rippleRise = Segment(cue, kCueGrow, kCueSettle, kRippleOffsetY, 0.0, EaseSmooth);
+    }
+    return f;
+}
+
+struct ModSettings {
+    WCHAR rows[kMaxRows][256] = {};
+    int rowCount = 0;
+    // ClickAction == Toggle: a click shows or hides the panel (default).
+    // ClickAction == Proximity: a click switches between mouse-activated and
+    // always shown, which is a display *mode*, not a visibility setting.
+    bool clickToggle = true;
+    int monitorMode = 0;           // 0 topmost, 1 primary
+    int panelWidth = 420;
+    int rowHeight = 30;
+    int cornerRadius = 22;
+    int borderThickness = 1;
+    int fontSize = 15;
+    WCHAR fontFamily[64] = L"Segoe UI";
+    DWORD background = 0xE6312F30;
+    DWORD border = 0xFFC6CA4C;
+    DWORD borderCollapsed = 0xFF6A6C3A;
+    DWORD text = 0xFFF2F2F2;
+    int ringSize = 26;
+    int ringThickness = 4;
+    int ringRightOffset = 12;
+    int updateMs = 1000;
+    int hotZoneDepth = 8;
+    int hideDelayMs = 700;
+
+    // Left icon plates and intro animation. One icon per row, row-aligned with the
+    // RowN settings.
+    IconSpec icons[kMaxRows] = {};
+    int iconCount = 0;             // entries actually configured
+    int introStyle = 0;            // 0 slide, 1 fade, 2 none
+    int introMs = 1200;
+    int rippleCount = 2;
+
+    // Appearance preset and per-colour overrides.
+    int themeIndex = 0;            // index into kThemes, -1 for "Custom"
+    DWORD accent = kAccent;
+    DWORD ringColor = 0;           // valid only when ringColorUserSet
+    bool ringColorUserSet = false;
+    bool userSetBackground = false;
+    bool userSetBorder = false;
+    bool userSetBorderCollapsed = false;
+    bool userSetText = false;
+    bool userSetAccent = false;
+};
+
+static void ReadSettings(ModSettings &s) {
+    s.rowCount = 0;
+    for (int i = 0; i < kMaxRows; i++) {
+        WCHAR key[16];
+        swprintf(key, 16, L"Row%d", i + 1);
+        PCWSTR value = Wh_GetStringSetting(key);
+        if (value && value[0]) {
+            // Keep only non-empty rows, preserving their relative order.
+            wcsncpy(s.rows[s.rowCount], value, 255);
+            s.rows[s.rowCount][255] = L'\0';
+            s.rowCount++;
+        }
+        Wh_FreeStringSetting(value);
+    }
+
+    PCWSTR clickAction = Wh_GetStringSetting(L"ClickAction");
+    s.clickToggle = !clickAction || wcscmp(clickAction, L"Proximity") != 0;
+    Wh_FreeStringSetting(clickAction);
+
+    PCWSTR monitor = Wh_GetStringSetting(L"Monitor");
+    s.monitorMode = 0;
+    if (monitor && wcscmp(monitor, L"Primary") == 0) s.monitorMode = 1;
+    Wh_FreeStringSetting(monitor);
+
+    PCWSTR font = Wh_GetStringSetting(L"FontFamily");
+    if (font && font[0]) {
+        wcsncpy(s.fontFamily, font, 63);
+        s.fontFamily[63] = L'\0';
+        // A family that is not installed falls back to Segoe UI rather than
+        // silently rendering in whatever GDI+ picks.
+        if (!FontIsInstalled(s.fontFamily)) {
+            Wh_Log(L"Font '%s' is not installed; using Segoe UI", s.fontFamily);
+            wcsncpy(s.fontFamily, L"Segoe UI", 63);
+            s.fontFamily[63] = L'\0';
+        }
+    }
+    Wh_FreeStringSetting(font);
+
+    s.panelWidth = ClampInt((int)Wh_GetIntSetting(L"PanelWidth"), 200, 1600);
+    s.rowHeight = ClampInt((int)Wh_GetIntSetting(L"RowHeight"), 18, 80);
+    s.cornerRadius = ClampInt((int)Wh_GetIntSetting(L"CornerRadius"), 0, 60);
+    s.borderThickness = ClampInt((int)Wh_GetIntSetting(L"BorderThickness"), 0, 8);
+    s.fontSize = ClampInt((int)Wh_GetIntSetting(L"FontSize"), 9, 48);
+    s.ringSize = ClampInt((int)Wh_GetIntSetting(L"RingSize"), 12, 64);
+    s.ringThickness = ClampInt((int)Wh_GetIntSetting(L"RingThickness"), 1, 16);
+    s.ringRightOffset = ClampInt((int)Wh_GetIntSetting(L"RingRightOffset"), 0, 200);
+    s.updateMs = ClampInt((int)Wh_GetIntSetting(L"UpdateMs"), 200, 10000);
+    s.hotZoneDepth = ClampInt((int)Wh_GetIntSetting(L"HotZoneDepth"), 2, 64);
+    s.hideDelayMs = ClampInt((int)Wh_GetIntSetting(L"HideDelayMs"), 0, 10000);
+    s.introMs = ClampInt((int)Wh_GetIntSetting(L"IntroMs"), 200, 4000);
+    s.rippleCount = ClampInt((int)Wh_GetIntSetting(L"RippleCount"), 0, 3);
+
+    PCWSTR introStyle = Wh_GetStringSetting(L"IntroStyle");
+    s.introStyle = 0;
+    if (introStyle) {
+        if (wcscmp(introStyle, L"Fade") == 0) s.introStyle = 1;
+        else if (wcscmp(introStyle, L"None") == 0) s.introStyle = 2;
+    }
+    Wh_FreeStringSetting(introStyle);
+
+    // Icons are read as a row-aligned list: Icon1/Icon1Path .. Icon{kMaxRows}.
+    // An entry counts as configured when it names a glyph other than None or
+    // supplies an image path.
+    s.iconCount = 0;
+    for (int i = 0; i < kMaxRows; i++) {
+        IconSpec &slot = s.icons[i];
+        slot.style = 0;
+        slot.path[0] = L'\0';
+
+        WCHAR key[32];
+        swprintf(key, 32, L"Icon%d", i + 1);
+        PCWSTR styleName = Wh_GetStringSetting(key);
+        slot.style = IconStyleFromName(styleName);
+        Wh_FreeStringSetting(styleName);
+
+        swprintf(key, 32, L"Icon%dPath", i + 1);
+        PCWSTR path = Wh_GetStringSetting(key);
+        if (path && path[0]) {
+            CopyUserPath(slot.path, MAX_PATH, path);
+            if (slot.path[0] == L'\0') {
+                // The field had content but nothing usable survived trimming.
+                Wh_Log(L"Icon%d: the icon path is empty after trimming "
+                       L"quotes and spaces; ignoring it", i + 1);
+            }
+        }
+        Wh_FreeStringSetting(path);
+
+        if (slot.style > 0 || slot.path[0]) s.iconCount++;
+    }
+
+    // A slot that supplies only an image needs a glyph to fall back on when that
+    // image cannot be decoded, otherwise the row shows an empty plate. Borrow the
+    // first configured glyph; if there is none, use Memory so a failed load is still
+    // visibly "an icon that did not load" rather than a blank disc.
+    bool anyGlyph = false;
+    for (int i = 0; i < kMaxRows; i++) {
+        if (s.icons[i].style > 0) { anyGlyph = true; break; }
+    }
+    if (!anyGlyph && s.iconCount > 0) {
+        for (int i = 0; i < kMaxRows; i++) {
+            if (s.icons[i].path[0]) s.icons[i].style = 2;   // Memory
+        }
+        Wh_Log(L"Icons: no built-in glyph was chosen, so image-only slots fall back "
+               L"to the Memory glyph if their file cannot be loaded");
+    }
+
+    // Palette resolution. The two sources are mutually exclusive on purpose:
+    //
+    //   Theme = Endfield / Midnight / Mono  ->  that preset is used, and the
+    //                                           colour fields below are ignored
+    //   Theme = Custom                      ->  the colour fields are used
+    //
+    // Letting the fields win over a named theme would mean the preset could never
+    // be seen on a config that had ever stored a colour, which is exactly the
+    // complaint that produced this arrangement.
+    PCWSTR theme = Wh_GetStringSetting(L"Theme");
+    s.themeIndex = 0;
+    if (theme && wcscmp(theme, L"Custom") == 0) {
+        s.themeIndex = -1;
+    } else if (theme) {
+        for (int i = 0; i < kThemeCount; i++) {
+            if (wcscmp(theme, kThemes[i].name) == 0) {
+                s.themeIndex = i;
+                break;
+            }
+        }
+    }
+    Wh_FreeStringSetting(theme);
+
+    // Read the custom fields first, so "was it set?" is known before choosing.
+    struct ColorKey { PCWSTR key; DWORD *target; bool *userSet; };
+    ColorKey colorKeys[] = {
+        {L"BackgroundColor", &s.background, &s.userSetBackground},
+        {L"BorderColor", &s.border, &s.userSetBorder},
+        {L"BorderCollapsedColor", &s.borderCollapsed, &s.userSetBorderCollapsed},
+        {L"TextColor", &s.text, &s.userSetText},
+        {L"AccentColor", &s.accent, &s.userSetAccent},
+        {L"RingColor", &s.ringColor, &s.ringColorUserSet},
+    };
+    for (const ColorKey &ck : colorKeys) {
+        *ck.userSet = false;
+        PCWSTR raw = Wh_GetStringSetting(ck.key);
+        if (raw && raw[0]) {
+            const WCHAR *p = raw;
+            while (*p == L' ' || *p == L'\t') p++;
+            if (*p == L'#') p++;
+            WCHAR *end = nullptr;
+            unsigned long long v = wcstoull(p, &end, 16);
+            if (end && end != p && v <= 0xFFFFFFFFull) {
+                *ck.target = (DWORD)v;
+                *ck.userSet = true;
+            }
+        }
+        Wh_FreeStringSetting(raw);
+    }
+
+    if (s.themeIndex >= 0 && s.themeIndex < kThemeCount) {
+        // A named theme wins outright: the colour fields are not consulted. The
+        // ring-colour flag is cleared here rather than merely being unused, so
+        // there is no path by which a stale field can leak into a preset palette.
+        const ThemePreset &preset = kThemes[s.themeIndex];
+        s.background = preset.background;
+        s.border = preset.border;
+        s.borderCollapsed = preset.borderCollapsed;
+        s.text = preset.text;
+        s.accent = preset.accent;
+        s.ringColor = 0;
+        s.ringColorUserSet = false;
+    } else {
+        // Custom: a field left empty falls back to the Endfield value, so an
+        // incomplete custom palette still produces something coherent.
+        const ThemePreset &fallback = kThemes[0];
+        if (!s.userSetBackground) s.background = fallback.background;
+        if (!s.userSetBorder) s.border = fallback.border;
+        if (!s.userSetBorderCollapsed) s.borderCollapsed = fallback.borderCollapsed;
+        if (!s.userSetText) s.text = fallback.text;
+        if (!s.userSetAccent) s.accent = fallback.accent;
+    }
+}
+
+// Per-row icon resolution.
+//
+// A row with no icon of its own inherits the first configured one. That makes
+// "set Icon1 only" mean "this glyph on every row", which is the obvious reading,
+// while still allowing Icon2..Icon4 to override individual rows.
+static bool SlotIsConfigured(const IconSpec &slot) {
+    return slot.style > 0 || slot.path[0] != L'\0';
+}
+
+static int ResolveIconStyle(const ModSettings &settings, int index) {
+    if (index >= 0 && index < kMaxRows && SlotIsConfigured(settings.icons[index])) {
+        // A slot that supplies only an image still needs a style for its glyph
+        // fallback if the image fails to load.
+        return settings.icons[index].style;
+    }
+    for (int i = 0; i < kMaxRows; i++) {
+        if (SlotIsConfigured(settings.icons[i])) return settings.icons[i].style;
+    }
+    return 0;
+}
+
+static const WCHAR *ResolveIconPath(const ModSettings &settings, int index) {
+    if (index >= 0 && index < kMaxRows && SlotIsConfigured(settings.icons[index])) {
+        return settings.icons[index].path[0] ? settings.icons[index].path : L"";
+    }
+    for (int i = 0; i < kMaxRows; i++) {
+        if (SlotIsConfigured(settings.icons[i])) return settings.icons[i].path;
+    }
+    return L"";
+}
+
+// ---------------------------------------------------------------------------
+// Variable registry
+// ---------------------------------------------------------------------------
+enum Group : unsigned {
+    G_NONE = 0,
+    G_CPU = 1 << 0,
+    G_MEM = 1 << 1,
+    G_NET = 1 << 2,
+    G_GPU = 1 << 3,
+    G_SYS = 1 << 4,   // clock / date / uptime, always collected (free)
+};
+
+struct VarDef {
+    const WCHAR *name;
+    unsigned group;
+};
+
+// Registry order also documents the token list shown in the readme.
+static const VarDef kVariables[] = {
+    {L"cpu", G_CPU}, {L"cpu.user", G_CPU}, {L"cpu.kernel", G_CPU}, {L"cpu.ghz", G_CPU},
+    {L"cpu.ghz.max", G_CPU}, {L"cpu.name", G_CPU}, {L"cpu.cores", G_CPU}, {L"cpu.threads", G_CPU},
+    {L"mem", G_MEM}, {L"mem.used", G_MEM}, {L"mem.total", G_MEM}, {L"mem.free", G_MEM},
+    {L"mem.commit", G_MEM},
+    {L"net.down", G_NET}, {L"net.up", G_NET}, {L"net.down.bps", G_NET}, {L"net.up.bps", G_NET},
+    {L"net.total", G_NET}, {L"net.nics", G_NET},
+    {L"gpu", G_GPU}, {L"gpu.mem", G_GPU}, {L"gpu.temp", G_GPU}, {L"gpu.name", G_GPU},
+    {L"gpu.vram.used", G_GPU}, {L"gpu.vram.total", G_GPU}, {L"gpu.fan", G_GPU}, {L"gpu.power", G_GPU},
+    {L"time", G_SYS}, {L"date", G_SYS}, {L"uptime", G_SYS},
+    {L"mod.ws", G_SYS}, {L"mod.cpu", G_SYS},
+};
+static const int kVariableCount = (int)(sizeof(kVariables) / sizeof(kVariables[0]));
+
+static unsigned GroupForName(const WCHAR *name, int nameLen) {
+    for (int i = 0; i < kVariableCount; i++) {
+        if ((int)wcslen(kVariables[i].name) == nameLen &&
+            _wcsnicmp(kVariables[i].name, name, nameLen) == 0) {
+            return kVariables[i].group;
+        }
+    }
+    return G_NONE;
+}
+
+// Which groups does the configured text actually reference?
+static unsigned RequiredGroups(const ModSettings &s) {
+    unsigned groups = 0;
+    for (int r = 0; r < s.rowCount; r++) {
+        const WCHAR *p = s.rows[r];
+        while (*p) {
+            if (*p == L'{') {
+                const WCHAR *end = wcschr(p + 1, L'}');
+                if (!end) break;
+                const WCHAR *pipe = p + 1;
+                while (pipe < end && *pipe != L'|') pipe++;
+                groups |= GroupForName(p + 1, (int)(pipe - (p + 1)));
+                p = end + 1;
+            } else {
+                p++;
+            }
+        }
+    }
+    return groups;
+}
+
+// ---------------------------------------------------------------------------
+// Collected values
+// ---------------------------------------------------------------------------
+struct Values {
+    double cpu = 0, cpuUser = 0, cpuKernel = 0;
+    double cpuGhz = 0, cpuGhzMax = 0;
+    WCHAR cpuName[64] = L"CPU";
+    int cores = 0, threads = 0;
+
+    double memPercent = 0, memUsedGb = 0, memTotalGb = 0, memFreeGb = 0, memCommit = 0;
+
+    double netDownBps = 0, netUpBps = 0, netTotalBytes = 0;
+    int netNics = 0;
+
+    bool gpuValid = false;
+    double gpu = 0, gpuMem = 0, gpuTemp = 0;
+    // Temperature is a separate capability: NVML reads a real sensor, the PDH
+    // counter path has no equivalent. Without this flag a PDH-only machine
+    // reported "0C", which looks like a real (and alarming) reading.
+    bool gpuTempValid = false;
+    double vramUsedGb = 0, vramTotalGb = 0, gpuFan = 0, gpuPower = 0;
+    WCHAR gpuName[64] = L"GPU";
+
+    WCHAR timeText[16] = L"";
+    WCHAR dateText[16] = L"";
+    WCHAR uptimeText[24] = L"";
+
+    double modWsMb = 0, modCpuMs = 0;
+    bool valid = false;
+};
+
+static CRITICAL_SECTION g_valuesLock;       // guards g_rowState and g_publishedRows
+static Values g_values;                     // published snapshot
+static unsigned g_activeGroups = 0;
+
+// ---------------------------------------------------------------------------
+// CPU
+// ---------------------------------------------------------------------------
+static bool g_cpuPrimed = false;
+static ULONGLONG g_prevIdle = 0, g_prevKernel = 0, g_prevUser = 0;
+
+// CPU identity is static for the process lifetime and is read on the loader
+// thread, so it lives in globals rather than in the published Values snapshot
+// (writing into that snapshot from two threads would be a data race).
+static WCHAR g_cpuName[64] = L"CPU";
+static double g_cpuGhzMax = 1.0;
+static int g_cpuCores = 0, g_cpuThreads = 0;
+
+static void ReadCpuStatic() {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                      L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                      0, KEY_READ, &key) == ERROR_SUCCESS) {
+        WCHAR name[64] = {};
+        DWORD size = sizeof(name);
+        DWORD type = 0;
+        if (RegQueryValueExW(key, L"ProcessorNameString", nullptr, &type,
+                             (LPBYTE)name, &size) == ERROR_SUCCESS && name[0]) {
+            WCHAR *start = name;
+            while (*start == L' ') start++;
+            wcsncpy(g_cpuName, start, 63);
+            g_cpuName[63] = L'\0';
+            size_t len = wcslen(g_cpuName);
+            while (len && g_cpuName[len - 1] == L' ') g_cpuName[--len] = L'\0';
+        }
+        DWORD mhz = 0;
+        size = sizeof(mhz);
+        if (RegQueryValueExW(key, L"~MHz", nullptr, &type, (LPBYTE)&mhz, &size) == ERROR_SUCCESS &&
+            mhz > 0) {
+            g_cpuGhzMax = mhz / 1000.0;
+        }
+        RegCloseKey(key);
+    }
+
+    SYSTEM_INFO si = {};
+    GetNativeSystemInfo(&si);
+    g_cpuThreads = (int)si.dwNumberOfProcessors;
+
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    if (len) {
+        auto *buffer = (BYTE *)malloc(len);
+        if (buffer &&
+            GetLogicalProcessorInformationEx(RelationProcessorCore,
+                                             (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buffer,
+                                             &len)) {
+            int cores = 0;
+            DWORD offset = 0;
+            while (offset < len) {
+                auto *info = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buffer + offset);
+                if (info->Relationship == RelationProcessorCore) cores++;
+                offset += info->Size;
+            }
+            if (cores > 0) g_cpuCores = cores;
+        }
+        free(buffer);
+    }
+    if (g_cpuCores <= 0) g_cpuCores = g_cpuThreads > 1 ? g_cpuThreads / 2 : g_cpuThreads;
+}
+
+static void ReadCpu(Values &v) {
+    FILETIME idleFt, kernelFt, userFt;
+    if (GetSystemTimes(&idleFt, &kernelFt, &userFt)) {
+        ULARGE_INTEGER i, k, u;
+        i.LowPart = idleFt.dwLowDateTime; i.HighPart = idleFt.dwHighDateTime;
+        k.LowPart = kernelFt.dwLowDateTime; k.HighPart = kernelFt.dwHighDateTime;
+        u.LowPart = userFt.dwLowDateTime; u.HighPart = userFt.dwHighDateTime;
+
+        if (g_cpuPrimed) {
+            ULONGLONG idle = i.QuadPart - g_prevIdle;
+            ULONGLONG kern = k.QuadPart - g_prevKernel;
+            ULONGLONG user = u.QuadPart - g_prevUser;
+            ULONGLONG total = kern + user;
+            if (total > 0) {
+                v.cpuUser = MinDouble(100.0, user * 100.0 / (double)total);
+                v.cpuKernel = MinDouble(100.0, (kern > idle ? kern - idle : 0) * 100.0 / (double)total);
+                v.cpu = MinDouble(100.0, v.cpuUser + v.cpuKernel);
+            }
+        }
+        g_prevIdle = i.QuadPart;
+        g_prevKernel = k.QuadPart;
+        g_prevUser = u.QuadPart;
+        g_cpuPrimed = true;
+    }
+
+    // Effective clock: Windows exposes it through PDH "Processor Performance",
+    // but that means a PDH query. The registry base clock is free, so report it.
+    wcsncpy(v.cpuName, g_cpuName, 63);
+    v.cpuName[63] = L'\0';
+    v.cores = g_cpuCores;
+    v.threads = g_cpuThreads;
+    v.cpuGhzMax = g_cpuGhzMax;
+    v.cpuGhz = g_cpuGhzMax;
+}
+
+// ---------------------------------------------------------------------------
+// Memory
+// ---------------------------------------------------------------------------
+static void ReadMemory(Values &v) {
+    MEMORYSTATUSEX m = {};
+    m.dwLength = sizeof(m);
+    if (!GlobalMemoryStatusEx(&m)) return;
+    const double gb = 1073741824.0;
+    v.memTotalGb = m.ullTotalPhys / gb;
+    double freeGb = m.ullAvailPhys / gb;
+    v.memFreeGb = freeGb;
+    v.memUsedGb = v.memTotalGb - freeGb;
+    v.memPercent = (double)m.dwMemoryLoad;
+    ULONGLONG used = m.ullTotalPageFile - m.ullAvailPageFile;
+    v.memCommit = m.ullTotalPageFile > 0 ? used * 100.0 / (double)m.ullTotalPageFile : 0;
+}
+
+// ---------------------------------------------------------------------------
+// Network
+// ---------------------------------------------------------------------------
+typedef DWORD(WINAPI *GetIfTable2Fn)(PMIB_IF_TABLE2 *);
+static GetIfTable2Fn g_getIfTable2 = nullptr;
+static bool g_netPrimed = false;
+static ULONGLONG g_prevRx = 0, g_prevTx = 0, g_prevNetTick = 0;
+
+static void ReadNetwork(Values &v) {
+    if (!g_getIfTable2) return;
+    PMIB_IF_TABLE2 table = nullptr;
+    if (g_getIfTable2(&table) != NO_ERROR || !table) return;
+
+    ULONGLONG rx = 0, tx = 0;
+    int nics = 0;
+    for (ULONG i = 0; i < table->NumEntries; i++) {
+        const MIB_IF_ROW2 &row = table->Table[i];
+        if (row.OperStatus != IfOperStatusUp) continue;
+        if (row.Type == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        if (row.Type == IF_TYPE_TUNNEL) continue;
+        nics++;
+        rx += row.InOctets;
+        tx += row.OutOctets;
+    }
+    FreeMibTable(table);
+
+    v.netNics = nics;
+    v.netTotalBytes = (double)(rx + tx);
+
+    ULONGLONG now = GetTickCount64();
+    if (g_netPrimed && now > g_prevNetTick) {
+        double seconds = (now - g_prevNetTick) / 1000.0;
+        v.netDownBps = rx >= g_prevRx ? (rx - g_prevRx) / seconds : 0;
+        v.netUpBps = tx >= g_prevTx ? (tx - g_prevTx) / seconds : 0;
+    }
+    g_prevRx = rx;
+    g_prevTx = tx;
+    g_prevNetTick = now;
+    g_netPrimed = true;
+}
+
+// ---------------------------------------------------------------------------
+// GPU: NVML first (exact, and cheap per sample), PDH counters as fallback.
+//
+// Both are expensive to *start* (NVML ~22 MB resident, PDH ~6 MB plus a ~550 ms
+// first call), so neither is touched unless a row references {gpu...}.
+// ---------------------------------------------------------------------------
+typedef int nvmlReturn_t;
+typedef void *nvmlDevice_t;
+struct nvmlUtilization_t { unsigned int gpu; unsigned int memory; };
+struct nvmlMemory_t { unsigned long long total, free, used; };
+typedef nvmlReturn_t(WINAPI *nvmlInitFn)(void);
+typedef nvmlReturn_t(WINAPI *nvmlShutdownFn)(void);
+typedef nvmlReturn_t(WINAPI *nvmlDeviceGetHandleByIndexFn)(unsigned int, nvmlDevice_t *);
+typedef nvmlReturn_t(WINAPI *nvmlDeviceGetTemperatureFn)(nvmlDevice_t, int, unsigned int *);
+typedef nvmlReturn_t(WINAPI *nvmlDeviceGetUtilizationRatesFn)(nvmlDevice_t, nvmlUtilization_t *);
+typedef nvmlReturn_t(WINAPI *nvmlDeviceGetMemoryInfoFn)(nvmlDevice_t, nvmlMemory_t *);
+typedef nvmlReturn_t(WINAPI *nvmlDeviceGetNameFn)(nvmlDevice_t, char *, unsigned int);
+typedef nvmlReturn_t(WINAPI *nvmlDeviceGetFanSpeedFn)(nvmlDevice_t, unsigned int *);
+typedef nvmlReturn_t(WINAPI *nvmlDeviceGetPowerUsageFn)(nvmlDevice_t, unsigned int *);
+
+struct GpuBackend {
+    enum Kind { None, Nvml, Pdh } kind = None;
+
+    // NVML
+    HMODULE nvmlModule = nullptr;
+    nvmlDevice_t device = nullptr;
+    nvmlDeviceGetTemperatureFn getTemp = nullptr;
+    nvmlDeviceGetUtilizationRatesFn getUtil = nullptr;
+    nvmlDeviceGetMemoryInfoFn getMemory = nullptr;
+    nvmlDeviceGetNameFn getName = nullptr;
+    nvmlDeviceGetFanSpeedFn getFan = nullptr;
+    nvmlDeviceGetPowerUsageFn getPower = nullptr;
+    nvmlShutdownFn shutdown = nullptr;
+
+    // PDH
+    PDH_HQUERY query = nullptr;
+    PDH_HCOUNTER engineCounter = nullptr;
+    PDH_HCOUNTER memCounter = nullptr;
+
+    bool Start(Values &v);
+    void Sample(Values &v);
+};
+
+// Loads nvml.dll, working around a real-world driver-install defect.
+//
+// Some NVIDIA installs leave nvml.dll in System32 but never place its dependency
+// nvml_loader.dll there, so a plain LoadLibrary("nvml.dll") fails with
+// ERROR_MOD_NOT_FOUND (126). The loader does exist in the driver store, so it is
+// located and preloaded first; once it is already mapped, nvml.dll's import
+// resolves. Verified against a machine showing exactly that split.
+static HMODULE LoadNvmlWithDependencies() {
+    HMODULE module = ((HMODULE(WINAPI *)(LPCWSTR))LoadLibraryW)(L"nvml.dll");
+    if (module) return module;
+
+    // Already mapped with the right name? Then the failure is something else.
+    if (GetModuleHandleW(L"nvml_loader.dll")) return nullptr;
+
+    WCHAR searchRoot[MAX_PATH] = L"C:\\Windows\\System32\\DriverStore\\FileRepository";
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                      L"SOFTWARE\\NVIDIA Corporation\\Global\\NVSMI", 0, KEY_READ,
+                      &key) == ERROR_SUCCESS) {
+        WCHAR installPath[MAX_PATH] = {};
+        DWORD size = sizeof(installPath);
+        DWORD type = 0;
+        if (RegQueryValueExW(key, L"InstallPath", nullptr, &type, (LPBYTE)installPath,
+                             &size) == ERROR_SUCCESS && installPath[0]) {
+            wcsncpy(searchRoot, installPath, MAX_PATH - 1);
+        }
+        RegCloseKey(key);
+    }
+
+    // A bounded breadth-first sweep for nvml_loader.dll. Depth 3 is enough for
+    // both the driver store layout and an NVSMI install directory.
+    struct Node { WCHAR path[MAX_PATH]; int depth; };
+    static Node queue[64];
+    int head = 0, tail = 0;
+    wcsncpy(queue[tail].path, searchRoot, MAX_PATH - 1);
+    queue[tail].path[MAX_PATH - 1] = L'\0';
+    queue[tail].depth = 0;
+    tail++;
+
+    HMODULE loader = nullptr;
+    while (head < tail && !loader) {
+        Node node = queue[head++];
+        WCHAR pattern[MAX_PATH];
+        swprintf(pattern, MAX_PATH, L"%s\\nvml_loader.dll", node.path);
+        loader = ((HMODULE(WINAPI *)(LPCWSTR))LoadLibraryW)(pattern);
+        if (loader) break;
+        if (node.depth >= 3 || tail >= 64) continue;
+
+        WCHAR childPattern[MAX_PATH];
+        swprintf(childPattern, MAX_PATH, L"%s\\*", node.path);
+        WIN32_FIND_DATAW data;
+        HANDLE find = FindFirstFileW(childPattern, &data);
+        if (find == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if (data.cFileName[0] == L'.') continue;
+            if (tail >= 64) break;
+            swprintf(queue[tail].path, MAX_PATH, L"%s\\%s", node.path, data.cFileName);
+            queue[tail].depth = node.depth + 1;
+            tail++;
+        } while (FindNextFileW(find, &data));
+        FindClose(find);
+    }
+
+    if (loader) {
+        Wh_Log(L"NVML: preloaded nvml_loader.dll to satisfy nvml.dll's import");
+        module = ((HMODULE(WINAPI *)(LPCWSTR))LoadLibraryW)(L"nvml.dll");
+    }
+    return module;
+}
+
+static bool GpuStartNvml(GpuBackend &b, Values &v) {
+    b.nvmlModule = LoadNvmlWithDependencies();
+    if (!b.nvmlModule) {
+        // Report both numbers: 126 with the module present means a missing
+        // dependency, 2 means the file itself is absent.
+        Wh_Log(L"NVML: could not load nvml.dll, error=%lu, already-in-system32=%d",
+               GetLastError(),
+               GetFileAttributesW(L"C:\\Windows\\System32\\nvml.dll") != INVALID_FILE_ATTRIBUTES);
+        return false;
+    }
+    auto init = (nvmlInitFn)GetProcAddress(b.nvmlModule, "nvmlInit_v2");
+    auto count = (nvmlReturn_t(WINAPI *)(unsigned int *))GetProcAddress(b.nvmlModule, "nvmlDeviceGetCount_v2");
+    auto handle = (nvmlDeviceGetHandleByIndexFn)GetProcAddress(b.nvmlModule, "nvmlDeviceGetHandleByIndex_v2");
+    b.getTemp = (nvmlDeviceGetTemperatureFn)GetProcAddress(b.nvmlModule, "nvmlDeviceGetTemperature");
+    b.getUtil = (nvmlDeviceGetUtilizationRatesFn)GetProcAddress(b.nvmlModule, "nvmlDeviceGetUtilizationRates");
+    b.getMemory = (nvmlDeviceGetMemoryInfoFn)GetProcAddress(b.nvmlModule, "nvmlDeviceGetMemoryInfo");
+    b.getName = (nvmlDeviceGetNameFn)GetProcAddress(b.nvmlModule, "nvmlDeviceGetName");
+    b.getFan = (nvmlDeviceGetFanSpeedFn)GetProcAddress(b.nvmlModule, "nvmlDeviceGetFanSpeed");
+    b.getPower = (nvmlDeviceGetPowerUsageFn)GetProcAddress(b.nvmlModule, "nvmlDeviceGetPowerUsage");
+    b.shutdown = (nvmlShutdownFn)GetProcAddress(b.nvmlModule, "nvmlShutdown");
+
+    if (!init || !count || !handle || !b.getUtil) {
+        Wh_Log(L"NVML: exports missing (init=%d count=%d handle=%d util=%d)",
+               init ? 1 : 0, count ? 1 : 0, handle ? 1 : 0, b.getUtil ? 1 : 0);
+        return false;
+    }
+    nvmlReturn_t rc = init();
+    if (rc != 0) {
+        Wh_Log(L"NVML: nvmlInit_v2 failed, rc=%d", (int)rc);
+        return false;
+    }
+    unsigned int devices = 0;
+    rc = count(&devices);
+    if (rc != 0 || devices == 0) {
+        Wh_Log(L"NVML: device count rc=%d devices=%u", (int)rc, devices);
+        return false;
+    }
+    rc = handle(0, &b.device);
+    if (rc != 0) {
+        Wh_Log(L"NVML: GetHandleByIndex(0) failed, rc=%d", (int)rc);
+        return false;
+    }
+
+    if (b.getName) {
+        char name[96] = {};
+        if (b.getName(b.device, name, sizeof(name)) == 0 && name[0]) {
+            MultiByteToWideChar(CP_UTF8, 0, name, -1, v.gpuName, 63);
+        }
+    }
+    b.kind = GpuBackend::Nvml;
+    Wh_Log(L"NVML ready: %s (%u device(s))", v.gpuName, devices);
+    return true;
+}
+
+static bool GpuStartPdh(GpuBackend &b) {
+    if (PdhOpenQueryW(nullptr, 0, &b.query) != ERROR_SUCCESS) return false;
+    if (PdhAddEnglishCounterW(b.query, L"\\GPU Engine(*)\\Utilization Percentage", 0,
+                              &b.engineCounter) != ERROR_SUCCESS) {
+        PdhCloseQuery(b.query);
+        b.query = nullptr;
+        return false;
+    }
+    // VRAM is optional; a failure here must not disable utilisation.
+    PdhAddEnglishCounterW(b.query, L"\\GPU Adapter Memory(*)\\Dedicated Usage", 0, &b.memCounter);
+    // Counters need two collections before the first value is meaningful.
+    PdhCollectQueryData(b.query);
+    b.kind = GpuBackend::Pdh;
+    return true;
+}
+
+// NVML is preferred: one call pair reads temperature and both utilisation axes,
+// and it needs no PDH query (which costs ~550 ms to start and never returns its
+// ~6 MB). PDH is the fallback for non-NVIDIA adapters.
+bool GpuBackend::Start(Values &v) {
+    if (GpuStartNvml(*this, v)) return true;
+    Wh_Log(L"NVML unavailable; falling back to PDH GPU counters (may take ~500 ms)");
+    return GpuStartPdh(*this);
+}
+
+// Reads the busiest engine of the selected adapter, mirroring Task Manager.
+static double PdhReadMaxEngine(PDH_HQUERY query, PDH_HCOUNTER counter) {
+    DWORD bufferSize = 0;
+    DWORD itemCount = 0;
+    if (PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &bufferSize, &itemCount, nullptr)
+        != PDH_MORE_DATA) {
+        return 0;
+    }
+    BYTE *buffer = (BYTE *)malloc(bufferSize);
+    if (!buffer) return 0;
+    double best = 0;
+    if (PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &bufferSize, &itemCount,
+                                     (PPDH_FMT_COUNTERVALUE_ITEM_W)buffer) == ERROR_SUCCESS) {
+        auto *items = (PPDH_FMT_COUNTERVALUE_ITEM_W)buffer;
+        for (DWORD i = 0; i < itemCount; i++) {
+            if (items[i].FmtValue.CStatus != ERROR_SUCCESS) continue;
+            double value = items[i].FmtValue.doubleValue;
+            if (value > best) best = value;
+        }
+    }
+    free(buffer);
+    return MinDouble(100.0, best);
+}
+
+void GpuBackend::Sample(Values &v) {
+    if (kind == Nvml) {
+        nvmlUtilization_t util = {};
+        if (getUtil && getUtil(device, &util) == 0) {
+            v.gpu = util.gpu;
+            v.gpuMem = util.memory;
+            v.gpuValid = true;
+        }
+        if (getTemp) {
+            unsigned int celsius = 0;
+            if (getTemp(device, 0, &celsius) == 0) {
+                v.gpuTemp = celsius;
+                v.gpuTempValid = true;
+            }
+        }
+        if (getMemory) {
+            nvmlMemory_t mem = {};
+            if (getMemory(device, &mem) == 0) {
+                v.vramUsedGb = mem.used / 1073741824.0;
+                v.vramTotalGb = mem.total / 1073741824.0;
+            }
+        }
+        if (getFan) {
+            unsigned int fan = 0;
+            if (getFan(device, &fan) == 0) v.gpuFan = fan;
+        }
+        if (getPower) {
+            unsigned int mw = 0;
+            if (getPower(device, &mw) == 0) v.gpuPower = mw / 1000.0;
+        }
+    } else if (kind == Pdh) {
+        if (PdhCollectQueryData(query) == ERROR_SUCCESS) {
+            v.gpu = PdhReadMaxEngine(query, engineCounter);
+            v.gpuValid = true;
+            if (memCounter) {
+                DWORD bufferSize = 0, itemCount = 0;
+                if (PdhGetFormattedCounterArrayW(memCounter, PDH_FMT_LARGE, &bufferSize,
+                                                 &itemCount, nullptr) == PDH_MORE_DATA) {
+                    BYTE *buffer = (BYTE *)malloc(bufferSize);
+                    if (buffer) {
+                        if (PdhGetFormattedCounterArrayW(memCounter, PDH_FMT_LARGE, &bufferSize,
+                                                         &itemCount,
+                                                         (PPDH_FMT_COUNTERVALUE_ITEM_W)buffer) == ERROR_SUCCESS) {
+                            auto *items = (PPDH_FMT_COUNTERVALUE_ITEM_W)buffer;
+                            ULONGLONG best = 0;
+                            for (DWORD i = 0; i < itemCount; i++) {
+                                if (items[i].FmtValue.CStatus != ERROR_SUCCESS) continue;
+                                ULONGLONG value = (ULONGLONG)items[i].FmtValue.largeValue;
+                                if (value > best) best = value;
+                            }
+                            v.vramUsedGb = best / 1073741824.0;
+                        }
+                        free(buffer);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rendering the rows
+// ---------------------------------------------------------------------------
+static void FormatBytes(double bytes, WCHAR *out, size_t count) {
+    static const WCHAR *units[] = {L"B", L"KB", L"MB", L"GB", L"TB", L"PB"};
+    int unit = 0;
+    double value = bytes;
+    while (value >= 1024.0 && unit < 5) {
+        value /= 1024.0;
+        unit++;
+    }
+    if (unit == 0) swprintf(out, count, L"%.0f %s", value, units[unit]);
+    else if (value < 10.0) swprintf(out, count, L"%.2f %s", value, units[unit]);
+    else swprintf(out, count, L"%.1f %s", value, units[unit]);
+}
+
+static void FormatSpeed(double bps, WCHAR *out, size_t count) {
+    WCHAR bytes[32];
+    FormatBytes(bps, bytes, 32);
+    swprintf(out, count, L"%s/s", bytes);
+}
+
+// Returns a pointer to a pre-formatted display string, or nullptr when unknown.
+// Numbers that can be reformatted are handled by LookupNumber instead.
+static const WCHAR *LookupRaw(const WCHAR *name, int len, const Values &v, WCHAR *scratch, size_t scratchCount) {
+#define MATCH(literal) (len == (int)(sizeof(literal) / sizeof(WCHAR)) - 1 && _wcsnicmp(name, literal, len) == 0)
+    if (MATCH(L"cpu.name")) return v.cpuName;
+    if (MATCH(L"gpu.name")) return v.gpuName;
+    if (MATCH(L"time")) return v.timeText;
+    if (MATCH(L"date")) return v.dateText;
+    if (MATCH(L"uptime")) return v.uptimeText;
+    if (MATCH(L"gpu.vram.total")) { swprintf(scratch, scratchCount, L"%.1f", v.vramTotalGb); return scratch; }
+    if (MATCH(L"cpu.cores")) { swprintf(scratch, scratchCount, L"%d", v.cores); return scratch; }
+    if (MATCH(L"cpu.threads")) { swprintf(scratch, scratchCount, L"%d", v.threads); return scratch; }
+    if (MATCH(L"net.nics")) { swprintf(scratch, scratchCount, L"%d", v.netNics); return scratch; }
+    if (MATCH(L"net.down")) { FormatSpeed(v.netDownBps, scratch, scratchCount); return scratch; }
+    if (MATCH(L"net.up")) { FormatSpeed(v.netUpBps, scratch, scratchCount); return scratch; }
+    if (MATCH(L"net.total")) { FormatBytes(v.netTotalBytes, scratch, scratchCount); return scratch; }
+#undef MATCH
+    return nullptr;
+}
+
+// Numeric variables, so a format spec can set precision and padding on them.
+// Distinct from LookupRaw because formatting has to happen before the digits are
+// fixed: once "12%" is a string it is too late to ask for two decimals.
+static bool LookupNumber(const WCHAR *name, int len, const Values &v, double &out) {
+#define MATCH(literal) (len == (int)(sizeof(literal) / sizeof(WCHAR)) - 1 && _wcsnicmp(name, literal, len) == 0)
+    if (MATCH(L"cpu")) { out = v.cpu; return true; }
+    if (MATCH(L"cpu.user")) { out = v.cpuUser; return true; }
+    if (MATCH(L"cpu.kernel")) { out = v.cpuKernel; return true; }
+    if (MATCH(L"cpu.ghz")) { out = v.cpuGhz; return true; }
+    if (MATCH(L"cpu.ghz.max")) { out = v.cpuGhzMax; return true; }
+    if (MATCH(L"cpu.cores")) { out = v.cores; return true; }
+    if (MATCH(L"cpu.threads")) { out = v.threads; return true; }
+    if (MATCH(L"mem")) { out = v.memPercent; return true; }
+    if (MATCH(L"mem.used")) { out = v.memUsedGb; return true; }
+    if (MATCH(L"mem.total")) { out = v.memTotalGb; return true; }
+    if (MATCH(L"mem.free")) { out = v.memFreeGb; return true; }
+    if (MATCH(L"mem.commit")) { out = v.memCommit; return true; }
+    if (MATCH(L"net.nics")) { out = v.netNics; return true; }
+    if (MATCH(L"net.down.bps")) { out = v.netDownBps; return true; }
+    if (MATCH(L"net.up.bps")) { out = v.netUpBps; return true; }
+    if (MATCH(L"mod.ws")) { out = v.modWsMb; return true; }
+    if (MATCH(L"mod.cpu")) { out = v.modCpuMs; return true; }
+    // GPU values are only meaningful once a backend reported something.
+    if (MATCH(L"gpu")) { out = v.gpuValid ? v.gpu : 0; return v.gpuValid; }
+    if (MATCH(L"gpu.mem")) { out = v.gpuValid ? v.gpuMem : 0; return v.gpuValid; }
+    if (MATCH(L"gpu.temp")) { out = v.gpuTemp; return v.gpuTempValid; }
+    if (MATCH(L"gpu.fan")) { out = v.gpuFan; return true; }
+    if (MATCH(L"gpu.power")) { out = v.gpuPower; return true; }
+    if (MATCH(L"gpu.vram.used")) { out = v.vramUsedGb; return true; }
+    if (MATCH(L"gpu.vram.total")) { out = v.vramTotalGb; return true; }
+#undef MATCH
+    return false;
+}
+
+// One format spec: digits | int | pct | wN | padC
+static void ApplySpecToken(const WCHAR *spec, int specLen, WCHAR *value, size_t valueCount) {
+    if (specLen <= 0) return;
+    WCHAR formatted[128];
+
+    if (specLen == 1 && spec[0] >= L'0' && spec[0] <= L'9') {
+        // Digit count, applied to the value as it stands. This is the only spec
+        // that works on the pre-formatted form of a numeric variable.
+        swprintf(formatted, 128, L"%.*f", spec[0] - L'0', _wtof(value));
+        wcsncpy(value, formatted, valueCount - 1);
+        value[valueCount - 1] = L'\0';
+    } else if (_wcsnicmp(spec, L"int", specLen) == 0) {
+        swprintf(formatted, 128, L"%.0f", _wtof(value));
+        wcsncpy(value, formatted, valueCount - 1);
+        value[valueCount - 1] = L'\0';
+    } else if (_wcsnicmp(spec, L"pct", specLen) == 0) {
+        swprintf(formatted, 128, L"%.0f%%", _wtof(value));
+        wcsncpy(value, formatted, valueCount - 1);
+        value[valueCount - 1] = L'\0';
+    } else if ((spec[0] == L'w' || spec[0] == L'W') && specLen > 1) {
+        int width = _wtoi(spec + 1);
+        if (width > 0 && width < 64) {
+            size_t current = wcslen(value);
+            if ((int)current < width) {
+                // Padded on the left, which is what makes numbers line up in a
+                // column. The fill character comes from a later padX token.
+                size_t pad = (size_t)width - current;
+                WCHAR fill = L' ';
+                for (int i = 0; i < (int)pad && i < 63; i++) formatted[i] = fill;
+                formatted[pad < 63 ? (int)pad : 63] = L'\0';
+                wcsncat(formatted, value, 127 - wcslen(formatted) - 1);
+                wcsncpy(value, formatted, valueCount - 1);
+                value[valueCount - 1] = L'\0';
+            }
+        }
+    } else if ((spec[0] == L'p' || spec[0] == L'P') && specLen > 1 &&
+               (spec[1] == L'a' || spec[1] == L'A')) {
+        WCHAR fill = specLen > 3 ? spec[3] : L' ';   // pad_ / pad0
+        wchar_t *space = wcschr(value, L' ');
+        if (space) {
+            for (WCHAR *c = value; c < space; c++) *c = fill;
+        }
+    }
+}
+
+// Applies a |-separated spec chain, e.g. {cpu|0|w3|pad0}.
+//
+// When the variable is numeric the chain runs on the number first, so
+// {mem.used|2} really does give two decimals rather than zero. Variables that
+// are only available pre-formatted (speeds, byte totals, clock text) take the
+// digit spec applied to their string form.
+static void ApplySpec(const WCHAR *spec, int specLen, const WCHAR *name, int nameLen,
+                      const Values &v, WCHAR *value, size_t valueCount) {
+    if (specLen <= 0) return;
+
+    // Split the chain and note whether it starts with a digit count.
+    const WCHAR *tokens[8];
+    int lengths[8];
+    int tokenCount = 0;
+    const WCHAR *p = spec;
+    int remaining = specLen;
+    while (remaining > 0 && tokenCount < 8) {
+        const WCHAR *bar = p;
+        int span = 0;
+        while (span < remaining && bar[span] != L'|') span++;
+        while (span > 0 && bar[span - 1] == L' ') span--;
+        tokens[tokenCount] = bar;
+        lengths[tokenCount] = span;
+        tokenCount++;
+        p = bar + span;
+        remaining -= span;
+        if (remaining > 0) {
+            p++;
+            remaining--;
+        }
+    }
+
+    double number = 0;
+    bool numeric = LookupNumber(name, nameLen, v, number);
+    int firstToken = 0;
+    if (numeric && tokenCount > 0 && lengths[0] == 1 && tokens[0][0] >= L'0' && tokens[0][0] <= L'9') {
+        swprintf(value, valueCount, L"%.*f", tokens[0][0] - L'0', number);
+        firstToken = 1;
+    }
+
+    for (int i = firstToken; i < tokenCount; i++) {
+        ApplySpecToken(tokens[i], lengths[i], value, valueCount);
+        // A pad token only rewrites existing spaces, so it has to run after the
+        // width token that created them. Chained specs preserve that order.
+    }
+}
+
+// The StringFormat every row's text is drawn and measured with.
+//
+// Factored out so the paint path and the regression test share ONE definition: the
+// test asserting "no run wraps" against its own copy of this setup would keep passing
+// while the panel wrapped, which is a test that proves nothing. The flag is the whole
+// fix for the wrap, so it lives here and nowhere else.
+static GpStringFormat *CreateRowStringFormat() {
+    GpStringFormat *format = nullptr;
+    if (g_gdiplus.CreateStringFormat(kStringFormatNoWrap, 0, &format) != 0 || !format) {
+        return nullptr;
+    }
+    if (g_gdiplus.SetStringFormatAlign(format, kAlignNear) != 0 ||
+        g_gdiplus.SetStringFormatLineAlign(format, kAlignCenter) != 0) {
+        g_gdiplus.DeleteStringFormat(format);
+        return nullptr;
+    }
+    return format;
+}
+
+// The panel's intro transform: a scale about the panel's centre, expressed as the
+// matrix GDI+ is given. Factored out because the ripple used to be painted outside
+// this transform while the icon was painted inside it, and matrix.dy grows with the
+// panel height -- so the two only agreed on a single row.
+struct PanelTransform {
+    float scale;
+    float dx;
+    float dy;
+    bool active;
+};
+
+static PanelTransform ComputePanelTransform(float width, float height, double introScale,
+                                            bool introActive) {
+    PanelTransform t = {};
+    t.active = introActive && introScale > 0.001 &&
+               (introScale < 0.999 || introScale > 1.001);
+    t.scale = t.active ? (float)introScale : 1.0f;
+    t.dx = (1.0f - t.scale) * width / 2.0f;
+    t.dy = (1.0f - t.scale) * height / 2.0f;
+    return t;
+}
+
+// Maps a point from local (untransformed) panel space to rendered space.
+static void ApplyPanelTransform(const PanelTransform &t, float x, float y,
+                                float *outX, float *outY) {
+    *outX = t.scale * x + t.dx;
+    *outY = t.scale * y + t.dy;
+}
+
+// Right edge available to text on one row, and the width the text should occupy.
+//
+// This is factored out because getting it wrong is invisible in a compile and
+// subtle on screen: a zero here makes GDI+ clip the entire row away, which is
+// what made every text-only row disappear. It is covered by _layouttest.cpp.
+struct RowTextMetrics {
+    float textRight;
+    float textWidth;
+};
+
+static RowTextMetrics ComputeRowTextMetrics(float panelWidth, int ringCount, int ringSize,
+                                            int ringRightOffset, bool inlineFlow,
+                                            float leftInset = 12.0f) {
+    RowTextMetrics m;
+    const float inset = leftInset;
+    m.textRight = panelWidth - 12.0f;
+    if (!inlineFlow && ringCount > 0) {
+        float ringsWidth = (float)ringCount * ((float)ringSize + 4.0f);
+        m.textRight = panelWidth - (float)ringRightOffset - ringsWidth;
+    }
+    m.textWidth = m.textRight - inset;
+    if (m.textWidth < 0.0f) m.textWidth = 0.0f;
+    return m;
+}
+
+// Colour of a ring gauge. Precedence, highest first:
+//
+//   1. the per-ring :COLOR field in [[ring:VALUE:MAX:THICK:COLOR]]
+//   2. the RingColor setting, when Theme is Custom
+//   3. the theme's border colour
+//
+// Factored out so the precedence is testable rather than implied by wherever the
+// expression happens to sit in the paint loop.
+static DWORD ResolveRingColor(const RingSpec &ring, const ModSettings &settings) {
+    if (ring.hasColor) return ring.color;
+    if (settings.ringColorUserSet) return settings.ringColor;
+    return settings.border;
+}
+
+// Width of a text run, in pixels, including its trailing spaces.
+//
+// GDI+ MeasureString deliberately ignores trailing spaces (normal typographic
+// behaviour), which is wrong for a layout that positions a gauge immediately
+// after the text: "9%  " must advance by the two spaces or the gauge lands on
+// top of the '%'. Appending a sentinel glyph and subtracting its own width is
+// the portable way to get the true advance.
+//
+// The sentinel is U+2502 BOX DRAWINGS LIGHT VERTICAL, chosen because it is
+// effectively never present in a status row and is not whitespace, so it
+// terminates the trailing-space run that GDI+ would otherwise trim.
+//
+// exactLength >= 0 measures that prefix and stops there, ignoring anything after it.
+// FitTextToWidth needs this: measuring a prefix by copying it into a shorter buffer
+// would let the sentinel absorb the following whitespace, so "ab" and "ab      "
+// would report the same width and a width-ordered search would have no order to
+// rely on.
+static float MeasureAdvance(GpGraphics *graphics, GpFont *font, GpStringFormat *format,
+                            const WCHAR *text, float boxHeight, int exactLength = -1) {
+    static const WCHAR kSentinel = 0x2502;
+
+    WCHAR probe[644];
+    int length = exactLength >= 0 ? exactLength : (int)wcslen(text);
+    if (length > 640) length = 640;
+    wcsncpy(probe, text, length);
+    probe[length] = kSentinel;
+    probe[length + 1] = L'\0';
+
+    RectF box(0.0f, 0.0f, 4000.0f, boxHeight);
+    RectF bounds = {};
+    INT codepoints = 0, lines = 0;
+    float withSentinel = 0.0f;
+    if (g_gdiplus.MeasureString(graphics, probe, -1, font, &box, format, &bounds,
+                                &codepoints, &lines) == 0) {
+        withSentinel = bounds.Width;
+    }
+
+    WCHAR justSentinel[2] = {kSentinel, L'\0'};
+    float sentinelOnly = 0.0f;
+    bounds = {};
+    if (g_gdiplus.MeasureString(graphics, justSentinel, -1, font, &box, format, &bounds,
+                                &codepoints, &lines) == 0) {
+        sentinelOnly = bounds.Width;
+    }
+
+    float advance = withSentinel - sentinelOnly;
+    if (advance < 0.0f) advance = 0.0f;
+    return advance;
+}
+
+// How many characters of a run fit inside `budget` pixels.
+//
+// `width` answers "how wide is the first count characters", and a prefix only ever
+// gets wider as characters are added, so the longest fitting prefix is bisected
+// rather than scanned. Factored out of FitTextToWidth with the measurement injected
+// so the search itself is assertable in the regression test, which has no GDI+ or
+// font to measure with.
+static int FitCharacterCount(int length, float budget, float (*width)(int, void *),
+                             void *context) {
+    if (length <= 0 || budget <= 0.0f || !width) return 0;
+    int low = 0, high = length;
+    while (low < high) {
+        int mid = low + (high - low + 1) / 2;
+        if (width(mid, context) <= budget) low = mid;
+        else high = mid - 1;
+    }
+    return low;
+}
+
+// How many leading characters to keep when a run is too wide, reserving one
+// character for the ellipsis. Returns 0 when only the ellipsis would fit, which the
+// caller renders as "keep the raw prefix" instead: a lone ellipsis carries no
+// information, and a run trimmed to nothing is indistinguishable from an empty row.
+static int FitCharsWithEllipsis(int length, float budget, float ellipsisWidth,
+                                float (*width)(int, void *), void *context) {
+    if (length <= 0 || budget <= 0.0f) return 0;
+    if (ellipsisWidth <= 0.0f || ellipsisWidth >= budget) return 0;
+    int keep = FitCharacterCount(length, budget - ellipsisWidth, width, context);
+    if (keep >= length) return 0;   // nothing was actually shortened
+    return keep;
+}
+
+// Shortens a run in place until it can be drawn inside `available` pixels.
+//
+// Needed because GDI+ does not clip text to the layout box: it either wraps (which
+// kStringFormatNoWrap now forbids) or simply draws past the box. A row packs several
+// segments -- text, ring, text -- into one row width, and every segment is drawn in
+// its own box, so a segment that runs long would draw across the gauge that follows
+// it. Trimming here also shows the reader that something was cut, instead of
+// overflowing silently.
+//
+// The head is kept and an ellipsis is appended, which is the order the readings are
+// written in ("CPU ... 12%  RAM ... 73%"): dropping the head would remove the labels
+// and leave bare numbers with no way to tell which is which.
+//
+// Returns true when the text was shortened.
+static bool FitTextToWidth(GpGraphics *graphics, GpFont *font, GpStringFormat *format,
+                           WCHAR *text, size_t capacity, float available, float boxHeight) {
+    if (!text || capacity == 0 || available <= 0.0f) return false;
+
+    int length = (int)wcslen(text);
+    if (length <= 0) return false;
+    if (MeasureAdvance(graphics, font, format, text, boxHeight) <= available) return false;
+
+    // Width of the ellipsis on its own, measured once per process. The font is fixed
+    // for the lifetime of the panel, so this cannot go stale.
+    static float ellipsisWidth = -1.0f;
+    if (ellipsisWidth < 0.0f) {
+        ellipsisWidth = MeasureAdvance(graphics, font, format, L"\x2026", boxHeight);
+    }
+
+    // A lambda captures nothing it could pass as a C callback, so the measurement is
+    // reached through a small context struct instead.
+    struct PrefixMeasure {
+        GpGraphics *graphics;
+        GpFont *font;
+        GpStringFormat *format;
+        const WCHAR *text;
+        float boxHeight;
+    };
+    PrefixMeasure measure = {graphics, font, format, text, boxHeight};
+    auto prefixWidth = [](int count, void *raw) -> float {
+        PrefixMeasure *m = (PrefixMeasure *)raw;
+        return MeasureAdvance(m->graphics, m->font, m->format, m->text, m->boxHeight, count);
+    };
+
+    int keep = FitCharsWithEllipsis(length, available, ellipsisWidth, prefixWidth, &measure);
+    if (keep > 0 && (size_t)keep + 2 <= capacity) {
+        text[keep] = L'\x2026';
+        text[keep + 1] = L'\0';
+        return true;
+    }
+
+    // No room for an ellipsis: keep the widest prefix that fits on its own.
+    keep = FitCharacterCount(length, available, prefixWidth, &measure);
+    if (keep < length) {
+        text[keep] = L'\0';
+        return true;
+    }
+    return false;
+}
+
+// True when a name is a variable this mod knows about, whether or not the machine
+// can currently supply a value for it. LookupNumber answering "no" is not enough
+// to conclude "unknown token": GPU temperature is a known variable that simply has
+// no sensor on some machines, and it must render as "--" rather than being left
+// on screen as literal "{gpu.temp}" text.
+static bool IsKnownNumberVariable(const WCHAR *name, int len) {
+#define MATCH(literal) (len == (int)(sizeof(literal) / sizeof(WCHAR)) - 1 && _wcsnicmp(name, literal, len) == 0)
+    return MATCH(L"cpu") || MATCH(L"cpu.user") || MATCH(L"cpu.kernel") || MATCH(L"cpu.ghz") ||
+           MATCH(L"cpu.ghz.max") || MATCH(L"cpu.cores") || MATCH(L"cpu.threads") ||
+           MATCH(L"mem") || MATCH(L"mem.used") || MATCH(L"mem.total") || MATCH(L"mem.free") ||
+           MATCH(L"mem.commit") || MATCH(L"net.nics") || MATCH(L"net.down.bps") ||
+           MATCH(L"net.up.bps") || MATCH(L"mod.ws") || MATCH(L"mod.cpu") ||
+           MATCH(L"gpu") || MATCH(L"gpu.mem") || MATCH(L"gpu.temp") || MATCH(L"gpu.fan") ||
+           MATCH(L"gpu.power") || MATCH(L"gpu.vram.used") || MATCH(L"gpu.vram.total");
+#undef MATCH
+}
+
+// Outcome of resolving one token.
+enum LookupResult {
+    LR_UNKNOWN,    // not a variable: keep the source text so a typo is obvious
+    LR_RESOLVED,   // value written to the caller's buffer
+    LR_UNAVAILABLE // known variable, but this machine cannot supply it
+};
+
+// Resolves {name} or {name|spec} into out. Numeric variables apply the digit spec
+// to the number itself, which is why the spec is passed down rather than applied
+// to an already-formatted string.
+static LookupResult ResolveToken(const WCHAR *name, int nameLen, const WCHAR *spec, int specLen,
+                                 const Values &v, WCHAR *out, size_t outCount) {
+    WCHAR scratch[64];
+    const WCHAR *raw = LookupRaw(name, nameLen, v, scratch, sizeof(scratch) / sizeof(WCHAR));
+    if (raw) {
+        wcsncpy(out, raw, outCount - 1);
+        out[outCount - 1] = L'\0';
+        if (specLen > 0) ApplySpec(spec, specLen, name, nameLen, v, out, outCount);
+        return LR_RESOLVED;
+    }
+
+    double number = 0;
+    if (LookupNumber(name, nameLen, v, number)) {
+        swprintf(out, outCount, L"%.0f", number);
+        if (specLen > 0) ApplySpec(spec, specLen, name, nameLen, v, out, outCount);
+        return LR_RESOLVED;
+    }
+
+    // Known but not available on this machine (for example {gpu.temp} when the GPU
+    // collector has no temperature sensor). The caller shows "--".
+    if (IsKnownNumberVariable(name, nameLen)) return LR_UNAVAILABLE;
+
+    return LR_UNKNOWN;
+}
+
+// Expands every {token|spec} in source into out. Shared by the panel renderer
+// and by the ring scanner, so both always agree on what a row says.
+static void ExpandTokens(const WCHAR *source, const Values &v, WCHAR *out, size_t outCount) {
+    size_t written = 0;
+    const WCHAR *p = source;
+    while (*p && written + 1 < outCount) {
+        if (*p != L'{') {
+            out[written++] = *p++;
+            continue;
+        }
+        const WCHAR *end = wcschr(p + 1, L'}');
+        if (!end) {
+            out[written++] = *p++;
+            continue;
+        }
+        const WCHAR *pipe = p + 1;
+        while (pipe < end && *pipe != L'|') pipe++;
+        int nameLen = (int)(pipe - (p + 1));
+        int specLen = (*pipe == L'|') ? (int)(end - pipe - 1) : 0;
+
+        WCHAR value[128];
+        LookupResult result = ResolveToken(p + 1, nameLen, pipe + 1, specLen, v, value, 128);
+        if (result == LR_UNKNOWN) {
+            // Not a variable at all: keep it visible so a typo is obvious.
+            size_t span = (size_t)(end - p + 1);
+            if (written + span < outCount) {
+                wcsncpy(out + written, p, span);
+                written += span;
+            }
+        } else {
+            // LR_UNAVAILABLE renders as "--", matching the rest of the mod.
+            const WCHAR *text = result == LR_RESOLVED ? value : L"--";
+            size_t span = wcslen(text);
+            if (written + span < outCount) {
+                wcscpy(out + written, text);
+                written += span;
+            }
+        }
+        p = end + 1;
+    }
+    out[written] = L'\0';
+}
+
+// ---------------------------------------------------------------------------
+// Row layout
+//
+// A row is an alternating sequence of text and gauges, taken from the markers
+// ExpandTokensAndRings leaves behind. Only slice offsets are stored, which keeps
+// the sampler thread cheap and lets the painter measure text with a real
+// Graphics instead of guessing at glyph widths.
+// ---------------------------------------------------------------------------
+static const int kMaxSegments = 12;
+
+struct TextSeg {
+    int offset;
+    int length;
+};
+
+struct RowState {
+    WCHAR text[kMaxRows][640];
+    RingSpec rings[kMaxRows][kMaxRingsPerRow];
+    int ringCount[kMaxRows];
+    TextSeg segments[kMaxRows][kMaxSegments];
+    int segmentCount[kMaxRows];
+    bool inlineRing[kMaxRows];
+};
+
+static RowState g_rowState;
+static int g_publishedRows = 0;
+
+// Private markers that remember where each gauge was written. They are stripped
+// before anything is measured or drawn.
+static const WCHAR kRingMarkStart = 0xE000;
+static const WCHAR kRingMarkEnd = 0xE001;
+
+// Expands tokens, swaps each ring token for a marker, and returns the gauges in
+// source order.
+static void ExpandTokensAndRings(const WCHAR *source, const Values &v,
+                                 const ModSettings &settings, WCHAR *out, size_t outCount,
+                                 RingSpec *rings, int *ringCount, int maxRings) {
+    *ringCount = 0;
+    size_t written = 0;
+    const WCHAR *p = source;
+
+    while (*p && written + 4 < outCount) {
+        if (p[0] == L'[' && p[1] == L'[') {
+            const WCHAR *close = wcsstr(p + 2, L"]]");
+            if (close) {
+                const WCHAR *body = p + 2;
+                int bodyLen = (int)(close - body);
+                if (bodyLen > 5 && _wcsnicmp(body, L"ring:", 5) == 0) {
+                    // The ring's own VALUE / MAX can be tokens, so expand the body
+                    // before parsing it.
+                    WCHAR rawBody[192];
+                    WCHAR bodyExpanded[192];
+                    int rawLen = MinInt(bodyLen - 5, 191);
+                    wcsncpy(rawBody, body + 5, rawLen);
+                    rawBody[rawLen] = L'\0';
+                    ExpandTokens(rawBody, v, bodyExpanded, 192);
+                    if (*ringCount < maxRings) {
+                        RingSpec spec;
+                        if (ParseRing(bodyExpanded, (int)wcslen(bodyExpanded), v, settings, spec)) {
+                            out[written++] = kRingMarkStart;
+                            out[written++] = (WCHAR)(L'0' + *ringCount);
+                            out[written++] = kRingMarkEnd;
+                            rings[*ringCount] = spec;
+                            (*ringCount)++;
+                        }
+                    }
+                    p = close + 2;
+                    continue;
+                }
+            }
+        }
+        if (*p == L'{') {
+            const WCHAR *end = wcschr(p + 1, L'}');
+            if (end) {
+                WCHAR token[320];
+                int span = MinInt((int)(end - p) + 1, 319);
+                wcsncpy(token, p, span);
+                token[span] = L'\0';
+                WCHAR expanded[384];
+                ExpandTokens(token, v, expanded, 384);
+                // Copy with a per-character bounds check, mirroring ExpandTokens.
+                // A single "written + 1 < outCount" guard before the whole run
+                // would let a long expansion overrun the destination.
+                for (const WCHAR *c = expanded; *c && written + 1 < outCount; c++)
+                    out[written++] = *c;
+                p = end + 1;
+                continue;
+            }
+        }
+        out[written++] = *p++;
+    }
+    out[written] = L'\0';
+}
+
+// Splits the marked string into text / ring segments. A ring segment is encoded
+// as offset = -1 with length = ring index.
+static void BuildRowLayout(const WCHAR *marked, int ringCount, RowState &state, int row) {
+    state.segmentCount[row] = 0;
+    state.ringCount[row] = ringCount;
+
+    int ringIndex = 0;
+    int textStart = 0;
+    int position = 0;
+    size_t out = 0;
+    bool sawText = false;
+
+    for (const WCHAR *p = marked; *p; p++) {
+        if (*p == kRingMarkStart) {
+            if (position > textStart && state.segmentCount[row] < kMaxSegments - 1) {
+                TextSeg &seg = state.segments[row][state.segmentCount[row]++];
+                seg.offset = textStart;
+                seg.length = position - textStart;
+                textStart = position;
+            }
+            if (ringIndex < ringCount && state.segmentCount[row] < kMaxSegments) {
+                TextSeg &seg = state.segments[row][state.segmentCount[row]++];
+                seg.offset = -1;
+                seg.length = ringIndex;
+                if (sawText) state.inlineRing[row] = true;
+            }
+            ringIndex++;
+            // Skip the digits and the end marker that follow.
+            while (p[1] && p[1] != kRingMarkEnd) p++;
+            if (p[1] == kRingMarkEnd) p++;
+            continue;
+        }
+        if (*p == kRingMarkEnd) continue;
+        state.text[row][out++] = *p;
+        position++;
+        if (*p != L' ' && *p != L'\t') sawText = true;
+    }
+    if (position > textStart && state.segmentCount[row] < kMaxSegments) {
+        TextSeg &seg = state.segments[row][state.segmentCount[row]++];
+        seg.offset = textStart;
+        seg.length = position - textStart;
+    }
+    state.text[row][out] = L'\0';
+}
+
+// ---------------------------------------------------------------------------
+// Ring gauges
+// ---------------------------------------------------------------------------
+// Parses "VALUE[:MAX[:THICK[:COLOUR]]]", expanding {variable} tokens in the
+// first three fields. Returns false when any numeric field is unusable, so the
+// caller can fall back to showing the raw text instead of a wrong gauge.
+static bool ParseRing(const WCHAR *body, int bodyLen, const Values &v,
+                      const ModSettings &settings, RingSpec &out) {
+    if (bodyLen <= 0) return false;
+
+    WCHAR buffer[192];
+    int len = bodyLen < 191 ? bodyLen : 191;
+    wcsncpy(buffer, body, len);
+    buffer[len] = L'\0';
+
+    WCHAR *fields[5] = {};
+    int fieldCount = 0;
+    fields[fieldCount++] = buffer;
+    for (WCHAR *p = buffer; *p && fieldCount < 5; p++) {
+        if (*p == L':') {
+            *p = L'\0';
+            fields[fieldCount++] = p + 1;
+        }
+    }
+
+    // A field is either a number or a single {token}; anything else is an error.
+    auto resolve = [&](const WCHAR *field, double &number) -> bool {
+        if (!field || !*field) return false;
+        const WCHAR *text = field;
+        const WCHAR *trimmed = field;
+        while (*trimmed == L' ') trimmed++;
+        if (*trimmed == L'{') {
+            const WCHAR *end = wcschr(trimmed + 1, L'}');
+            if (!end) return false;
+            WCHAR scratch[64];
+            const WCHAR *raw = LookupRaw(trimmed + 1, (int)(end - trimmed - 1), v, scratch, 64);
+            if (!raw) return false;
+            text = raw;
+        }
+        WCHAR *stop = nullptr;
+        double parsed = wcstod(text, &stop);
+        if (stop == text) return false;
+        number = parsed;
+        return true;
+    };
+
+    double value = 0, max = 100;
+    if (!resolve(fields[0], value)) return false;
+    if (fieldCount > 1) {
+        if (!resolve(fields[1], max)) return false;
+    }
+    if (max <= 0) return false;
+
+    out.value = value;
+    out.max = max;
+
+    if (fieldCount > 2 && fields[2] && *fields[2]) {
+        double thickness = 0;
+        if (resolve(fields[2], thickness) && thickness >= 1 && thickness <= 16)
+            out.thickness = (int)thickness;
+        else
+            out.thickness = settings.ringThickness;
+    } else {
+        out.thickness = settings.ringThickness;
+    }
+
+    if (fieldCount > 3 && fields[3] && *fields[3]) {
+        const WCHAR *colorText = fields[3];
+        while (*colorText == L' ') colorText++;
+        if (*colorText == L'#') colorText++;
+        WCHAR *stop = nullptr;
+        unsigned long long parsed = wcstoull(colorText, &stop, 16);
+        if (stop != colorText) {
+            out.color = (DWORD)parsed;
+            out.hasColor = true;
+        }
+    }
+    return true;
+}
+
+static void DrawRing(GpGraphics *graphics, float centerX, float centerY, float radius,
+                     float thickness, double fraction, DWORD trackColor, DWORD valueColor) {
+    if (fraction < 0) fraction = 0;
+    if (fraction > 1) fraction = 1;
+
+    GpPen *trackPen = nullptr;
+    if (g_gdiplus.CreatePen1(trackColor, thickness, 0, &trackPen) == 0 && trackPen) {
+        // Track: a full circle, so a zero-value gauge still reads as a gauge.
+        g_gdiplus.DrawEllipse(graphics, trackPen, centerX - radius, centerY - radius,
+                              radius * 2.0f, radius * 2.0f);
+        g_gdiplus.DeletePen(trackPen);
+    }
+    if (fraction <= 0.0) return;
+
+    GpPen *valuePen = nullptr;
+    if (g_gdiplus.CreatePen1(valueColor, thickness, 0, &valuePen) != 0 || !valuePen) return;
+
+    // Value arc: 12 o'clock, clockwise, stroked as a polyline (GDI+ has no arc).
+    const float start = -1.57079633f;  // -90 degrees
+    const float sweep = (float)(fraction * 6.28318531);
+    int segments = (int)(kRingSegments * fraction) + 2;
+    if (segments > kRingSegments * 2) segments = kRingSegments * 2;
+
+    POINTF *points = (POINTF *)malloc(sizeof(POINTF) * (segments + 1));
+    if (points) {
+        for (int i = 0; i <= segments; i++) {
+            float angle = start + sweep * ((float)i / (float)segments);
+            points[i].x = centerX + radius * (float)cos(angle);
+            points[i].y = centerY + radius * (float)sin(angle);
+        }
+        g_gdiplus.DrawLines(graphics, valuePen, points, segments + 1);
+        free(points);
+    }
+    g_gdiplus.DeletePen(valuePen);
+}
+
+// ---------------------------------------------------------------------------
+// Monitors
+// ---------------------------------------------------------------------------
+struct MonitorEntry {
+    RECT rect;
+    bool primary;
+};
+static MonitorEntry g_monitors[kMaxMonitors];
+static int g_monitorCount = 0;
+
+static BOOL CALLBACK MonitorEnumProc(HMONITOR monitor, HDC, LPRECT, LPARAM) {
+    if (g_monitorCount >= kMaxMonitors) return TRUE;
+    MONITORINFOEXW mi = {};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(monitor, &mi)) {
+        g_monitors[g_monitorCount].rect = mi.rcMonitor;
+        g_monitors[g_monitorCount].primary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+        g_monitorCount++;
+    }
+    return TRUE;
+}
+
+static void RefreshMonitors() {
+    g_monitorCount = 0;
+    EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, 0);
+}
+
+// Highest on the virtual desktop wins; ties go to the primary.
+static int TopmostMonitorIndex() {
+    if (g_monitorCount <= 0) return -1;
+    int best = 0;
+    for (int i = 1; i < g_monitorCount; i++) {
+        if (g_monitors[i].rect.top < g_monitors[best].rect.top) best = i;
+        else if (g_monitors[i].rect.top == g_monitors[best].rect.top &&
+                 g_monitors[i].primary && !g_monitors[best].primary) best = i;
+    }
+    return best;
+}
+
+static int PrimaryMonitorIndex() {
+    for (int i = 0; i < g_monitorCount; i++)
+        if (g_monitors[i].primary) return i;
+    return g_monitorCount > 0 ? 0 : -1;
+}
+
+// ---------------------------------------------------------------------------
+// Mod-level state
+//
+// Concurrency contract:
+//   loader thread  - WhTool_ModInit / SettingsChanged / Uninit
+//   HUD thread     - owns g_window, paints, pumps its own messages
+//   sampler thread - collects and publishes the row arrays and g_values
+//
+// g_settings is written by the loader thread and read by the sampler thread, so
+// every access goes through g_settingsLock. A version counter lets the sampler
+// notice a row change and re-evaluate which collectors it needs.
+// ---------------------------------------------------------------------------
+static ModSettings g_settings;
+static CRITICAL_SECTION g_settingsLock;
+static volatile LONG g_settingsVersion = 0;
+static LONG g_samplerSeenVersion = -1;
+
+static ULONG_PTR g_gdiplusToken = 0;
+static HWND g_window = nullptr;
+static HANDLE g_hudThread = nullptr;
+static DWORD g_hudThreadId = 0;
+static HANDLE g_hudReady = nullptr;
+static HANDLE g_samplerThread = nullptr;
+static volatile LONG g_stopSampler = 0;
+static volatile LONG g_refreshMs = 1000;
+
+// Display state.
+//
+// Three independent booleans, which is what makes the two click behaviours work:
+//   g_visible     - is the panel hidden entirely? A click flips this in Toggle mode.
+//   g_modeProximity - is the panel on the mouse? A click flips this in Proximity mode.
+//   g_expanded    - is it drawn at full height, or collapsed into its tab?
+//
+// Collapsed is NOT hidden: the collapsed state is a small always-clickable tab at
+// the top edge. Otherwise a hidden panel could never be clicked back, which is
+// exactly the trap the previous version fell into.
+static const int kTabHeight = 8;
+// Distance from the monitor's top edge to the window's top edge. Shared by
+// PlaceWindow and CursorInHotZone so the hot zone always begins at the panel's
+// real top rather than at the monitor edge.
+static const int kPanelTopOffset = 6;
+
+static bool g_visible = true;             // Toggle mode: shown vs hidden
+static bool g_modeProximity = true;       // Proximity mode active?
+static bool g_expanded = true;            // painted at full height
+static DWORD g_hideAt = 0;                // proximity linger deadline
+static int g_visibleRows = 0;
+static int g_panelHeight = 0;             // expanded height
+// Resting height of the window: what PlaceWindow and WM_NCHITTEST use. Set only
+// by ComputeGeometry, so both agree with each other at all times.
+static int g_displayHeight = 0;
+// Height the last frame actually painted. The intro animation drives this, and it
+// is deliberately separate from g_displayHeight: writing the animated height back
+// into the geometry value made the window and its hit-test rectangle shrink to
+// tab size mid-animation, which read as the panel collapsing the moment it opened.
+static int g_paintedHeight = 0;
+static int g_anchorIndex = -1;
+static DWORD g_lastTopmostAssert = 0;
+
+static unsigned long long g_perfBaseTick = 0, g_perfBaseCpu100ns = 0;
+static unsigned long long g_sampleCount = 0, g_paintCount = 0;
+
+static unsigned long long CpuTime100ns() {
+    FILETIME c, e, k, u;
+    if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return 0;
+    return ((unsigned long long)k.dwHighDateTime << 32 | k.dwLowDateTime) +
+           ((unsigned long long)u.dwHighDateTime << 32 | u.dwLowDateTime);
+}
+
+// ---------------------------------------------------------------------------
+// Custom icon image
+//
+// GDI+ decodes PNG, JPEG, BMP, GIF and TIFF through GdipLoadImageFromFile, so any
+// of those work. SVG does NOT: GDI+ has no SVG support, and adding it would mean
+// writing an XML parser plus an SVG path-data interpreter (arcs have to become
+// beziers, because GDI+ has no arc primitive) and guessing at stroke/fill
+// semantics. That is a large amount of unverifiable code for a 23 px glyph, so an
+// .svg path is rejected with a clear log message rather than silently ignored.
+//
+// The decoded image is cached because this is on the paint path: re-reading and
+// re-decoding a file every frame at 16 ms intervals would be visible.
+// ---------------------------------------------------------------------------
+// One decoded image per icon slot, so each row can carry its own file. The decoded
+// image is cached because this is on the paint path: re-reading and re-decoding a
+// file every frame at 16 ms intervals would be visible.
+//
+// The decoded source is cached, and a second, resampled copy at the exact plate
+// size is cached alongside it. Drawing the source every frame would make GDI+
+// resample the whole file once per frame, which for a large image is both slow and
+// aliased (a naive single-step shrink skips source pixels whenever the ratio drops
+// below 0.5).
+static GpImage *g_iconImage[kMaxRows] = {};
+static WCHAR g_iconImagePath[kMaxRows][MAX_PATH] = {};
+// Bounded diagnostic counter: prints what the paint path decided for the first few
+// frames after a change, then stops.
+static int g_iconDrawLogs = 0;
+// The resampled copy actually drawn, and the size it was built for. The plate
+// diameter follows FontSize, so changing the font has to invalidate this.
+static GpImage *g_iconScaled[kMaxRows] = {};
+static int g_iconScaledFor[kMaxRows] = {};
+// A path that already failed once, per slot. Without this, a typo'd path would be
+// re-read from disk and re-logged on every painted frame.
+static WCHAR g_iconFailedPath[kMaxRows][MAX_PATH] = {};
+
+static bool PathEndsWith(const WCHAR *path, const WCHAR *suffix) {
+    size_t pathLen = wcslen(path), suffixLen = wcslen(suffix);
+    if (suffixLen > pathLen) return false;
+    return _wcsicmp(path + pathLen - suffixLen, suffix) == 0;
+}
+
+static void ReleaseSlotImage(int slot) {
+    if (slot < 0 || slot >= kMaxRows) return;
+    if (g_iconScaled[slot]) {
+        g_gdiplus.DisposeImage(g_iconScaled[slot]);
+        g_iconScaled[slot] = nullptr;
+    }
+    g_iconScaledFor[slot] = 0;
+    if (g_iconImage[slot]) {
+        g_gdiplus.DisposeImage(g_iconImage[slot]);
+        g_iconImage[slot] = nullptr;
+    }
+    g_iconImagePath[slot][0] = L'\0';
+}
+
+// Plans the resampling chain for one image: a sequence of halving steps followed by
+// a final step to the exact target box, aspect ratio preserved.
+//
+// Factored out of the drawing code so the reduction plan is testable. A single
+// large reduction step makes the resampler emit only a few samples of the source,
+// which loses detail and aliases; halving first keeps every source pixel
+// contributing. `steps` counts the halving intermediates, `final` is the last entry.
+struct DownscalePlan {
+    int count = 0;          // entries filled in `sizes`
+    int steps = 0;          // how many are halving intermediates
+    struct { int w, h; } sizes[16] = {};
+};
+
+static DownscalePlan PlanDownscale(int srcW, int srcH, int target) {
+    DownscalePlan plan = {};
+    if (srcW <= 0 || srcH <= 0 || target <= 0) return plan;
+
+    int w = srcW, h = srcH;
+    int guard = 0;
+    while (guard++ < 12) {
+        if (w <= target * 2 && h <= target * 2) break;
+        int nw = w / 2, nh = h / 2;
+        // Clamp proportionally. Clamping the two axes independently stretches the
+        // image: a 2:1 source reduced toward a 23 px box would land on 23x17
+        // (1.35:1) instead of keeping its shape.
+        if (nw < target) {
+            // Scale the other axis by the same factor so the aspect ratio survives.
+            double factor = (double)target / (double)nw;
+            nw = target;
+            nh = (int)((double)nh * factor + 0.5);
+        }
+        if (nh < target) {
+            double factor = (double)target / (double)nh;
+            nh = target;
+            nw = (int)((double)nw * factor + 0.5);
+        }
+        if (nw < 1) nw = 1;
+        if (nh < 1) nh = 1;
+        // Never allow a step to grow a dimension.
+        if (nw > w) nw = w;
+        if (nh > h) nh = h;
+        w = nw;
+        h = nh;
+        if (plan.count < 15) {
+            plan.sizes[plan.count].w = w;
+            plan.sizes[plan.count].h = h;
+            plan.count++;
+        }
+    }
+    plan.steps = plan.count;
+
+    // Final step to the exact box, aspect ratio preserved.
+    float fit = (float)target / (float)(w > h ? w : h);
+    int fw = (int)((float)w * fit + 0.5f);
+    int fh = (int)((float)h * fit + 0.5f);
+    if (fw < 1) fw = 1;
+    if (fh < 1) fh = 1;
+    if (plan.count < 16) {
+        plan.sizes[plan.count].w = fw;
+        plan.sizes[plan.count].h = fh;
+        plan.count++;
+    }
+    return plan;
+}
+
+// Reports what a bitmap actually contains, by sampling a grid of pixels. Used to
+// tell "the file has no colour" apart from "the renderer lost the colour", which
+// look identical on screen when the plate behind the icon is light.
+static void LogBitmapContent(const WCHAR *label, GpImage *image) {
+    if (!image || !g_gdiplus.BitmapGetPixel) return;
+    UINT w = 0, h = 0;
+    if (g_gdiplus.GetImageWidth) g_gdiplus.GetImageWidth(image, &w);
+    if (g_gdiplus.GetImageHeight) g_gdiplus.GetImageHeight(image, &h);
+    if (w == 0 || h == 0) return;
+
+    DWORD sumR = 0, sumG = 0, sumB = 0, sumA = 0;
+    int samples = 0, opaque = 0;
+    // A 5x5 grid is enough to characterise the image and costs 25 calls.
+    for (int gy = 0; gy < 5; gy++) {
+        for (int gx = 0; gx < 5; gx++) {
+            INT x = (INT)((gx + 0.5) * w / 5);
+            INT y = (INT)((gy + 0.5) * h / 5);
+            DWORD px = 0;
+            if (g_gdiplus.BitmapGetPixel((GpBitmap *)image, x, y, &px) != 0) continue;
+            DWORD a = (px >> 24) & 0xFF;
+            sumR += (px >> 16) & 0xFF;
+            sumG += (px >> 8) & 0xFF;
+            sumB += px & 0xFF;
+            sumA += a;
+            samples++;
+            if (a > 200) opaque++;
+        }
+    }
+    if (samples == 0) return;
+    Wh_Log(L"%s: %ux%u sampled RGBA avg = %u,%u,%u,%u over %d px (%d nearly opaque)",
+           label, w, h, sumR / samples, sumG / samples, sumB / samples, sumA / samples,
+           samples, opaque);
+}
+
+// Resamples `source` down to fit a `target` pixel box, preserving aspect ratio.
+//
+// Halves repeatedly before the final resize. A single large reduction step makes
+// GDI+ output only a few samples of the source -- the text-book aliasing case --
+// whereas each halving keeps every source pixel contributing. The final step is
+// then within 2x, where bicubic is well behaved. This is the standard mipmap
+// approach, and it runs once per loaded file, not per frame.
+static GpImage *DownscaleToFit(GpImage *source, int target) {
+    UINT w = 0, h = 0;
+    if (g_gdiplus.GetImageWidth) g_gdiplus.GetImageWidth(source, &w);
+    if (g_gdiplus.GetImageHeight) g_gdiplus.GetImageHeight(source, &h);
+    if (w == 0 || h == 0 || target <= 0) return nullptr;
+
+    // Guard the intermediate allocations: a 20000 px image would otherwise build
+    // full-size halving steps before shrinking.
+    if (w > 4096 || h > 4096) return nullptr;
+
+    DownscalePlan plan = PlanDownscale((int)w, (int)h, target);
+    if (plan.count == 0) return nullptr;
+
+    GpImage *current = source;
+    bool ownsCurrent = false;
+    for (int i = 0; i < plan.count; i++) {
+        int nw = plan.sizes[i].w;
+        int nh = plan.sizes[i].h;
+
+        GpBitmap *next = nullptr;
+        if (!g_gdiplus.CreateBitmapFromScan0 || !g_gdiplus.GetImageGraphicsContext) break;
+        if (g_gdiplus.CreateBitmapFromScan0(nw, nh, 0, kPixelFormat32bppPARGB, nullptr,
+                                            &next) != 0 || !next) break;
+
+        GpGraphics *ng = nullptr;
+        bool ok = false;
+        if (g_gdiplus.GetImageGraphicsContext((GpImage *)next, &ng) == 0 && ng) {
+            if (g_gdiplus.SetInterpolationMode) {
+                g_gdiplus.SetInterpolationMode(ng, kInterpolationHighQualityBicubic);
+            }
+            ok = g_gdiplus.DrawImageRect(ng, current, 0.0f, 0.0f, (float)nw, (float)nh) == 0;
+        }
+        if (!ok) {
+            g_gdiplus.DisposeImage((GpImage *)next);
+            break;
+        }
+
+        if (ownsCurrent && current) g_gdiplus.DisposeImage(current);
+        current = (GpImage *)next;
+        ownsCurrent = true;
+    }
+
+    if (!ownsCurrent) return nullptr;   // nothing was produced
+    return current;
+}
+
+// Returns the image to draw for this slot: resampled to the plate size, or the
+// decoded source when no resampling was needed.
+//
+// target is the plate diameter in pixels, which follows FontSize. The resampled
+// copy is rebuilt when that size changes, so a font-size change does not leave a
+// stale bitmap at the wrong resolution.
+static GpImage *IconImageFor(int slot, const WCHAR *path, int target, bool *failed) {
+    *failed = false;
+    if (slot < 0 || slot >= kMaxRows) return nullptr;
+    if (!path || !path[0]) return nullptr;
+
+    if (g_iconImage[slot] && _wcsicmp(g_iconImagePath[slot], path) == 0) {
+        if (g_iconScaled[slot] && g_iconScaledFor[slot] == target) return g_iconScaled[slot];
+        if (!g_iconScaled[slot]) {
+            // Already decided this file needs no resampling.
+            UINT w = 0, h = 0;
+            if (g_gdiplus.GetImageWidth) g_gdiplus.GetImageWidth(g_iconImage[slot], &w);
+            if (g_gdiplus.GetImageHeight) g_gdiplus.GetImageHeight(g_iconImage[slot], &h);
+            if ((int)w <= target && (int)h <= target) return g_iconImage[slot];
+        }
+        // Target size changed: rebuild the resampled copy.
+        if (g_iconScaled[slot]) {
+            g_gdiplus.DisposeImage(g_iconScaled[slot]);
+            g_iconScaled[slot] = nullptr;
+        }
+        g_iconScaled[slot] = DownscaleToFit(g_iconImage[slot], target);
+        g_iconScaledFor[slot] = g_iconScaled[slot] ? target : 0;
+        if (g_iconScaled[slot]) return g_iconScaled[slot];
+        // Resampling failed; fall back to the source rather than dropping the icon.
+        UINT w2 = 0, h2 = 0;
+        if (g_gdiplus.GetImageWidth) g_gdiplus.GetImageWidth(g_iconImage[slot], &w2);
+        if (g_gdiplus.GetImageHeight) g_gdiplus.GetImageHeight(g_iconImage[slot], &h2);
+        if ((int)w2 <= target && (int)h2 <= target) return g_iconImage[slot];
+        *failed = true;
+        return nullptr;
+    }
+    if (g_iconFailedPath[slot][0] && _wcsicmp(g_iconFailedPath[slot], path) == 0) {
+        *failed = true;
+        return nullptr;
+    }
+
+    // Settings changed (or first call): drop this slot's old images and load anew.
+    ReleaseSlotImage(slot);
+    g_iconFailedPath[slot][0] = L'\0';
+
+    if (PathEndsWith(path, L".svg")) {
+        Wh_Log(L"Icon%d: SVG is not supported (GDI+ has no SVG decoder); "
+               L"using the built-in glyph. Export the icon as PNG instead.",
+               slot + 1);
+        *failed = true;
+        wcsncpy(g_iconFailedPath[slot], path, MAX_PATH - 1);
+        return nullptr;
+    }
+
+    GpImage *image = nullptr;
+    if (!g_gdiplus.LoadImageFromFile || g_gdiplus.LoadImageFromFile(path, &image) != 0 || !image) {
+        Wh_Log(L"Icon%d: could not load \"%s\"; using the built-in glyph", slot + 1, path);
+        *failed = true;
+        wcsncpy(g_iconFailedPath[slot], path, MAX_PATH - 1);
+        return nullptr;
+    }
+
+    UINT w = 0, h = 0;
+    if (g_gdiplus.GetImageWidth) g_gdiplus.GetImageWidth(image, &w);
+    if (g_gdiplus.GetImageHeight) g_gdiplus.GetImageHeight(image, &h);
+
+    g_iconImage[slot] = image;
+    wcsncpy(g_iconImagePath[slot], path, MAX_PATH - 1);
+    g_iconImagePath[slot][MAX_PATH - 1] = L'\0';
+
+    if ((int)w <= target && (int)h <= target) {
+        // Smaller than the plate: drawing it directly never upsamples, and the
+        // caller scales it, so there is nothing to precompute.
+        if (g_iconDrawLogs < 4) LogBitmapContent(L"Icon source (as-is)", image);
+        Wh_Log(L"Icon%d: loaded \"%s\" (%ux%u), used as-is (plate is %d px)",
+               slot + 1, path, w, h, target);
+        return image;
+    }
+
+    g_iconScaled[slot] = DownscaleToFit(image, target);
+    g_iconScaledFor[slot] = g_iconScaled[slot] ? target : 0;
+    if (g_iconScaled[slot]) {
+        UINT sw = 0, sh = 0;
+        if (g_gdiplus.GetImageWidth) g_gdiplus.GetImageWidth(g_iconScaled[slot], &sw);
+        if (g_gdiplus.GetImageHeight) g_gdiplus.GetImageHeight(g_iconScaled[slot], &sh);
+        // Sampling the resampled copy is what distinguishes "the file really is
+        // white" from "resampling destroyed the colours".
+        LogBitmapContent(L"Icon resampled", g_iconScaled[slot]);
+        Wh_Log(L"Icon%d: loaded \"%s\" (%ux%u) -> resampled to %ux%u for a %d px plate",
+               slot + 1, path, w, h, sw, sh, target);
+        return g_iconScaled[slot];
+    }
+
+    Wh_Log(L"Icon%d: loaded \"%s\" (%ux%u); resampling failed, drawing the source",
+           slot + 1, path, w, h);
+    return image;
+}
+
+static void DisposeIconImage() {
+    for (int i = 0; i < kMaxRows; i++) {
+        ReleaseSlotImage(i);
+        g_iconFailedPath[i][0] = L'\0';
+    }
+    g_iconDrawLogs = 0;   // report again after a settings change
+}
+
+// ---------------------------------------------------------------------------
+// Left icon plate
+//
+// The original capsule has a light disc at its left end with a dark glyph on it
+// (Hud.IconPlate #E9E7E4 over Hud.BoltDark #141313). It is the most recognisable
+// thing about the HUD, so the mod reproduces the plate and draws its own glyphs
+// as plain primitives: a chip, a memory module, a platter, a link and a fan.
+// ---------------------------------------------------------------------------
+static void PaintIconGlyph(GpGraphics *graphics, int style, float cx, float cy,
+                           float size, GpSolidFill *fill) {
+    const float h = size / 2.0f;
+    GpBrush *brush = (GpBrush *)fill;
+    switch (style) {
+    case 1: {   // CPU: chip body with a die window, pins on all four sides
+        float body = size * 0.58f, die = size * 0.24f, pin = size * 0.09f;
+        g_gdiplus.FillRectangle(graphics, brush, cx - body / 2, cy - body / 2, body, body);
+        g_gdiplus.FillRectangle(graphics, brush, cx - die / 2, cy - die / 2, die, die);
+        for (int i = -1; i <= 1; i++) {
+            float along = (float)i * size * 0.20f;
+            g_gdiplus.FillRectangle(graphics, brush, cx + along - pin / 2, cy - h, pin, h - body / 2);
+            g_gdiplus.FillRectangle(graphics, brush, cx + along - pin / 2, cy + body / 2, pin, h - body / 2);
+            g_gdiplus.FillRectangle(graphics, brush, cx - h, cy + along - pin / 2, h - body / 2, pin);
+            g_gdiplus.FillRectangle(graphics, brush, cx + body / 2, cy + along - pin / 2, h - body / 2, pin);
+        }
+        break;
+    }
+    case 2: {   // Memory: a filled module with one notch, kept chunky so it stays
+                // legible at the plate's ~23 px size.
+        float body = size * 0.74f, thickness = size * 0.40f;
+        g_gdiplus.FillRectangle(graphics, brush, cx - body / 2, cy - thickness / 2,
+                                body, thickness);
+        float notch = size * 0.10f;
+        g_gdiplus.FillRectangle(graphics, (GpBrush *)fill, cx - notch / 2, cy - thickness / 2,
+                                notch, thickness);
+        break;
+    }
+    case 3: {   // Disk: platter outline with a spindle
+        float radius = size * 0.44f;
+        GpPath *ring = nullptr;
+        g_gdiplus.CreatePath(0, &ring);
+        if (ring) {
+            g_gdiplus.AddPathArc(ring, cx - radius, cy - radius, radius * 2, radius * 2, 0, 359.9f);
+            g_gdiplus.ClosePathFigure(ring);
+            GpSolidFill *plate = nullptr;
+            g_gdiplus.CreateSolidFill(kPlateLight, &plate);
+            if (plate) {
+                g_gdiplus.FillPath(graphics, (GpBrush *)plate, ring);
+                g_gdiplus.DeleteBrush((GpBrush *)plate);
+            }
+            g_gdiplus.DeletePath(ring);
+        }
+        float hub = size * 0.16f;
+        GpSolidFill *hubFill = nullptr;
+        g_gdiplus.CreateSolidFill(kGlyphDark, &hubFill);
+        if (hubFill) {
+            g_gdiplus.FillRectangle(graphics, (GpBrush *)hubFill, cx - hub / 2, cy - hub / 2, hub, hub);
+            g_gdiplus.DeleteBrush((GpBrush *)hubFill);
+        }
+        break;
+    }
+    case 4: {   // Network: two ascending bars plus a drop
+        float bar = size * 0.16f;
+        g_gdiplus.FillRectangle(graphics, brush, cx - size * 0.30f, cy, bar, size * 0.30f);
+        g_gdiplus.FillRectangle(graphics, brush, cx - size * 0.07f, cy - size * 0.16f, bar, size * 0.46f);
+        g_gdiplus.FillRectangle(graphics, brush, cx + size * 0.16f, cy - size * 0.32f, bar, size * 0.62f);
+        break;
+    }
+    case 5: {   // GPU: shroud with a fan
+        float body = size * 0.64f;
+        g_gdiplus.FillRectangle(graphics, brush, cx - body / 2, cy - body / 2, body, body);
+        GpSolidFill *inner = nullptr;
+        g_gdiplus.CreateSolidFill(kPlateLight, &inner);
+        if (inner) {
+            float radius = size * 0.19f;
+            GpPath *fan = nullptr;
+            g_gdiplus.CreatePath(0, &fan);
+            if (fan) {
+                g_gdiplus.AddPathArc(fan, cx - radius, cy - radius, radius * 2, radius * 2, 0, 359.9f);
+                g_gdiplus.ClosePathFigure(fan);
+                g_gdiplus.FillPath(graphics, (GpBrush *)inner, fan);
+                g_gdiplus.DeletePath(fan);
+            }
+            g_gdiplus.DeleteBrush((GpBrush *)inner);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+// Returns the plate diameter for the current settings, or 0 when no icon is on.
+// A custom image counts as an icon even when no built-in glyph was chosen, so
+// setting only a path is enough to get a plate.
+// Diameter of the plate for one icon slot, or 0 when that slot has no icon. Every
+// plate is the same size: the diameter follows the font size, not the slot, so
+// there is no per-icon geometry to keep in sync.
+static float IconPlateDiameter(const ModSettings &settings, int slot) {
+    if (ResolveIconStyle(settings, slot) <= 0 && !ResolveIconPath(settings, slot)[0]) {
+        return 0.0f;
+    }
+    return (float)settings.fontSize * (float)kIconPlateRatio;
+}
+
+// True when at least one slot has an icon.
+static bool AnyIconConfigured(const ModSettings &settings) {
+    for (int i = 0; i < kMaxRows; i++) {
+        if (SlotIsConfigured(settings.icons[i])) return true;
+    }
+    return false;
+}
+
+// Centre of the icon plate for one row, in the panel's own (untransformed)
+// coordinates. All plates share a size, so the X offset is the same for every row;
+// only the vertical position varies.
+static void IconPlateCenterForRow(const ModSettings &settings, int slot, float rowTop,
+                                  float rowHeight, float *outX, float *outY) {
+    float diameter = IconPlateDiameter(settings, slot);
+    *outX = kIconLeftMargin + diameter / 2.0f;
+    *outY = rowTop + rowHeight / 2.0f;
+}
+
+// ---------------------------------------------------------------------------
+// Plate and ring geometry.
+//
+// The plate and the rings around it are one object as far as the eye is concerned,
+// so they are derived here together rather than by two code paths that each work
+// out "where is the icon" for themselves. They differ in size on purpose -- the
+// plate is the disc, the rings are larger and expand outward from it -- but they
+// share exactly one centre, and that centre is what the rings are built around.
+// ---------------------------------------------------------------------------
+struct IconGeometry {
+    bool present = false;
+    float centerX = 0.0f;
+    float centerY = 0.0f;
+    float plateRadius = 0.0f;   // the icon disc
+    float ringInner = 0.0f;     // radius a ring has at the start of its expansion
+};
+
+// rowTop is the row's own offset, so one call describes exactly one plate and its
+// rings. Passing the row offset matters: a fixed offset would put every row's rings
+// on row 1.
+static IconGeometry ComputeIconGeometry(const ModSettings &settings, int slot,
+                                        float rowTop) {
+    IconGeometry g = {};
+    float diameter = IconPlateDiameter(settings, slot);
+    if (diameter <= 0.0f) return g;
+    g.present = true;
+    IconPlateCenterForRow(settings, slot, rowTop, (float)settings.rowHeight,
+                          &g.centerX, &g.centerY);
+    g.plateRadius = diameter / 2.0f;
+    // Rings are larger than the plate and measured from its radius, so the
+    // innermost ring starts at the plate's edge rather than on top of the glyph.
+    g.ringInner = diameter / 2.0f;
+    return g;
+}
+
+// Ring radius for a given expansion progress, measured from the shared centre.
+//
+// The ring starts AT the plate's edge and grows outward from there, so its
+// innermost state is a ring grazing the plate rather than a smaller circle sitting
+// on top of the glyph. Starting below the plate radius is what made the rings look
+// concentric with the glyph instead of with the plate.
+static float RingRadiusAt(const IconGeometry &geometry, int ringIndex, double progress) {
+    double endScale = kRippleScaleEnd[ringIndex < 3 ? ringIndex : 2];
+    double outer = geometry.plateRadius * endScale;
+    return (float)Lerp(geometry.plateRadius, outer, progress);
+}
+
+// Draws one plate, at the centre and radius the shared geometry reports.
+static void PaintIconPlate(GpGraphics *graphics, const ModSettings &settings,
+                           const IntroFrame &frame, int slot, const IconGeometry &geometry) {
+    if (!geometry.present) return;
+    float scale = (float)(frame.iconScale > 0.0 ? frame.iconScale : 0.0);
+    if (scale <= 0.001f) return;
+    float radius = geometry.plateRadius * scale;
+    float centerX = geometry.centerX;
+    float centerY = geometry.centerY;
+
+    // Circular plate. GDI+ has no arc primitive, so the disc is filled from a
+    // closed two-arc path and the glyph is drawn inside the same transform.
+    BYTE alpha = (BYTE)(Clamp01(frame.iconAlpha) * 255.0 + 0.5);
+    GpPath *disc = nullptr;
+    g_gdiplus.CreatePath(0, &disc);
+    if (!disc) return;
+    g_gdiplus.AddPathArc(disc, centerX - radius, centerY - radius, radius * 2, radius * 2, 0, 359.9f);
+    g_gdiplus.ClosePathFigure(disc);
+
+    GpSolidFill *plate = nullptr;
+    g_gdiplus.CreateSolidFill((kPlateLight & 0x00FFFFFF) | ((DWORD)alpha << 24), &plate);
+    if (plate) {
+        g_gdiplus.FillPath(graphics, (GpBrush *)plate, disc);
+        g_gdiplus.DeleteBrush((GpBrush *)plate);
+    }
+    g_gdiplus.DeletePath(disc);
+
+    GpSolidFill *glyph = nullptr;
+    g_gdiplus.CreateSolidFill((kGlyphDark & 0x00FFFFFF) | ((DWORD)alpha << 24), &glyph);
+
+    // A custom image replaces the drawn glyph but keeps the plate, so the icon
+    // stays visually anchored.
+    //
+    // The image arrives already resampled to the plate's pixel size, so this only
+    // has to place it: the drawn size is the cached size times the intro's icon
+    // scale, and nothing is resampled per frame. When the plate is large enough to
+    // hold the source unchanged, the source is used and this never upsamples it
+    // past its natural size.
+    bool imageFailed = false;
+    const WCHAR *iconPath = ResolveIconPath(settings, slot);
+    int target = (int)(geometry.plateRadius * 2.0f + 0.5f);
+    GpImage *image = iconPath[0] ? IconImageFor(slot, iconPath, target, &imageFailed) : nullptr;
+    if (g_iconDrawLogs < 8) {
+        g_iconDrawLogs++;
+        Wh_Log(L"Icon%d draw: plate diameter target=%d  image=%s  built-in glyph=%d",
+               slot + 1, target, image ? L"custom" : L"none", ResolveIconStyle(settings, slot));
+    }
+    if (image) {
+        UINT iw = 0, ih = 0;
+        if (g_gdiplus.GetImageWidth) g_gdiplus.GetImageWidth(image, &iw);
+        if (g_gdiplus.GetImageHeight) g_gdiplus.GetImageHeight(image, &ih);
+        if (iw > 0 && ih > 0) {
+            // Cached images are already at plate size, so `scale` carries only the
+            // intro animation. A source smaller than the plate is drawn at its own
+            // size rather than blown up, which is the "never upsample past natural
+            // size" rule.
+            float dw = (float)iw;
+            float dh = (float)ih;
+            if (dw > geometry.plateRadius * 2.0f * 1.01f) {
+                dw = geometry.plateRadius * 2.0f * scale;
+                dh = dw * (float)ih / (float)iw;
+            }
+            g_gdiplus.DrawImageRect(graphics, image, centerX - dw / 2.0f,
+                                    centerY - dh / 2.0f, dw, dh);
+        }
+    } else if (glyph) {
+        PaintIconGlyph(graphics, ResolveIconStyle(settings, slot), centerX, centerY,
+                       geometry.plateRadius * 2.0f * scale, glyph);
+    }
+    if (glyph) g_gdiplus.DeleteBrush((GpBrush *)glyph);
+}
+
+// Concentric rings expanding outward from the plate, from the original's Ripple
+// animation: radii 1.5x / 2.0x / 2.5x, peak opacity 0.50 / 0.50 / 0.60.
+//
+// The rings are centred on the very same point as the plate, taken from the shared
+// geometry rather than recomputed. The original also lifted its ripple host by
+// 16 px (RippleRise), which made sense for a full-screen HUD whose icon travels
+// while the layout settles; here it would push the rings off the plate they are
+// supposed to be coming out of, so it is intentionally not applied.
+static void PaintRipples(GpGraphics *graphics, const ModSettings &settings,
+                         const IntroFrame &frame, int slot, const IconGeometry &geometry) {
+    if (!geometry.present) return;   // rings come out of a plate, so no plate means none
+    if (settings.rippleCount <= 0 || frame.rippleProgress <= 0.0) return;
+
+    int count = MinInt(settings.rippleCount, 3);
+    for (int i = 0; i < count; i++) {
+        double progress = frame.rippleProgress;
+        // Stagger: each ring is slightly behind the previous one.
+        if (i > 0) {
+            double lag = 0.12 * i;
+            progress = Clamp01((progress - lag) / (1.0 - lag));
+        }
+        if (progress <= 0.0) continue;
+
+        double opacity = progress < 0.5 ? Lerp(0.0, kRipplePeakOpacity[i], progress / 0.5)
+                                        : Lerp(kRipplePeakOpacity[i], 0.0, (progress - 0.5) / 0.5);
+        float radius = RingRadiusAt(geometry, i, progress);
+        if (radius < 1.0f) continue;
+
+        BYTE alpha = (BYTE)(Clamp01(opacity) * 255.0 + 0.5);
+        DWORD color = (g_settings.border & 0x00FFFFFF) | ((DWORD)alpha << 24);
+
+        GpPen *pen = nullptr;
+        g_gdiplus.CreatePen1(color, 2.0f, 0, &pen);
+        if (pen) {
+            // Centred on the plate's centre exactly: same X and same Y, no offset.
+            g_gdiplus.DrawEllipse(graphics, pen, geometry.centerX - radius,
+                                  geometry.centerY - radius,
+                                  radius * 2.0f, radius * 2.0f);
+            g_gdiplus.DeletePen(pen);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Painting
+// ---------------------------------------------------------------------------
+static void BuildRoundedRect(GpPath *path, float x, float y, float w, float h, float r) {
+    float d = r * 2.0f;
+    g_gdiplus.AddPathArc(path, x, y, d, d, 180.0f, 90.0f);
+    g_gdiplus.AddPathArc(path, x + w - d, y, d, d, 270.0f, 90.0f);
+    g_gdiplus.AddPathArc(path, x + w - d, y + h - d, d, d, 0.0f, 90.0f);
+    g_gdiplus.AddPathArc(path, x, y + h - d, d, d, 90.0f, 90.0f);
+    g_gdiplus.ClosePathFigure(path);
+}
+
+// Defined further down, but the collapsing frame has to resize the window to match
+// the animated height, so it is declared here.
+static void PlaceWindow(HWND hwnd);
+
+static void PaintPanel(HWND hwnd) {
+    int width = g_settings.panelWidth;
+    bool collapsed = !g_expanded;
+
+    // The intro drives the *painted* height. g_displayHeight is left alone: it is
+    // the resting geometry that ComputeGeometry owns, and letting the animation
+    // write to it made the hit-test rectangle shrink to tab size mid-animation,
+    // which read as the panel collapsing as it opened.
+    //
+    // The two directions need different window handling:
+    //
+    //   arriving  the window already sits at the resting height and the panel
+    //             grows into it, so nothing has to move
+    //   leaving   the panel shrinks away, so the window has to follow it down or
+    //             it would hold a transparent band below a shrinking panel
+    //
+    // Whether the intro is still running comes from g_intro.active, not from a
+    // second cue calculation: that second sample could report "finished" while
+    // EvaluateIntro had not, and the height then jumped backwards on the last frame.
+    IntroFrame intro = EvaluateIntro();
+    const bool introRunning = g_intro.active;
+    int height = g_displayHeight;
+    if (introRunning && !intro.expanding) {
+        height = (int)(intro.height + 0.5);
+        if (height < kTabHeight) height = kTabHeight;
+        // SetExpanded already shrank the window to the resting (tab) height, so the
+        // frame has to grow it back to the animated height. Without this the
+        // collapsing frame would be a full-height bitmap clipped into an 8 px
+        // window.
+        if (height != g_displayHeight) {
+            g_displayHeight = height;
+            PlaceWindow(hwnd);
+        }
+    } else if (introRunning) {
+        height = (int)(intro.height + 0.5);
+        if (height < 1) height = 1;
+    }
+    g_paintedHeight = height;
+    if (width <= 0 || height <= 0) return;
+
+    HDC screenDc = GetDC(nullptr);
+    HDC memDc = CreateCompatibleDC(screenDc);
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void *bits = nullptr;
+    HBITMAP dib = CreateDIBSection(screenDc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!dib || !bits) {
+        DeleteDC(memDc);
+        ReleaseDC(nullptr, screenDc);
+        return;
+    }
+    HGDIOBJ oldBitmap = SelectObject(memDc, dib);
+
+    GpBitmap *bitmap = nullptr;
+    if (g_gdiplus.CreateBitmapFromScan0(width, height, width * 4, kPixelFormat32bppPARGB,
+                                        (BYTE *)bits, &bitmap) == 0 && bitmap) {
+        GpGraphics *graphics = nullptr;
+        if (g_gdiplus.GetImageGraphicsContext((GpImage *)bitmap, &graphics) == 0 && graphics) {
+            g_gdiplus.SetSmoothingMode(graphics, kSmoothingAntiAlias);
+            g_gdiplus.SetTextRenderingHint(graphics, kTextHintAntiAliasGridFit);
+
+            // Panel transform. The original scales the whole capsule about its
+            // centre with a BackOut overshoot, so the panel does the same: build
+            // the panel in local coordinates and let GDI+ apply the transform.
+            const bool introActive = g_intro.active;
+            float panelRadius = (float)MinInt(g_settings.cornerRadius, MinInt(width, height) / 2);
+            PanelTransform transform = ComputePanelTransform((float)width, (float)height,
+                                                             intro.scale, introActive);
+            float scale = transform.scale;
+            bool transformed = transform.active;
+
+            GpMatrix matrix;
+            matrix.m11 = scale; matrix.m12 = 0.0f;
+            matrix.m21 = 0.0f;   matrix.m22 = scale;
+            matrix.dx = transform.dx;
+            matrix.dy = transform.dy;
+            if (transformed) {
+                // MatrixOrderPrepend == 0: the scale applies about the panel centre.
+                g_gdiplus.MultiplyWorldTransform(graphics, &matrix, 0);
+            }
+
+            GpPath *panelPath = nullptr;
+            g_gdiplus.CreatePath(0, &panelPath);
+            BuildRoundedRect(panelPath, 0.5f, 0.5f, (float)width - 1.0f,
+                             (float)height - 1.0f, panelRadius);
+
+            GpSolidFill *background = nullptr;
+            g_gdiplus.CreateSolidFill(g_settings.background, &background);
+            if (background && panelPath) g_gdiplus.FillPath(graphics, (GpBrush *)background, panelPath);
+
+            // Every plate is the same size (it follows the font size), so one
+            // diameter decides the left margin for all rows.
+            float iconDiameter = IconPlateDiameter(g_settings, 0);
+            bool iconsPresent = AnyIconConfigured(g_settings);
+
+            // The border doubles as the state indicator: it dims while collapsed,
+            // so the current state is readable without any tooltip.
+            DWORD borderColor = collapsed ? g_settings.borderCollapsed : g_settings.border;
+            if (g_settings.borderThickness > 0) {
+                GpPen *pen = nullptr;
+                float penWidth = (float)g_settings.borderThickness;
+                g_gdiplus.CreatePen1(borderColor, penWidth, 0, &pen);
+                if (pen && panelPath) g_gdiplus.DrawPath(graphics, pen, panelPath);
+                if (pen) g_gdiplus.DeletePen(pen);
+            }
+
+            if (collapsed) {
+                // Nothing but the tab: this is the clickable grip that brings the
+                // panel back, so it must stay on screen and hit-testable.
+                GpSolidFill *gripBrush = nullptr;
+                // Tertiary tier: the grip should read as a hint, not a stripe.
+                g_gdiplus.CreateSolidFill(WithOpacity(borderColor, kTextTertiaryOpacity),
+                                          &gripBrush);
+                float gripWidth = (float)MinInt(56, width / 4);
+                float gripHeight = 4.0f;
+                if (gripBrush) {
+                    float gripX = (width - gripWidth) / 2.0f;
+                    float gripY = (height - gripHeight) / 2.0f;
+                    GpPath *gripPath = nullptr;
+                    g_gdiplus.CreatePath(0, &gripPath);
+                    BuildRoundedRect(gripPath, gripX, gripY, gripWidth, gripHeight, gripHeight / 2.0f);
+                    if (gripPath) {
+                        g_gdiplus.FillPath(graphics, (GpBrush *)gripBrush, gripPath);
+                        g_gdiplus.DeletePath(gripPath);
+                    }
+                    g_gdiplus.DeleteBrush((GpBrush *)gripBrush);
+                }
+            } else {
+                GpFontFamily *family = nullptr;
+                g_gdiplus.CreateFontFamilyFromName(g_settings.fontFamily, nullptr, &family);
+                GpFont *font = nullptr;
+                if (family) g_gdiplus.CreateFont(family, (float)g_settings.fontSize, 0, 0, &font);
+                GpSolidFill *textBrush = nullptr;
+                g_gdiplus.CreateSolidFill(g_settings.text, &textBrush);
+                GpStringFormat *format = CreateRowStringFormat();
+
+                EnterCriticalSection(&g_valuesLock);
+                int rows = MinInt(g_publishedRows, g_visibleRows);
+                // Diagnostic budget. It repeats for the first few paints on
+                // purpose: a debug-output viewer is usually started after the mod
+                // has already painted, so a once-only dump is easy to miss.
+                // Remove this block once the layout is confirmed.
+                //
+                // It is decremented once per paint and merely *read* by the
+                // per-segment logging below, so a single paint emits its whole
+                // picture instead of running out mid-row.
+                static int dumpBudget = 8;
+                if (dumpBudget > 0) {
+                    dumpBudget--;
+                    Wh_Log(L"Paint#%d rows=%d published=%d visibleRows=%d collapsed=%d size=%dx%d",
+                           8 - dumpBudget, rows, g_publishedRows, g_visibleRows,
+                           collapsed ? 1 : 0, width, height);
+                    for (int d = 0; d < kMaxRows; d++) {
+                        Wh_Log(L"  row%d segs=%d textLen=%d inline=%d text=\"%ls\"",
+                               d, g_rowState.segmentCount[d],
+                               (int)wcslen(g_rowState.text[d]),
+                               g_rowState.inlineRing[d] ? 1 : 0,
+                               g_rowState.text[d]);
+                    }
+                }
+                bool logDraws = dumpBudget > 0;
+
+                // Text and rings fade in together once the shape has settled, and
+                // fade out first when collapsing. The intro reports both.
+                float contentAlpha = (float)intro.contentAlpha;
+                if (contentAlpha < 0.01f) contentAlpha = 0.0f;
+                // The icon plate claims the left margin; text starts after it.
+                float leftInset = 12.0f;
+                if (iconsPresent) {
+                    leftInset = kIconLeftMargin + iconDiameter + (float)kIconContentGap;
+                }
+
+                for (int r = 0; r < rows; r++) {
+                    float top = (float)(r * g_settings.rowHeight);
+                    float centerY = top + g_settings.rowHeight / 2.0f;
+                    float cursor = leftInset;
+
+                    // One plate per row, at that row's vertical centre, drawn before
+                    // the row's text so the text never sits under it. Each row uses
+                    // its own IconN / IconNPath.
+                    //
+                    // The plate and its rings are built from one geometry value, so
+                    // there is no way for the rings to end up beside the plate.
+                    if (iconsPresent) {
+                        IconGeometry geometry = ComputeIconGeometry(g_settings, r, top);
+                        if (geometry.present) {
+                            if (introActive && intro.rippleProgress > 0.0f) {
+                                PaintRipples(graphics, g_settings, intro, r, geometry);
+                            }
+                            PaintIconPlate(graphics, g_settings, intro, r, geometry);
+                        }
+                    }
+
+                    int ringCount = g_rowState.ringCount[r];
+                    bool inlineFlow = g_rowState.inlineRing[r];
+
+                    // Ahead of an inline gauge the text is drawn normally, and the
+                    // gauge is laid down wherever the text ended. In the other
+                    // layout the gauges are parked at the right edge and the text
+                    // is confined to whatever space is left.
+                    RowTextMetrics metrics = ComputeRowTextMetrics(
+                        (float)width, ringCount, g_settings.ringSize,
+                        g_settings.ringRightOffset, inlineFlow, leftInset);
+
+                    float parkX = 0.0f;
+                    if (!inlineFlow && ringCount > 0) {
+                        // Centre of the first parked gauge.
+                        parkX = metrics.textRight + (float)g_settings.ringSize / 2.0f;
+                    }
+
+                    for (int s = 0; s < g_rowState.segmentCount[r]; s++) {
+                        const TextSeg &seg = g_rowState.segments[r][s];
+                        if (seg.offset < 0) {
+                            // A gauge.
+                            int ringIndex = seg.length;
+                            if (ringIndex < 0 || ringIndex >= ringCount) continue;
+                            const RingSpec &ring = g_rowState.rings[r][ringIndex];
+                            float thickness = (float)ring.thickness;
+                            float outer = (float)g_settings.ringSize;
+                            float ringRadius = (outer - thickness) / 2.0f;
+                            if (ringRadius < 3.0f) ringRadius = 3.0f;
+
+                            float centerX;
+                            if (inlineFlow) {
+                                centerX = cursor + outer / 2.0f;
+                                cursor = centerX + outer / 2.0f + 4.0f;
+                            } else {
+                                centerX = parkX;
+                                parkX += outer + 4.0f;
+                            }
+
+                            double fraction = ring.max > 0 ? ring.value / ring.max : 0.0;
+                            if (fraction < 0) fraction = 0;
+                            if (fraction > 1) fraction = 1;
+                            DWORD valueColor = ResolveRingColor(ring, g_settings);
+                            // Content fades in as one unit during the intro, so
+                            // the rings inherit the same alpha as the text.
+                            if (contentAlpha < 1.0f) {
+                                valueColor = WithOpacity(valueColor, contentAlpha);
+                            }
+                            // The track is the same hue at the secondary opacity
+                            // tier, which is how the original dims a surface rather
+                            // than introducing a second colour.
+                            DWORD trackColor = WithOpacity(valueColor, kTextSecondaryOpacity);
+
+                            DrawRing(graphics, centerX, centerY, ringRadius, thickness,
+                                     fraction, trackColor, valueColor);
+                            continue;
+                        }
+
+                        if (!font || !textBrush || seg.length <= 0) continue;
+                        WCHAR slice[640];
+                        int length = MinInt(seg.length, 639);
+                        wcsncpy(slice, g_rowState.text[r] + seg.offset, length);
+                        slice[length] = L'\0';
+
+                        float advance = 0.0f;
+                        if (inlineFlow) {
+                            // Measure so an inline gauge lands right after the text,
+                            // including any spaces written before it.
+                            advance = MeasureAdvance(graphics, font, format, slice,
+                                                     (float)g_settings.rowHeight);
+                        } else {
+                            // Right-parked gauges: the text gets the width that is
+                            // left over, so a run that does not fit is trimmed
+                            // rather than overrunning the gauges. With no gauges
+                            // this is the full inner width, which a plain text row
+                            // needs in order to be visible at all.
+                            advance = metrics.textWidth;
+                        }
+
+                        // Trim to the space this segment is actually allowed to
+                        // occupy. GDI+ does not clip text to the layout box, so
+                        // without this a long run would be drawn straight across the
+                        // gauge that follows it. The fit is measured through the same
+                        // helper used for the advance, so a fitted run costs exactly
+                        // what it reports.
+                        float budget = advance > kMinLayoutWidth ? advance : kMinLayoutWidth;
+                        bool fitted = FitTextToWidth(graphics, font, format, slice,
+                                                     sizeof(slice) / sizeof(slice[0]),
+                                                     budget, (float)g_settings.rowHeight);
+                        if (fitted) {
+                            advance = MeasureAdvance(graphics, font, format, slice,
+                                                     (float)g_settings.rowHeight);
+                        }
+
+                        float drawWidth = advance > kMinLayoutWidth ? advance : kMinLayoutWidth;
+                        RectF layout(cursor, top, drawWidth, (float)g_settings.rowHeight);
+                        if (logDraws) {
+                            Wh_Log(L"    draw row=%d seg=%d x=%.1f y=%.1f w=%.1f "
+                                   L"adv=%.1f inline=%d fitted=%d \"%ls\"",
+                                   r, s, layout.X, layout.Y,
+                                   layout.Width, advance, inlineFlow ? 1 : 0,
+                                   fitted ? 1 : 0, slice);
+                        }
+                        // Text alpha tracks the intro so the numbers fade in with
+                        // the rings rather than appearing before them.
+                        if (textBrush) {
+                            g_gdiplus.SetSolidFillColor(textBrush,
+                                contentAlpha < 1.0f
+                                    ? WithOpacity(g_settings.text, contentAlpha)
+                                    : g_settings.text);
+                        }
+                        g_gdiplus.DrawString(graphics, slice, -1, font, &layout, format,
+                                             (GpBrush *)textBrush);
+                        if (inlineFlow) cursor += advance;
+                    }
+                }
+                LeaveCriticalSection(&g_valuesLock);
+
+                if (format) g_gdiplus.DeleteStringFormat(format);
+                if (textBrush) g_gdiplus.DeleteBrush((GpBrush *)textBrush);
+                if (font) g_gdiplus.DeleteFont(font);
+                if (family) g_gdiplus.DeleteFontFamily(family);
+            }
+
+            if (background) g_gdiplus.DeleteBrush((GpBrush *)background);
+            if (panelPath) g_gdiplus.DeletePath(panelPath);
+            g_gdiplus.DeleteGraphics(graphics);
+        }
+        g_gdiplus.DisposeImage((GpImage *)bitmap);
+    }
+
+    // Analytic alpha mask: the panel body is opaque, the corners are rounded.
+    // A monochrome mask drawn by GDI+ keeps the corner antialiasing clean and the
+    // text fully opaque, which per-pixel ARGB text rasterisation does not.
+    {
+        float r = (float)MinInt(g_settings.cornerRadius, MinInt(width, height) / 2);
+        BYTE *pixels = (BYTE *)bits;
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                float px = (float)x + 0.5f, py = (float)y + 0.5f;
+                float dx = 0.0f, dy = 0.0f;
+                if (px < r) dx = r - px;
+                else if (px > width - r) dx = px - (width - r);
+                if (py < r) dy = r - py;
+                else if (py > height - r) dy = py - (height - r);
+
+                float coverage = 1.0f;
+                if (dx > 0.0f && dy > 0.0f) {
+                    float dist = (float)sqrt((double)(dx * dx + dy * dy));
+                    coverage = r + 0.5f - dist;
+                    if (coverage < 0.0f) coverage = 0.0f;
+                    if (coverage > 1.0f) coverage = 1.0f;
+                }
+                BYTE alpha = (BYTE)(coverage * 255.0f + 0.5f);
+                BYTE *p = pixels + ((size_t)y * width + x) * 4;
+                if (alpha == 0) {
+                    p[0] = p[1] = p[2] = p[3] = 0;
+                } else {
+                    p[3] = alpha;
+                    if (p[0] > alpha) p[0] = alpha;
+                    if (p[1] > alpha) p[1] = alpha;
+                    if (p[2] > alpha) p[2] = alpha;
+                }
+            }
+        }
+    }
+
+    POINT src = {0, 0};
+    SIZE size = {width, height};
+    RECT rect;
+    GetWindowRect(hwnd, &rect);
+    POINT dst = {rect.left, rect.top};
+    BLENDFUNCTION blend = {};
+    blend.BlendOp = AC_SRC_OVER;
+    blend.SourceConstantAlpha = 255;
+    blend.AlphaFormat = AC_SRC_ALPHA;
+    UpdateLayeredWindow(hwnd, screenDc, &dst, &size, memDc, &src, 0, &blend, ULW_ALPHA);
+    g_paintCount++;
+
+    SelectObject(memDc, oldBitmap);
+    DeleteObject(dib);
+    DeleteDC(memDc);
+    ReleaseDC(nullptr, screenDc);
+}
+
+// ---------------------------------------------------------------------------
+// Placement and visibility
+// ---------------------------------------------------------------------------
+static void ComputeGeometry() {
+    g_visibleRows = g_settings.rowCount;
+    if (g_visibleRows < 1) g_visibleRows = 1;
+    g_panelHeight = g_visibleRows * g_settings.rowHeight;
+    g_displayHeight = g_expanded ? g_panelHeight : kTabHeight;
+
+    RefreshMonitors();
+    g_anchorIndex = g_settings.monitorMode == 1 ? PrimaryMonitorIndex() : TopmostMonitorIndex();
+}
+
+// The window always sits at the anchor monitor's top-centre and always occupies
+// exactly the height it is currently painted at, so the hit-test rectangle and
+// the visible panel can never disagree.
+// Defined just below; declared here because PlaceWindow re-establishes the
+// topmost state every time it moves the window.
+static bool IsTopmost(HWND hwnd);
+static bool ForceTopmost(HWND hwnd);
+
+static void PlaceWindow(HWND hwnd) {
+    if (g_anchorIndex < 0 || g_anchorIndex >= g_monitorCount) return;
+    const RECT &rect = g_monitors[g_anchorIndex].rect;
+    int x = rect.left + (rect.right - rect.left - g_settings.panelWidth) / 2;
+    int y = rect.top + kPanelTopOffset;
+
+    if (g_visible) {
+        SetWindowPos(hwnd, HWND_TOPMOST, x, y, g_settings.panelWidth, g_displayHeight,
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        // PlaceWindow is where the geometry is decided, so the topmost state is
+        // re-established here rather than assumed to have survived the move.
+        ForceTopmost(hwnd);
+        g_lastTopmostAssert = GetTickCount();
+    } else {
+        SetWindowPos(hwnd, HWND_TOPMOST, x, y, g_settings.panelWidth, g_displayHeight,
+                     SWP_NOACTIVATE);
+        ForceTopmost(hwnd);
+        ShowWindow(hwnd, SW_HIDE);
+    }
+}
+
+// Is the window actually flagged topmost right now?
+static bool IsTopmost(HWND hwnd) {
+    return (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+}
+
+// Force the window into the topmost band and to the front of it.
+//
+// Two mechanisms, because one is not always enough:
+//   * SetWindowLongPtr(WS_EX_TOPMOST) sets the style bit directly. SetWindowPos
+//     normally sets it as a side effect, but the bit is what the compositor
+//     actually consults, so it is written explicitly.
+//   * SetWindowPos(HWND_TOPMOST, HWND_TOP) then raises the window within the
+//     topmost band. HWND_TOPMOST alone only re-inserts it at the top of its
+//     current band, which is not the same as being in front of every other
+//     topmost window.
+static bool ForceTopmost(HWND hwnd) {
+    if (IsTopmost(hwnd)) {
+        SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        return true;
+    }
+
+    LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_TOPMOST);
+    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER |
+                 SWP_FRAMECHANGED);
+    return IsTopmost(hwnd);
+}
+
+// Topmost can be lost to another process raising itself, to a full-screen app, or
+// to the shell rebuilding the z-order.
+//
+// Measured behaviour of this mechanism (see _topprobe.cpp): the style bit is set
+// correctly and a topmost window keeps its place in the topmost band even when
+// another window is raised to topmost afterwards. What a periodic re-assert buys
+// is therefore not correctness but *latency*: between the moment another topmost
+// window is raised and the next re-assert, the panel is genuinely behind it. A
+// one-second gap is very visible; ~100 ms is not.
+static const DWORD kTopmostIntervalMs = 100;
+
+static void ReassertTopmost(HWND hwnd) {
+    if (!g_visible) return;
+    DWORD now = GetTickCount();
+    bool topmost = IsTopmost(hwnd);
+    // Lost the bit entirely: recover at once. Otherwise just refresh the order.
+    if (topmost && now - g_lastTopmostAssert < kTopmostIntervalMs) return;
+    g_lastTopmostAssert = now;
+
+    bool ok = ForceTopmost(hwnd);
+    // Log only genuine losses, not the routine refresh, so the log stays useful.
+    if (!topmost || !ok) {
+        Wh_Log(L"Topmost lost and re-asserted: was=%d now=%d setpos=%d err=%lu",
+               topmost ? 1 : 0, IsTopmost(hwnd) ? 1 : 0, ok ? 1 : 0, GetLastError());
+    }
+}
+
+// Is the pointer inside the hot zone of the anchor monitor's top edge?
+static bool CursorInHotZone() {
+    if (g_anchorIndex < 0) return false;
+    POINT cursor;
+    if (!GetCursorPos(&cursor)) return false;
+    const RECT &rect = g_monitors[g_anchorIndex].rect;
+
+    int monitorWidth = rect.right - rect.left;
+    int zoneWidth = MaxInt(160, monitorWidth / 3);
+    int centerX = rect.left + monitorWidth / 2;
+    // The zone spans the panel's top edge and extends downward far enough to cover
+    // the whole panel plus the configured margin, so a pointer resting anywhere on
+    // the panel keeps it open.
+    //
+    // It starts at the window's actual top (rect.top + kPanelTopOffset), not the
+    // monitor's top: the window is drawn 6 px below the monitor edge, so anchoring
+    // the zone at rect.top left the panel's upper pixels outside its own hot zone.
+    int panelTop = rect.top + kPanelTopOffset;
+    int depth = g_settings.hotZoneDepth + (g_expanded ? g_panelHeight : 0);
+
+    return cursor.x >= centerX - zoneWidth / 2 && cursor.x <= centerX + zoneWidth / 2 &&
+           cursor.y >= panelTop - kPanelTopOffset && cursor.y <= panelTop + depth;
+}
+
+static void SetVisible(HWND hwnd, bool visible) {
+    if (g_visible == visible) return;
+    g_visible = visible;
+    PlaceWindow(hwnd);
+}
+
+// Kicks off the arrival or departure animation. The height animates from wherever
+// the panel currently is to where it is going, so the same code covers expand and
+// collapse; the direction also selects the duration.
+static void StartIntro(HWND hwnd, double fromHeight, double toHeight) {
+    // Clear first: a stale active flag from a previous run would make the caller's
+    // very next paint take the "intro finished" path and show one frame of fully
+    // visible content at rest scale, which reads as a flash.
+    g_intro.active = false;
+    if (g_settings.introStyle == 2 || g_settings.introMs <= 0) {
+        return;
+    }
+    const bool expanding = toHeight >= fromHeight;
+    g_intro.active = true;
+    g_intro.startedAt = GetTickCount();
+    g_intro.durationMs = (double)g_settings.introMs *
+                         (expanding ? 1.0 : kCollapseDurationRatio);
+    g_intro.fromHeight = fromHeight;
+    g_intro.toHeight = toHeight;
+    g_intro.style = g_settings.introStyle;
+    g_intro.rippleCount = g_settings.rippleCount;
+    // Run the 40 ms tick as a frame clock while the animation lasts, then drop it
+    // back so an idle panel is not repainting continuously.
+    SetTimer(hwnd, kTimerTick, 16, nullptr);
+}
+
+// Expand/collapse. Both states stay on screen, so the panel can always be clicked
+// back; collapsing only shrinks it to the tab.
+static void SetExpanded(HWND hwnd, bool expanded) {
+    if (g_expanded == expanded) return;
+    double fromHeight = (double)g_displayHeight;
+    g_expanded = expanded;
+    ComputeGeometry();
+    double toHeight = (double)g_displayHeight;
+    StartIntro(hwnd, fromHeight, toHeight);
+    PlaceWindow(hwnd);
+    PaintPanel(hwnd);
+}
+
+// Proximity: expand on approach, collapse after a linger once the pointer leaves.
+static void UpdateProximity(HWND hwnd) {
+    if (!g_modeProximity) return;
+    DWORD now = GetTickCount();
+    bool inside = CursorInHotZone();
+    if (inside) {
+        g_hideAt = now + g_settings.hideDelayMs;
+        if (!g_visible) SetVisible(hwnd, true);
+        if (!g_expanded) SetExpanded(hwnd, true);
+    } else if (g_expanded && now >= g_hideAt) {
+        // Log where the cursor actually was, so a collapse caused by pointer
+        // tracking can be told apart from one caused by stale geometry.
+        POINT cursor = {};
+        GetCursorPos(&cursor);
+        const RECT &rect = g_monitors[g_anchorIndex].rect;
+        int depth = g_settings.hotZoneDepth + (g_expanded ? g_panelHeight : 0);
+        Wh_Log(L"Proximity: collapsing. cursor=(%ld,%ld) monitor.top=%ld depth=%d "
+               L"panel=%dx%d painted=%d",
+               cursor.x, cursor.y, rect.top, depth, g_settings.panelWidth,
+               g_displayHeight, g_paintedHeight);
+        SetExpanded(hwnd, false);
+    }
+}
+
+// Drives the intro animation. While one is running the tick doubles as a frame
+// clock; when it finishes the tick drops back to the cheap cursor-poll rate so an
+// idle panel is not repainting 60 times a second.
+static void UpdateIntro(HWND hwnd) {
+    if (!g_intro.active) return;
+    if (IntroCue() >= 1.0) {
+        const bool wasExpanding = g_intro.toHeight >= g_intro.fromHeight;
+        g_intro.active = false;
+        SetTimer(hwnd, kTimerTick, kCursorPollMs, nullptr);
+        if (!wasExpanding) {
+            // The collapse drove g_displayHeight down frame by frame; put it back to
+            // the resting value so the window and WM_NCHITTEST agree with the
+            // painted result, instead of leaving it one frame short.
+            double target = g_intro.toHeight;
+            g_expanded = false;
+            ComputeGeometry();
+            if ((double)g_displayHeight != target) PlaceWindow(hwnd);
+        }
+        PaintPanel(hwnd);   // one last frame at rest
+        return;
+    }
+    PaintPanel(hwnd);
+}
+
+// ---------------------------------------------------------------------------
+// Window procedure
+// ---------------------------------------------------------------------------
+static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_TIMER:
+        if (wParam == kTimerTick) {
+            UpdateProximity(hwnd);
+            UpdateIntro(hwnd);
+            ReassertTopmost(hwnd);
+        } else if (wParam == kTimerPerf) {
+            unsigned long long cpuMs = (CpuTime100ns() - g_perfBaseCpu100ns) / 10000ULL;
+            PROCESS_MEMORY_COUNTERS_EX mem = {};
+            mem.cb = sizeof(mem);
+            GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&mem, sizeof(mem));
+            unsigned long long elapsed = GetTickCount64() - g_perfBaseTick;
+            Wh_Log(L"[perf] up=%llus rows=%d groups=0x%X samples=%llu paints=%llu cpu=%llums "
+                   L"cpu/sample=%.3fms ws=%.1fMB private=%.1fMB visible=%d expanded=%d prox=%d",
+                   elapsed / 1000ULL, g_visibleRows, g_activeGroups, g_sampleCount, g_paintCount,
+                   cpuMs, g_sampleCount ? (double)cpuMs / (double)g_sampleCount : 0.0,
+                   mem.WorkingSetSize / 1048576.0, mem.PrivateUsage / 1048576.0,
+                   g_visible ? 1 : 0, g_expanded ? 1 : 0, g_modeProximity ? 1 : 0);
+        }
+        return 0;
+
+    case kMsgRatesReady:
+        if (g_visible) PaintPanel(hwnd);
+        return 0;
+
+    case kMsgApplySettings: {
+        // The loader thread posted this after writing g_settings, so the values
+        // needed below are read fresh out of it (see PushSettings).
+        //
+        // The panel is always hit-testable so it can always be clicked; only the
+        // rounded-corner test decides which pixels actually take the click.
+        LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        ex &= ~WS_EX_TRANSPARENT;
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
+
+        ComputeGeometry();
+        // The icon file may have changed, so drop the decoded copy before the
+        // next paint re-reads it.
+        DisposeIconImage();
+        PlaceWindow(hwnd);
+        PaintPanel(hwnd);
+        // Publishing a new version is what tells the sampler to re-evaluate which
+        // collector groups are needed.
+        InterlockedIncrement(&g_settingsVersion);
+        return 0;
+    }
+
+    case WM_LBUTTONUP:
+        if (g_settings.clickToggle) {
+            // Toggle mode: a click is the only way in and out. Opening also pins
+            // the panel, so it stays until the next click instead of being driven
+            // back down by the mouse.
+            if (g_expanded) {
+                SetExpanded(hwnd, false);
+            } else {
+                g_modeProximity = false;
+                SetExpanded(hwnd, true);
+                SetVisible(hwnd, true);
+            }
+        } else {
+            // Proximity mode: a click switches how the panel is driven, which is a
+            // display mode rather than a visibility setting. Switching back to
+            // mouse mode collapses it, which is the visible confirmation.
+            g_modeProximity = !g_modeProximity;
+            if (g_modeProximity) {
+                g_hideAt = GetTickCount() + g_settings.hideDelayMs;
+                SetExpanded(hwnd, false);
+            } else {
+                SetExpanded(hwnd, true);
+            }
+            SetVisible(hwnd, true);
+        }
+        Wh_Log(L"Click: %s, display mode = %s",
+               g_settings.clickToggle ? L"toggle" : L"mode switch",
+               g_modeProximity ? L"proximity" : L"always");
+        return 0;
+
+    case WM_NCHITTEST: {
+        // Rounded-corner aware: outside the panel, let the click fall through.
+        POINT cursor;
+        GetCursorPos(&cursor);
+        RECT rect;
+        GetWindowRect(hwnd, &rect);
+        int x = cursor.x - rect.left;
+        int y = cursor.y - rect.top;
+        float r = (float)MinInt(g_settings.cornerRadius,
+                                MinInt(g_settings.panelWidth, g_displayHeight) / 2);
+        float dx = 0.0f, dy = 0.0f;
+        if (x < r) dx = r - x;
+        else if (x > g_settings.panelWidth - r) dx = x - (g_settings.panelWidth - r);
+        if (y < r) dy = r - y;
+        else if (y > g_displayHeight - r) dy = y - (g_displayHeight - r);
+        bool inside = true;
+        if (dx > 0.0f && dy > 0.0f) {
+            inside = (dx * dx + dy * dy) <= r * r;
+        }
+        return inside ? HTCLIENT : HTTRANSPARENT;
+    }
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+// ---------------------------------------------------------------------------
+// HUD thread
+// ---------------------------------------------------------------------------
+static DWORD WINAPI HudThreadProc(LPVOID) {
+    static const WCHAR kClassName[] = L"ECP.Lite.Hud.2";
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = WindowProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = kClassName;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        Wh_Log(L"RegisterClassExW failed: %lu", GetLastError());
+        SetEvent(g_hudReady);
+        return 1;
+    }
+
+    // The window is never transparent to input: it must always be clickable, and
+    // WM_NCHITTEST decides which pixels take the click. It is also never hidden,
+    // so the collapsed tab can always be clicked back open.
+    // WS_EX_TOPMOST is set at creation as well as through SetWindowPos, because
+    // the style bit is what the compositor consults.
+    LONG_PTR exStyle = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST;
+
+    ComputeGeometry();
+    HWND hwnd = CreateWindowExW(exStyle, kClassName, L"ECP Lite", WS_POPUP,
+                                0, 0, g_settings.panelWidth, g_displayHeight,
+                                nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!hwnd) {
+        Wh_Log(L"CreateWindowExW failed: %lu", GetLastError());
+        SetEvent(g_hudReady);
+        return 1;
+    }
+    g_window = hwnd;
+
+    PlaceWindow(hwnd);
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    ForceTopmost(hwnd);
+    SetTimer(hwnd, kTimerTick, kCursorPollMs, nullptr);
+    SetTimer(hwnd, kTimerPerf, 30000, nullptr);
+    PaintPanel(hwnd);
+    {
+        RECT placed = {};
+        GetWindowRect(hwnd, &placed);
+        Wh_Log(L"Window ready: topmost=%d exstyle=0x%llX rect=%ld,%ld %ldx%ld",
+               IsTopmost(hwnd) ? 1 : 0,
+               (unsigned long long)GetWindowLongPtrW(hwnd, GWL_EXSTYLE),
+               placed.left, placed.top, placed.right - placed.left,
+               placed.bottom - placed.top);
+    }
+    // Start expanded only in the mouse-driven mode; in Toggle mode the panel
+    // begins as a tab so the collapsed state is discoverable.
+    if (g_modeProximity) {
+        g_hideAt = GetTickCount() + g_settings.hideDelayMs;
+    } else {
+        SetExpanded(hwnd, false);
+    }
+    SetEvent(g_hudReady);
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == kMsgQuit && msg.hwnd == nullptr) break;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    KillTimer(hwnd, kTimerTick);
+    KillTimer(hwnd, kTimerPerf);
+    DestroyWindow(hwnd);
+    g_window = nullptr;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Sampler
+// ---------------------------------------------------------------------------
+static GpuBackend g_gpu;
+static bool g_gpuStartAttempted = false;
+
+static void FillSystemFields(Values &v) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    swprintf(v.timeText, 16, L"%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
+    swprintf(v.dateText, 16, L"%04d-%02d-%02d", st.wYear, st.wMonth, st.wDay);
+    unsigned long long secs = GetTickCount64() / 1000ULL;
+    swprintf(v.uptimeText, 24, L"%llud %02llu:%02llu", secs / 86400,
+             (secs % 86400) / 3600, (secs % 3600) / 60);
+
+    PROCESS_MEMORY_COUNTERS_EX mem = {};
+    mem.cb = sizeof(mem);
+    GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&mem, sizeof(mem));
+    v.modWsMb = mem.WorkingSetSize / 1048576.0;
+    v.modCpuMs = (CpuTime100ns() - g_perfBaseCpu100ns) / 10000.0;
+}
+
+static void PublishRows(const Values &v, const ModSettings &settings) {
+    int count = settings.rowCount;
+    if (count > kMaxRows) count = kMaxRows;
+
+    // Build everything off-lock, then swap it in.
+    WCHAR marked[kMaxRows][640];
+    RingSpec rings[kMaxRows][kMaxRingsPerRow];
+    int ringCounts[kMaxRows] = {};
+
+    for (int r = 0; r < count; r++) {
+        ExpandTokensAndRings(settings.rows[r], v, settings, marked[r], 640,
+                             rings[r], &ringCounts[r], kMaxRingsPerRow);
+    }
+
+    EnterCriticalSection(&g_valuesLock);
+    g_publishedRows = count;
+    for (int r = 0; r < count; r++) {
+        // BuildRowLayout records where each gauge sits inside the text flow, which
+        // is what lets a ring be drawn mid-sentence rather than only at the edge.
+        g_rowState.inlineRing[r] = false;
+        BuildRowLayout(marked[r], ringCounts[r], g_rowState, r);
+        for (int i = 0; i < ringCounts[r]; i++) g_rowState.rings[r][i] = rings[r][i];
+    }
+    g_values = v;
+    LeaveCriticalSection(&g_valuesLock);
+}
+
+static void SamplerIteration() {
+    // Take a consistent snapshot of the settings, and notice row changes so the
+    // collector set can be re-derived.
+    ModSettings settings;
+    EnterCriticalSection(&g_settingsLock);
+    settings = g_settings;
+    LONG version = InterlockedCompareExchange(&g_settingsVersion, 0, 0);
+    LeaveCriticalSection(&g_settingsLock);
+
+    if (version != g_samplerSeenVersion) {
+        g_samplerSeenVersion = version;
+        EnterCriticalSection(&g_valuesLock);
+        g_publishedRows = 0;
+        LeaveCriticalSection(&g_valuesLock);
+    }
+
+    unsigned groups = RequiredGroups(settings);
+
+    Values v;
+    FillSystemFields(v);
+
+    if (groups & G_CPU) ReadCpu(v);
+    if (groups & G_MEM) ReadMemory(v);
+    if (groups & G_NET) ReadNetwork(v);
+    if (groups & G_GPU) {
+        // Starting a GPU backend is the expensive step: NVML costs ~22 MB and PDH
+        // costs ~550 ms plus ~6 MB. Do it once, on this thread, and only because a
+        // row genuinely referenced a GPU variable.
+        if (g_gpu.kind == GpuBackend::None && !g_gpuStartAttempted) {
+            g_gpuStartAttempted = true;
+            if (!g_gpu.Start(v)) Wh_Log(L"No GPU backend available (NVML and PDH both failed)");
+        }
+        g_gpu.Sample(v);
+    }
+    v.valid = true;
+    g_activeGroups = groups;
+    g_sampleCount++;
+    PublishRows(v, settings);
+}
+
+static DWORD WINAPI SamplerThread(LPVOID) {
+    // Prime CPU/network deltas so the first published sample is meaningful.
+    SamplerIteration();
+    while (InterlockedCompareExchange(&g_stopSampler, 0, 0) == 0) {
+        for (LONG waited = 0; waited < g_refreshMs; waited += 50) {
+            if (InterlockedCompareExchange(&g_stopSampler, 0, 0) != 0) break;
+            Sleep(50);
+        }
+        if (InterlockedCompareExchange(&g_stopSampler, 0, 0) != 0) break;
+        SamplerIteration();
+        if (g_window) PostMessage(g_window, kMsgRatesReady, 0, 0);
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Loader-thread settings plumbing
+// ---------------------------------------------------------------------------
+static void PushSettings() {
+    // No allocation: the HUD thread reads g_settings under the same lock the
+    // loader thread writes it with. That keeps this DLL free of any C++ runtime
+    // import (new/delete is what pulls in libc++.dll), so it stays a ~125 KB
+    // self-contained mod instead of a ~590 KB statically-linked one.
+    HWND window = g_window;
+    if (!window) return;
+    PostMessageW(window, kMsgApplySettings, 0, 0);
+    InterlockedExchange(&g_refreshMs, g_settings.updateMs);
+}
+
+// ---------------------------------------------------------------------------
+// Tool mod callbacks
+// ---------------------------------------------------------------------------
+BOOL WhTool_ModInit() {
+    InitializeCriticalSection(&g_valuesLock);
+    InitializeCriticalSection(&g_settingsLock);
+    g_perfBaseTick = GetTickCount64();
+    g_perfBaseCpu100ns = CpuTime100ns();
+
+    if (!g_gdiplus.Load()) return FALSE;
+    GdiplusStartupInput startupInput;
+    if (g_gdiplus.Startup(&g_gdiplusToken, &startupInput, nullptr) != 0) {
+        Wh_Log(L"GdiplusStartup failed");
+        return FALSE;
+    }
+
+    // Network is cheap to prepare; the GPU backends are deliberately left alone
+    // here and started later, on the sampler thread, only if a row needs them.
+    HMODULE iphlp = ((HMODULE(WINAPI *)(LPCWSTR))LoadLibraryW)(L"iphlpapi.dll");
+    if (iphlp) g_getIfTable2 = (GetIfTable2Fn)GetProcAddress(iphlp, "GetIfTable2");
+
+    // Fonts must be enumerated before the settings are read, because reading them
+    // validates the configured family against the installed list.
+    EnumerateFonts();
+    ReadSettings(g_settings);
+    InterlockedExchange(&g_refreshMs, g_settings.updateMs);
+    ReadCpuStatic();   // identity fields are static and cost nothing to keep
+
+    {
+        int families = 0;
+        for (const WCHAR *p = g_fontList; *p; p++)
+            if (*p == L';') families++;
+        Wh_Log(L"%d installed font families found; using '%s'", families + 1,
+               g_settings.fontFamily);
+    }
+
+    // Report the palette that actually won. Resolving two colour sources silently
+    // is exactly what made "why is my theme ignored" hard to answer.
+    {
+        const WCHAR *themeName = g_settings.themeIndex >= 0 && g_settings.themeIndex < kThemeCount
+                                     ? kThemes[g_settings.themeIndex].name
+                                     : L"Custom";
+        Wh_Log(L"Theme=%s  bg=%08X border=%08X collapsed=%08X text=%08X accent=%08X",
+               themeName, g_settings.background, g_settings.border,
+               g_settings.borderCollapsed, g_settings.text, g_settings.accent);
+    }
+
+    // In Proximity mode the mouse drives expansion; in Toggle mode the panel
+    // starts collapsed and a click opens it.
+    g_modeProximity = !g_settings.clickToggle;
+    g_expanded = g_modeProximity;
+
+    g_hudReady = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_hudReady) {
+        Wh_Log(L"CreateEvent failed: %lu", GetLastError());
+        return FALSE;
+    }
+    g_hudThread = CreateThread(nullptr, 0, HudThreadProc, nullptr, 0, &g_hudThreadId);
+    if (!g_hudThread) {
+        Wh_Log(L"CreateThread (HUD) failed: %lu", GetLastError());
+        return FALSE;
+    }
+    WaitForSingleObject(g_hudReady, 5000);
+    if (!g_window) {
+        Wh_Log(L"HUD window was not created");
+        return FALSE;
+    }
+
+    g_samplerThread = CreateThread(nullptr, 0, SamplerThread, nullptr, 0, nullptr);
+    if (!g_samplerThread) {
+        Wh_Log(L"CreateThread (sampler) failed: %lu", GetLastError());
+        return FALSE;
+    }
+
+    Wh_Log(L"Started: rows=%d clickAction=%s monitor=%d update=%dms panel=%dx%d rings=%d/%d",
+           g_settings.rowCount, g_settings.clickToggle ? L"toggle" : L"proximity",
+           g_settings.monitorMode, g_settings.updateMs, g_settings.panelWidth,
+           g_panelHeight, g_settings.ringSize, g_settings.ringThickness);
+    return TRUE;
+}
+
+void WhTool_ModSettingsChanged() {
+    ReadSettings(g_settings);
+    ReadCpuStatic();
+    PushSettings();
+    Wh_Log(L"Settings applied: rows=%d clickAction=%s", g_settings.rowCount,
+           g_settings.clickToggle ? L"toggle" : L"proximity");
+}
+
+void WhTool_ModUninit() {
+    InterlockedExchange(&g_stopSampler, 1);
+    if (g_samplerThread) {
+        WaitForSingleObject(g_samplerThread, 2000);
+        CloseHandle(g_samplerThread);
+        g_samplerThread = nullptr;
+    }
+    if (g_hudThreadId) PostThreadMessageW(g_hudThreadId, kMsgQuit, 0, 0);
+    if (g_hudThread) {
+        WaitForSingleObject(g_hudThread, 3000);
+        CloseHandle(g_hudThread);
+        g_hudThread = nullptr;
+        g_hudThreadId = 0;
+    }
+    if (g_hudReady) {
+        CloseHandle(g_hudReady);
+        g_hudReady = nullptr;
+    }
+    if (g_gpu.query) {
+        PdhCloseQuery(g_gpu.query);
+        g_gpu.query = nullptr;
+    }
+    if (g_gpu.shutdown && g_gpu.kind == GpuBackend::Nvml) g_gpu.shutdown();
+    // Must happen before GDI+ shuts down, or the cached image leaks the decoder's
+    // resources.
+    DisposeIconImage();
+    if (g_gdiplusToken) {
+        g_gdiplus.Shutdown(g_gdiplusToken);
+        g_gdiplusToken = 0;
+    }
+    DeleteCriticalSection(&g_valuesLock);
+    DeleteCriticalSection(&g_settingsLock);
+    Wh_Log(L"Unloaded");
+}
+
+// ===========================================================================
+// Windhawk tool mod boilerplate.
+//
+// Runs this mod in a dedicated windhawk.exe process instead of injecting it into
+// another process. Structure from:
+// https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-dedicated-process
+//
+// Only WhTool_ModInit / WhTool_ModSettingsChanged / WhTool_ModUninit are
+// supported for tool mods.
+// ===========================================================================
+static bool g_isToolModProcessLauncher = false;
+static HANDLE g_toolModProcessMutex = nullptr;
+
+static void WINAPI EntryPoint_Hook() {
+    Wh_Log(L">");
+    ExitThread(0);
+}
+
+BOOL Wh_ModInit() {
+    DWORD sessionId;
+    if (ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) && sessionId == 0) return FALSE;
+
+    bool isExcluded = false, isToolModProcess = false, isCurrentToolModProcess = false;
+    int argc = 0;
+    LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) {
+        Wh_Log(L"CommandLineToArgvW failed");
+        return FALSE;
+    }
+    for (int i = 1; i < argc; i++) {
+        if (wcscmp(argv[i], L"-service") == 0 || wcscmp(argv[i], L"-service-start") == 0 ||
+            wcscmp(argv[i], L"-service-stop") == 0) {
+            isExcluded = true;
+            break;
+        }
+    }
+    for (int i = 1; i < argc - 1; i++) {
+        if (wcscmp(argv[i], L"-tool-mod") == 0) {
+            isToolModProcess = true;
+            if (wcscmp(argv[i + 1], WH_MOD_ID) == 0) isCurrentToolModProcess = true;
+            break;
+        }
+    }
+    LocalFree(argv);
+
+    if (isExcluded) return FALSE;
+
+    if (isCurrentToolModProcess) {
+        g_toolModProcessMutex = CreateMutexW(nullptr, TRUE, L"windhawk-tool-mod_" WH_MOD_ID);
+        if (!g_toolModProcessMutex) {
+            Wh_Log(L"CreateMutex failed");
+            ExitProcess(1);
+        }
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            Wh_Log(L"Tool mod already running");
+            ExitProcess(1);
+        }
+        if (!WhTool_ModInit()) ExitProcess(1);
+
+        IMAGE_DOS_HEADER *dosHeader = (IMAGE_DOS_HEADER *)GetModuleHandleW(nullptr);
+        IMAGE_NT_HEADERS *ntHeaders = (IMAGE_NT_HEADERS *)((BYTE *)dosHeader + dosHeader->e_lfanew);
+        void *entryPoint = (BYTE *)dosHeader + ntHeaders->OptionalHeader.AddressOfEntryPoint;
+        Wh_SetFunctionHook(entryPoint, (void *)EntryPoint_Hook, nullptr);
+        return TRUE;
+    }
+
+    if (isToolModProcess) return FALSE;
+
+    g_isToolModProcessLauncher = true;
+    return TRUE;
+}
+
+void Wh_ModAfterInit() {
+    if (!g_isToolModProcessLauncher) return;
+
+    WCHAR currentProcessPath[MAX_PATH];
+    if (GetModuleFileNameW(nullptr, currentProcessPath, MAX_PATH) == 0) {
+        Wh_Log(L"GetModuleFileName failed");
+        return;
+    }
+    WCHAR commandLine[MAX_PATH + 2 + (sizeof(L" -tool-mod \"" WH_MOD_ID "\"") / sizeof(WCHAR))];
+    swprintf(commandLine, MAX_PATH + 2 + (sizeof(L" -tool-mod \"" WH_MOD_ID "\"") / sizeof(WCHAR)),
+             L"\"%s\" -tool-mod \"%s\"", currentProcessPath, WH_MOD_ID);
+
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_FORCEOFFFEEDBACK;
+    PROCESS_INFORMATION pi = {};
+    if (!CreateProcessW(currentProcessPath, commandLine, nullptr, nullptr, FALSE,
+                        NORMAL_PRIORITY_CLASS, nullptr, nullptr, &si, &pi)) {
+        Wh_Log(L"CreateProcess failed: %lu", GetLastError());
+        return;
+    }
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+}
+
+void Wh_ModSettingsChanged() {
+    if (g_isToolModProcessLauncher) return;
+    WhTool_ModSettingsChanged();
+}
+
+void Wh_ModUninit() {
+    if (g_isToolModProcessLauncher) return;
+    WhTool_ModUninit();
+    ExitProcess(0);
+}
