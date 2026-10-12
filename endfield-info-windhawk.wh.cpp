@@ -4,7 +4,7 @@
 // @description     A configurable always-on-top status capsule: user-defined rows, on-demand collectors (CPU / memory / network / GPU), top-of-the-topmost-monitor anchoring, and proximity-or-always display with click-to-toggle.
 // @version         0.2.0
 // @author          Silicon Dioxide
-// @github          https://github.com/Tetrachlorosilane/zmd-info-windhawk
+// @github          https://github.com/Tetrachlorosilane/endfield-info-windhawk
 // @include         windhawk.exe
 // @compilerOptions -lgdi32 -lpdh -liphlpapi -lpsapi -ladvapi32
 // ==/WindhawkMod==
