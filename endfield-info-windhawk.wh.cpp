@@ -2175,6 +2175,76 @@ static void ReadCpuStatic() {
 }
 
 // ---------------------------------------------------------------------------
+// Nominal CPU clock: two sources, and they disagree
+// ---------------------------------------------------------------------------
+// The registry's "~MHz" is what ACPI/BIOS reports and is not always the nominal clock
+// (measured: 2.42 GHz on a CPU whose nominal is 2.20 GHz). The power manager knows the
+// real one: PROCESSOR_POWER_INFORMATION.MaxMhz. So the API wins and the registry value
+// stays as the fallback. powrprof is loaded on demand through GetProcAddress, the same
+// way iphlpapi and nvml are, so the import table does not change.
+struct ProcPowerInfo {
+    ULONG number;
+    ULONG maxMhz;
+    ULONG currentMhz;
+    ULONG mhzLimit;
+    ULONG maxIdleState;
+    ULONG currentIdleState;
+};
+
+typedef LONG(WINAPI *CallNtPowerInformationFn)(int, PVOID, ULONG, PVOID, ULONG);
+
+static bool g_cpuNominalSettled = false;    // one attempt; the registry value then stands
+
+// Pure, so the choice between the two sources can be asserted: the *highest* per-processor
+// maximum is the nominal -- a hybrid CPU reports a lower maximum for its efficiency cores,
+// and a single "nominal" must not be the slow one.
+static double CpuNominalFromInfo(const ProcPowerInfo *info, int count, double fallbackGhz) {
+    ULONG best = 0;
+    for (int i = 0; i < count; i++) {
+        if (info[i].maxMhz > best) best = info[i].maxMhz;
+    }
+    if (best == 0) return fallbackGhz;
+    return best / 1000.0;
+}
+
+static void CpuNominalEnsure() {
+    if (g_cpuNominalSettled) return;
+    g_cpuNominalSettled = true;
+
+    const double fallback = g_cpuGhzMax;
+    HMODULE lib = LoadLibraryW(L"powrprof.dll");
+    if (!lib) {
+        Wh_Log(L"CPU clock: powrprof.dll unavailable, keeping the registry's %.2f GHz",
+               fallback);
+        return;
+    }
+    auto call = (CallNtPowerInformationFn)GetProcAddress(lib, "CallNtPowerInformation");
+    if (!call) {
+        Wh_Log(L"CPU clock: CallNtPowerInformation missing, keeping %.2f GHz", fallback);
+        return;
+    }
+
+    const int count = g_cpuThreads > 0 ? g_cpuThreads : 1;
+    const ULONG bytes = (ULONG)(sizeof(ProcPowerInfo) * (size_t)count);
+    auto *info = (ProcPowerInfo *)malloc(bytes);
+    if (!info) return;
+    memset(info, 0, bytes);
+
+    const LONG status = call(11 /* ProcessorInformation */, nullptr, 0, info, bytes);
+    const double nominal = CpuNominalFromInfo(info, count, fallback);
+    free(info);
+
+    if (status != 0) {
+        Wh_Log(L"CPU clock: CallNtPowerInformation status=0x%08X, keeping %.2f GHz",
+               (unsigned)status, fallback);
+        return;
+    }
+    Wh_Log(L"CPU clock: nominal %.2f GHz from the power API (registry said %.2f)", nominal,
+           fallback);
+    g_cpuGhzMax = nominal;
+}
+
+// ---------------------------------------------------------------------------
 // Effective CPU clock
 // ---------------------------------------------------------------------------
 // Windows does not hand out a frequency; what it exposes is the *ratio* of the clock
@@ -2308,6 +2378,8 @@ static bool RowUsesEffectiveClock(const WCHAR *row) {
 }
 
 static void ReadCpu(Values &v, bool wantEffectiveClock) {
+    // The nominal clock has two sources; settle which applies before anything uses it.
+    CpuNominalEnsure();
     FILETIME idleFt, kernelFt, userFt;
     if (GetSystemTimes(&idleFt, &kernelFt, &userFt)) {
         ULARGE_INTEGER i, k, u;

@@ -1573,6 +1573,27 @@ int main() {
                   "and text without the token does not");
         }
 
+        // The nominal clock has two sources: the registry's "~MHz" (what ACPI/BIOS
+        // reports) and the power API's per-processor maximum. They disagree by ~10% on
+        // the machine this was reported from, and the API is the one Windows treats as
+        // nominal.
+        {
+            ProcPowerInfo one[1] = {};
+            one[0].maxMhz = 2200;
+            Check(CpuNominalFromInfo(one, 1, 2.42) == 2.2,
+                  "the power API's nominal beats the registry's value");
+            ProcPowerInfo hybrid[4] = {};
+            hybrid[0].maxMhz = 2200;
+            hybrid[1].maxMhz = 1600;
+            hybrid[2].maxMhz = 2200;
+            hybrid[3].maxMhz = 1600;
+            Check(CpuNominalFromInfo(hybrid, 4, 2.42) == 2.2,
+                  "a hybrid CPU's slower cores must not become the nominal");
+            ProcPowerInfo nothing[1] = {};
+            Check(CpuNominalFromInfo(nothing, 1, 2.42) == 2.42,
+                  "and when the API reports nothing, the registry value stands");
+        }
+
         // The pipe's DACL has to actually admit this user. Getting it wrong is
         // invisible until a real client is refused, so a pipe built with the very
         // same descriptor is opened here -- but only where the environment allows
