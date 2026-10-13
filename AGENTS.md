@@ -331,6 +331,10 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   替换出来的文本不会被重新扫描——并且有断言钉住：把展开改成递归，
   `test-layout.cpp` 里 "a pushed value that looks like a token stays literal" 必须变红（已实测）。
 - **停机顺序：IPC 先于 sampler**（写者先于读者），最后才 `DeleteCriticalSection(&g_extLock)`。
+- **`CreateNamedPipe` 的 `nMaxInstances` 必须等于实例线程数**（每线程建一个实例）。
+  传 1 会让第一个线程占满额度、其余线程以 `ERROR_PIPE_BUSY (231)` 退出——表面上"serving 4
+  instances"，实际只有一个客户端能连。**231 是瞬态**（实例都被占着），要等一会儿重试，
+  不能把线程退掉；其他错误码才是永久的。
 
 ---
 
@@ -358,6 +362,7 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 | 关掉换行后文本不截断 | 文字压到后面的环上 | 每段都落在自己的预算内 |
 | 管道 DACL 写成 `CO`（creator owner） | **每个客户端都被拒绝**（`PermissionError` / `ERROR_ACCESS_DENIED`），连启动 mod 的用户自己都连不上 | 用同一个 SD 建管道、让当前用户连上：`test-layout.cpp` 的 "the pipe DACL admits the user running the mod" |
 | 提供者名从帧行拷贝时未按长度截断 | 客户端连上、`SET` 被接受，行**永远显示 `--`**；且每次重连占一个新槽位，8 次后 `HELLO` 开始回 403 | 用**带换行**的 `HELLO`/`SET` 驱动 handler，断言 `{ext.provider.key}` 查得到（旧代码下红两条） |
+| `CreateNamedPipe` 的 `nMaxInstances` 传 1 而线程数是 4 | 日志写着 `serving 4 pipe instance(s)`，实际 3 个线程以 `CreateNamedPipe failed: 231` 当场退出，只支持 1 个并发客户端 | **没有断言能覆盖**（这是 API 调用点的常量错，宿主里没有真管道）；判别依据是错误码语义——**断言覆盖不到的地方，日志就是防线** |
 
 ### 排查心法：先分类，再定位
 

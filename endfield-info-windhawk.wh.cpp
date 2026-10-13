@@ -1530,6 +1530,7 @@ static HANDLE           g_extThreads[kExtInstances] = {};
 static int              g_extThreadCount = 0;
 static HANDLE           g_extStopEvent = nullptr;
 static bool             g_extStartAttempted = false;
+static int              g_extBusyLogs = 0;     // bounded: "all instances busy" messages
 
 // Does this name select the external namespace at all? Full validation happens in
 // ExtLookup, so a malformed {ext...} still reaches the "unknown" path and keeps
@@ -5065,13 +5066,34 @@ static DWORD WINAPI ExtPipeThread(LPVOID) {
     sa.bInheritHandle = FALSE;
 
     while (!InterlockedCompareExchange(&g_extStop, 0, 0)) {
+        // nMaxInstances must be the number of worker threads, because each thread
+        // creates exactly one instance. Passing 1 here made the first thread the
+        // only one that could ever create a pipe and killed the other three with
+        // ERROR_PIPE_BUSY (231) -- so the server silently served one client while
+        // claiming four instances.
         HANDLE pipe = CreateNamedPipeW(kExtPipeName,
                                        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                                        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT |
                                            PIPE_REJECT_REMOTE_CLIENTS,
-                                       1, 8192, 8192, 0, &sa);
+                                       kExtInstances, 8192, 8192, 0, &sa);
         if (pipe == INVALID_HANDLE_VALUE) {
-            Wh_Log(L"EXT: CreateNamedPipe failed: %lu", GetLastError());
+            DWORD err = GetLastError();
+            if (err == ERROR_PIPE_BUSY) {
+                // Every instance is taken right now. That is transient -- a client
+                // will disconnect -- so wait for one instead of retiring this thread
+                // for the rest of the session.
+                if (g_extBusyLogs < 4) {
+                    Wh_Log(L"EXT: all %d instances are busy; waiting for one to free up",
+                           kExtInstances);
+                    g_extBusyLogs++;
+                }
+                for (int waited = 0; waited < 200; waited += 50) {
+                    if (InterlockedCompareExchange(&g_extStop, 0, 0)) break;
+                    Sleep(50);
+                }
+                continue;
+            }
+            Wh_Log(L"EXT: CreateNamedPipe failed: %lu", err);
             break;
         }
         if (!ExtConnect(pipe, &ov)) { CloseHandle(pipe); break; }
