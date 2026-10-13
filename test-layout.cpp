@@ -1463,6 +1463,61 @@ int main() {
                   "raising the minimum raises the floor for the same card");
         }
 
+        // M3: geometry, regions, hit test and dismissal. The property the milestone is
+        // judged on is the last one: every visible pixel must belong to some region.
+        {
+            ModSettings cfg = {};
+            cfg.rowHeight = 30;
+            cfg.islandMinWidth = 260;
+            IslandMetrics m = {};
+            m.titleChars = 20;
+            PanelRect monitor = {0, 0, 1920, 1080};
+            PanelRect card = ComputeIslandRect(m, cfg, monitor, 0, 168);
+            Check(card.w == ComputeIslandCardWidth(m, cfg, monitor.w),
+                  "the card's rectangle and its width come out of one function");
+            Check(card.x == (1920 - card.w) / 2 && card.y == 0 && card.h == 168,
+                  "the card is centred in the monitor and keeps the panel's top edge");
+
+            PanelRect narrowMonitor = {0, 0, 400, 1080};
+            PanelRect narrow = ComputeIslandRect(m, cfg, narrowMonitor, 0, 168);
+            Check(narrow.w <= 400 && narrow.x >= 0 && narrow.x + narrow.w <= 400,
+                  "on a narrow monitor the card stays inside the screen");
+
+            IslandHitRegion regions[4];
+            const int count = BuildIslandRegions(card, cfg.rowHeight, regions, 4);
+            Check(count == 2 && regions[0].id == IR_CARD && regions[1].id == IR_CLOSE,
+                  "the card is one region and the close button sits on top of it");
+
+            const PanelRect &close = regions[1].rect;
+            Check(close.x >= card.x && close.x + close.w <= card.x + card.w &&
+                      close.y >= card.y && close.y + close.h <= card.y + card.h,
+                  "the close button never pokes outside the card");
+            Check(IslandHitTest(regions, count, close.x + 2, close.y + 2) == IR_CLOSE,
+                  "a click on the button is the button");
+            Check(IslandHitTest(regions, count, card.x + 5, card.y + 5) == IR_CARD,
+                  "a click on the card is the card");
+            Check(IslandHitTest(regions, count, card.x - 1, card.y - 1) == IR_NONE,
+                  "a click outside the card is nothing");
+
+            int unclickable = 0;
+            for (int x = card.x; x < card.x + card.w; x++) {
+                for (int y = card.y; y < card.y + card.h; y++) {
+                    if (IslandHitTest(regions, count, x, y) == IR_NONE) unclickable++;
+                }
+            }
+            Check(unclickable == 0,
+                  "every visible pixel of the card belongs to a clickable region");
+
+            IslandView view = {};
+            view.state = IS_CARD;
+            view.phaseStarted = 1000;
+            Check(IslandDismiss(&view, 2000) && view.state == IS_COLLAPSING &&
+                      view.phaseStarted == 2000,
+                  "dismissing a card starts the same collapse the ttl expiry would");
+            Check(!IslandDismiss(&view, 2500) && view.phaseStarted == 2000,
+                  "and a second click does not restart the fade");
+        }
+
         // The pipe's DACL has to actually admit this user. Getting it wrong is
         // invisible until a real client is refused, so a pipe built with the very
         // same descriptor is opened here -- but only where the environment allows

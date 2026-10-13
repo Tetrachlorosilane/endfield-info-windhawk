@@ -4058,6 +4058,91 @@ static void BuildRoundedRect(GpPath *path, float x, float y, float w, float h, f
 // the animated height, so it is declared here.
 static void PlaceWindow(HWND hwnd);
 
+// ---------------------------------------------------------------------------
+// M3: card geometry, regions, hit testing and dismissal
+// ---------------------------------------------------------------------------
+// One source of truth for where the card is (design 8 / M3): the window placement, the
+// hit test and the painter all derive from these functions, and none of them computes a
+// rectangle of its own. Coordinates are whatever space the caller works in -- screen
+// space for the hit test, bitmap space for the painter -- because only the *relation*
+// between the card and its parts has to be shared.
+struct PanelRect {
+    int x;
+    int y;
+    int w;
+    int h;
+};
+
+static PanelRect ComputeIslandRect(const IslandMetrics &m, const ModSettings &cfg,
+                                   const PanelRect &monitor, int top, int height) {
+    PanelRect out = {};
+    out.w = ComputeIslandCardWidth(m, cfg, monitor.w);
+    out.x = monitor.x + (monitor.w - out.w) / 2;
+    out.y = top;
+    out.h = height;
+    return out;
+}
+
+// The close affordance: a square at the card's right edge, centred on its first line.
+// The clamps win over the padding, so on a very narrow card it stays inside the card
+// rather than poking out of it -- which would be a click target outside the panel.
+static const int kIslandCloseSize = 22;
+
+static PanelRect ComputeIslandCloseRect(const PanelRect &card, int rowHeight) {
+    PanelRect out = {};
+    out.w = kIslandCloseSize;
+    out.h = kIslandCloseSize;
+    out.x = card.x + card.w - kIslandCloseSize - 8;
+    out.y = card.y + (rowHeight - kIslandCloseSize) / 2;
+    if (out.x + out.w > card.x + card.w) out.x = card.x + card.w - out.w;
+    if (out.x < card.x) out.x = card.x;
+    if (out.y < card.y) out.y = card.y;
+    if (out.y + out.h > card.y + card.h) out.y = card.y + card.h - out.h;
+    return out;
+}
+
+enum IslandRegion {
+    IR_NONE = 0,
+    IR_CARD,
+    IR_CLOSE,
+};
+
+struct IslandHitRegion {
+    IslandRegion id;
+    PanelRect rect;
+};
+
+// Regions are written back to front: later entries sit on top, and the hit test returns
+// the last match. That ordering *is* the rule "what is visible is what is clickable" --
+// the card accepts everything, and the button wins inside itself.
+static int BuildIslandRegions(const PanelRect &card, int rowHeight, IslandHitRegion *out,
+                              int cap) {
+    if (!out || cap < 2) return 0;
+    out[0].id = IR_CARD;
+    out[0].rect = card;
+    out[1].id = IR_CLOSE;
+    out[1].rect = ComputeIslandCloseRect(card, rowHeight);
+    return 2;
+}
+
+static IslandRegion IslandHitTest(const IslandHitRegion *regions, int count, int x, int y) {
+    for (int i = count - 1; i >= 0; i--) {
+        const PanelRect &r = regions[i].rect;
+        if (x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) return regions[i].id;
+    }
+    return IR_NONE;
+}
+
+// Closing a card early takes the same road the ttl expiry takes, so the fade and the
+// state machine cannot diverge. Idempotent on purpose: a second click on the button must
+// not restart the fade.
+static bool IslandDismiss(IslandView *v, DWORD now) {
+    if (v->state != IS_POPPING && v->state != IS_CARD) return false;
+    v->state = IS_COLLAPSING;
+    v->phaseStarted = now;
+    return true;
+}
+
 static void PaintPanel(HWND hwnd) {
     // Card mode: a static width, applied here and now. The width used to animate, and
     // that is what flickered: resizing from the timer left one frame in which the window
@@ -4079,7 +4164,13 @@ static void PaintPanel(HWND hwnd) {
         if (monitor && GetMonitorInfoW(monitor, &info)) {
             monitorWidth = (int)(info.rcMonitor.right - info.rcMonitor.left);
         }
-        width = ComputeIslandCardWidth(metrics, g_settings, monitorWidth);
+        // The width comes from the shared geometry function -- the same one the hit test's
+        // rectangles are built from -- so the card cannot be drawn at one size and
+        // accepted at another. Only the width transfers into bitmap space: the bitmap the
+        // painter is about to fill *is* the card, so its local origin is (0,0) by
+        // definition, while the function's x centres it inside the monitor.
+        const PanelRect monitorRect = {0, 0, monitorWidth, 0};
+        width = ComputeIslandRect(metrics, g_settings, monitorRect, 0, 0).w;
     }
     // Resize before the bitmap exists, never after: inside one frame the window and the
     // layered blit are then always the same size, so no band can be left behind.
@@ -4437,7 +4528,10 @@ static void PaintPanel(HWND hwnd) {
                         ResolveSeverityColor(g_islandCard.severity, g_settings.text), cardAlpha);
                     const IslandCardLayout plan = PlanIslandCard(g_islandCard);
                     const float textX = pad + 12.0f;
-                    float textWidth = (float)width - textX - pad;
+                    // Leave room for the close affordance: GDI+ does not clip to the
+                    // layout box, so text would happily run underneath it.
+                    float textWidth =
+                        (float)width - textX - pad - (float)(kIslandCloseSize + 6);
                     if (textWidth < kMinLayoutWidth) textWidth = kMinLayoutWidth;
 
                     // Accent bar: severity, and the only thing that carries colour.
@@ -4447,23 +4541,51 @@ static void PaintPanel(HWND hwnd) {
                     g_gdiplus.FillRectangle(graphics, (GpBrush *)textBrush, pad, pad + 3.0f,
                                             3.0f, barHeight);
 
+                    // The rows' rule, applied here too: measure and ellipsise to the
+                    // budget, because GDI+ would otherwise draw straight past the box.
+                    WCHAR fitted[kIslandBodyChars];
+                    wcsncpy(fitted, g_islandCard.title, kIslandBodyChars - 1);
+                    fitted[kIslandBodyChars - 1] = L'\0';
+                    FitTextToWidth(graphics, font, format, fitted, kIslandBodyChars, textWidth,
+                                   lineHeight);
                     g_gdiplus.SetSolidFillColor(
                         textBrush, WithOpacity(g_settings.text, cardAlpha));
                     RectF titleRect(textX, pad, textWidth, lineHeight);
-                    g_gdiplus.DrawString(graphics, g_islandCard.title, -1, font, &titleRect,
-                                         format, (GpBrush *)textBrush);
+                    g_gdiplus.DrawString(graphics, fitted, -1, font, &titleRect, format,
+                                         (GpBrush *)textBrush);
                     if (plan.lines > 1) {
+                        wcsncpy(fitted, g_islandCard.body, kIslandBodyChars - 1);
+                        fitted[kIslandBodyChars - 1] = L'\0';
+                        FitTextToWidth(graphics, font, format, fitted, kIslandBodyChars,
+                                       textWidth, lineHeight);
                         g_gdiplus.SetSolidFillColor(
                             textBrush,
                             WithOpacity(g_settings.text, kTextSecondaryOpacity * cardAlpha));
                         RectF bodyRect(textX, pad + lineHeight, textWidth, lineHeight);
-                        g_gdiplus.DrawString(graphics, g_islandCard.body, -1, font, &bodyRect,
+                        g_gdiplus.DrawString(graphics, fitted, -1, font, &bodyRect,
                                              format, (GpBrush *)textBrush);
+                    }
+                    // The close affordance, drawn from the same rectangle the hit test
+                    // accepts: an x, which is the glyph the merge badge already uses, so
+                    // no new drawing surface is needed.
+                    {
+                        PanelRect localCard = {0, 0, width, height};
+                        const PanelRect closeRect =
+                            ComputeIslandCloseRect(localCard, g_settings.rowHeight);
+                        g_gdiplus.SetSolidFillColor(
+                            textBrush,
+                            WithOpacity(g_settings.text, kTextSecondaryOpacity * cardAlpha));
+                        RectF closeBox((float)closeRect.x, (float)closeRect.y,
+                                       (float)closeRect.w, (float)closeRect.h);
+                        g_gdiplus.DrawString(graphics, L"\x00D7", -1, font, &closeBox, format,
+                                             (GpBrush *)textBrush);
                     }
                     if (plan.hasBadge) {
                         // The merge counter from design 7.3, drawn in the accent colour.
                         g_gdiplus.SetSolidFillColor(textBrush, accent);
-                        RectF badgeRect((float)width - 46.0f, pad, 38.0f, lineHeight);
+                        RectF badgeRect(
+                            (float)width - 46.0f - (float)(kIslandCloseSize + 6), pad, 38.0f,
+                            lineHeight);
                         g_gdiplus.DrawString(graphics, plan.badge, -1, font, &badgeRect, format,
                                              (GpBrush *)textBrush);
                     }
@@ -4882,6 +5004,26 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     }
 
     case WM_LBUTTONUP:
+        // The card's close affordance comes first: while a card is up it owns the click,
+        // and the panel's own click behaviour (toggle / mode switch) must not also fire.
+        // Everything here is on the HUD thread, which is the only thread that touches the
+        // island view.
+        if (g_settings.islandEnabled && g_islandCardValid &&
+            g_islandView.state != IS_IDLE) {
+            RECT wr = {};
+            GetWindowRect(hwnd, &wr);
+            PanelRect card = {wr.left, wr.top, wr.right - wr.left, wr.bottom - wr.top};
+            IslandHitRegion regions[2];
+            const int regionCount =
+                BuildIslandRegions(card, g_settings.rowHeight, regions, 2);
+            const int screenX = wr.left + (int)(short)LOWORD(lParam);
+            const int screenY = wr.top + (int)(short)HIWORD(lParam);
+            if (IslandHitTest(regions, regionCount, screenX, screenY) == IR_CLOSE &&
+                IslandDismiss(&g_islandView, GetTickCount())) {
+                PaintPanel(hwnd);
+                return 0;
+            }
+        }
         if (g_settings.clickToggle) {
             // Toggle mode: a click is the only way in and out. Opening also pins
             // the panel, so it stays until the next click instead of being driven
