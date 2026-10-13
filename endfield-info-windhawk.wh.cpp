@@ -4827,14 +4827,17 @@ static bool ExtConnect(HANDLE pipe, OVERLAPPED *ov) {
 
 // 1 = one frame read, 0 = the frame is larger than the buffer, -1 = stopped or broken.
 //
-// The wait is bounded (kExtIoTimeoutMs) and a timeout is not an error:
-//   * an empty buffer means the client is simply quiet, so the *same* pending read
-//     keeps waiting -- cancelling and re-posting there would burn CPU for nothing;
-//   * data queued while the completion has not arrived means the completion was
-//     lost. That is worth a log line and a re-post, because the bytes are still
-//     there (a cancelled read consumes nothing).
+// The wait is bounded (kExtIoTimeoutMs) and a timeout is not an error. What happens
+// next depends on what the pipe says:
+//   * bytes queued with no completion -> the completion was lost; log it and re-post
+//     at once (a cancelled read consumes nothing, so the bytes are still there);
+//   * an empty buffer -> normally just a quiet client, so the same pending read keeps
+//     waiting -- but re-post every few seconds anyway as a safety net, because
+//     PeekNamedPipe is the only witness that the bytes are not there. The outer loop
+//     is unbounded on purpose: a quiet provider must never be disconnected for being
+//     quiet, and a re-post costs one cancel plus two I/O calls.
 static int ExtReadFrame(HANDLE pipe, OVERLAPPED *ov, char *buffer, DWORD cap, DWORD *got) {
-    for (int attempt = 0; attempt < 4; attempt++) {
+    for (;;) {
         *got = 0;
         ResetEvent(ov->hEvent);
         if (ReadFile(pipe, buffer, cap, got, ov)) return 1;
@@ -4852,27 +4855,34 @@ static int ExtReadFrame(HANDLE pipe, OVERLAPPED *ov, char *buffer, DWORD cap, DW
 
             DWORD available = 0;
             if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) return -1;
-            if (available == 0) {
-                // Nothing queued yet. If that goes on, say so once: a connected
-                // client whose bytes never arrive must not look like a mystery.
-                if (!warned && GetTickCount() - started >= 2000 && g_extStallLogs < 4) {
-                    Wh_Log(L"EXT: no frame for 2s and the pipe buffer is empty "
-                           L"(nothing this instance can see)");
-                    g_extStallLogs++;
-                    warned = true;
-                }
-                continue;
-            }
+            const bool empty = (available == 0);
+            const DWORD elapsed = GetTickCount() - started;
 
-            if (g_extStallLogs < 4) {
-                Wh_Log(L"EXT: read completion never arrived with %lu bytes queued; re-posting",
-                       available);
+            if (empty && !warned && elapsed >= 2000 && g_extStallLogs < 4) {
+                // Nothing queued yet. If that goes on, say so once: a connected client
+                // whose bytes never arrive must not look like a mystery.
+                Wh_Log(L"EXT: no frame for 2s and the pipe buffer is empty "
+                       L"(nothing this instance can see)");
+                g_extStallLogs++;
+                warned = true;
+            }
+            // Queued bytes with no completion is a lost completion: re-post at once.
+            if (!empty && g_extStallLogs < 4) {
+                Wh_Log(L"EXT: read completion never arrived with %lu bytes queued; "
+                       L"re-posting", available);
                 g_extStallLogs++;
             }
-            CancelIoEx(pipe, ov);
-            DWORD ignored = 0;
-            GetOverlappedResult(pipe, ov, &ignored, TRUE);
-            break;                             // re-post; the queued bytes are untouched
+            // An empty buffer is normally just a quiet client -- but re-post every few
+            // seconds anyway. PeekNamedPipe is the only witness that the bytes are not
+            // there, and a cancelled read consumes nothing, so if it ever under-reports
+            // this recovers the frame instead of waiting forever for a completion that
+            // was already delivered.
+            if (!empty || elapsed >= 4000) {
+                CancelIoEx(pipe, ov);
+                DWORD ignored = 0;
+                GetOverlappedResult(pipe, ov, &ignored, TRUE);
+                break;                         // re-post; queued bytes are untouched
+            }
         }
     }
     return -1;
@@ -5229,15 +5239,18 @@ static void ExtSelfTest() {
         return;
     }
     // Two separate writes: one message per line is what the protocol relies on, so
-    // that is the part worth testing rather than a single byte stream.
+    // that is the part worth testing rather than a single byte stream. The TTL is
+    // explicit and long: this value is meant to be *looked at* afterwards through a
+    // row like "{ext.selftest.ok}", so it must outlive the moment of startup.
     const char line1[] = "HELLO 1 selftest\n";
-    const char line2[] = "SET selftest ok - pipe self-test\n";
+    const char line2[] = "SET selftest ok 600000 - pipe self-test\n";
     DWORD written = 0;
     BOOL sent1 = WriteFile(client, line1, (DWORD)sizeof(line1) - 1, &written, nullptr);
     BOOL sent2 = WriteFile(client, line2, (DWORD)sizeof(line2) - 1, &written, nullptr);
     CloseHandle(client);
-    Wh_Log(L"EXT: self-test sent 2 frames (wrote=%d/%d); the lines above say whether "
-           L"they arrived", sent1 ? 1 : 0, sent2 ? 1 : 0);
+    Wh_Log(L"EXT: self-test sent 2 frames (wrote=%d/%d, ttl=600000); the {ext.selftest.ok} "
+           L"row should read \"pipe self-test\" for ten minutes", sent1 ? 1 : 0,
+           sent2 ? 1 : 0);
 }
 
 static void ExtStart(const ModSettings &snap) {
