@@ -247,9 +247,9 @@ through WMI.
   $name: 'Allowed external providers'
   $description: 'Semicolon separated provider names, for example music;discord. Empty allows any name, which is still logged and rate limited. Matched case-insensitively.'
 - ExtValueTtlMs: 30000
-  - ExternalPublisherCommand:
-      $name: 'External publisher command'
-      $description: 'Optional. A command line the mod starts for you while {ext.*} values are in use, e.g. pwsh -NoProfile -File C:\path\_netease-bridge.ps1. The process is stopped when the mod unloads, and restarted at most 5 times if it dies. The mod never starts or restarts your other applications.'
+- ExternalPublisherCommand: ""
+  $name: 'External publisher command'
+  $description: 'Optional. A command line the mod starts for you while {ext.*} values are in use, e.g. pwsh -NoProfile -File C:\path\_netease-bridge.ps1. The process is stopped when the mod unloads, and restarted at most 5 times if it dies. The mod never starts or restarts your other applications.'
   $name: 'External value lifetime (ms)'
   $description: '100-600000. How long a value stays valid when the provider sends - as its ttl. An expired value renders as two dashes.'
 - ExtMaxValue: 128
