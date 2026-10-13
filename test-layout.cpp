@@ -1516,6 +1516,34 @@ int main() {
                   "dismissing a card starts the same collapse the ttl expiry would");
             Check(!IslandDismiss(&view, 2500) && view.phaseStarted == 2000,
                   "and a second click does not restart the fade");
+
+            // The frame clock is a decision: 16 ms only while something moves. A resting
+            // card must not hold the tick up -- that is the difference between a hover
+            // highlight and 25 wake-ups a second for a window doing nothing.
+            IslandView anim = {};
+            anim.state = IS_POPPING;
+            Check(IslandPhaseAnimating(anim), "a popping phase wants the frame clock");
+            anim.state = IS_COLLAPSING;
+            Check(IslandPhaseAnimating(anim), "a collapsing phase wants it too");
+            anim.state = IS_CARD;
+            Check(!IslandPhaseAnimating(anim),
+                  "but a card that is just sitting there does not");
+            anim.state = IS_IDLE;
+            Check(!IslandPhaseAnimating(anim), "and neither does an idle island");
+
+            const bool savedIntroActive = g_intro.active;
+            const IslandView savedView = g_islandView;
+            g_intro.active = false;
+            g_islandView.state = IS_CARD;
+            Check(DesiredTickMs() == kCursorPollMs,
+                  "with nothing animating the tick falls back to the cheap cursor poll");
+            g_islandView.state = IS_POPPING;
+            Check(DesiredTickMs() == 16, "and while a phase runs it is the frame rate");
+            g_islandView.state = IS_CARD;
+            g_intro.active = true;
+            Check(DesiredTickMs() == 16, "the panel's own intro asks for it as well");
+            g_intro.active = savedIntroActive;
+            g_islandView = savedView;
         }
 
         // The pipe's DACL has to actually admit this user. Getting it wrong is

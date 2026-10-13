@@ -4143,6 +4143,40 @@ static bool IslandDismiss(IslandView *v, DWORD now) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Frame clock and hover: both are kept off unless something needs them
+// ---------------------------------------------------------------------------
+// The HUD tick is a *decision*, not a habit: the cheap cursor poll unless something is
+// actually animating. Two animations share this clock (the panel's height intro and the
+// island's phases), so the decision lives in one place. Escalating the tick for the
+// whole lifetime of a card -- which is what a hover highlight would tempt you into --
+// would buy 16 ms wake-ups for a card that is sitting still doing nothing.
+static bool IslandPhaseAnimating(const IslandView &v) {
+    return v.state == IS_POPPING || v.state == IS_COLLAPSING;
+}
+
+static int DesiredTickMs() {
+    return (g_intro.active || IslandPhaseAnimating(g_islandView)) ? 16 : kCursorPollMs;
+}
+
+static int g_tickMs = kCursorPollMs;
+
+// Only touch the timer when the answer changed: a SetTimer per tick would be a call per
+// tick for no reason.
+static void ApplyTickRate(HWND hwnd) {
+    const int want = DesiredTickMs();
+    if (want == g_tickMs) return;
+    g_tickMs = want;
+    if (hwnd) SetTimer(hwnd, kTimerTick, (UINT)want, nullptr);
+}
+
+// Hover is driven by the mouse, not by the clock. WM_MOUSEMOVE costs nothing while the
+// pointer is still, and WM_MOUSELEAVE (via TrackMouseEvent, registered only while a card
+// is up) closes it. The rectangle is the one the click already uses -- the region table
+// -- so the highlight and the hit target cannot drift apart.
+static bool g_islandCloseHot = false;
+static bool g_islandTrackingLeave = false;
+
 static void PaintPanel(HWND hwnd) {
     // Card mode: a static width, applied here and now. The width used to animate, and
     // that is what flickered: resizing from the timer left one frame in which the window
@@ -4572,9 +4606,20 @@ static void PaintPanel(HWND hwnd) {
                         PanelRect localCard = {0, 0, width, height};
                         const PanelRect closeRect =
                             ComputeIslandCloseRect(localCard, g_settings.rowHeight);
+                        // Hover feedback: only ever a repaint when the state flips (the
+                        // window procedure decides that), never a per-frame one.
+                        if (g_islandCloseHot && cardAlpha > 0.0) {
+                            g_gdiplus.SetSolidFillColor(
+                                textBrush, WithOpacity(g_settings.text, 0.12 * cardAlpha));
+                            g_gdiplus.FillRectangle(graphics, (GpBrush *)textBrush,
+                                                    (float)closeRect.x, (float)closeRect.y,
+                                                    (float)closeRect.w, (float)closeRect.h);
+                        }
                         g_gdiplus.SetSolidFillColor(
                             textBrush,
-                            WithOpacity(g_settings.text, kTextSecondaryOpacity * cardAlpha));
+                            WithOpacity(g_settings.text,
+                                        (g_islandCloseHot ? 1.0 : kTextSecondaryOpacity) *
+                                            cardAlpha));
                         RectF closeBox((float)closeRect.x, (float)closeRect.y,
                                        (float)closeRect.w, (float)closeRect.h);
                         g_gdiplus.DrawString(graphics, L"\x00D7", -1, font, &closeBox, format,
@@ -4812,7 +4857,7 @@ static void StartIntro(HWND hwnd, double fromHeight, double toHeight) {
     g_intro.rippleCount = g_settings.rippleCount;
     // Run the 40 ms tick as a frame clock while the animation lasts, then drop it
     // back so an idle panel is not repainting continuously.
-    SetTimer(hwnd, kTimerTick, 16, nullptr);
+    ApplyTickRate(hwnd);
 }
 
 // Expand/collapse. Both states stay on screen, so the panel can always be clicked
@@ -4868,7 +4913,9 @@ static void UpdateIntro(HWND hwnd) {
     if (IntroCue() >= 1.0) {
         const bool wasExpanding = g_intro.toHeight >= g_intro.fromHeight;
         g_intro.active = false;
-        SetTimer(hwnd, kTimerTick, kCursorPollMs, nullptr);
+        // Not unconditionally back to the cheap poll: an island phase may still be
+        // animating, and it shares this clock.
+        ApplyTickRate(hwnd);
         if (!wasExpanding) {
             // The collapse drove g_displayHeight down frame by frame; put it back to
             // the resting value so the window and WM_NCHITTEST agree with the
@@ -4932,11 +4979,6 @@ static void UpdateIsland() {
     // stale one would otherwise be one state transition away from being drawn again.
     if (next == IS_IDLE && pop < 0) g_islandCardValid = false;
 
-    // The card's target width is decided in the painter, which owns the window handle and
-    // applies it in the same frame as the blit. Nothing about the width is animated any
-    // more: animating it meant resizing the window between frames, which is what flickered.
-    if (next == IS_IDLE && pop < 0) g_islandCardValid = false;
-
     if (next != was && g_islandLogs < 8) {
         Wh_Log(L"EXT island: %s -> %s (queued=%d, showing=%d%s)", IslandStateName(was),
                IslandStateName(next), count, (int)g_islandView.showing,
@@ -4961,6 +5003,15 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             UpdateProximity(hwnd);
             UpdateIntro(hwnd);
             UpdateIsland();
+            // The island's phases share this clock -- the height intro is not the only
+            // animation -- so the rate is decided here, once, for both. And once the
+            // machine is idle nothing may stay hot or stay tracked, or the next card
+            // would open with a highlight it never earned and no leave notification.
+            if (g_islandView.state == IS_IDLE) {
+                g_islandCloseHot = false;
+                g_islandTrackingLeave = false;
+            }
+            ApplyTickRate(hwnd);
             ReassertTopmost(hwnd);
         } else if (wParam == kTimerPerf) {
             unsigned long long cpuMs = (CpuTime100ns() - g_perfBaseCpu100ns) / 10000ULL;
@@ -5002,6 +5053,44 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         InterlockedIncrement(&g_settingsVersion);
         return 0;
     }
+
+    case WM_MOUSEMOVE: {
+        // Hover costs a message, not a wake-up: with the pointer still, this never runs.
+        // Only while a card is up is there anything to highlight, and TrackMouseEvent is
+        // registered then and only then, so an idle panel receives neither message.
+        if (!g_settings.islandEnabled || !g_islandCardValid ||
+            g_islandView.state == IS_IDLE) {
+            break;
+        }
+        RECT wr = {};
+        GetWindowRect(hwnd, &wr);
+        PanelRect card = {wr.left, wr.top, wr.right - wr.left, wr.bottom - wr.top};
+        IslandHitRegion regions[2];
+        const int regionCount = BuildIslandRegions(card, g_settings.rowHeight, regions, 2);
+        const bool hot =
+            IslandHitTest(regions, regionCount, wr.left + (int)(short)LOWORD(lParam),
+                          wr.top + (int)(short)HIWORD(lParam)) == IR_CLOSE;
+        if (!g_islandTrackingLeave) {
+            TRACKMOUSEEVENT track = {};
+            track.cbSize = sizeof(track);
+            track.dwFlags = TME_LEAVE;
+            track.hwndTrack = hwnd;
+            g_islandTrackingLeave = TrackMouseEvent(&track) != FALSE;
+        }
+        if (hot != g_islandCloseHot) {
+            g_islandCloseHot = hot;
+            PaintPanel(hwnd);          // the only repaint a hover ever causes
+        }
+        return 0;
+    }
+
+    case WM_MOUSELEAVE:
+        g_islandTrackingLeave = false;
+        if (g_islandCloseHot) {
+            g_islandCloseHot = false;
+            PaintPanel(hwnd);
+        }
+        return 0;
 
     case WM_LBUTTONUP:
         // The card's close affordance comes first: while a card is up it owns the click,

@@ -381,7 +381,7 @@ Windhawk 不支持动态下拉框，所以字体需要手输。拼错了就去�
 | `External updates per second` | 100 | 1-1000，每连接；超限丢弃并计数，不断开连接 |
 | `External event duration` | 6000 | 1000-60000 ms；事件卡片在屏幕上停留多久（提供者用 `-` 当 ttl 时用这个值） |
 | `External event queue` | 4 | 1-8；同时最多几个事件在排队。满了以后丢掉优先级最低、且最旧的那个 |
-| `Notification island` | `Off` | 把外部事件（`EVENT`）做成临时卡片：主行 + 可选副行 + severity 配色 + 重复计数徽标，**右上角的 × 点一下立刻关掉它**（与到期收回走同一条淡出）。卡片在时盖住行列表；宽度按文字估算（下限是下面的最小宽度，上限是屏宽与 640 中较小者），出现与消失时文字与底色一起淡入淡出，行列表原样回来。用 `pwsh -File _extclient.ps1 -Event -Severity critical -Text "标题 副行"` 试 |
+| `Notification island` | `Off` | 把外部事件（`EVENT`）做成临时卡片：主行 + 可选副行 + severity 配色 + 重复计数徽标，**右上角的 × 点一下立刻关掉它**（鼠标移上去会提亮；与到期收回走同一条淡出）。卡片在时盖住行列表；宽度按文字估算（下限是下面的最小宽度，上限是屏宽与 640 中较小者），出现与消失时文字与底色一起淡入淡出，行列表原样回来。用 `pwsh -File _extclient.ps1 -Event -Severity critical -Text "标题 副行"` 试 |
 | `Island minimum width` | `260` | `120–640`。事件卡片的最小宽度；卡片会随文字变宽，但不小于这个值，也不超过屏幕宽度与 640 中较小者 |
 
 ---
