@@ -564,6 +564,73 @@ function Invoke-CdpProbe {
     return $false
 }
 
+# 找到第一个带 webSocketDebuggerUrl 的调试目标（CDP 的 /json/list）。
+function Get-CdpTab {
+    foreach ($port in $CdpPorts) {
+        try {
+            $list = Invoke-RestMethod -Uri "http://127.0.0.1:$port/json/list" -TimeoutSec 2 -ErrorAction Stop
+            foreach ($t in $list) {
+                if ($t.webSocketDebuggerUrl) {
+                    return [pscustomobject]@{ Port = $port; Url = $t.webSocketDebuggerUrl; Title = $t.title }
+                }
+            }
+        }
+        catch { }
+    }
+    return $null
+}
+
+# 在客户端页面里求值一条表达式（只读：只调用 Runtime.evaluate，表达式由我们给定）。
+# 全程有上界（连接 4 s、最多读 20 帧）——没有上界的等待会把诊断能力一起吃掉（AGENTS §7.10）。
+function Invoke-CdpExpression {
+    param([string]$Expression)
+    $tab = Get-CdpTab
+    if (-not $tab) { return $null }
+    $ws = $null
+    try {
+        $ws = New-Object System.Net.WebSockets.ClientWebSocket
+        $cts = New-Object System.Threading.CancellationTokenSource
+        $cts.CancelAfter(4000)
+        $ws.ConnectAsync([Uri]$tab.Url, $cts.Token).Wait(4000) | Out-Null
+
+        $payload = @{
+            id     = 1
+            method = 'Runtime.evaluate'
+            params = @{ expression = $Expression; returnByValue = $true }
+        } | ConvertTo-Json -Depth 6 -Compress
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+        $seg = New-Object System.ArraySegment[byte] -ArgumentList @(, $bytes)
+        $ws.SendAsync($seg, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $cts.Token).Wait(4000) | Out-Null
+
+        $buf = New-Object byte[] 16384
+        for ($i = 0; $i -lt 20; $i++) {
+            $recvSeg = New-Object System.ArraySegment[byte] -ArgumentList @(, $buf)
+            $r = $ws.ReceiveAsync($recvSeg, $cts.Token)
+            $r.Wait(4000) | Out-Null
+            $text = [System.Text.Encoding]::UTF8.GetString($buf, 0, $r.Result.Count)
+            if ($text -match '"id"\s*:\s*1') { return $text }
+        }
+        return $null
+    }
+    catch { return $null }
+    finally { if ($ws) { try { $ws.Dispose() } catch { } } }
+}
+
+# 探测表达式：只读、无副作用，一次把"页面里有什么"尽量问全，避免来回猜。
+$script:CdpProbeExpression = @'
+(function(){
+  var o = { title: document.title, url: location.href, audio: [], cands: [] };
+  var a = document.querySelectorAll('audio,video');
+  for (var i = 0; i < a.length; i++) o.audio.push({ t: a[i].currentTime, d: a[i].duration, p: a[i].paused });
+  var s = ['.title', '.author', '.m-playbar', '#g_player', '[class*=progress]', '[class*=lyric]', '[class*=bar]'];
+  for (var j = 0; j < s.length; j++) {
+    var e = document.querySelector(s[j]);
+    if (e) o.cands.push(s[j] + ' = ' + ((e.innerText || e.textContent || '') + '').slice(0, 120));
+  }
+  return JSON.stringify(o);
+})()
+'@
+
 if ($ProbeCdp) {
     Write-Host '探测 CDP（需要客户端是"带调试端口的快捷方式"启动的）：'
     if (-not (Invoke-CdpProbe)) {
@@ -580,8 +647,19 @@ if ($ProbeCdp) {
         }
     }
     else {
-        Write-Host '  端口可用 ✓。下一步：把上面 target 的输出发我，我据此定"取位置与当前歌词行"的表达式，'
-        Write-Host '  再把它接成 -PositionSource cdp（本插件仍然不会替你启动音乐软件）。'
+        Write-Host '  端口可用 ✓。下面用一条**只读探测表达式**问一下页面里有什么'
+        Write-Host '  （页面标题、audio/video 的 currentTime 与时长、若干候选节点的文本）：'
+        $res = Invoke-CdpExpression -Expression $script:CdpProbeExpression
+        if ($res) {
+            Write-Host ''
+            Write-Host ('  ' + $res)
+            Write-Host ''
+            Write-Host '  把上面这行发我：据此固化"取位置与当前歌词行"的表达式，接成 -PositionSource cdp ✓'
+        }
+        else {
+            Write-Host '  求值失败 ✗（页面可能不接受 Runtime.evaluate，或调试目标是别的东西）。'
+            Write-Host '  把上面 target 的输出发我，我按它挑目标重试 ✓'
+        }
     }
     exit 0
 }
