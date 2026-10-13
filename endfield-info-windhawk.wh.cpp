@@ -1533,6 +1533,8 @@ static bool             g_extStartAttempted = false;
 static int              g_extBusyLogs = 0;     // bounded: "all instances busy" messages
 static int              g_extStallLogs = 0;    // bounded: "the read never completed" messages
 static int              g_extConnLogs = 0;     // bounded: per-connection "what is this pipe" lines
+static int              g_extConnectLogs = 0;  // bounded: which branch of the accept path ran
+static int              g_extReadErrLogs = 0;  // bounded: why a read gave up
 
 // Does this name select the external namespace at all? Full validation happens in
 // ExtLookup, so a malformed {ext...} still reaches the "unknown" path and keeps
@@ -4847,22 +4849,51 @@ static int ExtWaitIo(HANDLE pipe, OVERLAPPED *ov, DWORD *bytes) {
     return GetLastError() == ERROR_MORE_DATA ? 0 : -1;
 }
 
+// Which branch of the accept sequence ran. The mod's own self-test and a foreign
+// client can take different paths through ConnectNamedPipe, and a difference there is
+// a lead -- this is the last part of the accept path that was invisible.
+static void ExtConnectLog(const WCHAR *branch) {
+    if (g_extConnectLogs < 8) {
+        Wh_Log(L"EXT connect: %s", branch);
+        g_extConnectLogs++;
+    }
+}
+
 static bool ExtConnect(HANDLE pipe, OVERLAPPED *ov) {
     ResetEvent(ov->hEvent);
-    if (ConnectNamedPipe(pipe, ov)) return true;
+    if (ConnectNamedPipe(pipe, ov)) {
+        ExtConnectLog(L"sync");
+        return true;
+    }
     DWORD err = GetLastError();
     // A client that connected between CreateNamedPipe and ConnectNamedPipe makes
     // this call fail with ERROR_PIPE_CONNECTED. That is success, and treating it
     // as failure is the classic bug in this sequence.
-    if (err == ERROR_PIPE_CONNECTED) return true;
-    if (err != ERROR_IO_PENDING) return false;
+    if (err == ERROR_PIPE_CONNECTED) {
+        ExtConnectLog(L"already connected");
+        return true;
+    }
+    if (err != ERROR_IO_PENDING) {
+        ExtConnectLog(L"failed");
+        if (g_extReadErrLogs < 4) {
+            Wh_Log(L"EXT connect failed: %lu", err);
+            g_extReadErrLogs++;
+        }
+        return false;
+    }
     // Nobody connected yet. Waiting here is this thread's whole job, so a timeout
     // must not be read as failure -- it just means "still listening".
     for (;;) {
         DWORD bytes = 0;
         int wait = ExtWaitIo(pipe, ov, &bytes);
-        if (wait == 1) return true;
-        if (wait != -2) return false;          // stopped (already cancelled) or failed
+        if (wait == 1) {
+            ExtConnectLog(L"pending, then a client arrived");
+            return true;
+        }
+        if (wait != -2) {
+            ExtConnectLog(L"wait failed");
+            return false;
+        }
     }
 }
 
@@ -4886,7 +4917,15 @@ static int ExtReadFrame(HANDLE pipe, OVERLAPPED *ov, char *buffer, DWORD cap, DW
         // Message mode reports an over-long frame this way instead of truncating it:
         // this is the over-long-frame detector, not a generic failure.
         if (err == ERROR_MORE_DATA) return 0;
-        if (err != ERROR_IO_PENDING) return -1;
+        if (err != ERROR_IO_PENDING) {
+            // "result=-1" on its own says nothing; the code says whether the client
+            // left (109 ERROR_BROKEN_PIPE) or something else went wrong.
+            if (g_extReadErrLogs < 4) {
+                Wh_Log(L"EXT read failed: %lu", err);
+                g_extReadErrLogs++;
+            }
+            return -1;
+        }
 
         DWORD started = GetTickCount();
         bool warned = false;
@@ -4895,7 +4934,13 @@ static int ExtReadFrame(HANDLE pipe, OVERLAPPED *ov, char *buffer, DWORD cap, DW
             if (wait != -2) return wait;
 
             DWORD available = 0;
-            if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) return -1;
+            if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) {
+                if (g_extReadErrLogs < 4) {
+                    Wh_Log(L"EXT peek failed: %lu", GetLastError());
+                    g_extReadErrLogs++;
+                }
+                return -1;
+            }
             const bool empty = (available == 0);
             const DWORD elapsed = GetTickCount() - started;
 
