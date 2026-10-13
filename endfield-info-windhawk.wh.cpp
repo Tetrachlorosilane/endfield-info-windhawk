@@ -1858,6 +1858,10 @@ static unsigned         g_islandWakes = 0;            // HUD-side: wakes actuall
 static IslandView      g_islandView;
 static IslandEvent     g_islandCard;
 static bool            g_islandCardValid = false;
+// The current card's target width. It has to be kept here rather than read back from
+// g_restWidth: the collapse shrinks g_restWidth every frame, and using that shrinking
+// value as the animation's starting point makes the endpoint drift under the animation.
+static int             g_cardWidth = 0;
 static int             g_islandLogs = 0;
 
 static bool ExtParseSeverity(const WCHAR *s, int len, ExtSeverity *out) {
@@ -4086,7 +4090,9 @@ static void PaintPanel(HWND hwnd) {
         // geometry is still settling (design 7.2 leaves the overshoot to the transform).
         const double eased = t * t * (3.0 - 2.0 * t);
         const double baseW = (double)g_settings.panelWidth;
-        const double cardW = (double)g_restWidth;
+        // The card's *target* width, not the shrinking resting width: reading the latter
+        // back as the animation's start point makes the endpoint drift frame by frame.
+        const double cardW = (double)(g_cardWidth > 0 ? g_cardWidth : g_restWidth);
         const double from = g_islandView.state == IS_COLLAPSING ? cardW : baseW;
         const double to = g_islandView.state == IS_COLLAPSING ? baseW : cardW;
         width = (int)(from + (to - from) * eased + 0.5);
@@ -4790,11 +4796,19 @@ static void UpdateIsland() {
     // A card has to be readable, so while one is up the proximity collapse is
     // deferred: the collapse is timer-driven off g_hideAt, so pushing that deadline
     // is all it takes. Normal proximity behaviour resumes on the tick after the card.
+    // Only while the card is on its way in or on screen. Forcing the panel open while
+    // the card is collapsing would expand the panel and then collapse it again one tick
+    // later, which is exactly the short flicker that was still visible on the way out.
     const bool cardUp = g_islandCardValid && g_islandView.state != IS_IDLE;
-    if (cardUp) {
+    const bool cardVisible = g_islandCardValid && (g_islandView.state == IS_POPPING ||
+                                                  g_islandView.state == IS_CARD);
+    if (cardVisible) {
         if (g_modeProximity) g_hideAt = now + g_settings.hideDelayMs;
         if (!g_expanded && g_window) SetExpanded(g_window, true);
     }
+    // Once the machine is idle again nothing is on screen, so the card is dropped: a
+    // stale one would otherwise be one state transition away from being drawn again.
+    if (next == IS_IDLE && pop < 0) g_islandCardValid = false;
 
     // The card's target width, decided here so that PlaceWindow, the hit test and the
     // painter all read one number: the user's minimum, or as wide as the text wants,
@@ -4822,6 +4836,7 @@ static void UpdateIsland() {
         int wantWidth = g_settings.panelWidth;
         if (cardUp) {
             const int cardWidth = ComputeIslandCardWidth(metrics, g_settings, monitorWidth);
+            g_cardWidth = cardWidth;          // stable across pop, card and collapse
             // The union rule from design 8, doing real work while the card *grows*: the
             // clickable area covers both states, so everything visible is clickable.
             PanelRect baseRect = {0, 0, g_settings.panelWidth, 0};
