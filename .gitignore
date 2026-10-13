@@ -1,3 +1,5 @@
 # Local byproducts of the development tools (none of these ship with the mod).
 __pycache__/
 *.pyc
+# The smoke client's captured output, written when a run has to be inspected later.
+_extclient-last.txt
