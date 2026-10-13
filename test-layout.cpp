@@ -1573,6 +1573,29 @@ int main() {
                   "and text without the token does not");
         }
 
+        // The publisher command line is split the way CreateProcessW does when
+        // lpApplicationName is null: a quoted first token may contain spaces, an unquoted
+        // one stops at the first space, and everything after it is the argument string.
+        {
+            WCHAR exe[512];
+            WCHAR args[512];
+            bool ok = ExtParsePublisherCommand(L"pwsh -NoProfile -File C:\\a\\b.ps1",
+                                               exe, 512, args, 512);
+            Check(ok && wcscmp(exe, L"pwsh") == 0 &&
+                      wcscmp(args, L"-NoProfile -File C:\\a\\b.ps1") == 0,
+                  "an unquoted publisher command splits at the first space");
+            ok = ExtParsePublisherCommand(
+                L"  \"C:\\Program Files\\PowerShell\\pwsh.exe\"  -File \"x y.ps1\"",
+                exe, 512, args, 512);
+            Check(ok && wcscmp(exe, L"C:\\Program Files\\PowerShell\\pwsh.exe") == 0 &&
+                      wcscmp(args, L"-File \"x y.ps1\"") == 0,
+                  "a quoted publisher executable may contain spaces; arguments keep their quotes");
+            Check(!ExtParsePublisherCommand(L"   ", exe, 512, args, 512),
+                  "a whitespace-only publisher command has no executable");
+            Check(!ExtParsePublisherCommand(L"", exe, 512, args, 512),
+                  "an empty publisher command has no executable");
+        }
+
         // The nominal clock has two sources: the registry's "~MHz" (what ACPI/BIOS
         // reports) and the power API's per-processor maximum. They disagree by ~10% on
         // the machine this was reported from, and the API is the one Windows treats as

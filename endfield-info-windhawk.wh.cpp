@@ -247,6 +247,9 @@ through WMI.
   $name: 'Allowed external providers'
   $description: 'Semicolon separated provider names, for example music;discord. Empty allows any name, which is still logged and rate limited. Matched case-insensitively.'
 - ExtValueTtlMs: 30000
+  - ExternalPublisherCommand:
+      $name: 'External publisher command'
+      $description: 'Optional. A command line the mod starts for you while {ext.*} values are in use, e.g. pwsh -NoProfile -File C:\path\_netease-bridge.ps1. The process is stopped when the mod unloads, and restarted at most 5 times if it dies. The mod never starts or restarts your other applications.'
   $name: 'External value lifetime (ms)'
   $description: '100-600000. How long a value stays valid when the provider sends - as its ttl. An expired value renders as two dashes.'
 - ExtMaxValue: 128
@@ -380,6 +383,7 @@ static bool ParseRing(const WCHAR *body, int bodyLen, const Values &v,
 static bool ExtIsExtToken(const WCHAR *name, int len);
 static void ExtStart(const ModSettings &snap);
 static void ExtStop();
+static void ExtPublisherTick();
 
 // ---------------------------------------------------------------------------
 // Minimal GDI+ surface, resolved at runtime.
@@ -5561,6 +5565,11 @@ static void SamplerIteration() {
         g_extStartAttempted = true;
         ExtStart(settings);
     }
+    if ((groups & G_EXT) && settings.externalData) {
+        // Cheap every-pass call: starts the configured publisher, supervises it with a
+        // bounded restart policy, and stops it the moment the command is cleared.
+        ExtPublisherTick();
+    }
 
     Values v;
     FillSystemFields(v);
@@ -6299,6 +6308,185 @@ static void ExtSelfTest() {
            sent2 ? 1 : 0);
 }
 
+// ---------------------------------------------------------------------------
+// External publisher: the mod starts the publisher the user configured
+// ---------------------------------------------------------------------------
+// {ext.*} only has values if something publishes them. The user types a command line in
+// the settings; the mod starts it, restarts it a bounded number of times if it dies, and
+// makes sure it cannot outlive the mod. A job object with KILL_ON_JOB_CLOSE reaps the whole
+// tree -- TerminateProcess on the child alone cannot reach grandchildren the script itself
+// started.
+//
+// It deliberately does NOT start or restart any third-party application the user already
+// uses (the music client, say): that would change how their software starts, which is not
+// ours to change. Only the command written in the setting is started.
+static HANDLE g_pubJob = nullptr;
+static HANDLE g_pubProc = nullptr;
+static DWORD g_pubRestarts = 0;
+static DWORD g_pubLastTry = 0;
+static DWORD g_pubLastRead = 0;
+static WCHAR g_pubCmd[512] = L"";
+static bool g_pubGaveUp = false;
+
+static const DWORD kPubMaxRestarts = 5;
+static const DWORD kPubBackoffMs = 5000;
+static const DWORD kPubSettingRecheckMs = 10000;
+
+// Pure: split a command line the way CreateProcessW does when lpApplicationName is null.
+// A leading quoted token may contain spaces; an unquoted one ends at the first space.
+// Everything after the executable is the argument string, kept verbatim (no shell).
+static bool ExtParsePublisherCommand(const WCHAR *cmd, WCHAR *exe, size_t exeChars,
+                                     WCHAR *args, size_t argsChars) {
+    if (exeChars) exe[0] = 0;
+    if (argsChars) args[0] = 0;
+    if (!cmd || !exeChars) return false;
+    const WCHAR *p = cmd;
+    while (*p == L' ' || *p == L'\t') p++;
+    size_t n = 0;
+    if (*p == L'"') {
+        p++;
+        while (*p && *p != L'"') {
+            if (n + 1 < exeChars) exe[n++] = *p;
+            p++;
+        }
+        if (*p == L'"') p++;
+    } else {
+        while (*p && *p != L' ' && *p != L'\t') {
+            if (n + 1 < exeChars) exe[n++] = *p;
+            p++;
+        }
+    }
+    exe[n] = 0;
+    if (n == 0) return false;
+    while (*p == L' ' || *p == L'\t') p++;
+    size_t m = 0;
+    if (argsChars) {
+        while (*p) {
+            if (m + 1 < argsChars) args[m++] = *p;
+            p++;
+        }
+        args[m] = 0;
+    }
+    return true;
+}
+
+static bool ExtPublisherAlive() {
+    if (!g_pubProc) return false;
+    DWORD code = 0;
+    if (!GetExitCodeProcess(g_pubProc, &code)) {
+        CloseHandle(g_pubProc);
+        g_pubProc = nullptr;
+        return false;
+    }
+    if (code == STILL_ACTIVE) return true;
+    CloseHandle(g_pubProc);
+    g_pubProc = nullptr;
+    return false;
+}
+
+static void ExtPublisherStop() {
+    if (g_pubProc) {
+        TerminateProcess(g_pubProc, 0);
+        CloseHandle(g_pubProc);
+        g_pubProc = nullptr;
+    }
+    if (g_pubJob) {
+        CloseHandle(g_pubJob);   // KILL_ON_JOB_CLOSE: nothing of ours outlives the mod
+        g_pubJob = nullptr;
+    }
+}
+
+static void ExtPublisherStart(const WCHAR *exe, const WCHAR *args) {
+    WCHAR cmdline[768];
+    if (args && *args) wsprintfW(cmdline, L"\"%s\" %s", exe, args);
+    else wsprintfW(cmdline, L"\"%s\"", exe);
+
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(pi));
+    si.cb = sizeof(si);
+
+    // CREATE_NO_WINDOW: a publisher must not flash a console. SUSPENDED so the child cannot
+    // run away before it is inside the job object.
+    if (!CreateProcessW(nullptr, cmdline, nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) {
+        Wh_Log(L"EXT publisher: CreateProcess failed for '%s' (error=%lu)", exe, GetLastError());
+        return;
+    }
+
+    if (!g_pubJob) {
+        g_pubJob = CreateJobObjectW(nullptr, nullptr);
+        if (g_pubJob) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION li;
+            ZeroMemory(&li, sizeof(li));
+            li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if (!SetInformationJobObject(g_pubJob, JobObjectExtendedLimitInformation, &li,
+                                        sizeof(li))) {
+                Wh_Log(L"EXT publisher: SetInformationJobObject failed (error=%lu)",
+                       GetLastError());
+            }
+        }
+    }
+    if (g_pubJob && !AssignProcessToJobObject(g_pubJob, pi.hProcess)) {
+        Wh_Log(L"EXT publisher: AssignProcessToJobObject failed (error=%lu)", GetLastError());
+    }
+
+    ResumeThread(pi.hThread);
+    CloseHandle(pi.hThread);
+    g_pubProc = pi.hProcess;
+    Wh_Log(L"EXT publisher: started pid=%lu '%s'", pi.dwProcessId, cmdline);
+}
+
+// Called on every sampler pass; cheap. The setting is re-read every 10 s so an edit takes
+// effect, the restart policy is bounded, and nothing is ever started twice.
+static void ExtPublisherTick() {
+    DWORD now = GetTickCount();
+    if (g_pubLastRead == 0 || now - g_pubLastRead > kPubSettingRecheckMs) {
+        g_pubLastRead = now ? now : 1;
+        PCWSTR value = Wh_GetStringSetting(L"ExternalPublisherCommand");
+        if (value) {
+            if (wcscmp(value, g_pubCmd) != 0) {
+                ExtPublisherStop();          // a changed command line replaces the old one
+                g_pubRestarts = 0;
+                g_pubGaveUp = false;
+                wcsncpy(g_pubCmd, value, 511);
+                g_pubCmd[511] = 0;
+            }
+            Wh_FreeStringSetting(value);
+        } else if (g_pubCmd[0]) {
+            g_pubCmd[0] = 0;
+            ExtPublisherStop();
+        }
+    }
+
+    if (!g_pubCmd[0]) return;
+    if (ExtPublisherAlive()) return;
+
+    if (g_pubRestarts >= kPubMaxRestarts) {
+        if (!g_pubGaveUp) {
+            g_pubGaveUp = true;
+            Wh_Log(L"EXT publisher: gave up after %lu restarts; {ext.*} values will go stale",
+                   g_pubRestarts);
+        }
+        return;
+    }
+    if (g_pubLastTry && now - g_pubLastTry < kPubBackoffMs) return;
+    g_pubLastTry = now ? now : 1;
+
+    WCHAR exe[512];
+    WCHAR args[512];
+    if (!ExtParsePublisherCommand(g_pubCmd, exe, 512, args, 512)) {
+        if (!g_pubGaveUp) {
+            g_pubGaveUp = true;
+            Wh_Log(L"EXT publisher: the command line has no executable");
+        }
+        return;
+    }
+    g_pubRestarts++;
+    ExtPublisherStart(exe, args);
+}
+
 static void ExtStart(const ModSettings &snap) {
     InitializeCriticalSection(&g_extLock);
     g_extLockReady = true;
@@ -6336,6 +6524,8 @@ static void ExtStart(const ModSettings &snap) {
 }
 
 static void ExtStop() {
+    // The publisher goes first: a writer must stop before the thing it writes into.
+    ExtPublisherStop();
     InterlockedExchange(&g_extStop, 1);
     if (g_extStopEvent) SetEvent(g_extStopEvent);
     if (g_extThreadCount > 0) {
