@@ -693,12 +693,25 @@ $script:CdpProbeExpression = @'
     // 找到了就顺手把切片名与 playing 的键名列出来（只看结构，不取值 ✗）
     if (hits.length) {
       try {
-        var c0 = [cache[hits[0].id].exports, cache[hits[0].id].exports.a, cache[hits[0].id].exports.default][hits[0].at];
-        var store0 = (typeof c0.getStore === 'function') ? c0.getStore() : c0;
-        var st = store0.getState();
-        o.store.slices = Object.keys(st).slice(0, 40);
-        var p = st.playing || {};
+        var ex0 = cache[hits[0].id].exports;
+        var c0 = [ex0, ex0.a, ex0.default, ex0.exports][hits[0].at];
+        var g = c0.getStore();
+        // 真机教训（2026-10-13）：cloudmusic-desktop-mcp 的用法是 `getStore()` 之后**直接用 s.playing**
+        // （server.py:339-346），**不调 getState()** ✓ —— 我上一版多调了一次，于是
+        // "getState is not a function" ✗。所以这里两种形状都兼容 ✓。
+        var st = (g && typeof g.getState === 'function') ? g.getState() : g;
+        o.store.stateKeys = Object.keys(st || {}).slice(0, 40);
+        var p = (st && st.playing) || {};
         o.store.playingKeys = Object.keys(p).slice(0, 60);
+        // 只回报 playing 里的**标量**（数字 / 短字符串）——播放位置就在其中 ✓，其余类型一律跳过 ✗
+        o.store.playingScalars = {};
+        for (var pk in p) {
+          try {
+            var pv = p[pk];
+            if (typeof pv === 'number') o.store.playingScalars[pk] = pv;
+            else if (typeof pv === 'string' && pv.length <= 60) o.store.playingScalars[pk] = pv;
+          } catch (x3) { }
+        }
       } catch (x2) { o.store.probeError = '' + x2; }
     }
   } catch (x) { o.store.error = '' + x; }
