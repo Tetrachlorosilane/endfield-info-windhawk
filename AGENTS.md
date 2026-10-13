@@ -28,6 +28,8 @@ endfield-info-windhawk/
 ├── endfield-info-windhawk.wh.cpp      唯一的交付物（约 190 KB）
 ├── README.md                          用户文档
 ├── AGENTS.md                          本文
+├── docs/                              规划与设计文档（不是实现说明）
+│   └── external-data-island-design.md 提案：外部数据源 + 灵动岛形态（尚未实现）
 │
 ├── 开发工具（不随 mod 交付）
 ├── build.ps1                          本地编译，不用开 Windhawk GUI
@@ -487,3 +489,5 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   <https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-dedicated-process>
 - 本地工具链：`D:\Program Files\Windhawk\Compiler\`（clang 20.1.3 + MinGW）
 - 真实编译参数：`C:\ProgramData\Windhawk\EditorWorkspace\compile_flags.txt`
+- 本仓库的规划文档（**提案，尚未实现**，不要当成现有行为）：
+  [docs/external-data-island-design.md](docs/external-data-island-design.md)
