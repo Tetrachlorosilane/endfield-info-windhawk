@@ -628,7 +628,8 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 
 **未验证**（需要真实运行环境）：
 
-- 点击/热区的实际手感（M3 的本地按钮落地后才会真正被考验）。
+- 点击/热区的实际手感：关闭按钮与悬停都已落地，但"按下去、移上去是什么感觉"只能在真机上判断；
+  另外要确认圆角外穿透没有被新增的鼠标消息处理破坏。
 - 100 ms 重申是否足以消除"被短暂盖住"。
 - 多于 2 台显示器的定位。
 - 长时间运行稳定性（线程退出、采集器生命周期）。
@@ -665,6 +666,6 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   <https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-dedicated-process>
 - 本地工具链：`D:\Program Files\Windhawk\Compiler\`（clang 20.1.3 + MinGW）
 - 真实编译参数：`C:\ProgramData\Windhawk\EditorWorkspace\compile_flags.txt`
-- 本仓库的设计文档（**M1 与 M2 已实现；M3 进行中——几何/区域/命中/关闭按钮已落地，悬停态待做；
-  M4 仍是提案**，不要当成现有行为）：
+- 本仓库的设计文档（**M1 与 M2 已实现；M3 进行中——几何/区域/命中/关闭按钮/悬停/帧率决策均已落地，
+  剩下 `ComputeIslandRect` 接管窗口定位；M4 仍是提案**，不要当成现有行为）：
   [docs/external-data-island-design.md](docs/external-data-island-design.md)
