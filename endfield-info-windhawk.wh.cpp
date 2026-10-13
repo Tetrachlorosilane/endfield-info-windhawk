@@ -1858,10 +1858,6 @@ static unsigned         g_islandWakes = 0;            // HUD-side: wakes actuall
 static IslandView      g_islandView;
 static IslandEvent     g_islandCard;
 static bool            g_islandCardValid = false;
-// The current card's target width. It has to be kept here rather than read back from
-// g_restWidth: the collapse shrinks g_restWidth every frame, and using that shrinking
-// value as the animation's starting point makes the endpoint drift under the animation.
-static int             g_cardWidth = 0;
 static int             g_islandLogs = 0;
 
 static bool ExtParseSeverity(const WCHAR *s, int len, ExtSeverity *out) {
@@ -2061,24 +2057,11 @@ static int ComputeIslandCardWidth(const IslandMetrics &m, const ModSettings &cfg
     return width;
 }
 
-// The clickable rectangle: while a phase animates, the union of where the panel was
-// and where it is going, so everything visible stays clickable (design 8). With no
-// buttons yet this can only widen the target -- M3's region table is what makes it do
-// real work -- but the rule is written down here so it cannot be forgotten later.
-struct PanelRect { int x, y, w, h; };
-
-static PanelRect UnionPanelRect(const PanelRect &a, const PanelRect &b) {
-    PanelRect out = {};
-    const int left = a.x < b.x ? a.x : b.x;
-    const int top = a.y < b.y ? a.y : b.y;
-    const int right = (a.x + a.w) > (b.x + b.w) ? (a.x + a.w) : (b.x + b.w);
-    const int bottom = (a.y + a.h) > (b.y + b.h) ? (a.y + a.h) : (b.y + b.h);
-    out.x = left;
-    out.y = top;
-    out.w = right - left;
-    out.h = bottom - top;
-    return out;
-}
+// The clickable rectangle while the island is up is the card's own rectangle, derived
+// from the same resting width the window is placed at. The union-of-two-states rule from
+// design 8 belonged to the width *animation*: with that animation reverted (it flickered
+// -- see the collapse notes in PaintPanel) there are no two states to union, so the rule
+// is written down here as a comment rather than carried as dead code.
 
 // Drives the island from the HUD's frame clock. Defined with the other HUD updaters,
 // because it reads g_settings and belongs to that thread; everything it decides with
@@ -4076,38 +4059,46 @@ static void BuildRoundedRect(GpPath *path, float x, float y, float w, float h, f
 static void PlaceWindow(HWND hwnd);
 
 static void PaintPanel(HWND hwnd) {
-    // Painted width. g_restWidth is what the window and the hit test use; this is only
-    // what is drawn, so an animating width can never move the clickable area -- the
-    // same separation the height rule above describes.
-    int width = g_restWidth > 0 ? g_restWidth : g_settings.panelWidth;
-    if (g_settings.islandEnabled && g_islandCardValid && g_islandView.state != IS_IDLE &&
-        g_restWidth > 0) {
+    // Card mode: a static width, applied here and now. The width used to animate, and
+    // that is what flickered: resizing from the timer left one frame in which the window
+    // was wider than the bitmap about to be submitted, and even squeezing the animation
+    // into this function still resized the window mid-frame. The card now appears and
+    // disappears at its own width, the way the panel appears and disappears at its own
+    // height -- the fade below is what carries the transition.
+    const bool cardUp = g_settings.islandEnabled && g_islandCardValid &&
+                        g_islandView.state != IS_IDLE;
+    int width = g_settings.panelWidth;
+    if (cardUp) {
+        IslandMetrics metrics = {};
+        metrics.titleChars = (int)wcslen(g_islandCard.title);
+        metrics.bodyChars = (int)wcslen(g_islandCard.body);
+        int monitorWidth = 0;
+        HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO info = {};
+        info.cbSize = sizeof(info);
+        if (monitor && GetMonitorInfoW(monitor, &info)) {
+            monitorWidth = (int)(info.rcMonitor.right - info.rcMonitor.left);
+        }
+        width = ComputeIslandCardWidth(metrics, g_settings, monitorWidth);
+    }
+    // Resize before the bitmap exists, never after: inside one frame the window and the
+    // layered blit are then always the same size, so no band can be left behind.
+    if (width != g_restWidth) {
+        g_restWidth = width;
+        PlaceWindow(hwnd);
+    }
+    // The card's own fade, driven by its phase: in while popping, out while collapsing.
+    // Without it the text sat at full opacity and then vanished when the machine reached
+    // Idle, which reads as a flash instead of a transition.
+    double cardAlpha = 1.0;
+    if (cardUp) {
         const DWORD elapsed = GetTickCount() - g_islandView.phaseStarted;
         const DWORD span = g_islandView.state == IS_COLLAPSING ? kIslandCollapseMs : kIslandPopMs;
         double t = span == 0 ? 1.0 : (double)elapsed / (double)span;
         if (t > 1.0) t = 1.0;
-        // Smoothstep: no new easing surface, and no overshoot to reason about while the
-        // geometry is still settling (design 7.2 leaves the overshoot to the transform).
-        const double eased = t * t * (3.0 - 2.0 * t);
-        const double baseW = (double)g_settings.panelWidth;
-        // The card's *target* width, not the shrinking resting width: reading the latter
-        // back as the animation's start point makes the endpoint drift frame by frame.
-        const double cardW = (double)(g_cardWidth > 0 ? g_cardWidth : g_restWidth);
-        const double from = g_islandView.state == IS_COLLAPSING ? cardW : baseW;
-        const double to = g_islandView.state == IS_COLLAPSING ? baseW : cardW;
-        width = (int)(from + (to - from) * eased + 0.5);
-        if (width < 1) width = 1;
-
-        // Collapsing has to follow the height rule that is already two dozen lines up:
-        // the window comes down *with* the shrinking content, frame by frame. Holding it
-        // at the wider union leaves a band on the right that the layered blit no longer
-        // covers, so that band keeps whatever transparency was there last -- the
-        // flicker. Growing is the opposite and needs no help: the window sits at the
-        // target and the content grows into it.
-        if (g_islandView.state == IS_COLLAPSING && width != g_restWidth) {
-            g_restWidth = width;
-            PlaceWindow(hwnd);
-        }
+        cardAlpha = g_islandView.state == IS_COLLAPSING ? 1.0 - t : t;
+        if (cardAlpha < 0.0) cardAlpha = 0.0;
+        if (cardAlpha > 1.0) cardAlpha = 1.0;
     }
     bool collapsed = !g_expanded;
 
@@ -4432,18 +4423,18 @@ static void PaintPanel(HWND hwnd) {
                 // Still drawn in the panel's own geometry: the width animation channel
                 // and ComputeIslandRect are the next step, and they need the resting
                 // geometry to become a rectangle first (design 8).
-                if (g_settings.islandEnabled && g_islandCardValid &&
-                    g_islandView.state != IS_IDLE && font && format && textBrush &&
-                    background) {
+                if (cardUp && font && format && textBrush && background) {
                     const float pad = 10.0f;
                     const float lineHeight = (float)g_settings.rowHeight;
                     // Cover with the panel's own background, inside the same rounded
-                    // path, so nothing rectangular pokes out of the capsule corners.
-                    g_gdiplus.SetSolidFillColor(background, g_settings.background);
+                    // path, so nothing rectangular pokes out of the capsule corners. It
+                    // fades with the card, which cross-fades it against the rows beneath.
+                    g_gdiplus.SetSolidFillColor(
+                        background, WithOpacity(g_settings.background, cardAlpha));
                     if (panelPath) g_gdiplus.FillPath(graphics, (GpBrush *)background, panelPath);
 
-                    const DWORD accent =
-                        ResolveSeverityColor(g_islandCard.severity, g_settings.text);
+                    const DWORD accent = WithOpacity(
+                        ResolveSeverityColor(g_islandCard.severity, g_settings.text), cardAlpha);
                     const IslandCardLayout plan = PlanIslandCard(g_islandCard);
                     const float textX = pad + 12.0f;
                     float textWidth = (float)width - textX - pad;
@@ -4456,13 +4447,15 @@ static void PaintPanel(HWND hwnd) {
                     g_gdiplus.FillRectangle(graphics, (GpBrush *)textBrush, pad, pad + 3.0f,
                                             3.0f, barHeight);
 
-                    g_gdiplus.SetSolidFillColor(textBrush, g_settings.text);
+                    g_gdiplus.SetSolidFillColor(
+                        textBrush, WithOpacity(g_settings.text, cardAlpha));
                     RectF titleRect(textX, pad, textWidth, lineHeight);
                     g_gdiplus.DrawString(graphics, g_islandCard.title, -1, font, &titleRect,
                                          format, (GpBrush *)textBrush);
                     if (plan.lines > 1) {
                         g_gdiplus.SetSolidFillColor(
-                            textBrush, WithOpacity(g_settings.text, kTextSecondaryOpacity));
+                            textBrush,
+                            WithOpacity(g_settings.text, kTextSecondaryOpacity * cardAlpha));
                         RectF bodyRect(textX, pad + lineHeight, textWidth, lineHeight);
                         g_gdiplus.DrawString(graphics, g_islandCard.body, -1, font, &bodyRect,
                                              format, (GpBrush *)textBrush);
@@ -4799,7 +4792,6 @@ static void UpdateIsland() {
     // Only while the card is on its way in or on screen. Forcing the panel open while
     // the card is collapsing would expand the panel and then collapse it again one tick
     // later, which is exactly the short flicker that was still visible on the way out.
-    const bool cardUp = g_islandCardValid && g_islandView.state != IS_IDLE;
     const bool cardVisible = g_islandCardValid && (g_islandView.state == IS_POPPING ||
                                                   g_islandView.state == IS_CARD);
     if (cardVisible) {
@@ -4810,45 +4802,10 @@ static void UpdateIsland() {
     // stale one would otherwise be one state transition away from being drawn again.
     if (next == IS_IDLE && pop < 0) g_islandCardValid = false;
 
-    // The card's target width, decided here so that PlaceWindow, the hit test and the
-    // painter all read one number: the user's minimum, or as wide as the text wants,
-    // never wider than the cap.
-    //
-    // Collapsing is excluded on purpose: that direction is driven from the painter, which
-    // shrinks the window with the content frame by frame (the same rule the height
-    // collapse follows). Overwriting the width here would re-widen the window and bring
-    // back the transparent band this used to leave behind.
-    // The monitor the card has to live on: the width cap is the screen, not a constant
-    // (design 8). PlaceWindow centres inside the same monitor, so the two agree.
-    int monitorWidth = 0;
-    if (g_window) {
-        HMONITOR monitor = MonitorFromWindow(g_window, MONITOR_DEFAULTTONEAREST);
-        MONITORINFO info = {};
-        info.cbSize = sizeof(info);
-        if (monitor && GetMonitorInfoW(monitor, &info)) {
-            monitorWidth = (int)(info.rcMonitor.right - info.rcMonitor.left);
-        }
-    }
-    if (g_islandView.state != IS_COLLAPSING) {
-        IslandMetrics metrics = {};
-        metrics.titleChars = (int)wcslen(g_islandCard.title);
-        metrics.bodyChars = (int)wcslen(g_islandCard.body);
-        int wantWidth = g_settings.panelWidth;
-        if (cardUp) {
-            const int cardWidth = ComputeIslandCardWidth(metrics, g_settings, monitorWidth);
-            g_cardWidth = cardWidth;          // stable across pop, card and collapse
-            // The union rule from design 8, doing real work while the card *grows*: the
-            // clickable area covers both states, so everything visible is clickable.
-            PanelRect baseRect = {0, 0, g_settings.panelWidth, 0};
-            PanelRect cardRect = {0, 0, cardWidth, 0};
-            wantWidth = UnionPanelRect(baseRect, cardRect).w;
-        }
-        if (wantWidth != g_restWidth) {
-            g_restWidth = wantWidth;
-            if (g_window) PlaceWindow(g_window);
-        }
-    }
-    // (The width is decided above; the collapsing direction is driven from the painter.)
+    // The card's target width is decided in the painter, which owns the window handle and
+    // applies it in the same frame as the blit. Nothing about the width is animated any
+    // more: animating it meant resizing the window between frames, which is what flickered.
+    if (next == IS_IDLE && pop < 0) g_islandCardValid = false;
 
     if (next != was && g_islandLogs < 8) {
         Wh_Log(L"EXT island: %s -> %s (queued=%d, showing=%d%s)", IslandStateName(was),

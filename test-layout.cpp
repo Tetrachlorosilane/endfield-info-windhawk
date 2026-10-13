@@ -1461,14 +1461,6 @@ int main() {
             cfg.islandMinWidth = 600;
             Check(ComputeIslandCardWidth(narrow, cfg, 0) == 600,
                   "raising the minimum raises the floor for the same card");
-
-            // Hits during an animation: the union of the two states, so nothing that is
-            // visible is ever unclickable (design 8).
-            PanelRect from = {0, 0, 100, 50};
-            PanelRect to = {10, -5, 200, 60};
-            PanelRect unioned = UnionPanelRect(from, to);
-            Check(unioned.x == 0 && unioned.y == -5 && unioned.w == 210 && unioned.h == 60,
-                  "the animated hit target is the union of where it was and where it goes");
         }
 
         // The pipe's DACL has to actually admit this user. Getting it wrong is
