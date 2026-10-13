@@ -604,11 +604,11 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   （头顺序 + `ApplyPanelTransform` 未使用）。
 - 7 个导出入口齐全。
 - 依赖仅系统 DLL：`USER32 / GDI32 / PDH / IPHLPAPI / PSAPI / ADVAPI32 / msvcrt / KERNEL32`。
-- 回归测试全绿（295 条断言，含一段**真启动 GDI+** 的排版断言：
+- 回归测试全绿（302 条断言，含一段**真启动 GDI+** 的排版断言：
   文字不折行、且在预算内）。
 - GDI+ 缩放管线用**已知内容**的图验证过（含透明底、纯 RGB、索引色、灰度+alpha、
   16 位、隔行 PNG）。
-- 外部数据（M1）：编译只剩上面那两条已知警告；回归 **295 条断言**全绿（M1、M2 与 M3 第一片共新增 144 条）；
+- 外部数据（M1）：编译只剩上面那两条已知警告；回归 **302 条断言**全绿（M1、M2 与 M3 共新增 151 条）；
   并做了**负对照**——把展开改成递归后，注入断言确实变红（不是"看着像在守"）。
 - 设置块 46 项 / 10 个选项组，`_settings.py` 报 `no structural problems found`。
 - **mod 的日志格式串**用测试宿主查过：`-Wformat` 指向 `endfield-info-windhawk.wh.cpp`
@@ -640,12 +640,14 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   这块只能靠 mod 的开机自检（`ExtSelfTest` 的两帧是否被服务端记录）与真机日志来验证。
 - **事件面（M2）**：队列规则（替换/合并/优先级/丢弃）、状态机（`StepIsland`）、
   卡片内容模型（`PlanIslandCard`）、severity 配色（`ResolveSeverityColor`）、
-  卡片宽度（`ComputeIslandCardWidth`，含最小宽度与屏幕钳位）都有断言，共 295 条；
+  卡片宽度（`ComputeIslandCardWidth`，含最小宽度与屏幕钳位）都有断言，共 302 条；
   **卡片绘制本身与宽度改动的观感**只能在机器上看，仍列在未验证之内。
 - **M3 第一片（卡片交互）**：`ComputeIslandRect`（矩形与宽度同源）、`ComputeIslandCloseRect`、
   `BuildIslandRegions`、`IslandHitTest`、`IslandDismiss` 都有断言，其中包括一条**整体性质**：
-  逐像素遍历卡片，要求没有任何像素落在 `IR_NONE`（"看得见的都能点"）。**悬停态尚未实现**；
-  关闭按钮在真机上的点击手感（含圆角外穿透是否照旧）仍列在未验证之内。
+  逐像素遍历卡片，要求没有任何像素落在 `IR_NONE`（"看得见的都能点"）。悬停不占定时器
+  （`WM_MOUSEMOVE` 驱动、`WM_MOUSELEAVE` 收尾、只在热态翻转时重绘），帧率决策本身
+  （`DesiredTickMs` / `ApplyTickRate`）也有断言；**关闭按钮与悬停在真机上的手感、以及圆角外
+  穿透是否照旧**仍列在未验证之内。
 - **收起闪烁已真机确认修复（2026-10-13）**：原因是 `SetExpanded(false)` 先把窗口缩到标签高度、
   再由绘制帧长回来（§5.4 / §6 / §7.12）。修复方式是不再预缩，由绘制侧逐帧跟随；用户在真机上
   确认闪烁消失。这条**没有断言能守**（是分层窗口的帧内顺序），只能靠这条不变量与注释。
