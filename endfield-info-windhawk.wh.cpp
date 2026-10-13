@@ -264,6 +264,9 @@ through WMI.
 - ExtEventQueue: 4
   $name: 'External event queue'
   $description: '1-8. Events waiting behind the one on screen. When full, the lowest priority and oldest event is dropped.'
+- IslandMinWidth: 260
+  $name: 'Island minimum width'
+  $description: '120-640. Narrowest width for an event card. The card grows with its text but never below this, and never past 640.'
 - IslandEnabled: Off
   $name: 'Notification island'
   $description: 'Turns an external event into a temporary card: title, optional body, a severity colour and a repeat badge. The card covers the rows while it is up and gives them back when it goes.'
@@ -1131,6 +1134,7 @@ struct ModSettings {
     int extMaxUpdates = 100;
     int extEventMs = 6000;
     int extEventQueue = 4;
+    int islandMinWidth = 260;        // floor for the card's width; text widens it
 
     // Left icon plates and intro animation. One icon per row, row-aligned with the
     // RowN settings.
@@ -1356,6 +1360,7 @@ static void ReadSettings(ModSettings &s) {
     s.extMaxUpdates = ClampInt((int)Wh_GetIntSetting(L"ExtMaxUpdates"), 1, 1000);
     s.extEventMs = ClampInt((int)Wh_GetIntSetting(L"ExtEventMs"), 1000, 60000);
     s.extEventQueue = ClampInt((int)Wh_GetIntSetting(L"ExtEventQueue"), 1, 8);
+    s.islandMinWidth = ClampInt((int)Wh_GetIntSetting(L"IslandMinWidth"), 120, 640);
 }
 
 // Per-row icon resolution.
@@ -2024,12 +2029,39 @@ static DWORD ResolveSeverityColor(ExtSeverity sev, DWORD themeText) {
     }
 }
 
-// The card is drawn in the panel's own rectangle -- deliberately a fixed width. Giving
-// the island its own width meant resizing the window around the card, and every variant
-// of that left one frame in which the window and the layered bitmap disagreed, which is
-// the flicker that could not be tuned away. One width for both states removes the whole
-// class. The union-of-two-states rule from design 8 belonged to that animation; with no
-// animation and no second width there are no two states to union.
+struct IslandMetrics {
+    int titleChars;
+    int bodyChars;
+};
+
+// The card's target width. Pure so the two properties that matter can be asserted
+// (design 12): it is never narrower than the user's configured minimum, and it never
+// grows without bound. The estimate is coarse on purpose -- the painter measures the
+// real text and ellipsises to fit -- because measuring needs GDI+ and this has to be
+// decidable before anything is drawn.
+static const int kIslandMaxWidth = 640;
+
+static int ComputeIslandCardWidth(const IslandMetrics &m, const ModSettings &cfg,
+                                  int monitorWidth) {
+    int chars = m.titleChars > m.bodyChars ? m.titleChars : m.bodyChars;
+    if (chars < 0) chars = 0;
+    int width = 26 + chars * (cfg.rowHeight / 2);      // padding, accent bar, glyphs
+    if (width < cfg.islandMinWidth) width = cfg.islandMinWidth;
+    // Design 12: a long title must not grow the window without bound. Design 8 wants
+    // that bound to be the screen rather than an arbitrary number, so the cap is
+    // whichever is smaller -- a narrow monitor beats the 640 default.
+    int cap = kIslandMaxWidth;
+    if (monitorWidth > 0 && monitorWidth - 24 < cap) cap = monitorWidth - 24;
+    if (cap < 120) cap = 120;                         // keep it inside the setting's range
+    if (width > cap) width = cap;
+    return width;
+}
+
+// The clickable rectangle while the island is up is the card's own rectangle, derived
+// from the same resting width the window is placed at. The union-of-two-states rule from
+// design 8 belonged to the width *animation*: with that animation reverted (it flickered
+// -- see the collapse notes in PaintPanel) there are no two states to union, so the rule
+// is written down here as a comment rather than carried as dead code.
 
 // Drives the island from the HUD's frame clock. Defined with the other HUD updaters,
 // because it reads g_settings and belongs to that thread; everything it decides with
@@ -4033,14 +4065,28 @@ static void PaintPanel(HWND hwnd) {
     // into this function still resized the window mid-frame. The card now appears and
     // disappears at its own width, the way the panel appears and disappears at its own
     // height -- the fade below is what carries the transition.
-    // The card uses the panel's own width -- a fixed width, deliberately. A width of its
-    // own meant the window had to be resized around the card, and every arrangement of
-    // that (animated, snapped, driven from the timer or from this function) left a frame
-    // in which the window and the layered bitmap disagreed: that is what flickered. With
-    // one width for both states there is nothing left to resize.
     const bool cardUp = g_settings.islandEnabled && g_islandCardValid &&
                         g_islandView.state != IS_IDLE;
-    const int width = g_settings.panelWidth;
+    int width = g_settings.panelWidth;
+    if (cardUp) {
+        IslandMetrics metrics = {};
+        metrics.titleChars = (int)wcslen(g_islandCard.title);
+        metrics.bodyChars = (int)wcslen(g_islandCard.body);
+        int monitorWidth = 0;
+        HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO info = {};
+        info.cbSize = sizeof(info);
+        if (monitor && GetMonitorInfoW(monitor, &info)) {
+            monitorWidth = (int)(info.rcMonitor.right - info.rcMonitor.left);
+        }
+        width = ComputeIslandCardWidth(metrics, g_settings, monitorWidth);
+    }
+    // Resize before the bitmap exists, never after: inside one frame the window and the
+    // layered blit are then always the same size, so no band can be left behind.
+    if (width != g_restWidth) {
+        g_restWidth = width;
+        PlaceWindow(hwnd);
+    }
     // The card's own fade, driven by its phase: in while popping, out while collapsing.
     // Without it the text sat at full opacity and then vanished when the machine reached
     // Idle, which reads as a flash instead of a transition.
@@ -4401,29 +4447,17 @@ static void PaintPanel(HWND hwnd) {
                     g_gdiplus.FillRectangle(graphics, (GpBrush *)textBrush, pad, pad + 3.0f,
                                             3.0f, barHeight);
 
-                    // Fitted to the same budget the rows use: GDI+ does not clip to the
-                    // layout box, so an over-long title would otherwise run past the
-                    // capsule edge (AGENTS 5.1).
-                    WCHAR fitted[kIslandBodyChars];
-                    wcsncpy(fitted, g_islandCard.title, kIslandBodyChars - 1);
-                    fitted[kIslandBodyChars - 1] = L'\0';
-                    FitTextToWidth(graphics, font, format, fitted, kIslandBodyChars, textWidth,
-                                   lineHeight);
                     g_gdiplus.SetSolidFillColor(
                         textBrush, WithOpacity(g_settings.text, cardAlpha));
                     RectF titleRect(textX, pad, textWidth, lineHeight);
-                    g_gdiplus.DrawString(graphics, fitted, -1, font, &titleRect, format,
-                                         (GpBrush *)textBrush);
+                    g_gdiplus.DrawString(graphics, g_islandCard.title, -1, font, &titleRect,
+                                         format, (GpBrush *)textBrush);
                     if (plan.lines > 1) {
-                        wcsncpy(fitted, g_islandCard.body, kIslandBodyChars - 1);
-                        fitted[kIslandBodyChars - 1] = L'\0';
-                        FitTextToWidth(graphics, font, format, fitted, kIslandBodyChars,
-                                       textWidth, lineHeight);
                         g_gdiplus.SetSolidFillColor(
                             textBrush,
                             WithOpacity(g_settings.text, kTextSecondaryOpacity * cardAlpha));
                         RectF bodyRect(textX, pad + lineHeight, textWidth, lineHeight);
-                        g_gdiplus.DrawString(graphics, fitted, -1, font, &bodyRect,
+                        g_gdiplus.DrawString(graphics, g_islandCard.body, -1, font, &bodyRect,
                                              format, (GpBrush *)textBrush);
                     }
                     if (plan.hasBadge) {
@@ -4668,7 +4702,15 @@ static void SetExpanded(HWND hwnd, bool expanded) {
     ComputeGeometry();
     double toHeight = (double)g_displayHeight;
     StartIntro(hwnd, fromHeight, toHeight);
-    PlaceWindow(hwnd);
+    // Growing: the window goes to the expanded resting size at once and the content grows
+    // into it, which is intended -- there is nothing under a growing panel to hide.
+    //
+    // Shrinking: it must NOT go to the tab height here. Doing so and then growing it back
+    // inside PaintPanel's collapse branch -- which has to, or the expanded bitmap would be
+    // clipped into an 8 px window -- leaves one slice in which the window has no matching
+    // bitmap at all, and that slice is the flash on collapse. The per-frame height follow
+    // in the painter brings the window down, together with the content.
+    if (expanded) PlaceWindow(hwnd);
     PaintPanel(hwnd);
 }
 
