@@ -712,6 +712,24 @@ $script:CdpProbeExpression = @'
             else if (typeof pv === 'string' && pv.length <= 60) o.store.playingScalars[pk] = pv;
           } catch (x3) { }
         }
+        // 真机发现（2026-10-13）：store 里**直接有"当前歌词行"** ✓✓ ——
+        // `playingLyricLineNumber: 10`（客户端自己记的行号 ✓）与 `playingLyric`（非标量 ✓）。
+        // 所以**位置不是必需的** ✓：行号 + 歌词本身就能精确定位当前行（拖动/暂停天然正确 ✓）。
+        // 这里只问清 `playingLyric` 的**形状**（字符串？还是含原文/翻译/时间的对象？✓），
+        // 以及两个常被拿来当"当前曲目"的对象的键名 ✓ —— 全是结构与短值，不外传长文本 ✓。
+        o.store.lyricShape = {};
+        try {
+          var ly = p.playingLyric;
+          o.store.lyricShape.type = (ly === null) ? 'null' : (typeof ly);
+          if (typeof ly === 'string') o.store.lyricShape.sample = ly.slice(0, 60);
+          else if (ly && typeof ly === 'object') {
+            o.store.lyricShape.keys = Object.keys(ly).slice(0, 30);
+            try { o.store.lyricShape.json = ('' + JSON.stringify(ly)).slice(0, 600); } catch (x4) { }
+          }
+        } catch (x5) { }
+        try { o.store.curTrackKeys = Object.keys(p.curTrack || {}).slice(0, 40); } catch (x6) { }
+        try { o.store.curPlayingKeys = Object.keys(p.curPlaying || {}).slice(0, 40); } catch (x7) { }
+        try { o.store.playingLyricLineNumber = p.playingLyricLineNumber; } catch (x8) { }
       } catch (x2) { o.store.probeError = '' + x2; }
     }
   } catch (x) { o.store.error = '' + x; }
