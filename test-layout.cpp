@@ -1418,6 +1418,25 @@ int main() {
             Check(v.showing == ES_CRITICAL, "the view now shows the critical");
         }
 
+        // What the card shows, and how severity maps to colour (design 7.4 / 14 Q4).
+        {
+            IslandEvent ev = {};
+            wcsncpy(ev.title, L"T", kIslandTitleChars - 1);
+            ev.repeat = 1;
+            IslandCardLayout p1 = PlanIslandCard(ev);
+            Check(p1.lines == 1 && !p1.hasBadge,
+                  "a card without a body is one line and carries no merge badge");
+            wcsncpy(ev.body, L"B", kIslandBodyChars - 1);
+            ev.repeat = 7;
+            IslandCardLayout p2 = PlanIslandCard(ev);
+            Check(p2.lines == 2 && p2.hasBadge && wcscmp(p2.badge, L"\x00D7" L"7") == 0,
+                  "a body adds the second line and a repeat adds the merged count");
+            Check(ResolveSeverityColor(ES_CRITICAL, 0xFF112233) == 0xFFE4573D &&
+                      ResolveSeverityColor(ES_WARN, 0xFF112233) == 0xFFF2C14E &&
+                      ResolveSeverityColor(ES_INFO, 0xFF112233) == 0xFF112233,
+                  "severity picks the accent: fixed for warn/critical, the theme's text for info");
+        }
+
         // The pipe's DACL has to actually admit this user. Getting it wrong is
         // invisible until a real client is refused, so a pipe built with the very
         // same descriptor is opened here -- but only where the environment allows

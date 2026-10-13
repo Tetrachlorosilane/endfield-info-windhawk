@@ -1995,6 +1995,35 @@ static bool IslandTakeMatching(IslandEvent *queue, int *count, const IslandEvent
     return false;
 }
 
+// What the card shows, decided without touching GDI+ so it can be asserted.
+struct IslandCardLayout {
+    int   lines;          // 1 without a body, 2 with one
+    bool  hasBadge;       // repeat > 1
+    WCHAR badge[8];
+};
+
+static IslandCardLayout PlanIslandCard(const IslandEvent &ev) {
+    IslandCardLayout plan = {};
+    plan.lines = ev.body[0] ? 2 : 1;
+    plan.hasBadge = ev.repeat > 1;
+    if (plan.hasBadge) {
+        unsigned shown = ev.repeat > 99 ? 99 : ev.repeat;
+        swprintf(plan.badge, 8, L"\x00D7" L"%u", shown);
+    }
+    return plan;
+}
+
+// Severity to colour. A provider cannot choose colours (design 14 Q4): info borrows
+// the theme's own text colour so it never looks foreign in any theme, while warn and
+// critical are fixed and therefore mean the same thing everywhere.
+static DWORD ResolveSeverityColor(ExtSeverity sev, DWORD themeText) {
+    switch (sev) {
+    case ES_WARN: return 0xFFF2C14E;
+    case ES_CRITICAL: return 0xFFE4573D;
+    default: return themeText;
+    }
+}
+
 // Drives the island from the HUD's frame clock. Defined with the other HUD updaters,
 // because it reads g_settings and belongs to that thread; everything it decides with
 // is the pure state machine above.
@@ -4302,6 +4331,58 @@ static void PaintPanel(HWND hwnd) {
                 }
                 LeaveCriticalSection(&g_valuesLock);
 
+                // --- island card (M2) ------------------------------------------
+                // A parallel drawing branch, not a RowState variant (design 7.4). It
+                // paints over the rows, so while a card is up the card is what is
+                // visible; the rows are untouched and come straight back afterwards.
+                //
+                // Still drawn in the panel's own geometry: the width animation channel
+                // and ComputeIslandRect are the next step, and they need the resting
+                // geometry to become a rectangle first (design 8).
+                if (g_settings.islandEnabled && g_islandCardValid &&
+                    g_islandView.state != IS_IDLE && font && format && textBrush &&
+                    background) {
+                    const float pad = 10.0f;
+                    const float lineHeight = (float)g_settings.rowHeight;
+                    // Cover with the panel's own background, inside the same rounded
+                    // path, so nothing rectangular pokes out of the capsule corners.
+                    g_gdiplus.SetSolidFillColor(background, g_settings.background);
+                    if (panelPath) g_gdiplus.FillPath(graphics, (GpBrush *)background, panelPath);
+
+                    const DWORD accent =
+                        ResolveSeverityColor(g_islandCard.severity, g_settings.text);
+                    const IslandCardLayout plan = PlanIslandCard(g_islandCard);
+                    const float textX = pad + 12.0f;
+                    float textWidth = (float)width - textX - pad;
+                    if (textWidth < kMinLayoutWidth) textWidth = kMinLayoutWidth;
+
+                    // Accent bar: severity, and the only thing that carries colour.
+                    g_gdiplus.SetSolidFillColor(textBrush, accent);
+                    float barHeight = lineHeight * (float)plan.lines - 6.0f;
+                    if (barHeight < 6.0f) barHeight = 6.0f;
+                    g_gdiplus.FillRectangle(graphics, (GpBrush *)textBrush, pad, pad + 3.0f,
+                                            3.0f, barHeight);
+
+                    g_gdiplus.SetSolidFillColor(textBrush, g_settings.text);
+                    RectF titleRect(textX, pad, textWidth, lineHeight);
+                    g_gdiplus.DrawString(graphics, g_islandCard.title, -1, font, &titleRect,
+                                         format, (GpBrush *)textBrush);
+                    if (plan.lines > 1) {
+                        g_gdiplus.SetSolidFillColor(
+                            textBrush, WithOpacity(g_settings.text, kTextSecondaryOpacity));
+                        RectF bodyRect(textX, pad + lineHeight, textWidth, lineHeight);
+                        g_gdiplus.DrawString(graphics, g_islandCard.body, -1, font, &bodyRect,
+                                             format, (GpBrush *)textBrush);
+                    }
+                    if (plan.hasBadge) {
+                        // The merge counter from design 7.3, drawn in the accent colour.
+                        g_gdiplus.SetSolidFillColor(textBrush, accent);
+                        RectF badgeRect((float)width - 46.0f, pad, 38.0f, lineHeight);
+                        g_gdiplus.DrawString(graphics, plan.badge, -1, font, &badgeRect, format,
+                                             (GpBrush *)textBrush);
+                    }
+                }
+
                 if (format) g_gdiplus.DeleteStringFormat(format);
                 if (textBrush) g_gdiplus.DeleteBrush((GpBrush *)textBrush);
                 if (font) g_gdiplus.DeleteFont(font);
@@ -4616,6 +4697,15 @@ static void UpdateIsland() {
         if (g_islandCardValid) g_islandCard = local[pop];
         LeaveCriticalSection(&g_islandLock);
     }
+    // A card has to be readable, so while one is up the proximity collapse is
+    // deferred: the collapse is timer-driven off g_hideAt, so pushing that deadline
+    // is all it takes. Normal proximity behaviour resumes on the tick after the card.
+    const bool cardUp = g_islandCardValid && g_islandView.state != IS_IDLE;
+    if (cardUp) {
+        if (g_modeProximity) g_hideAt = now + g_settings.hideDelayMs;
+        if (!g_expanded && g_window) SetExpanded(g_window, true);
+    }
+
     if (next != was && g_islandLogs < 8) {
         Wh_Log(L"EXT island: %s -> %s (queued=%d, showing=%d%s)", IslandStateName(was),
                IslandStateName(next), count, (int)g_islandView.showing,

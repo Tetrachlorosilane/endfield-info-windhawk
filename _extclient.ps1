@@ -18,13 +18,17 @@ param(
     [string]$Key = 'title',
     [int]$Ttl = 600000,
     [string]$Text = 'Now Playing: Blue Hour',
-    [string]$Raw = ''
+    [string]$Raw = '',
+    [switch]$Event
 )
 
 $ErrorActionPreference = 'Stop'
 $name = 'endfield-info-windhawk'
 
-$lines = if ($Raw) { @($Raw) } else {
+$lines = if ($Raw) { @($Raw) } elseif ($Event) {
+    # In event mode -Text is the card's title and -Key is unused.
+    @("HELLO 1 $Provider", "EVENT $Provider info $Ttl $Text")
+} else {
     @("HELLO 1 $Provider", "SET $Provider $Key $Ttl $Text")
 }
 
