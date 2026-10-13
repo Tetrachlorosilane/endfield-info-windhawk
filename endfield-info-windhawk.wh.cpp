@@ -4091,6 +4091,17 @@ static void PaintPanel(HWND hwnd) {
         const double to = g_islandView.state == IS_COLLAPSING ? baseW : cardW;
         width = (int)(from + (to - from) * eased + 0.5);
         if (width < 1) width = 1;
+
+        // Collapsing has to follow the height rule that is already two dozen lines up:
+        // the window comes down *with* the shrinking content, frame by frame. Holding it
+        // at the wider union leaves a band on the right that the layered blit no longer
+        // covers, so that band keeps whatever transparency was there last -- the
+        // flicker. Growing is the opposite and needs no help: the window sits at the
+        // target and the content grows into it.
+        if (g_islandView.state == IS_COLLAPSING && width != g_restWidth) {
+            g_restWidth = width;
+            PlaceWindow(hwnd);
+        }
     }
     bool collapsed = !g_expanded;
 
@@ -4788,9 +4799,11 @@ static void UpdateIsland() {
     // The card's target width, decided here so that PlaceWindow, the hit test and the
     // painter all read one number: the user's minimum, or as wide as the text wants,
     // never wider than the cap.
-    IslandMetrics metrics = {};
-    metrics.titleChars = (int)wcslen(g_islandCard.title);
-    metrics.bodyChars = (int)wcslen(g_islandCard.body);
+    //
+    // Collapsing is excluded on purpose: that direction is driven from the painter, which
+    // shrinks the window with the content frame by frame (the same rule the height
+    // collapse follows). Overwriting the width here would re-widen the window and bring
+    // back the transparent band this used to leave behind.
     // The monitor the card has to live on: the width cap is the screen, not a constant
     // (design 8). PlaceWindow centres inside the same monitor, so the two agree.
     int monitorWidth = 0;
@@ -4802,24 +4815,25 @@ static void UpdateIsland() {
             monitorWidth = (int)(info.rcMonitor.right - info.rcMonitor.left);
         }
     }
-    int wantWidth = g_settings.panelWidth;
-    if (cardUp) {
-        IslandMetrics metrics2 = {};
-        metrics2.titleChars = (int)wcslen(g_islandCard.title);
-        metrics2.bodyChars = (int)wcslen(g_islandCard.body);
-        const int cardWidth = ComputeIslandCardWidth(metrics2, g_settings, monitorWidth);
-        // The union rule from design 8, doing real work: while a phase animates, the
-        // resting width is the union of the two states, so the clickable area always
-        // contains what is visible. Both states are centred, so the union's width is
-        // simply the wider of the two; when the phase settles it becomes the target.
-        PanelRect baseRect = {0, 0, g_settings.panelWidth, 0};
-        PanelRect cardRect = {0, 0, cardWidth, 0};
-        wantWidth = UnionPanelRect(baseRect, cardRect).w;
+    if (g_islandView.state != IS_COLLAPSING) {
+        IslandMetrics metrics = {};
+        metrics.titleChars = (int)wcslen(g_islandCard.title);
+        metrics.bodyChars = (int)wcslen(g_islandCard.body);
+        int wantWidth = g_settings.panelWidth;
+        if (cardUp) {
+            const int cardWidth = ComputeIslandCardWidth(metrics, g_settings, monitorWidth);
+            // The union rule from design 8, doing real work while the card *grows*: the
+            // clickable area covers both states, so everything visible is clickable.
+            PanelRect baseRect = {0, 0, g_settings.panelWidth, 0};
+            PanelRect cardRect = {0, 0, cardWidth, 0};
+            wantWidth = UnionPanelRect(baseRect, cardRect).w;
+        }
+        if (wantWidth != g_restWidth) {
+            g_restWidth = wantWidth;
+            if (g_window) PlaceWindow(g_window);
+        }
     }
-    if (wantWidth != g_restWidth) {
-        g_restWidth = wantWidth;
-        if (g_window) PlaceWindow(g_window);
-    }
+    // (The width is decided above; the collapsing direction is driven from the painter.)
 
     if (next != was && g_islandLogs < 8) {
         Wh_Log(L"EXT island: %s -> %s (queued=%d, showing=%d%s)", IslandStateName(was),
