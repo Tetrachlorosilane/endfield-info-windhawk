@@ -1142,7 +1142,22 @@ try {
             if ($null -eq $positionMs) {
                 $positionMs = [int]((Get-Date) - $started).TotalMilliseconds
             }
-            $line = Select-LrcLine $lyricLines $positionMs
+            # 首选歌词来源：CDP store —— 客户端自己的当前行 ✓（拖动/暂停/切歌天然正确 ✓，不需要位置推算 ✓）
+            $storeLine = $null
+            if ($LyricSource -in 'auto', 'store') {
+                $ss = Get-CdpStoreState
+                if ($ss -and $ss.ok) {
+                    if ($ss.name) { [void](Publish $writer 'title' ('' + $ss.name)) }
+                    if ($ss.line) {
+                        $storeLine = '' + $ss.line
+                        [void](Publish $writer 'lyric' $storeLine)
+                    }
+                    if ($ss.trans) { [void](Publish $writer 'translation' ('' + $ss.trans)) }
+                    if ($null -ne $ss.lineTimeSec) { $positionMs = [int]([double]$ss.lineTimeSec * 1000) }
+                }
+            }
+            # 兜底：接口 LRC + 位置选行（store 不可用时才走这条 ✓）
+            $line = if ($storeLine) { $storeLine } else { Select-LrcLine $lyricLines $positionMs }
 
             [void](Publish $writer 'title' ("{0} - {1}" -f $now.Title, $now.Artist))
             if ($line) { [void](Publish $writer 'lyric' $line) }
