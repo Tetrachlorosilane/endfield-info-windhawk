@@ -179,6 +179,7 @@ text     := 任意 UTF-16 可表示字符，去掉 C0/C1 控制字符（\t→空
 | 403 | 幂等/容量：提供者或键超出上限 | 丢弃，计数 |
 | 404 | 速率超限 | 丢弃，计数（**不**断开：真实的突发不该被踢） |
 | 405 | `provider` 不在允许名单 | 丢弃，计数 |
+| 501 | 命令已识别但本里程碑不实现（`EVENT`） | 丢弃，连接保持；客户端能分辨"写错"与"还没做" |
 | 500 | 服务端内部失败（槽位/内存异常） | 记日志，断开 |
 
 所有 `ERR` 都只打**计数与码**，**绝不打值的内容**（§9 威胁 6）。
@@ -387,7 +388,7 @@ while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
 | R2 | `g_extDirty` 丢失唤醒（`SET` 正好落在 sampler 检查与 `Sleep` 之间） | — | 不存在：标志只由 sampler test-and-clear，置上就一定会被处理 |
 | R3 | IPC 读限额/允许名单时与 loader 写 `g_settings` 抢 | 中 | 每条命令**先在 `g_settingsLock` 内取一份快照**再校验；限额不缓存进全局（连带消灭这条本身） |
 | R4 | HUD 读 `g_extDeadlineMs` 与 sampler 写抢 | 低 | 只用 `InterlockedExchange` / `InterlockedCompareExchange`（对齐 `LONG`）；HUD 不做多字段读 |
-| R5 | IPC 线程 `PostMessage(g_window, …)` 时 `g_window` 正被 HUD 置空/销毁，甚至 HWND 被回收 | 低（自定义消息会被忽略） | **改用 `PostThreadMessage(g_hudThreadId, …)`**：不过窗口句柄，回收问题不存在；消息循环本来就是 `GetMessageW(&msg, nullptr, 0, 0)`（[4072](../endfield-info-windhawk.wh.cpp#L4072)），能收线程消息（需按 §5.6.2 显式处理）。另加 `if (g_extStop) return;` 守卫 |
+| R5 | IPC 线程 `PostMessage(g_window, …)` 时 `g_window` 正被 HUD 置空/销毁，甚至 HWND 被回收 | 低（自定义消息会被忽略） | **只在 M2 生效**：M1 的 IPC 线程不发任何面向 HUD 的消息（它只置 `g_extDirty`，由 sampler 去 `PostMessage(kMsgRatesReady)`），所以这条到事件通道才需要处理。届时的做法是 **`PostThreadMessage(g_hudThreadId, …)`**：不过窗口句柄，回收问题不存在；消息循环本来就是 `GetMessageW(&msg, nullptr, 0, 0)`（[4072](../endfield-info-windhawk.wh.cpp#L4072)），能收线程消息（需按 §5.6.2 显式处理 `hwnd == nullptr`） |
 | R6 | `ExtStoreValue` 淘汰与 `ExtLookup` 并发 | — | 两者都在 `g_extLock` 内（IPC 写 / sampler 读），不并发 |
 | R7 | `InitializeCriticalSection` / `DeleteCriticalSection` 与使用它的线程 | **高**（顺序错会崩） | 按 §5.6.4 的顺序；用 `g_extLockReady` 保证只删已初始化的 |
 | R8 | `EVENT` 洪泛导致重绘风暴（M2） | 中 | 队列上限 + 同源合并（§7.3）；16 ms 帧时钟本身限流 |
@@ -602,16 +603,16 @@ IslandRect ComputeIslandRect(const IslandState &s, const ContentMetrics &m,
 
 | 里程碑 | 内容 | 验收 |
 | :-- | :-- | :-- |
-| **M1 数据面** | `G_EXT` + 槽位表 + 管道线程 + `{ext.p.k}` + ttl/消毒/限速 + 设置项 + **§5.6.3 的 R1/R1b/R3/R5/R7** | 关掉开关时空闲成本为 0；`{ext.p.k}` 能显示；提供者退出后 **≤100 ms** 变 `--`（§5.6.2）；推 100 条 `SET` 后 `[perf]` 里 `paints` 只涨 1–2（合并生效）；`test-layout.cpp` 全绿 + `_settings.py` `no structural problems found` + `build.ps1` 只剩那 2 条已知警告 |
+| **M1 数据面** | **已实现**：`G_EXT` + 槽位表 + 管道线程 + `{ext.p.k}` + ttl/消毒/限速 + 设置项 + §5.6.3 的 R1/R1b/R3/R7 | 关掉开关时空闲成本为 0；`{ext.p.k}` 能显示；提供者退出后 **≤100 ms** 变 `--`（§5.6.2）；推 100 条 `SET` 后 `[perf]` 里 `paints` 只涨 1–2（合并生效）；`test-layout.cpp` 全绿 + `_settings.py` `no structural problems found` + `build.ps1` 只剩那 2 条已知警告 |
 | **M2 事件面** | `EVENT` + 队列/优先级/合并 + `Popping/Card/Collapsing` + width 动画通道 | 连点同 provider 只弹一次；critical 抢 info；ttl 到期收回；收回后基础面板仍可点 |
 | **M3 卡片与交互** | `ComputeIslandRect` + 区域表 + 本地按钮 + 悬停态 | 动画期间"看得见的都能点"；圆角外仍穿透；**不**出现"窗口缩到 8px"回归 |
 | **M4 打磨** | 提供者图标（内置字形白名单）、每提供者配色档、诊断页 | 文档与 AGENTS 更新；`_extclient.py` 进仓库 |
 
 **M1 与 M2 之间是可交付的独立状态**：M1 完成后即使不做灵动岛，也已经解决了"显示外部文本"这个原始需求。
 
-**M1 完成前必须逐条核对 §5.6.3**：R1 / R1b（锁的写侧）、R3（设置快照）、R5（线程消息）、
-R7（停机顺序）是必做项；R9 / R10 明确接受不修，并在代码注释里写明理由——"接受"必须是有据的，
-不能是没人看见。
+**M1 完成前必须逐条核对 §5.6.3**：R1 / R1b（锁的写侧）、R3（设置快照）、R7（停机顺序）
+是必做项；**R5 归 M2**（M1 不发面向 HUD 的消息）；R9 / R10 明确接受不修，
+并在代码注释里写明理由——"接受"必须是有据的，不能是没人看见。
 
 ---
 
@@ -760,11 +761,24 @@ static bool      ExtNameValid(const WCHAR *s, int len, bool provider);  // [a-z0
 static int       ExtParseLine(const WCHAR *line, ExtCommand *out);      // 0 = OK，否则错误码
 static void      ExtSanitize(const WCHAR *src, WCHAR *dst, int cap);    // 单行 + 去控制字符 + 截断
 static bool      ExtParseNumber(const WCHAR *text, double &out);        // 严格 [+-]?digits[.digits]?
-static ExtResult ExtLookup(const WCHAR *name, int len, const WCHAR **text, double *number);
-static void      ExtStoreValue(int provider, const WCHAR *key, const WCHAR *text, DWORD ttlMs);
-static void      ExtInvalidate(const WCHAR *name, int len);
+static ExtResult ExtLookup(const WCHAR *name, int len, const WCHAR **text);
+static void      ExtStoreValue(int provider, const WCHAR *key, const WCHAR *text, DWORD ttlMs,
+                               int maxChars);
+static void      ExtInvalidate(int slot, const WCHAR *key);
 static DWORD     ExtNextDeadline(const ExtProvider *table, int count);  // 0 = 没有有效值
+static int       ExtEvictIndex(const ExtProvider &p);                   // 淘汰谁
+static bool      ExtParseTtl(const WCHAR *ttl, int len, DWORD fallback, DWORD *out);
+static bool      ExtProviderAllowed(const ModSettings &s, const WCHAR *name, int len);
 ```
+
+**实现时的两处收敛**（与初稿不同，代码为准）：
+
+- `ExtLookup` **不返回数值**。数值与否由使用处解析文本决定（`ExtParseNumber` 用于格式说明符，
+  `wcstod` 与其它文本变量一致地用于 `[[ring:...]]`）。存一个 numeric 标志等于给同一件事
+  两个真相来源，它会和屏幕上的文本不一致。
+- 因此也没有 `ApplySpecFromNumber`：新增 `ResolveNumeric(name, len, v, out)`，先问内置表、
+  再问外部值，`ApplySpec` 改调它。`{ext.music.progress|0}` 与 `[[ring:{ext.music.progress}]]`
+  就这样同时成立。
 
 ### C.3 设置项原文（可直接粘贴）
 
@@ -832,8 +846,9 @@ if (ExtIsExtToken(name, nameLen)) {
 ```
 
 `ApplySpec`（[1960](../endfield-info-windhawk.wh.cpp#L1960)）现在需要 `const Values &` 才能给数值变量套
-`|0` / `|int`，所以要加一个只吃 `double` 的重载（推荐）；否则 `{ext.music.progress|0}` 与
-`[[ring:{ext.p.k}]]` 都用不了。
+`|0` / `|int`，所以它改调 `ResolveNumeric`（先内置表、再外部值），这样
+`{ext.music.progress|0}` 与 `[[ring:{ext.p.k}]]` 都能用；`ParseRing` 的 `resolve` 另外
+在 `LookupRaw` 未命中时回落到外部文本，再走它原有的 `wcstod`。
 
 ### C.5 验证判据
 

@@ -22,6 +22,7 @@
 - [数值对齐与格式化](#数值对齐与格式化)
 - [环形占用条](#环形占用条)
 - [左侧图标](#左侧图标)
+- [外部数据（管道）](#外部数据管道)
 - [外观与主题](#外观与主题)
 - [入场动画](#入场动画)
 - [全部设置项](#全部设置项)
@@ -145,6 +146,10 @@ CPU 12%  RAM 73%  GPU 33%  NET 1.2 MB/s  DISK 68%…     （面板放不下时�
 第二条很实用：非 NVIDIA 显卡走通用回退通路时**没有温度传感器**，`{gpu.temp}` 会显示 `--`
 而不是一个误导性的 `0`。
 
+第三条是外部数据：`{ext.提供者.键}` 由别的进程推来（见[外部数据（管道）](#外部数据管道)）。
+它和内置变量平权，唯一区别是**提供者没在推、或者值过期了，它就显示 `--`**；
+而名字写错（例如 `{ext.}`）会和别的拼错一样**原样显示**，让你一眼看出问题。
+
 ---
 
 ## 数值对齐与格式化
@@ -225,6 +230,58 @@ CPU [[ring:{cpu}]]  DISK [[ring:{disk.system.usage}]]
 - **小于图标尺寸的图不会被放大**，会按原尺寸绘制。
 - **不支持 SVG**。GDI+ 没有 SVG 解码器，请把图标导出成 PNG 再使用。
 - **加载失败会回退到内置字形**，并在日志里明确说明原因，不会留下一片空白。
+
+---
+
+## 外部数据（管道）
+
+**让别人往面板里推文本。** 任何进程都能把值推给面板，然后在行里当变量用：
+
+```
+CPU {cpu|0}%   ♪ {ext.music.title}
+RAM [[ring:{mem}]]   [[ring:{ext.music.progress}:1:5:FF6FB3E0]]
+```
+
+默认**关闭**。启用三步：
+
+1. 设置里把 `External data` 改成 `On`；
+2. 在任意一行写一个 `{ext.提供者.键}`——**没有这一行，管道根本不会被创建**（刻意的省资源设计，没引用就不加载）；
+3. 推数据：
+
+```powershell
+python _extclient.py "Now Playing: Blue Hour"
+```
+
+或者不用脚本：
+
+```powershell
+$p = New-Object System.IO.Pipes.NamedPipeClientStream('.', 'endfield-info-windhawk', 'Out')
+$p.Connect(2000)
+$w = New-Object System.IO.StreamWriter($p, [System.Text.UTF8Encoding]::new($false))
+$w.AutoFlush = $true
+$w.WriteLine('HELLO 1 music')
+$w.WriteLine('SET music title - Now Playing: Blue Hour')
+$w.Dispose(); $p.Dispose()
+```
+
+管道名 `\\.\pipe\endfield-info-windhawk`，UTF-8 单行文本，单条最长 4 KB。
+
+| 命令 | 作用 |
+| :-- | :-- |
+| `HELLO 1 <提供者>` | 注册，之后才能 `SET`。提供者名只能用字母数字与 `_ -`，≤16 字符 |
+| `SET <提供者> <键> <ttl\|-> <文本>` | 发布一个值。`ttl` 毫秒，`-` 表示用设置里的默认寿命；`0` 等于删除 |
+| `DEL <提供者> <键>` | 删除该键 |
+| `BYE` | 关闭连接（值按 ttl 自然过期，不会立刻消失） |
+
+几条刻意的规则：
+
+- **值会过期。** 超过 ttl 没更新就显示 `--`，**提供者崩溃不会留下陈旧数据**（到期后约 100 ms 内变 `--`，与刷新间隔无关）。
+- **值不会被二次解析。** 文本里写 `{cpu}` 就原样显示 `{cpu}`，不会被当成变量——注入不成立（有回归断言钉住）。
+- **值也能当数值用**（严格数字，如 `0.42`），所以可以直接驱动 `[[ring:...]]` 和 `|0`、`|2` 这类格式说明符。
+- **`ttl` 建议 ≥ 2 × `Update interval`**，否则值会在两次采样之间反复有效/失效，看起来在闪。
+- 日志里能查到是哪个进程连上来的（进程名 + 路径），但**不记录你推的值**。
+
+**它是信任边界，不是安全通道**：同一用户下的程序都能连（管道拒绝远程连接，也显式限制了 DACL）。面板不执行外部传来的任何指令，也不接受图片字节——图标只能用内置字形。
 
 ---
 
@@ -316,6 +373,15 @@ Windhawk 不支持动态下拉框，所以字体需要手输。拼错了就去�
 | `Update interval` | 1000 | 200-10000 ms；数据刷新间隔 |
 | `Hot-zone depth` | 8 | 2-64，顶部热区向下延伸的像素 |
 | `Hide delay` | 700 | 0-10000 ms，`Proximity` 模式下鼠标离开后的延迟 |
+| `External data` | `Off` | 打开命名管道，允许别的进程推 `{ext.提供者.键}` |
+| `Allowed external providers` | 空 | 分号分隔的允许名单；空 = 都允许（仍会记录与限速） |
+| `External value lifetime` | 30000 | 100-600000 ms；提供者写 `-` 时用的默认寿命 |
+| `External value length` | 128 | 16-512 字符；更长的会被截断并加 `…` |
+| `External provider limit` | 8 | 1-8；超出会被拒绝，已有的保留槽位 |
+| `External updates per second` | 100 | 1-1000，每连接；超限丢弃并计数，不断开连接 |
+| `External event duration` | 6000 | 1000-60000 ms；事件卡片的时长（事件通道尚未实现） |
+| `External event queue` | 4 | 1-8；事件排队深度（事件通道尚未实现） |
+| `Notification island` | `Off` | 把外部事件做成临时卡片（**尚未实现**，现在只有变量） |
 
 ---
 

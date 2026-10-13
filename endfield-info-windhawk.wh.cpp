@@ -237,6 +237,39 @@ through WMI.
 - HideDelayMs: 700
   $name: 'Hide delay (ms)'
   $description: '0-10000. Grace period after the pointer leaves before hiding.'
+- ExternalData: Off
+  $name: 'External data'
+  $description: 'Allows other programs to publish text into the panel through the named pipe endfield-info-windhawk. Off by default; nothing is created unless a row contains an {ext.provider.key} token.'
+  $options:
+    - Off: No external data
+    - On: Accept external providers
+- ExtProviders: ""
+  $name: 'Allowed external providers'
+  $description: 'Semicolon separated provider names, for example music;discord. Empty allows any name, which is still logged and rate limited. Matched case-insensitively.'
+- ExtValueTtlMs: 30000
+  $name: 'External value lifetime (ms)'
+  $description: '100-600000. How long a value stays valid when the provider sends - as its ttl. An expired value renders as two dashes.'
+- ExtMaxValue: 128
+  $name: 'External value length (chars)'
+  $description: '16-512. Longer values are truncated with a trailing ellipsis. 128 keeps four values plus template text inside one row buffer.'
+- ExtMaxProviders: 8
+  $name: 'External provider limit'
+  $description: '1-8. Providers beyond this are rejected with an error; existing ones keep their slots.'
+- ExtMaxUpdates: 100
+  $name: 'External updates per second'
+  $description: '1-1000, per connection. Updates beyond this are dropped and counted; the connection is not closed.'
+- ExtEventMs: 6000
+  $name: 'External event duration (ms)'
+  $description: '1000-60000. How long an external event card stays on screen when the provider sends - as its ttl. Used from the event milestone onwards.'
+- ExtEventQueue: 4
+  $name: 'External event queue'
+  $description: '1-8. Events waiting behind the one on screen. When full, the lowest priority and oldest event is dropped.'
+- IslandEnabled: Off
+  $name: 'Notification island'
+  $description: 'Turns an external event into a temporary card instead of only setting {ext...} values. Nothing is shown yet: the event milestone is not implemented.'
+  $options:
+    - Off: Values only
+    - On: Show event cards
 */
 // ==/WindhawkModSettings==
 
@@ -246,6 +279,9 @@ through WMI.
 #include <windows.h>
 #include <pdh.h>
 #include <psapi.h>
+// For ConvertStringSecurityDescriptorToSecurityDescriptorW: the pipe's DACL is
+// built from SDDL so the intent stays readable.
+#include <sddl.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -264,6 +300,17 @@ static const int kMaxRows = 4;
 static const int kMaxRingsPerRow = 4;
 static const int kCursorPollMs = 40;       // proximity responsiveness vs. cost
 static const int kMaxMonitors = 8;
+
+// External data providers (named pipe). The caps live here because the settings
+// reader and the slot table both need them before the external-data section.
+static const int kMaxExtProviders = 8;
+static const int kMaxExtKeys = 32;
+static const int kExtMaxValueChars = 512;   // absolute ceiling; the setting clamps lower
+static const int kExtMaxLineBytes = 4096;   // one pipe message
+static const int kExtProviderListChars = 256;
+static const int kExtProviderChars = 16;
+static const int kExtKeyChars = 32;
+static const int kExtInstances = 4;         // concurrent provider connections
 
 // PixelFormat32bppPARGB
 static const INT kPixelFormat32bppPARGB = 0x000E200B;
@@ -323,6 +370,10 @@ struct Values;
 struct ModSettings;
 static bool ParseRing(const WCHAR *body, int bodyLen, const Values &v,
                       const ModSettings &settings, RingSpec &out);
+// Defined with the external-data section, but RequiredGroups needs it first.
+static bool ExtIsExtToken(const WCHAR *name, int len);
+static void ExtStart();
+static void ExtStop();
 
 // ---------------------------------------------------------------------------
 // Minimal GDI+ surface, resolved at runtime.
@@ -1066,6 +1117,18 @@ struct ModSettings {
     int hotZoneDepth = 8;
     int hideDelayMs = 700;
 
+    // External data providers. Off by default, and even when on nothing is
+    // created unless a row actually references {ext.*} (see RequiredGroups).
+    bool externalData = false;
+    bool islandEnabled = false;      // read, but the event milestone is not implemented
+    WCHAR extProviders[kExtProviderListChars] = {};
+    int extValueTtlMs = 30000;
+    int extMaxValue = 128;
+    int extMaxProviders = kMaxExtProviders;
+    int extMaxUpdates = 100;
+    int extEventMs = 6000;
+    int extEventQueue = 4;
+
     // Left icon plates and intro animation. One icon per row, row-aligned with the
     // RowN settings.
     IconSpec icons[kMaxRows] = {};
@@ -1264,6 +1327,32 @@ static void ReadSettings(ModSettings &s) {
         if (!s.userSetText) s.text = fallback.text;
         if (!s.userSetAccent) s.accent = fallback.accent;
     }
+
+    // External data providers. A string enum rather than 0/1, matching every other
+    // non-numeric choice in this settings block (Theme, ClickAction, IntroStyle).
+    PCWSTR externalData = Wh_GetStringSetting(L"ExternalData");
+    s.externalData = externalData && wcscmp(externalData, L"On") == 0;
+    Wh_FreeStringSetting(externalData);
+
+    PCWSTR island = Wh_GetStringSetting(L"IslandEnabled");
+    s.islandEnabled = island && wcscmp(island, L"On") == 0;
+    Wh_FreeStringSetting(island);
+
+    PCWSTR providers = Wh_GetStringSetting(L"ExtProviders");
+    if (providers && providers[0]) {
+        wcsncpy(s.extProviders, providers, kExtProviderListChars - 1);
+        s.extProviders[kExtProviderListChars - 1] = L'\0';
+    } else {
+        s.extProviders[0] = L'\0';
+    }
+    Wh_FreeStringSetting(providers);
+
+    s.extValueTtlMs = ClampInt((int)Wh_GetIntSetting(L"ExtValueTtlMs"), 100, 600000);
+    s.extMaxValue = ClampInt((int)Wh_GetIntSetting(L"ExtMaxValue"), 16, kExtMaxValueChars);
+    s.extMaxProviders = ClampInt((int)Wh_GetIntSetting(L"ExtMaxProviders"), 1, kMaxExtProviders);
+    s.extMaxUpdates = ClampInt((int)Wh_GetIntSetting(L"ExtMaxUpdates"), 1, 1000);
+    s.extEventMs = ClampInt((int)Wh_GetIntSetting(L"ExtEventMs"), 1000, 60000);
+    s.extEventQueue = ClampInt((int)Wh_GetIntSetting(L"ExtEventQueue"), 1, 8);
 }
 
 // Per-row icon resolution.
@@ -1307,6 +1396,7 @@ enum Group : unsigned {
     G_NET = 1 << 2,
     G_GPU = 1 << 3,
     G_SYS = 1 << 4,   // clock / date / uptime, always collected (free)
+    G_EXT = 1 << 5,   // external providers; these are pushed, not collected
 };
 
 struct VarDef {
@@ -1350,7 +1440,11 @@ static unsigned RequiredGroups(const ModSettings &s) {
                 if (!end) break;
                 const WCHAR *pipe = p + 1;
                 while (pipe < end && *pipe != L'|') pipe++;
-                groups |= GroupForName(p + 1, (int)(pipe - (p + 1)));
+                int nameLen = (int)(pipe - (p + 1));
+                // {ext.*} names only exist at run time, so the static registry
+                // cannot answer them; the prefix is what selects the group.
+                groups |= ExtIsExtToken(p + 1, nameLen) ? G_EXT
+                                                        : GroupForName(p + 1, nameLen);
                 p = end + 1;
             } else {
                 p++;
@@ -1394,6 +1488,273 @@ struct Values {
 static CRITICAL_SECTION g_valuesLock;       // guards g_rowState and g_publishedRows
 static Values g_values;                     // published snapshot
 static unsigned g_activeGroups = 0;
+
+// ---------------------------------------------------------------------------
+// External data: named-pipe providers
+//
+// Any process can publish text into {ext.provider.key} tokens. The values live in
+// a fixed slot table: nothing is allocated, nothing runs unless a row references
+// {ext.*} (see RequiredGroups), and the pipe is not created until then either.
+//
+// Concurrency (see docs/external-data-island-design.md 5.6):
+//   * the pipe thread writes the table, and it takes g_extLock itself;
+//   * the sampler thread takes g_extLock around expanding the rows, so a lookup
+//     never sees a half-written entry;
+//   * the helpers below take NO lock. That is what lets the regression host call
+//     them directly -- it never runs WhTool_ModInit, so no critical section is
+//     initialised in that process.
+//   * the HUD thread never touches g_extLock. It only reads the two atomic
+//     LONGs below, which is what keeps the lock graph acyclic.
+// ---------------------------------------------------------------------------
+struct ExtEntry {
+    WCHAR  key[kExtKeyChars + 1];
+    WCHAR  text[kExtMaxValueChars + 1];   // raw text as sent, sanitised
+    DWORD  updatedAt;                     // GetTickCount()
+    DWORD  ttlMs;                         // 0 = invalidated
+};
+struct ExtProvider {
+    WCHAR    name[kExtProviderChars + 1];
+    ExtEntry entries[kMaxExtKeys];
+    int      count;
+    DWORD    lastSeenAt;
+    unsigned drops;                       // bounded counter for the log
+};
+
+static ExtProvider      g_ext[kMaxExtProviders];
+static CRITICAL_SECTION g_extLock;
+static bool             g_extLockReady = false;
+static volatile LONG    g_extDirty = 0;        // pipe -> sampler: re-sample now
+static volatile LONG    g_extStop = 0;
+static volatile LONG    g_extDeadlineMs = 0;   // sampler -> HUD: when to nudge
+static HANDLE           g_extThreads[kExtInstances] = {};
+static int              g_extThreadCount = 0;
+static HANDLE           g_extStopEvent = nullptr;
+static bool             g_extStartAttempted = false;
+
+// Does this name select the external namespace at all? Full validation happens in
+// ExtLookup, so a malformed {ext...} still reaches the "unknown" path and keeps
+// its literal text on screen.
+static bool ExtIsExtToken(const WCHAR *name, int len) {
+    return name && len > 4 && _wcsnicmp(name, L"ext.", 4) == 0;
+}
+
+static bool ExtNameEq(const WCHAR *stored, const WCHAR *name, int len) {
+    return (int)wcslen(stored) == len && _wcsnicmp(stored, name, len) == 0;
+}
+
+// provider: [A-Za-z0-9_-]{1,16}   key: [A-Za-z0-9_.-]{1,32}
+static bool ExtNameValid(const WCHAR *s, int len, bool provider) {
+    if (len <= 0 || len > (provider ? kExtProviderChars : kExtKeyChars)) return false;
+    for (int i = 0; i < len; i++) {
+        WCHAR c = s[i];
+        bool ok = (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') ||
+                  (c >= L'0' && c <= L'9') || c == L'_' || c == L'-' ||
+                  (!provider && c == L'.');
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// One line of text: control characters dropped, tab becomes a space, ends
+// trimmed, and a value that does not fit is cut and marked with an ellipsis.
+//
+// It deliberately does NOT expand {tokens}. That is not an extra guard: the
+// expansion pass walks the *template* and copies resolved values into its output
+// without rescanning them, so injected text can never become a variable. The
+// assertion in the regression test exists so that property cannot be lost
+// silently by someone "helpfully" making expansion recursive.
+static void ExtSanitize(const WCHAR *src, WCHAR *dst, int cap) {
+    if (cap <= 0) return;
+    if (cap < 3) { dst[0] = L'\0'; return; }
+    int n = 0;
+    bool more = false;
+    for (const WCHAR *p = src; p && *p; p++) {
+        WCHAR c = *p;
+        if (c == L'\r' || c == L'\n') continue;
+        if (c == L'\t') c = L' ';
+        else if (c < 0x20 || c == 0x7F || (c >= 0x80 && c <= 0x9F)) continue;
+        if (n >= cap - 2) { more = true; break; }
+        dst[n++] = c;
+    }
+    while (n > 0 && dst[n - 1] == L' ') n--;
+    int start = 0;
+    while (start < n && dst[start] == L' ') start++;
+    if (start > 0) {
+        for (int i = 0; i < n - start; i++) dst[i] = dst[start + i];
+        n -= start;
+    }
+    if (more) dst[n++] = 0x2026;   // HORIZONTAL ELLIPSIS
+    dst[n] = L'\0';
+}
+
+// Strict: [+-]?digits[.digits]? and nothing else. "73%", " 42", "4 2", ".5", "1."
+// and "1e3" are all rejected, so a value that only looks numeric never drives a
+// ring gauge or a |0 spec.
+static bool ExtParseNumber(const WCHAR *text, double &out) {
+    if (!text || !*text) return false;
+    const WCHAR *p = text;
+    if (*p == L'+' || *p == L'-') p++;
+    if (!(*p >= L'0' && *p <= L'9')) return false;
+    while (*p >= L'0' && *p <= L'9') p++;
+    if (*p == L'.') {
+        p++;
+        if (!(*p >= L'0' && *p <= L'9')) return false;
+        while (*p >= L'0' && *p <= L'9') p++;
+    }
+    if (*p) return false;
+    out = _wtof(text);
+    return true;
+}
+
+// Result of resolving {ext.provider.key}. ER_NONE means the name is not a
+// well-formed external token at all; the caller keeps the literal text then.
+enum ExtResult { ER_NONE, ER_VALUE, ER_EXPIRED };
+
+// No numeric flag is stored: whether a value can drive a gauge or a |0 spec is
+// decided by parsing its text where it is needed (ExtParseNumber for specs,
+// wcstod like every other text variable for [[ring:...]]). A stored flag would
+// be a second source of truth that can disagree with the text on screen.
+static ExtResult ExtLookup(const WCHAR *name, int len, const WCHAR **text) {
+    if (!ExtIsExtToken(name, len)) return ER_NONE;
+    const WCHAR *body = name + 4;
+    int bodyLen = len - 4;
+    const WCHAR *dot = nullptr;
+    for (int i = 0; i < bodyLen; i++) {
+        if (body[i] == L'.') { dot = body + i; break; }
+    }
+    if (!dot) return ER_NONE;
+    int providerLen = (int)(dot - body);
+    int keyLen = bodyLen - providerLen - 1;
+    if (!ExtNameValid(body, providerLen, true)) return ER_NONE;
+    if (!ExtNameValid(dot + 1, keyLen, false)) return ER_NONE;
+
+    for (int i = 0; i < kMaxExtProviders; i++) {
+        const ExtProvider &p = g_ext[i];
+        if (!p.name[0] || !ExtNameEq(p.name, body, providerLen)) continue;
+        for (int k = 0; k < p.count; k++) {
+            const ExtEntry &e = p.entries[k];
+            if (!ExtNameEq(e.key, dot + 1, keyLen)) continue;
+            // A known provider with a missing key is the same on screen as an
+            // expired value: "--". Only a malformed name is "unknown".
+            if (!e.ttlMs) return ER_EXPIRED;
+            if ((DWORD)(GetTickCount() - e.updatedAt) >= e.ttlMs) return ER_EXPIRED;
+            if (text) *text = e.text;
+            return ER_VALUE;
+        }
+        return ER_EXPIRED;
+    }
+    return ER_EXPIRED;
+}
+
+// Earliest moment at which some live value stops being live, or 0 when nothing is
+// live. The sampler publishes this (it holds g_extLock while expanding); the HUD
+// tick reads the atomic and asks for another sample once it has passed.
+static DWORD ExtNextDeadline(const ExtProvider *table, int count) {
+    DWORD best = 0;
+    for (int i = 0; i < count; i++) {
+        for (int k = 0; k < table[i].count; k++) {
+            const ExtEntry &e = table[i].entries[k];
+            if (!e.ttlMs) continue;
+            if ((DWORD)(GetTickCount() - e.updatedAt) >= e.ttlMs) continue;
+            DWORD at = e.updatedAt + e.ttlMs;
+            if (!best || (LONG)(at - best) < 0) best = at;
+        }
+    }
+    return best;
+}
+
+// Eviction pick: the entry that expires first, and among equals the one updated
+// longest ago. Pure, so the policy is assertable rather than implied by a loop.
+static int ExtEvictIndex(const ExtProvider &p) {
+    int best = 0;
+    for (int i = 1; i < p.count; i++) {
+        DWORD a = p.entries[i].updatedAt + p.entries[i].ttlMs;
+        DWORD b = p.entries[best].updatedAt + p.entries[best].ttlMs;
+        if ((LONG)(a - b) < 0) { best = i; continue; }
+        if (a == b && (LONG)(p.entries[i].updatedAt - p.entries[best].updatedAt) < 0) best = i;
+    }
+    return best;
+}
+
+static int ExtFindProvider(const WCHAR *name, int len, bool create, int maxProviders) {
+    int limit = maxProviders < kMaxExtProviders ? maxProviders : kMaxExtProviders;
+    for (int i = 0; i < limit; i++) {
+        if (g_ext[i].name[0] && ExtNameEq(g_ext[i].name, name, len)) return i;
+    }
+    if (!create) return -1;
+    for (int i = 0; i < limit; i++) {
+        if (!g_ext[i].name[0]) {
+            wcsncpy(g_ext[i].name, name, kExtProviderChars);
+            g_ext[i].name[kExtProviderChars] = L'\0';
+            g_ext[i].count = 0;
+            g_ext[i].drops = 0;
+            g_ext[i].lastSeenAt = GetTickCount();
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Allowlist: empty means "any provider name", otherwise a semicolon separated
+// list. A name list, not a secret -- see the design notes on why there is no
+// token.
+static bool ExtProviderAllowed(const ModSettings &s, const WCHAR *name, int len) {
+    if (!s.extProviders[0]) return true;
+    const WCHAR *p = s.extProviders;
+    while (*p) {
+        const WCHAR *end = p;
+        while (*end && *end != L';') end++;
+        const WCHAR *start = p;
+        while (start < end && (*start == L' ' || *start == L'\t')) start++;
+        const WCHAR *stop = end;
+        while (stop > start && (stop[-1] == L' ' || stop[-1] == L'\t')) stop--;
+        if (stop > start && (int)(stop - start) == len && _wcsnicmp(start, name, len) == 0) return true;
+        p = *end ? end + 1 : end;
+    }
+    return false;
+}
+
+// Writes one value. Takes the lock itself, so the pipe thread cannot forget to.
+static void ExtStoreValue(int slot, const WCHAR *key, const WCHAR *text, DWORD ttlMs, int maxChars) {
+    if (slot < 0 || slot >= kMaxExtProviders) return;
+    EnterCriticalSection(&g_extLock);
+    ExtProvider &p = g_ext[slot];
+    int index = -1;
+    for (int i = 0; i < p.count; i++) {
+        if (_wcsicmp(p.entries[i].key, key) == 0) { index = i; break; }
+    }
+    if (index < 0) {
+        if (p.count >= kMaxExtKeys) {
+            index = ExtEvictIndex(p);
+            p.drops++;
+        } else {
+            index = p.count++;
+        }
+        wcsncpy(p.entries[index].key, key, kExtKeyChars);
+        p.entries[index].key[kExtKeyChars] = L'\0';
+    }
+    ExtEntry &e = p.entries[index];
+    int cap = maxChars + 1;
+    if (cap > kExtMaxValueChars + 1) cap = kExtMaxValueChars + 1;
+    if (cap < 3) cap = 3;
+    ExtSanitize(text, e.text, cap);
+    e.updatedAt = GetTickCount();
+    e.ttlMs = ttlMs;
+    p.lastSeenAt = e.updatedAt;
+    LeaveCriticalSection(&g_extLock);
+}
+
+// Marks a key expired without freeing the slot, so a provider that comes back to
+// the same key reuses it instead of consuming another one.
+static void ExtInvalidate(int slot, const WCHAR *key) {
+    if (slot < 0 || slot >= kMaxExtProviders) return;
+    EnterCriticalSection(&g_extLock);
+    ExtProvider &p = g_ext[slot];
+    for (int i = 0; i < p.count; i++) {
+        if (_wcsicmp(p.entries[i].key, key) == 0) { p.entries[i].ttlMs = 0; break; }
+    }
+    LeaveCriticalSection(&g_extLock);
+}
 
 // ---------------------------------------------------------------------------
 // CPU
@@ -1951,6 +2312,17 @@ static void ApplySpecToken(const WCHAR *spec, int specLen, WCHAR *value, size_t 
     }
 }
 
+// Numeric view of one token: the built-in table first, then an external value
+// that happens to parse as a number. This is what makes {ext.music.progress|0}
+// and [[ring:{ext.music.progress}]] work without a second spec path.
+static bool ResolveNumeric(const WCHAR *name, int len, const Values &v, double &out) {
+    if (LookupNumber(name, len, v, out)) return true;
+    if (!ExtIsExtToken(name, len)) return false;
+    const WCHAR *text = nullptr;
+    if (ExtLookup(name, len, &text) != ER_VALUE || !text) return false;
+    return ExtParseNumber(text, out);
+}
+
 // Applies a |-separated spec chain, e.g. {cpu|0|w3|pad0}.
 //
 // When the variable is numeric the chain runs on the number first, so
@@ -1984,7 +2356,7 @@ static void ApplySpec(const WCHAR *spec, int specLen, const WCHAR *name, int nam
     }
 
     double number = 0;
-    bool numeric = LookupNumber(name, nameLen, v, number);
+    bool numeric = ResolveNumeric(name, nameLen, v, number);
     int firstToken = 0;
     if (numeric && tokenCount > 0 && lengths[0] == 1 && tokens[0][0] >= L'0' && tokens[0][0] <= L'9') {
         swprintf(value, valueCount, L"%.*f", tokens[0][0] - L'0', number);
@@ -2257,6 +2629,22 @@ enum LookupResult {
 static LookupResult ResolveToken(const WCHAR *name, int nameLen, const WCHAR *spec, int specLen,
                                  const Values &v, WCHAR *out, size_t outCount) {
     WCHAR scratch[64];
+
+    // External values first: their names only exist at run time, and the two
+    // failure modes are deliberately different. Malformed -> unknown, so the
+    // literal text stays visible and a typo is obvious; well formed but absent or
+    // expired -> unavailable, which renders as "--".
+    if (ExtIsExtToken(name, nameLen)) {
+        const WCHAR *text = nullptr;
+        ExtResult result = ExtLookup(name, nameLen, &text);
+        if (result == ER_NONE) return LR_UNKNOWN;
+        if (result == ER_EXPIRED) return LR_UNAVAILABLE;
+        wcsncpy(out, text ? text : L"", outCount - 1);
+        out[outCount - 1] = L'\0';
+        if (specLen > 0) ApplySpec(spec, specLen, name, nameLen, v, out, outCount);
+        return LR_RESOLVED;
+    }
+
     const WCHAR *raw = LookupRaw(name, nameLen, v, scratch, sizeof(scratch) / sizeof(WCHAR));
     if (raw) {
         wcsncpy(out, raw, outCount - 1);
@@ -2495,8 +2883,15 @@ static bool ParseRing(const WCHAR *body, int bodyLen, const Values &v,
         if (*trimmed == L'{') {
             const WCHAR *end = wcschr(trimmed + 1, L'}');
             if (!end) return false;
+            int nameLen = (int)(end - trimmed - 1);
             WCHAR scratch[64];
-            const WCHAR *raw = LookupRaw(trimmed + 1, (int)(end - trimmed - 1), v, scratch, 64);
+            const WCHAR *raw = LookupRaw(trimmed + 1, nameLen, v, scratch, 64);
+            if (!raw && ExtIsExtToken(trimmed + 1, nameLen)) {
+                // A gauge can be driven by an external value too. The caller holds
+                // g_extLock while expanding, so this read is consistent.
+                const WCHAR *extText = nullptr;
+                if (ExtLookup(trimmed + 1, nameLen, &extText) == ER_VALUE) raw = extText;
+            }
             if (!raw) return false;
             text = raw;
         }
@@ -3910,6 +4305,15 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     switch (msg) {
     case WM_TIMER:
         if (wParam == kTimerTick) {
+            // A pushed value goes stale on its own schedule, not on the refresh
+            // interval. This reads one atomic and, once the deadline has passed,
+            // asks for another sample -- the sampler is the only thread that can
+            // turn an expired value into "--".
+            LONG deadline = InterlockedCompareExchange(&g_extDeadlineMs, 0, 0);
+            if (deadline && (LONG)(GetTickCount() - (DWORD)deadline) >= 0) {
+                InterlockedExchange(&g_extDeadlineMs, 0);   // clear first: never spin
+                InterlockedExchange(&g_extDirty, 1);
+            }
             UpdateProximity(hwnd);
             UpdateIntro(hwnd);
             ReassertTopmost(hwnd);
@@ -4113,9 +4517,23 @@ static void PublishRows(const Values &v, const ModSettings &settings) {
     RingSpec rings[kMaxRows][kMaxRingsPerRow];
     int ringCounts[kMaxRows] = {};
 
+    // Expanding reads the external value table, so the whole expansion runs under
+    // g_extLock: a row can never contain a half-written entry. The lock is
+    // released before g_valuesLock is taken -- the two are never nested, which is
+    // what keeps the lock graph acyclic (docs/external-data-island-design.md 5.6.1).
+    bool lockedExt = g_extLockReady;
+    if (lockedExt) EnterCriticalSection(&g_extLock);
     for (int r = 0; r < count; r++) {
         ExpandTokensAndRings(settings.rows[r], v, settings, marked[r], 640,
                              rings[r], &ringCounts[r], kMaxRingsPerRow);
+    }
+    if (lockedExt) {
+        // Publish when the first live value goes stale, so "--" appears then and
+        // not at the next scheduled sample. A repaint alone could not do it:
+        // g_rowState already holds expanded text, so only a re-expansion can turn
+        // an expired value into "--".
+        InterlockedExchange(&g_extDeadlineMs, (LONG)ExtNextDeadline(g_ext, kMaxExtProviders));
+        LeaveCriticalSection(&g_extLock);
     }
 
     EnterCriticalSection(&g_valuesLock);
@@ -4142,12 +4560,24 @@ static void SamplerIteration() {
 
     if (version != g_samplerSeenVersion) {
         g_samplerSeenVersion = version;
+        // The CPU identity fields are written here and nowhere else. The loader
+        // thread used to refresh them on a settings change, which raced with this
+        // thread reading them (docs/external-data-island-design.md 5.6.3 R1b).
+        ReadCpuStatic();
         EnterCriticalSection(&g_valuesLock);
         g_publishedRows = 0;
         LeaveCriticalSection(&g_valuesLock);
     }
 
     unsigned groups = RequiredGroups(settings);
+
+    // External providers start lazily, and only when a row actually references
+    // {ext.*}: the same shape as the GPU backends below, and it is what keeps
+    // "off" free of cost.
+    if ((groups & G_EXT) && settings.externalData && !g_extStartAttempted) {
+        g_extStartAttempted = true;
+        ExtStart();
+    }
 
     Values v;
     FillSystemFields(v);
@@ -4177,6 +4607,13 @@ static DWORD WINAPI SamplerThread(LPVOID) {
     while (InterlockedCompareExchange(&g_stopSampler, 0, 0) == 0) {
         for (LONG waited = 0; waited < g_refreshMs; waited += 50) {
             if (InterlockedCompareExchange(&g_stopSampler, 0, 0) != 0) break;
+            // A pushed value must not wait a whole refresh interval to appear.
+            // Test-and-clear, so a burst of SETs costs exactly one extra sample
+            // and one repaint rather than one per message.
+            if ((g_activeGroups & G_EXT) &&
+                InterlockedCompareExchange(&g_extDirty, 0, 1) == 1) {
+                break;
+            }
             Sleep(50);
         }
         if (InterlockedCompareExchange(&g_stopSampler, 0, 0) != 0) break;
@@ -4187,17 +4624,403 @@ static DWORD WINAPI SamplerThread(LPVOID) {
 }
 
 // ---------------------------------------------------------------------------
+// External data: the pipe server
+//
+// One worker thread per pipe instance, so several providers stay connected at
+// once. Every operation is overlapped and every wait also waits on the stop
+// event: that is the only way Uninit can end these threads deterministically
+// instead of closing a handle under a blocked ReadFile. The stop order this
+// depends on is written down in docs/external-data-island-design.md 5.6.4.
+// ---------------------------------------------------------------------------
+static const DWORD kExtProto = 1;
+static const WCHAR kExtPipeName[] = L"\\\\.\\pipe\\endfield-info-windhawk";
+
+enum ExtCmd { EC_NONE = 0, EC_HELLO, EC_SET, EC_DEL, EC_EVENT, EC_BYE };
+
+struct ExtCommand {
+    ExtCmd cmd = EC_NONE;
+    const WCHAR *provider = nullptr; int providerLen = 0;
+    const WCHAR *key = nullptr;      int keyLen = 0;
+    const WCHAR *ttl = nullptr;      int ttlLen = 0;
+    const WCHAR *text = nullptr;     int textLen = 0;
+};
+
+struct ExtSession {
+    WCHAR    provider[kExtProviderChars + 1] = {};
+    int      slot = -1;                  // -1 until HELLO
+    DWORD    windowStart = 0;            // rate limit window
+    int      windowCount = 0;
+    unsigned dropped = 0;
+    unsigned setLogs = 0;
+};
+
+static bool ExtIsSpace(WCHAR c) {
+    return c == L' ' || c == L'\t' || c == L'\r' || c == L'\n';
+}
+
+static bool ExtToken(const WCHAR **cursor, const WCHAR **start, int *len) {
+    const WCHAR *p = *cursor;
+    while (ExtIsSpace(*p)) p++;
+    if (!*p) { *cursor = p; return false; }
+    const WCHAR *s = p;
+    while (*p && !ExtIsSpace(*p)) p++;
+    *start = s;
+    *len = (int)(p - s);
+    *cursor = p;
+    return true;
+}
+
+// Returns 0 for "handled or ignorable", otherwise the error code to answer with.
+// A blank line and a '#' comment are ignored silently, because that is what a
+// human typing at the pipe produces.
+static int ExtParseLine(const WCHAR *line, ExtCommand &out) {
+    out = ExtCommand();
+    const WCHAR *cursor = line;
+    const WCHAR *word = nullptr;
+    int wordLen = 0;
+    if (!ExtToken(&cursor, &word, &wordLen)) return 0;
+    if (word[0] == L'#') return 0;
+
+    if (wordLen == 3 && _wcsnicmp(word, L"BYE", 3) == 0) { out.cmd = EC_BYE; return 0; }
+    if (wordLen == 5 && _wcsnicmp(word, L"HELLO", 5) == 0) {
+        const WCHAR *proto = nullptr;
+        int protoLen = 0;
+        if (!ExtToken(&cursor, &proto, &protoLen)) return 400;
+        if (protoLen != 1 || proto[0] != (WCHAR)(L'0' + kExtProto)) return 400;
+        if (!ExtToken(&cursor, &out.provider, &out.providerLen)) return 400;
+        // The optional glyph/badge token is accepted and ignored until the event
+        // milestone needs it, so a client written against the protocol does not
+        // get an error for sending it.
+        const WCHAR *glyph = nullptr;
+        int glyphLen = 0;
+        ExtToken(&cursor, &glyph, &glyphLen);
+        out.cmd = EC_HELLO;
+        return 0;
+    }
+    if (wordLen == 3 && _wcsnicmp(word, L"SET", 3) == 0) {
+        if (!ExtToken(&cursor, &out.provider, &out.providerLen)) return 400;
+        if (!ExtToken(&cursor, &out.key, &out.keyLen)) return 400;
+        if (!ExtToken(&cursor, &out.ttl, &out.ttlLen)) return 400;
+        while (ExtIsSpace(*cursor)) cursor++;
+        out.text = cursor;                       // the rest of the line, spaces and all
+        out.textLen = (int)wcslen(cursor);
+        out.cmd = EC_SET;
+        return 0;
+    }
+    if (wordLen == 3 && _wcsnicmp(word, L"DEL", 3) == 0) {
+        if (!ExtToken(&cursor, &out.provider, &out.providerLen)) return 400;
+        if (!ExtToken(&cursor, &out.key, &out.keyLen)) return 400;
+        out.cmd = EC_DEL;
+        return 0;
+    }
+    if (wordLen == 5 && _wcsnicmp(word, L"EVENT", 5) == 0) {
+        out.cmd = EC_EVENT;
+        return 501;   // recognised, but this milestone does not show cards yet
+    }
+    return 400;
+}
+
+static bool ExtParseTtl(const WCHAR *ttl, int len, DWORD fallback, DWORD *out) {
+    if (len == 1 && ttl[0] == L'-') { *out = fallback; return true; }
+    if (len <= 0 || len > 7) return false;
+    DWORD value = 0;
+    for (int i = 0; i < len; i++) {
+        if (ttl[i] < L'0' || ttl[i] > L'9') return false;
+        value = value * 10 + (DWORD)(ttl[i] - L'0');
+    }
+    *out = value;
+    return true;
+}
+
+// Waits for a posted overlapped operation while staying responsive to the stop
+// event. 1 = completed, 0 = frame too long, -1 = stopped or failed.
+static int ExtWaitIo(HANDLE pipe, OVERLAPPED *ov, DWORD *bytes) {
+    HANDLE waits[2] = { ov->hEvent, g_extStopEvent };
+    DWORD count = g_extStopEvent ? 2 : 1;
+    DWORD which = WaitForMultipleObjects(count, waits, FALSE, INFINITE);
+    if (count == 2 && which == WAIT_OBJECT_0 + 1) {
+        // Cancel, then WAIT for the cancellation: returning while the kernel
+        // still owns this OVERLAPPED would let it write to dead stack.
+        CancelIoEx(pipe, ov);
+        DWORD ignored = 0;
+        GetOverlappedResult(pipe, ov, &ignored, TRUE);
+        return -1;
+    }
+    if (which != WAIT_OBJECT_0) return -1;
+    DWORD got = 0;
+    if (GetOverlappedResult(pipe, ov, &got, FALSE)) {
+        if (bytes) *bytes = got;
+        return 1;
+    }
+    return GetLastError() == ERROR_MORE_DATA ? 0 : -1;
+}
+
+static bool ExtConnect(HANDLE pipe, OVERLAPPED *ov) {
+    ResetEvent(ov->hEvent);
+    if (ConnectNamedPipe(pipe, ov)) return true;
+    DWORD err = GetLastError();
+    // A client that connected between CreateNamedPipe and ConnectNamedPipe makes
+    // this call fail with ERROR_PIPE_CONNECTED. That is success, and treating it
+    // as failure is the classic bug in this sequence.
+    if (err == ERROR_PIPE_CONNECTED) return true;
+    if (err != ERROR_IO_PENDING) return false;
+    DWORD bytes = 0;
+    return ExtWaitIo(pipe, ov, &bytes) == 1;
+}
+
+// 1 = one frame read, 0 = the frame is larger than the buffer, -1 = stopped or broken.
+static int ExtReadFrame(HANDLE pipe, OVERLAPPED *ov, char *buffer, DWORD cap, DWORD *got) {
+    *got = 0;
+    ResetEvent(ov->hEvent);
+    if (ReadFile(pipe, buffer, cap, got, ov)) return 1;
+    DWORD err = GetLastError();
+    // Message mode reports an over-long frame this way instead of truncating it:
+    // this is the over-long-frame detector, not a generic failure.
+    if (err == ERROR_MORE_DATA) return 0;
+    if (err != ERROR_IO_PENDING) return -1;
+    return ExtWaitIo(pipe, ov, got);
+}
+
+static void ExtWriteLine(HANDLE pipe, OVERLAPPED *ov, const WCHAR *text) {
+    char utf8[96];
+    int n = WideCharToMultiByte(CP_UTF8, 0, text, -1, utf8, (int)sizeof(utf8) - 2, nullptr, nullptr);
+    if (n <= 1) return;
+    utf8[n - 1] = '\n';                     // replace the terminator: one line per reply
+    ResetEvent(ov->hEvent);
+    DWORD written = 0;
+    if (WriteFile(pipe, utf8, (DWORD)n, &written, ov)) return;
+    if (GetLastError() != ERROR_IO_PENDING) return;
+    DWORD got = 0;
+    // A client that never reads its replies fills the out buffer. That must not
+    // take the server down with it, so the outcome is deliberately ignored.
+    ExtWaitIo(pipe, ov, &got);
+}
+
+static void ExtReplyErr(HANDLE pipe, OVERLAPPED *ov, int code) {
+    WCHAR text[24];
+    swprintf(text, 24, L"ERR %d", code);
+    ExtWriteLine(pipe, ov, text);
+}
+
+static void ExtLogClient(HANDLE pipe) {
+    ULONG pid = 0;
+    if (!GetNamedPipeClientProcessId(pipe, &pid)) return;
+    WCHAR path[MAX_PATH] = L"?";
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (proc) {
+        DWORD len = MAX_PATH;
+        if (!QueryFullProcessImageNameW(proc, 0, path, &len)) path[0] = L'\0';
+        CloseHandle(proc);
+    }
+    // Diagnostic only. This is NOT authentication: the trust boundary is "same
+    // user". A name in the log is what makes a badly behaved provider
+    // identifiable after the fact.
+    Wh_Log(L"EXT: client pid=%lu image=%s", pid, path);
+}
+
+static int ExtHandleLine(HANDLE pipe, OVERLAPPED *ov, const WCHAR *line, ExtSession &ses) {
+    ExtCommand cmd;
+    int code = ExtParseLine(line, cmd);
+    if (code == 0 && cmd.cmd == EC_NONE) return 0;
+    if (code != 0) { ExtReplyErr(pipe, ov, code); return code; }
+    if (cmd.cmd == EC_BYE) { ExtWriteLine(pipe, ov, L"OK bye"); return 0; }
+
+    // One snapshot per command, taken under the lock the loader writes with.
+    // Nothing is cached in a global, so a saved setting applies from the next
+    // command on and there is no second copy that can drift.
+    ModSettings snap;
+    EnterCriticalSection(&g_settingsLock);
+    snap = g_settings;
+    LeaveCriticalSection(&g_settingsLock);
+
+    if (!snap.externalData) { ExtReplyErr(pipe, ov, 405); return 405; }
+    if (!ExtNameValid(cmd.provider, cmd.providerLen, true)) { ExtReplyErr(pipe, ov, 400); return 400; }
+    if (!ExtProviderAllowed(snap, cmd.provider, cmd.providerLen)) {
+        ExtReplyErr(pipe, ov, 405);
+        return 405;
+    }
+
+    if (cmd.cmd == EC_HELLO) {
+        EnterCriticalSection(&g_extLock);
+        ses.slot = ExtFindProvider(cmd.provider, cmd.providerLen, true, snap.extMaxProviders);
+        LeaveCriticalSection(&g_extLock);
+        if (ses.slot < 0) { ExtReplyErr(pipe, ov, 403); return 403; }
+        wcsncpy(ses.provider, cmd.provider, cmd.providerLen);
+        ses.provider[cmd.providerLen] = L'\0';
+        ExtWriteLine(pipe, ov, L"OK");
+        return 0;
+    }
+
+    if (ses.slot < 0) { ExtReplyErr(pipe, ov, 401); return 401; }   // SET before HELLO
+    if (!ExtNameValid(cmd.key, cmd.keyLen, false)) { ExtReplyErr(pipe, ov, 400); return 400; }
+
+    WCHAR key[kExtKeyChars + 1];
+    wcsncpy(key, cmd.key, cmd.keyLen);
+    key[cmd.keyLen] = L'\0';
+
+    if (cmd.cmd == EC_DEL) {
+        ExtInvalidate(ses.slot, key);
+        InterlockedExchange(&g_extDirty, 1);   // show "--" without waiting a whole interval
+        ExtWriteLine(pipe, ov, L"OK");
+        return 0;
+    }
+
+    DWORD now = GetTickCount();
+    if (now - ses.windowStart >= 1000) {
+        ses.windowStart = now;
+        ses.windowCount = 0;
+    }
+    if (++ses.windowCount > snap.extMaxUpdates) {
+        ses.dropped++;
+        if (ses.dropped == 1 || (ses.dropped % 64) == 0)
+            Wh_Log(L"EXT drop reason=rate provider=%s count=%u", ses.provider, ses.dropped);
+        ExtReplyErr(pipe, ov, 404);
+        return 404;                            // dropped, connection stays open
+    }
+
+    DWORD ttl = 0;
+    if (!ExtParseTtl(cmd.ttl, cmd.ttlLen, (DWORD)snap.extValueTtlMs, &ttl)) {
+        ExtReplyErr(pipe, ov, 400);
+        return 400;
+    }
+    if (ttl == 0) {                            // "publish nothing" is a delete
+        ExtInvalidate(ses.slot, key);
+        InterlockedExchange(&g_extDirty, 1);
+        ExtWriteLine(pipe, ov, L"OK");
+        return 0;
+    }
+
+    ExtStoreValue(ses.slot, key, cmd.text, ttl, snap.extMaxValue);
+    InterlockedExchange(&g_extDirty, 1);       // the sampler merges bursts
+    // Bounded diagnostic. The key names what is on screen and is the useful part;
+    // the value itself is never logged.
+    if (ses.setLogs < 4 || (ses.setLogs % 256) == 0)
+        Wh_Log(L"EXT set provider=%s key=%s chars=%d ttl=%lu", ses.provider, key, cmd.textLen, ttl);
+    ses.setLogs++;
+    ExtWriteLine(pipe, ov, L"OK");
+    return 0;
+}
+
+static void ExtServeClient(HANDLE pipe, OVERLAPPED *ov, ExtSession &ses) {
+    char frame[kExtMaxLineBytes];
+    // 4 KB of UTF-8 can decode to at most that many UTF-16 units, so the wide
+    // buffer is sized from the byte cap rather than from half of it.
+    WCHAR line[kExtMaxLineBytes + 1];
+    for (;;) {
+        if (InterlockedCompareExchange(&g_extStop, 0, 0)) break;
+        DWORD got = 0;
+        int read = ExtReadFrame(pipe, ov, frame, (DWORD)sizeof(frame), &got);
+        if (read < 0) break;
+        if (read == 0) { ExtReplyErr(pipe, ov, 402); break; }
+        if (got == 0) continue;
+        int wide = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, frame, (int)got, line,
+                                       kExtMaxLineBytes);
+        if (wide <= 0) { ExtReplyErr(pipe, ov, 400); continue; }
+        line[wide] = L'\0';
+        ExtHandleLine(pipe, ov, line, ses);
+    }
+}
+
+static PSECURITY_DESCRIPTOR ExtPipeSecurityDescriptor() {
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    // SYSTEM, Administrators and the creating user (owner). Everything else is
+    // denied, and the pipe itself refuses remote clients outright.
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;CO)", SDDL_REVISION_1, &sd, nullptr)) {
+        return sd;
+    }
+    Wh_Log(L"EXT: could not build the pipe DACL (%lu); using the process default",
+           GetLastError());
+    return nullptr;
+}
+
+static DWORD WINAPI ExtPipeThread(LPVOID) {
+    OVERLAPPED ov = {};
+    ov.hEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!ov.hEvent) { Wh_Log(L"EXT: CreateEvent failed: %lu", GetLastError()); return 1; }
+
+    PSECURITY_DESCRIPTOR sd = ExtPipeSecurityDescriptor();
+    SECURITY_ATTRIBUTES sa = {};
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = sd;
+    sa.bInheritHandle = FALSE;
+
+    while (!InterlockedCompareExchange(&g_extStop, 0, 0)) {
+        HANDLE pipe = CreateNamedPipeW(kExtPipeName,
+                                       PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                                       PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT |
+                                           PIPE_REJECT_REMOTE_CLIENTS,
+                                       1, 8192, 8192, 0, &sa);
+        if (pipe == INVALID_HANDLE_VALUE) {
+            Wh_Log(L"EXT: CreateNamedPipe failed: %lu", GetLastError());
+            break;
+        }
+        if (!ExtConnect(pipe, &ov)) { CloseHandle(pipe); break; }
+        ExtLogClient(pipe);
+        ExtSession ses;                        // per connection: provider + rate window
+        ExtServeClient(pipe, &ov, ses);
+        // No FlushFileBuffers before disconnecting: it blocks until the client has
+        // read everything, and a client that never reads must not be able to pin
+        // this thread.
+        DisconnectNamedPipe(pipe);
+        CloseHandle(pipe);
+    }
+    if (sd) LocalFree(sd);
+    CloseHandle(ov.hEvent);
+    return 0;
+}
+
+static void ExtStart() {
+    InitializeCriticalSection(&g_extLock);
+    g_extLockReady = true;
+    g_extStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_extStopEvent) {
+        Wh_Log(L"EXT: CreateEvent failed: %lu; external values stay unavailable",
+               GetLastError());
+        return;
+    }
+    for (int i = 0; i < kExtInstances; i++) {
+        g_extThreads[i] = CreateThread(nullptr, 0, ExtPipeThread, nullptr, 0, nullptr);
+        if (!g_extThreads[i]) {
+            Wh_Log(L"EXT: pipe thread %d could not start: %lu", i, GetLastError());
+            break;
+        }
+        g_extThreadCount++;
+    }
+    Wh_Log(L"EXT: serving %d pipe instance(s) on %s", g_extThreadCount, kExtPipeName);
+}
+
+static void ExtStop() {
+    InterlockedExchange(&g_extStop, 1);
+    if (g_extStopEvent) SetEvent(g_extStopEvent);
+    if (g_extThreadCount > 0) {
+        WaitForMultipleObjects((DWORD)g_extThreadCount, g_extThreads, TRUE, 2000);
+        for (int i = 0; i < g_extThreadCount; i++) {
+            CloseHandle(g_extThreads[i]);
+            g_extThreads[i] = nullptr;
+        }
+        g_extThreadCount = 0;
+    }
+    if (g_extStopEvent) {
+        CloseHandle(g_extStopEvent);
+        g_extStopEvent = nullptr;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Loader-thread settings plumbing
 // ---------------------------------------------------------------------------
-static void PushSettings() {
+static void PushSettings(int updateMs) {
     // No allocation: the HUD thread reads g_settings under the same lock the
     // loader thread writes it with. That keeps this DLL free of any C++ runtime
     // import (new/delete is what pulls in libc++.dll), so it stays a ~125 KB
     // self-contained mod instead of a ~590 KB statically-linked one.
+    // The refresh interval comes from the caller's copy rather than from the
+    // global, so it cannot disagree with the settings that were just swapped in.
+    InterlockedExchange(&g_refreshMs, updateMs);
     HWND window = g_window;
     if (!window) return;
     PostMessageW(window, kMsgApplySettings, 0, 0);
-    InterlockedExchange(&g_refreshMs, g_settings.updateMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -4282,15 +5105,29 @@ BOOL WhTool_ModInit() {
 }
 
 void WhTool_ModSettingsChanged() {
-    ReadSettings(g_settings);
-    ReadCpuStatic();
-    PushSettings();
-    Wh_Log(L"Settings applied: rows=%d clickAction=%s", g_settings.rowCount,
-           g_settings.clickToggle ? L"toggle" : L"proximity");
+    // Read into a local, then swap it in under the lock the sampler copies it
+    // with. Writing g_settings in place left the sampler free to copy a
+    // half-applied configuration for one interval (docs/... 5.6.3 R1).
+    ModSettings fresh;
+    ReadSettings(fresh);
+    EnterCriticalSection(&g_settingsLock);
+    g_settings = fresh;
+    LeaveCriticalSection(&g_settingsLock);
+    // ReadCpuStatic() is deliberately not called here: it writes the CPU identity
+    // fields that the sampler thread reads, so it now runs on that thread when it
+    // notices the new settings version.
+    PushSettings(fresh.updateMs);
+    Wh_Log(L"Settings applied: rows=%d clickAction=%s", fresh.rowCount,
+           fresh.clickToggle ? L"toggle" : L"proximity");
 }
 
 void WhTool_ModUninit() {
     InterlockedExchange(&g_stopSampler, 1);
+    // Stop the pipe server first: it writes the external value table and the
+    // sampler (the reader) is still running. Stopping the reader first would
+    // leave a writer racing a lock that is about to be deleted
+    // (docs/external-data-island-design.md 5.6.4).
+    ExtStop();
     if (g_samplerThread) {
         WaitForSingleObject(g_samplerThread, 2000);
         CloseHandle(g_samplerThread);
@@ -4321,6 +5158,12 @@ void WhTool_ModUninit() {
     }
     DeleteCriticalSection(&g_valuesLock);
     DeleteCriticalSection(&g_settingsLock);
+    // Only now: the pipe threads and the sampler are both joined, so nothing can
+    // be inside the external lock any more.
+    if (g_extLockReady) {
+        DeleteCriticalSection(&g_extLock);
+        g_extLockReady = false;
+    }
     Wh_Log(L"Unloaded");
 }
 

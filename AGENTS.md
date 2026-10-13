@@ -25,11 +25,11 @@
 
 ```
 endfield-info-windhawk/
-├── endfield-info-windhawk.wh.cpp      唯一的交付物（约 190 KB）
+├── endfield-info-windhawk.wh.cpp      唯一的交付物（约 226 KB）
 ├── README.md                          用户文档
 ├── AGENTS.md                          本文
 ├── docs/                              规划与设计文档（不是实现说明）
-│   └── external-data-island-design.md 提案：外部数据源 + 灵动岛形态（尚未实现）
+│   └── external-data-island-design.md 设计：外部数据（M1 已实现）+ 灵动岛（提案）
 │
 ├── 开发工具（不随 mod 交付）
 ├── build.ps1                          本地编译，不用开 Windhawk GUI
@@ -37,6 +37,7 @@ endfield-info-windhawk/
 ├── test-gdiplus-scale.cpp             GDI+ 缩放探针（独立 exe）
 ├── _settings.py                       校验 mod 头部的设置块结构
 ├── _preview.py                        渲染 assets/panel-preview.png
+├── _extclient.py                      外部数据管道的冒烟客户端
 └── assets/panel-preview.png           版面预览（README 引用）
 ```
 
@@ -62,7 +63,7 @@ endfield-info-windhawk/
   `// ==WindhawkModSettings==` 块里的静态 YAML。字体、图标路径这类只能手输 + 校验。
 
 **约束**：不使用 `new` / `delete` / `std::*` / 异常。原因是**体积**
-（去掉堆分配后约 122 KB，静态链接 libc++ 会涨到约 578 KB），
+（去掉堆分配后约 158 KB，静态链接 libc++ 会涨到约 590 KB），
 **不是**因为运行时不可用——Windhawk 会自带并注入 `libc++.whl`，堆分配其实能用。
 早先 AGENTS 里"堆分配不可用"的说法是错的，已更正。
 
@@ -175,6 +176,8 @@ python _preview.py
 | `PaintPanel` | 唯一的绘制入口 |
 | `ForceTopmost` / `PlaceWindow` / `WindowProc` | 窗口生命周期、热区、命中测试 |
 | `HudThreadProc` / `SamplerThread` | HUD 线程（消息循环）与采样线程 |
+| `ExtLookup` / `ExtSanitize` / `ExtStoreValue` | 外部提供者推来的值：定长槽位表，零分配 |
+| `ExtPipeThread` / `ExtStart` / `ExtStop` | 命名管道服务端：每实例一线程，被引用到才启动 |
 
 ### 关键设计：把逻辑抽成纯函数以便断言
 
@@ -185,7 +188,9 @@ python _preview.py
 `ComputePanelTransform` · `ApplyPanelTransform` · `IconPlateDiameter` ·
 `IconPlateCenterForRow` · `ComputeIconGeometry` · `RingRadiusAt` ·
 `PlanDownscale` · `CopyUserPath` · `ResolveIconStyle` / `ResolveIconPath` ·
-`EvaluateIntro` · `FitCharacterCount` / `FitCharsWithEllipsis`（测量以函数指针注入）
+`EvaluateIntro` · `FitCharacterCount` / `FitCharsWithEllipsis`（测量以函数指针注入） ·
+`ExtParseLine` · `ExtSanitize` · `ExtParseNumber` · `ExtLookup` · `ExtNextDeadline` ·
+`ExtEvictIndex` · `ExtProviderAllowed`
 
 **新增绘制逻辑时照此办理。** 如果一段逻辑无法在测试里调用，它就无法被守住。
 反过来，**测试不应该自己复刻一份产品逻辑**（复刻出来的那份测不到产品）；
@@ -287,6 +292,21 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 - 置顶用三重手段：创建时样式位 + `SetWindowPos` 显式写位 + 每 100ms 重申。
   **周期性重申换来的不是正确性而是延迟**（已用独立探针验证），所以不要因为
   "反正会重申"就省掉创建时的样式位。
+
+### 5.6 外部数据（命名管道）
+
+- **只在有行引用 `{ext.*}` 且设置打开时才创建管道**：没有引用就是零成本
+  （不建线程、不建表）。这条和 `RequiredGroups` 的按需加载是同一个设计。
+- **展开行文本时持 `g_extLock`，且绝不给锁嵌套**：先放 `g_extLock` 再拿 `g_valuesLock`。
+  HUD 线程**永不**触碰 `g_extLock`——它只读两个原子（`g_extDeadlineMs`、`g_extDirty`），
+  这是锁图能保持无环的原因。
+- **值过期不能只重绘**：`g_rowState` 存的是**已展开的文本**，token 早就不在了，
+  只有 sampler 再展开一次，`--` 才会出现。所以 deadline 由 sampler 发布（`ExtNextDeadline`），
+  40 ms 的 tick 到期时只是**再要一次采样**。
+- **外部文本不被二次展开**（注入不成立）。这条由结构保证——`ExpandTokens` 只对模板做单向扫描，
+  替换出来的文本不会被重新扫描——并且有断言钉住：把展开改成递归，
+  `test-layout.cpp` 里 "a pushed value that looks like a token stays literal" 必须变红（已实测）。
+- **停机顺序：IPC 先于 sampler**（写者先于读者），最后才 `DeleteCriticalSection(&g_extLock)`。
 
 ---
 
@@ -436,6 +456,10 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
    **有测试保证"32 个变量全部能解析"**，漏了会被测出来。
 5. 更新 README 的「变量速查」表。
 
+> `{ext.*}` 是**运行期**变量，**不要**注册进 `kVariables[]`：那张表是编译期的采集通路清单，
+> 外部变量的组由 `RequiredGroups()` 里的前缀判断给出（[1343]），注册进去只会误导下一个人。
+> 它的断言写在 `test-layout.cpp` 末尾的 "external data" 一节。
+
 ### 改动绘制/布局/几何
 
 1. **先把要断言的关系抽成纯函数**（见 §4）。
@@ -463,10 +487,13 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   （头顺序 + `ApplyPanelTransform` 未使用）。
 - 7 个导出入口齐全。
 - 依赖仅系统 DLL：`USER32 / GDI32 / PDH / IPHLPAPI / PSAPI / ADVAPI32 / msvcrt / KERNEL32`。
-- 回归测试全绿（193 条断言，含一段**真启动 GDI+** 的排版断言：
+- 回归测试全绿（241 条断言，含一段**真启动 GDI+** 的排版断言：
   文字不折行、且在预算内）。
 - GDI+ 缩放管线用**已知内容**的图验证过（含透明底、纯 RGB、索引色、灰度+alpha、
   16 位、隔行 PNG）。
+- 外部数据（M1）：编译只剩上面那两条已知警告；回归 **241 条断言**全绿，其中 48 条是这一版新增；
+  并做了**负对照**——把展开改成递归后，注入断言确实变红（不是"看着像在守"）。
+- 设置块 46 项 / 10 个选项组，`_settings.py` 报 `no structural problems found`。
 
 **未验证**（需要真实运行环境）：
 
@@ -475,6 +502,9 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 - 多于 2 台显示器的定位。
 - 长时间运行稳定性（线程退出、采集器生命周期）。
 - `{gpu.temp}` 在非 NVIDIA 机器上的表现。
+- **外部数据的端到端行为**（无法在本机自动验证，必须真跑 Windhawk）：客户端连接/断开/重连、
+  多个提供者并发、50 ms 唤醒的实际延迟、到期 → `--` 的实测时间、非管理员账户下管道 DACL 的行为、
+  卸载时有在途消息时的收尾。
 
 **已知的残留警告**：`ApplyPanelTransform` 在主 mod 中未被调用（只服务于测试），
 会报 `unused function`。要么给它加 `__attribute__((unused))`，要么把它挪进测试文件。
@@ -489,5 +519,5 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   <https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-dedicated-process>
 - 本地工具链：`D:\Program Files\Windhawk\Compiler\`（clang 20.1.3 + MinGW）
 - 真实编译参数：`C:\ProgramData\Windhawk\EditorWorkspace\compile_flags.txt`
-- 本仓库的规划文档（**提案，尚未实现**，不要当成现有行为）：
+- 本仓库的设计文档（**M1 数据面已实现；灵动岛形态仍是提案**，不要当成现有行为）：
   [docs/external-data-island-design.md](docs/external-data-island-design.md)

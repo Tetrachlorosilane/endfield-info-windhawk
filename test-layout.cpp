@@ -1035,6 +1035,203 @@ int main() {
         }
     }
 
+    printf("\n=== external data (named-pipe providers) ===\n");
+    {
+        // The slot table's lock is normally created by ExtStart on the sampler
+        // thread. This host never runs WhTool_ModInit, so it creates the lock
+        // itself -- which is exactly why the lookup helpers take no lock.
+        InitializeCriticalSection(&g_extLock);
+        g_extLockReady = true;
+
+        // A value that only looks numeric must never drive a gauge or a |0 spec.
+        struct NumberCase { const WCHAR *text; bool ok; double value; };
+        const NumberCase numbers[] = {
+            {L"42", true, 42.0}, {L"-1.5", true, -1.5}, {L"+0", true, 0.0},
+            {L"73%", false, 0},  {L" 42", false, 0},    {L"4 2", false, 0},
+            {L".5", false, 0},   {L"1.", false, 0},     {L"1e3", false, 0},
+            {L"", false, 0},     {L"-", false, 0},      {L"abc", false, 0},
+        };
+        bool numbersOk = true;
+        for (const NumberCase &c : numbers) {
+            double parsed = -999;
+            bool ok = ExtParseNumber(c.text, parsed);
+            if (ok != c.ok || (ok && parsed != c.value)) {
+                numbersOk = false;
+                printf("  ExtParseNumber(\"%ls\") -> %d %f, expected %d %f\n",
+                       c.text, ok ? 1 : 0, parsed, c.ok ? 1 : 0, c.value);
+            }
+        }
+        Check(numbersOk, "only strictly numeric values count as numbers");
+
+        WCHAR buffer[64];
+        ExtSanitize(L"  hello\r\n\tworld  ", buffer, 64);
+        printf("  sanitised: \"%ls\"\n", buffer);
+        Check(wcscmp(buffer, L"hello world") == 0,
+              "control characters and edge spaces are removed");
+
+        // Unit level: the sanitiser itself never rewrites what it is given.
+        ExtSanitize(L"{cpu}%", buffer, 64);
+        Check(wcscmp(buffer, L"{cpu}%") == 0, "the sanitiser does not rewrite tokens");
+
+        WCHAR longValue[600];
+        for (int i = 0; i < 599; i++) longValue[i] = L'x';
+        longValue[599] = L'\0';
+        ExtSanitize(longValue, buffer, 16);
+        printf("  truncated: \"%ls\" (%d chars)\n", buffer, (int)wcslen(buffer));
+        Check((int)wcslen(buffer) == 15, "an over-long value is cut to the cap");
+        Check(buffer[14] == 0x2026, "the cut is marked with an ellipsis");
+
+        EnterCriticalSection(&g_extLock);
+        int slot = ExtFindProvider(L"music", 5, true, kMaxExtProviders);
+        LeaveCriticalSection(&g_extLock);
+        Check(slot >= 0, "a provider gets a slot");
+
+        ExtStoreValue(slot, L"title", L"  Now Playing: Blue Hour  ", 60000, 128);
+        const WCHAR *text = nullptr;
+        Check(ExtLookup(L"ext.music.title", (int)wcslen(L"ext.music.title"), &text) == ER_VALUE,
+              "a stored value resolves");
+        Check(text && wcscmp(text, L"Now Playing: Blue Hour") == 0,
+              "the stored value is trimmed before it is shown");
+        Check(ExtLookup(L"ext.MUSIC.Title", (int)wcslen(L"ext.MUSIC.Title"), &text) == ER_VALUE,
+              "provider and key match case-insensitively");
+        Check(ExtLookup(L"ext.music.nope", (int)wcslen(L"ext.music.nope"), &text) == ER_EXPIRED,
+              "a missing key of a known provider is unavailable");
+        Check(ExtLookup(L"ext.nobody.title", (int)wcslen(L"ext.nobody.title"), &text) == ER_EXPIRED,
+              "an unknown provider is unavailable");
+        Check(ExtLookup(L"ext.", 4, &text) == ER_NONE, "a bare ext. stays literal");
+        Check(ExtLookup(L"ext.music.", (int)wcslen(L"ext.music."), &text) == ER_NONE,
+              "an empty key stays literal");
+        Check(ExtLookup(L"ext.music.a b", (int)wcslen(L"ext.music.a b"), &text) == ER_NONE,
+              "an invalid key character stays literal");
+
+        ExtStoreValue(slot, L"short", L"x", 1, 128);      // 1 ms
+        Sleep(10);
+        Check(ExtLookup(L"ext.music.short", (int)wcslen(L"ext.music.short"), &text) == ER_EXPIRED,
+              "a value past its ttl renders as unavailable");
+
+        // The deadline is what lets the HUD tick turn a dead provider into "--"
+        // without waiting for the next scheduled sample.
+        Check(ExtNextDeadline(g_ext, kMaxExtProviders) != 0, "a live value publishes a deadline");
+        ExtInvalidate(slot, L"title");
+        Check(ExtNextDeadline(g_ext, kMaxExtProviders) == 0,
+              "nothing live -> no deadline, so the tick stops poking");
+
+        ExtProvider fake = {};
+        wcsncpy(fake.name, L"fake", kExtProviderChars);
+        fake.count = 3;
+        for (int i = 0; i < 3; i++) fake.entries[i].updatedAt = 100;
+        fake.entries[0].ttlMs = 10;
+        fake.entries[1].ttlMs = 50;
+        fake.entries[2].ttlMs = 20;
+        Check(ExtEvictIndex(fake) == 0, "eviction picks the entry that expires first");
+        fake.entries[0].updatedAt = 100;
+        fake.entries[0].ttlMs = 50;
+        fake.entries[1].updatedAt = 200;
+        fake.entries[1].ttlMs = 50;
+        fake.entries[2].updatedAt = 150;
+        fake.entries[2].ttlMs = 50;
+        Check(ExtEvictIndex(fake) == 0, "with equal expiry the oldest update goes");
+
+        ModSettings allow;
+        Check(ExtProviderAllowed(allow, L"music", 5), "an empty allowlist allows any provider");
+        wcsncpy(allow.extProviders, L"music; discord", kExtProviderListChars - 1);
+        Check(ExtProviderAllowed(allow, L"music", 5), "a listed provider is allowed");
+        Check(ExtProviderAllowed(allow, L"discord", 7), "space around a list entry is ignored");
+        Check(!ExtProviderAllowed(allow, L"other", 5), "an unlisted provider is refused");
+
+        ExtCommand cmd;
+        Check(ExtParseLine(L"", cmd) == 0 && cmd.cmd == EC_NONE, "a blank line is ignored");
+        Check(ExtParseLine(L"# note", cmd) == 0 && cmd.cmd == EC_NONE, "a comment is ignored");
+        Check(ExtParseLine(L"HELLO 1 music", cmd) == 0 && cmd.cmd == EC_HELLO, "HELLO is accepted");
+        Check(ExtParseLine(L"HELLO 2 music", cmd) == 400, "an unknown protocol version is refused");
+        Check(ExtParseLine(L"NOPE 1", cmd) == 400, "an unknown command is refused");
+        Check(ExtParseLine(L"SET music title", cmd) == 400, "a short SET is refused");
+        Check(ExtParseLine(L"SET music title - Now Playing: Blue Hour", cmd) == 0 &&
+                  cmd.cmd == EC_SET && cmd.textLen == 22 &&
+                  _wcsnicmp(cmd.text, L"Now Playing: Blue Hour", 22) == 0,
+              "SET keeps its text, spaces and all");
+        Check(ExtParseLine(L"EVENT music info - t b", cmd) == 501,
+              "EVENT is refused as not implemented yet");
+        DWORD ttl = 0;
+        Check(ExtParseTtl(L"-", 1, 5000, &ttl) && ttl == 5000, "- means the configured default");
+        Check(ExtParseTtl(L"250", 3, 5000, &ttl) && ttl == 250, "an explicit ttl is used as given");
+        Check(!ExtParseTtl(L"abc", 3, 5000, &ttl), "a non-numeric ttl is refused");
+
+        {
+            ModSettings rows;
+            wcsncpy(rows.rows[0], L"CPU {cpu}%  {ext.music.title}", 255);
+            rows.rowCount = 1;
+            unsigned groups = RequiredGroups(rows);
+            Check((groups & G_EXT) != 0, "{ext.*} selects the external group");
+            Check((groups & G_CPU) != 0, "and built-in groups are still found");
+            ModSettings bad;
+            wcsncpy(bad.rows[0], L"{ext.}", 255);
+            bad.rowCount = 1;
+            Check((RequiredGroups(bad) & G_EXT) == 0, "a malformed {ext.} selects nothing");
+        }
+
+        ExtStoreValue(slot, L"progress", L"0.42", 60000, 128);
+        {
+            Values v;
+            ModSettings cfg;
+            RingSpec ring = {};
+            const WCHAR *body = L"{ext.music.progress}:1";
+            Check(ParseRing(body, (int)wcslen(body), v, cfg, ring) &&
+                      ring.value > 0.41 && ring.value < 0.43,
+                  "a gauge can be driven by an external value");
+        }
+
+        // The property that actually matters, end to end: a pushed value that looks
+        // like a token is substituted as text and NOT re-expanded. Expansion walks
+        // the template once and never rescans what it copied, so this stays
+        // literal. Making expansion recursive is the way to break it, and this
+        // assertion is what turns red when someone does.
+        ExtStoreValue(slot, L"injected", L"{cpu}", 60000, 128);
+        {
+            Values v;
+            v.cpu = 12.0;
+            WCHAR out[64];
+            ExpandTokens(L"[{ext.music.injected}]", v, out, 64);
+            printf("  an injected token expands to: \"%ls\"\n", out);
+            Check(wcscmp(out, L"[{cpu}]") == 0,
+                  "a pushed value that looks like a token stays literal");
+        }
+
+        {
+            const StubSetting extOn[] = {
+                {L"ExternalData", L"On"},
+                {L"ExtProviders", L"music;discord"},
+            };
+            g_stubStrings = extOn;
+            g_stubStringCount = (int)(sizeof(extOn) / sizeof(extOn[0]));
+            const StubSetting extInts[] = {
+                {L"ExtMaxValue", L"4096"},     // above the ceiling
+                {L"ExtMaxProviders", L"99"},   // above the table
+                {L"ExtValueTtlMs", L"5"},      // below the floor
+            };
+            g_stubInts = extInts;
+            g_stubIntCount = (int)(sizeof(extInts) / sizeof(extInts[0]));
+            ModSettings s;
+            ReadSettings(s);
+            printf("  ExternalData=%d ttl=%d maxValue=%d providers=%d list=\"%ls\"\n",
+                   s.externalData ? 1 : 0, s.extValueTtlMs, s.extMaxValue, s.extMaxProviders,
+                   s.extProviders);
+            Check(s.externalData, "the string enum turns external data on");
+            Check(s.extMaxValue == kExtMaxValueChars, "the value length is clamped to the ceiling");
+            Check(s.extMaxProviders == kMaxExtProviders, "the provider limit is clamped to the table");
+            Check(s.extValueTtlMs == 100, "the ttl is clamped to the floor");
+            Check(wcscmp(s.extProviders, L"music;discord") == 0, "the allowlist is read verbatim");
+
+            g_stubStrings = nullptr;
+            g_stubStringCount = 0;
+            g_stubInts = nullptr;
+            g_stubIntCount = 0;
+        }
+
+        DeleteCriticalSection(&g_extLock);
+        g_extLockReady = false;
+    }
+
     printf("\n%s (%d failure(s))\n", g_failures ? "FAILED" : "PASSED", g_failures);
     return g_failures ? 1 : 0;
 }
