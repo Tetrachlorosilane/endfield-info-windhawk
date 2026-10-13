@@ -1159,8 +1159,8 @@ int main() {
                   cmd.cmd == EC_SET && cmd.textLen == 22 &&
                   _wcsnicmp(cmd.text, L"Now Playing: Blue Hour", 22) == 0,
               "SET keeps its text, spaces and all");
-        Check(ExtParseLine(L"EVENT music info - t b", cmd) == 501,
-              "EVENT is refused as not implemented yet");
+        Check(ExtParseLine(L"EVENT music info - t b", cmd) == 0 && cmd.cmd == EC_EVENT,
+              "EVENT parses now that the event milestone implements it");
         DWORD ttl = 0;
         Check(ExtParseTtl(L"-", 1, 5000, &ttl) && ttl == 5000, "- means the configured default");
         Check(ExtParseTtl(L"250", 3, 5000, &ttl) && ttl == 250, "an explicit ttl is used as given");
@@ -1312,6 +1312,110 @@ int main() {
             LeaveCriticalSection(&g_settingsLock);
             if (ov.hEvent) CloseHandle(ov.hEvent);
             DeleteCriticalSection(&g_settingsLock);
+        }
+
+        // --- M2: the event channel (design 4.2 / 7.2 / 7.3) -----------------------
+        {
+            ExtCommand ev;
+            Check(ExtParseLine(L"EVENT music info 8000 Title body text here", ev) == 0 &&
+                      ev.cmd == EC_EVENT && ev.severity == ES_INFO && ev.ttlLen == 4 &&
+                      ev.titleLen == 5 && ev.bodyLen == 14,
+                  "EVENT parses provider, severity, ttl, title and the rest as body");
+            Check(ExtParseLine(L"EVENT music critical - T b", ev) == 0 &&
+                      ev.severity == ES_CRITICAL && ev.ttlLen == 1,
+                  "critical severity and the default-ttl marker parse");
+            Check(ExtParseLine(L"EVENT music nope 8000 T b", ev) == 400,
+                  "an unknown severity is a parse error");
+            Check(ExtParseLine(L"EVENT music info 8000", ev) == 400,
+                  "EVENT without a title is a parse error");
+            Check(ExtParseLine(L"SET music title - x", ev) == 0 && ev.cmd == EC_SET,
+                  "SET still parses now that EVENT does");
+        }
+
+        // The queue's ordering rules, straight from design 7.3.
+        {
+            IslandEvent a = {};
+            wcsncpy(a.provider, L"music", kExtProviderChars);
+            wcsncpy(a.title, L"A", kIslandTitleChars - 1);
+            a.severity = ES_INFO; a.ttlMs = 6000; a.repeat = 1; a.queuedAt = 1000;
+            IslandEvent b = a; wcsncpy(b.title, L"B", kIslandTitleChars - 1); b.queuedAt = 2000;
+            IslandEvent c = a; wcsncpy(c.title, L"C", kIslandTitleChars - 1);
+            c.severity = ES_CRITICAL; c.queuedAt = 3000;
+
+            IslandEvent q[kIslandQueueMax] = {};
+            unsigned drops = 0;
+            int n = IslandEnqueue(q, 0, 4, a, &drops);
+            Check(n == 1 && wcscmp(q[0].title, L"A") == 0, "an event is queued");
+            n = IslandEnqueue(q, n, 4, b, &drops);
+            Check(n == 1 && wcscmp(q[0].title, L"B") == 0,
+                  "the same provider replaces its own pending event, not queue a second");
+            n = IslandEnqueue(q, n, 4, b, &drops);
+            Check(n == 1 && q[0].repeat == 2,
+                  "the same title inside the window bumps a repeat instead of queueing");
+            n = IslandEnqueue(q, n, 4, c, &drops);
+            Check(n == 1 && wcscmp(q[0].title, L"C") == 0 && q[0].severity == ES_CRITICAL,
+                  "a replaced slot takes the arriving severity");
+
+            IslandEvent d = b;
+            wcsncpy(d.provider, L"discord", kExtProviderChars); d.queuedAt = 4000;
+            n = IslandEnqueue(q, n, 4, d, &drops);
+            Check(n == 2 && IslandPick(q, n) == 0 && q[0].severity == ES_CRITICAL,
+                  "a second provider gets its own slot, and picking prefers severity");
+            IslandEvent e = d;
+            wcsncpy(e.provider, L"mail", kExtProviderChars); e.queuedAt = 5000;
+            n = IslandEnqueue(q, n, 4, e, &drops);
+            Check(n == 3 && IslandPick(q, n) == 0, "inside a level the earliest still wins");
+
+            IslandEvent f = d;
+            wcsncpy(f.provider, L"chat", kExtProviderChars); f.queuedAt = 6000;
+            n = IslandEnqueue(q, n, 3, f, &drops);
+            Check(n == 3 && drops == 1 && _wcsicmp(q[1].provider, L"chat") == 0 &&
+                      _wcsicmp(q[2].provider, L"mail") == 0,
+                  "a full queue drops the weakest, earliest entry and counts it");
+            IslandEvent alarm = c;
+            wcsncpy(alarm.provider, L"alarm", kExtProviderChars); alarm.queuedAt = 7000;
+            n = IslandEnqueue(q, n, 3, alarm, &drops);
+            Check(n == 3 && q[IslandPick(q, n)].severity == ES_CRITICAL,
+                  "a critical displaces an info rather than being dropped");
+        }
+
+        // The state machine's transitions (design 7.2), on an explicit clock.
+        {
+            IslandEvent q[2] = {};
+            wcsncpy(q[0].provider, L"music", kExtProviderChars);
+            wcsncpy(q[0].title, L"T", kIslandTitleChars - 1);
+            q[0].severity = ES_INFO; q[0].ttlMs = 500;
+            wcsncpy(q[1].provider, L"alarm", kExtProviderChars);
+            wcsncpy(q[1].title, L"Z", kIslandTitleChars - 1);
+            q[1].severity = ES_CRITICAL; q[1].ttlMs = 500;
+
+            IslandView v = {};
+            int pop = -1;
+            Check(StepIsland(&v, q, 1, 1000, false, &pop) == IS_POPPING && pop == 0,
+                  "a queued event starts the pop");
+            Check(v.cardDeadline == 1500, "the card inherits the event's ttl");
+            Check(StepIsland(&v, q, 1, 1100, false, nullptr) == IS_POPPING,
+                  "the pop keeps playing until the animation reports it finished");
+            Check(StepIsland(&v, q, 1, 1200, true, nullptr) == IS_CARD,
+                  "the pop settles into a card");
+            Check(StepIsland(&v, q, 1, 1499, false, nullptr) == IS_CARD,
+                  "the card lives until its ttl");
+            Check(StepIsland(&v, q, 1, 1500, false, nullptr) == IS_COLLAPSING,
+                  "then it collapses -- nothing stays on screen forever");
+            Check(StepIsland(&v, q, 0, 1600, true, nullptr) == IS_IDLE,
+                  "with nothing queued, collapsing settles back to idle");
+            v.state = IS_CARD; v.showing = ES_INFO; v.cardDeadline = 2000;
+            Check(StepIsland(&v, q, 1, 2000, false, nullptr) == IS_COLLAPSING,
+                  "an expired card starts collapsing");
+            Check(StepIsland(&v, q, 1, 2100, true, &pop) == IS_POPPING && pop == 0,
+                  "a queue that is not empty goes straight into the next pop");
+
+            v.state = IS_CARD; v.showing = ES_INFO; v.cardDeadline = 99000;
+            Check(StepIsland(&v, q, 2, 3000, false, nullptr) == IS_COLLAPSING,
+                  "a waiting critical preempts an info card");
+            Check(StepIsland(&v, q, 2, 3100, true, &pop) == IS_POPPING && pop == 1,
+                  "and the critical is what pops next");
+            Check(v.showing == ES_CRITICAL, "the view now shows the critical");
         }
 
         // The pipe's DACL has to actually admit this user. Getting it wrong is

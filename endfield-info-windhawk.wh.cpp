@@ -295,6 +295,9 @@ static const UINT_PTR kTimerPerf = 2;      // self-measurement
 static const UINT kMsgRatesReady = WM_APP + 1;
 static const UINT kMsgApplySettings = WM_APP + 2;
 static const UINT kMsgQuit = WM_APP + 3;
+// Posted to the HUD *thread* (never to the window handle) when an event is queued:
+// the handle can be gone while a pipe thread still holds it (design 5.6.3 R5).
+static const UINT kMsgIslandEvent = WM_APP + 4;
 
 static const int kMaxRows = 4;
 static const int kMaxRingsPerRow = 4;
@@ -1796,6 +1799,205 @@ static void ExtLogStatus(const WCHAR *name, int nameLen, int status) {
     g_extStatusSeen[free].status = status;
     Wh_Log(L"EXT %s -> %s", g_extStatusSeen[free].name, ExtStatusName(status));
 }
+
+// ---------------------------------------------------------------------------
+// External data: the event queue behind the island (design 7.3)
+//
+// Written by the pipe threads, read by the HUD, so it has its own lock and never
+// nests with g_extLock: the HUD never touches the value store, and a pipe thread
+// that enqueues an event touches nothing else. Everything below that decides
+// *order* is a pure function, so the rules -- replace your own pending event, merge
+// an identical title, prefer the higher severity, drop the weakest when full -- are
+// asserted without a window or a pipe.
+// ---------------------------------------------------------------------------
+static const int    kIslandQueueMax = 8;              // ExtEventQueue clamps to 1..8
+static const int    kIslandTitleChars = 96;
+static const int    kIslandBodyChars = 160;
+static const DWORD  kIslandMergeWindowMs = 2000;
+// Phase durations. They live here, not in the drawing code, because the state
+// machine is what decides when a phase is over; the visual layer reads the same
+// numbers so the two cannot disagree about what "settled" means.
+static const DWORD  kIslandPopMs = 220;
+static const DWORD  kIslandCollapseMs = 140;
+
+enum ExtSeverity { ES_INFO = 0, ES_WARN = 1, ES_CRITICAL = 2 };
+
+struct IslandEvent {
+    WCHAR       provider[kExtProviderChars + 1];
+    WCHAR       title[kIslandTitleChars];
+    WCHAR       body[kIslandBodyChars];
+    ExtSeverity severity;
+    DWORD       ttlMs;
+    unsigned    repeat;
+    DWORD       queuedAt;
+};
+
+enum IslandState { IS_IDLE = 0, IS_POPPING, IS_CARD, IS_COLLAPSING };
+
+struct IslandView {
+    IslandState state;
+    DWORD       phaseStarted;
+    DWORD       cardDeadline;
+    ExtSeverity showing;          // severity of the card on screen
+};
+
+static IslandEvent      g_islandQueue[kIslandQueueMax];
+static int              g_islandCount = 0;
+static CRITICAL_SECTION g_islandLock;
+static bool             g_islandLockReady = false;
+static unsigned         g_islandDrops = 0;
+static unsigned         g_islandAccepted = 0;
+static unsigned         g_islandWakes = 0;            // HUD-side: wakes actually seen
+// HUD thread only: the state machine's view, the card currently on screen, and a
+// bounded log counter. The queue itself stays behind its lock.
+static IslandView      g_islandView;
+static IslandEvent     g_islandCard;
+static bool            g_islandCardValid = false;
+static int             g_islandLogs = 0;
+
+static bool ExtParseSeverity(const WCHAR *s, int len, ExtSeverity *out) {
+    if (len <= 0 || !s) return false;
+    if (len == 4 && _wcsnicmp(s, L"info", 4) == 0) { *out = ES_INFO; return true; }
+    if (len == 4 && _wcsnicmp(s, L"warn", 4) == 0) { *out = ES_WARN; return true; }
+    if (len == 8 && _wcsnicmp(s, L"critical", 8) == 0) { *out = ES_CRITICAL; return true; }
+    return false;
+}
+
+// Which queued event to show next: highest severity first, FIFO inside a level.
+static int IslandPick(const IslandEvent *queue, int count) {
+    int best = -1;
+    for (int i = 0; i < count; i++) {
+        // Strictly greater, so the earliest of the highest level wins.
+        if (best < 0 || queue[i].severity > queue[best].severity) best = i;
+    }
+    return best;
+}
+
+// Adds an event; returns the new count. `drops` counts what was lost, so "the queue
+// was full" is visible in the log instead of being silent.
+static int IslandEnqueue(IslandEvent *queue, int count, int cap, const IslandEvent &ev,
+                         unsigned *drops) {
+    if (cap > kIslandQueueMax) cap = kIslandQueueMax;
+    if (cap < 1) cap = 1;
+
+    for (int i = 0; i < count; i++) {
+        if (_wcsicmp(queue[i].provider, ev.provider) != 0) continue;
+        if (_wcsicmp(queue[i].title, ev.title) == 0 &&
+            (DWORD)(ev.queuedAt - queue[i].queuedAt) <= kIslandMergeWindowMs) {
+            // The same thing again: bump the badge instead of queueing a twin.
+            queue[i].repeat++;
+            queue[i].queuedAt = ev.queuedAt;
+            queue[i].ttlMs = ev.ttlMs;
+            return count;
+        }
+        queue[i] = ev;            // a provider's own pending event is replaced
+        return count;
+    }
+
+    if (count < cap) {
+        queue[count] = ev;
+        return count + 1;
+    }
+
+    // Full: the weakest, and among equals the earliest, makes room. A critical must
+    // never be the one lost to an info.
+    int victim = 0;
+    for (int i = 1; i < count; i++) {
+        if (queue[i].severity < queue[victim].severity ||
+            (queue[i].severity == queue[victim].severity &&
+             queue[i].queuedAt < queue[victim].queuedAt)) {
+            victim = i;
+        }
+    }
+    if (ev.severity >= queue[victim].severity) queue[victim] = ev;
+    if (drops) (*drops)++;
+    return count;
+}
+
+// The island's state machine (design 7.2). Pure on purpose: the caller supplies the
+// clock and whether the current animation phase finished, so every transition is
+// assertable. *popOut receives the queue index to present when a card starts.
+static IslandState StepIsland(IslandView *v, const IslandEvent *queue, int count,
+                              DWORD now, bool phaseDone, int *popOut) {
+    if (popOut) *popOut = -1;
+    const int pick = IslandPick(queue, count);
+    const bool criticalWaiting = pick >= 0 && queue[pick].severity == ES_CRITICAL;
+
+    switch (v->state) {
+    case IS_IDLE:
+        if (pick >= 0) {
+            v->state = IS_POPPING;
+            v->phaseStarted = now;
+            v->showing = queue[pick].severity;
+            v->cardDeadline = now + queue[pick].ttlMs;
+            if (popOut) *popOut = pick;
+        }
+        break;
+    case IS_POPPING:
+        if (criticalWaiting && v->showing < ES_CRITICAL) {
+            v->state = IS_COLLAPSING;     // a critical outranks a card still growing
+            v->phaseStarted = now;
+        } else if (phaseDone) {
+            v->state = IS_CARD;
+            v->phaseStarted = now;
+        }
+        break;
+    case IS_CARD:
+        if (criticalWaiting && v->showing < ES_CRITICAL) {
+            v->state = IS_COLLAPSING;
+            v->phaseStarted = now;
+        } else if ((LONG)(now - v->cardDeadline) >= 0) {
+            v->state = IS_COLLAPSING;     // even a critical goes away: no notification centre
+            v->phaseStarted = now;
+        }
+        break;
+    case IS_COLLAPSING:
+        if (phaseDone) {
+            if (pick >= 0) {
+                // Straight into the next card: a queue that is not empty must not wait
+                // an extra idle tick (design 7.2).
+                v->state = IS_POPPING;
+                v->phaseStarted = now;
+                v->showing = queue[pick].severity;
+                v->cardDeadline = now + queue[pick].ttlMs;
+                if (popOut) *popOut = pick;
+            } else {
+                v->state = IS_IDLE;
+                v->phaseStarted = now;
+            }
+        }
+        break;
+    }
+    return v->state;
+}
+
+static const WCHAR *IslandStateName(IslandState s) {
+    switch (s) {
+    case IS_POPPING: return L"Popping";
+    case IS_CARD: return L"Card";
+    case IS_COLLAPSING: return L"Collapsing";
+    default: return L"Idle";
+    }
+}
+
+// Removes the entry that matches `want` (provider + title + timestamp, so a slot that
+// was replaced in the meantime simply does not match). Returns false when it is gone,
+// which is not an error: the next tick pops whatever replaced it.
+static bool IslandTakeMatching(IslandEvent *queue, int *count, const IslandEvent &want) {
+    for (int i = 0; i < *count; i++) {
+        if (_wcsicmp(queue[i].provider, want.provider) != 0) continue;
+        if (_wcsicmp(queue[i].title, want.title) != 0) continue;
+        if (queue[i].queuedAt != want.queuedAt) continue;
+        for (int j = i; j + 1 < *count; j++) queue[j] = queue[j + 1];
+        (*count)--;
+        return true;
+    }
+    return false;
+}
+
+// Drives the island from the HUD's frame clock. Defined with the other HUD updaters,
+// because it reads g_settings and belongs to that thread; everything it decides with
+// is the pure state machine above.
 
 // Writes one value. Takes the lock itself, so the pipe thread cannot forget to.
 static void ExtStoreValue(int slot, const WCHAR *key, const WCHAR *text, DWORD ttlMs, int maxChars) {
@@ -4385,6 +4587,43 @@ static void UpdateIntro(HWND hwnd) {
 // ---------------------------------------------------------------------------
 // Window procedure
 // ---------------------------------------------------------------------------
+// Drives the island from the HUD's frame clock. The visual layer (card geometry, the
+// width animation channel, painting the card) hangs off this same call in the next
+// step; the machine itself already runs, so its transitions are real and logged
+// rather than waiting for the drawing to exist.
+static void UpdateIsland() {
+    if (!g_settings.islandEnabled || !g_islandLockReady) return;
+
+    IslandEvent local[kIslandQueueMax];
+    int count = 0;
+    EnterCriticalSection(&g_islandLock);
+    count = g_islandCount;
+    for (int i = 0; i < count; i++) local[i] = g_islandQueue[i];
+    LeaveCriticalSection(&g_islandLock);
+
+    const DWORD now = GetTickCount();
+    bool phaseDone = false;
+    if (g_islandView.state == IS_POPPING) phaseDone = (now - g_islandView.phaseStarted) >= kIslandPopMs;
+    else if (g_islandView.state == IS_COLLAPSING) phaseDone = (now - g_islandView.phaseStarted) >= kIslandCollapseMs;
+
+    int pop = -1;
+    const IslandState was = g_islandView.state;
+    const IslandState next = StepIsland(&g_islandView, local, count, now, phaseDone, &pop);
+
+    if (pop >= 0 && pop < count) {
+        EnterCriticalSection(&g_islandLock);
+        g_islandCardValid = IslandTakeMatching(g_islandQueue, &g_islandCount, local[pop]);
+        if (g_islandCardValid) g_islandCard = local[pop];
+        LeaveCriticalSection(&g_islandLock);
+    }
+    if (next != was && g_islandLogs < 8) {
+        Wh_Log(L"EXT island: %s -> %s (queued=%d, showing=%d%s)", IslandStateName(was),
+               IslandStateName(next), count, (int)g_islandView.showing,
+               g_islandCardValid ? L" card=yes" : L" card=no");
+        g_islandLogs++;
+    }
+}
+
 static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_TIMER:
@@ -4400,6 +4639,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             }
             UpdateProximity(hwnd);
             UpdateIntro(hwnd);
+            UpdateIsland();
             ReassertTopmost(hwnd);
         } else if (wParam == kTimerPerf) {
             unsigned long long cpuMs = (CpuTime100ns() - g_perfBaseCpu100ns) / 10000ULL;
@@ -4559,6 +4799,21 @@ static DWORD WINAPI HudThreadProc(LPVOID) {
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         if (msg.message == kMsgQuit && msg.hwnd == nullptr) break;
+        if (msg.message == kMsgIslandEvent && msg.hwnd == nullptr) {
+            // A thread message, not a window message: the pipe thread must not hold
+            // (or need) the window handle, which may already be gone (design R5).
+            g_islandWakes++;
+            int queued = 0;
+            if (g_islandLockReady) {
+                EnterCriticalSection(&g_islandLock);
+                queued = g_islandCount;
+                LeaveCriticalSection(&g_islandLock);
+            }
+            if (g_islandWakes <= 4) {
+                Wh_Log(L"EXT island: wake %u, queued=%d", g_islandWakes, queued);
+            }
+            continue;               // thread messages are not dispatched
+        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -4735,6 +4990,10 @@ struct ExtCommand {
     const WCHAR *key = nullptr;      int keyLen = 0;
     const WCHAR *ttl = nullptr;      int ttlLen = 0;
     const WCHAR *text = nullptr;     int textLen = 0;
+    // EVENT only.
+    ExtSeverity severity = ES_INFO;
+    const WCHAR *title = nullptr;    int titleLen = 0;
+    const WCHAR *body = nullptr;     int bodyLen = 0;
 };
 
 struct ExtSession {
@@ -4806,8 +5065,18 @@ static int ExtParseLine(const WCHAR *line, ExtCommand &out) {
         return 0;
     }
     if (wordLen == 5 && _wcsnicmp(word, L"EVENT", 5) == 0) {
+        const WCHAR *sev = nullptr;
+        int sevLen = 0;
+        if (!ExtToken(&cursor, &out.provider, &out.providerLen)) return 400;
+        if (!ExtToken(&cursor, &sev, &sevLen)) return 400;
+        if (!ExtParseSeverity(sev, sevLen, &out.severity)) return 400;
+        if (!ExtToken(&cursor, &out.ttl, &out.ttlLen)) return 400;
+        if (!ExtToken(&cursor, &out.title, &out.titleLen)) return 400;
+        while (ExtIsSpace(*cursor)) cursor++;
+        out.body = cursor;                       // the rest of the line, spaces and all
+        out.bodyLen = (int)wcslen(cursor);
         out.cmd = EC_EVENT;
-        return 501;   // recognised, but this milestone does not show cards yet
+        return 0;
     }
     return 400;
 }
@@ -5094,7 +5363,50 @@ static int ExtHandleLine(HANDLE pipe, OVERLAPPED *ov, const WCHAR *line, ExtSess
         return 0;
     }
 
-    if (ses.slot < 0) return ExtRefuse(pipe, ov, 401, cmd, ses);   // SET before HELLO
+    if (ses.slot < 0) return ExtRefuse(pipe, ov, 401, cmd, ses);   // SET/DEL/EVENT before HELLO
+    if (cmd.cmd == EC_EVENT) {
+        DWORD ttl = 0;
+        if (!ExtParseTtl(cmd.ttl, cmd.ttlLen, (DWORD)snap.extEventMs, &ttl)) {
+            return ExtRefuse(pipe, ov, 400, cmd, ses);
+        }
+        if (ttl == 0) {
+            // "No duration" is not an event. Saying so beats queueing something that
+            // would have to vanish the instant it appeared.
+            if (g_extStallLogs < 4) {
+                Wh_Log(L"EXT event dropped reason=ttl0");
+                g_extStallLogs++;
+            }
+            ExtWriteLine(pipe, ov, L"OK");
+            return 0;
+        }
+        IslandEvent ev = {};
+        wcsncpy(ev.provider, ses.provider, kExtProviderChars);
+        ev.provider[kExtProviderChars] = L'\0';
+        ExtSanitize(cmd.title ? cmd.title : L"", ev.title, kIslandTitleChars);
+        ExtSanitize(cmd.body ? cmd.body : L"", ev.body, kIslandBodyChars);
+        ev.severity = cmd.severity;
+        ev.ttlMs = ttl;
+        ev.repeat = 1;
+        ev.queuedAt = GetTickCount();
+        int queued = 0;
+        if (g_islandLockReady) {
+            EnterCriticalSection(&g_islandLock);
+            g_islandCount = IslandEnqueue(g_islandQueue, g_islandCount, snap.extEventQueue, ev,
+                                          &g_islandDrops);
+            queued = g_islandCount;
+            g_islandAccepted++;
+            LeaveCriticalSection(&g_islandLock);
+        }
+        // Counts and lengths only: an event's text is content and never goes to the log.
+        Wh_Log(L"EXT event provider=%s sev=%d ttl=%lu titleLen=%d bodyLen=%d queue=%d drops=%u",
+               ev.provider, (int)ev.severity, ttl, (int)wcslen(ev.title), (int)wcslen(ev.body),
+               queued, g_islandDrops);
+        // Wake the HUD through its thread, never through the window handle: this
+        // thread cannot know whether the window still exists (design 5.6.3 R5).
+        if (g_hudThreadId) PostThreadMessageW(g_hudThreadId, kMsgIslandEvent, 0, 0);
+        ExtWriteLine(pipe, ov, L"OK");
+        return 0;
+    }
     if (!ExtNameValid(cmd.key, cmd.keyLen, false)) return ExtRefuse(pipe, ov, 400, cmd, ses);
 
     WCHAR key[kExtKeyChars + 1];
@@ -5342,6 +5654,13 @@ static void ExtSelfTest() {
 static void ExtStart(const ModSettings &snap) {
     InitializeCriticalSection(&g_extLock);
     g_extLockReady = true;
+    // The island queue's lock is a second, independent one: the HUD takes it to read
+    // an event, the pipe threads take it to enqueue one, and neither ever holds it
+    // together with g_extLock (design 5.6.1). It is torn down in the uninit path,
+    // after the HUD is gone -- not here, because ExtStop runs while the HUD is still
+    // alive.
+    InitializeCriticalSection(&g_islandLock);
+    g_islandLockReady = true;
     g_extStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!g_extStopEvent) {
         Wh_Log(L"EXT: CreateEvent failed: %lu; external values stay unavailable",
@@ -5538,6 +5857,12 @@ void WhTool_ModUninit() {
     DeleteCriticalSection(&g_settingsLock);
     // Only now: the pipe threads and the sampler are both joined, so nothing can
     // be inside the external lock any more.
+    if (g_islandLockReady) {
+        DeleteCriticalSection(&g_islandLock);
+        g_islandLockReady = false;
+        Wh_Log(L"EXT island: %u event(s) accepted, %u dropped, %u wake(s)",
+               g_islandAccepted, g_islandDrops, g_islandWakes);
+    }
     if (g_extLockReady) {
         DeleteCriticalSection(&g_extLock);
         g_extLockReady = false;
