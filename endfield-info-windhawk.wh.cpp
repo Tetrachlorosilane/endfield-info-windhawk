@@ -264,9 +264,12 @@ through WMI.
 - ExtEventQueue: 4
   $name: 'External event queue'
   $description: '1-8. Events waiting behind the one on screen. When full, the lowest priority and oldest event is dropped.'
+- IslandMinWidth: 260
+  $name: 'Island minimum width'
+  $description: '120-640. Narrowest width for an event card. The card grows with its text but never below this, and never past 640.'
 - IslandEnabled: Off
   $name: 'Notification island'
-  $description: 'Turns an external event into a temporary card instead of only setting {ext...} values. Nothing is shown yet: the event milestone is not implemented.'
+  $description: 'Turns an external event into a temporary card: title, optional body, a severity colour and a repeat badge. The card covers the rows while it is up and gives them back when it goes.'
   $options:
     - Off: Values only
     - On: Show event cards
@@ -1123,7 +1126,7 @@ struct ModSettings {
     // External data providers. Off by default, and even when on nothing is
     // created unless a row actually references {ext.*} (see RequiredGroups).
     bool externalData = false;
-    bool islandEnabled = false;      // read, but the event milestone is not implemented
+    bool islandEnabled = false;      // cost of the event channel is zero until an EVENT arrives
     WCHAR extProviders[kExtProviderListChars] = {};
     int extValueTtlMs = 30000;
     int extMaxValue = 128;
@@ -1131,6 +1134,7 @@ struct ModSettings {
     int extMaxUpdates = 100;
     int extEventMs = 6000;
     int extEventQueue = 4;
+    int islandMinWidth = 260;        // floor for the card's width; text widens it
 
     // Left icon plates and intro animation. One icon per row, row-aligned with the
     // RowN settings.
@@ -1356,6 +1360,7 @@ static void ReadSettings(ModSettings &s) {
     s.extMaxUpdates = ClampInt((int)Wh_GetIntSetting(L"ExtMaxUpdates"), 1, 1000);
     s.extEventMs = ClampInt((int)Wh_GetIntSetting(L"ExtEventMs"), 1000, 60000);
     s.extEventQueue = ClampInt((int)Wh_GetIntSetting(L"ExtEventQueue"), 1, 8);
+    s.islandMinWidth = ClampInt((int)Wh_GetIntSetting(L"IslandMinWidth"), 120, 640);
 }
 
 // Per-row icon resolution.
@@ -2022,6 +2027,27 @@ static DWORD ResolveSeverityColor(ExtSeverity sev, DWORD themeText) {
     case ES_CRITICAL: return 0xFFE4573D;
     default: return themeText;
     }
+}
+
+struct IslandMetrics {
+    int titleChars;
+    int bodyChars;
+};
+
+// The card's target width. Pure so the two properties that matter can be asserted
+// (design 12): it is never narrower than the user's configured minimum, and it never
+// grows without bound. The estimate is coarse on purpose -- the painter measures the
+// real text and ellipsises to fit -- because measuring needs GDI+ and this has to be
+// decidable before anything is drawn.
+static const int kIslandMaxWidth = 640;
+
+static int ComputeIslandCardWidth(const IslandMetrics &m, const ModSettings &cfg) {
+    int chars = m.titleChars > m.bodyChars ? m.titleChars : m.bodyChars;
+    if (chars < 0) chars = 0;
+    int width = 26 + chars * (cfg.rowHeight / 2);      // padding, accent bar, glyphs
+    if (width < cfg.islandMinWidth) width = cfg.islandMinWidth;
+    if (width > kIslandMaxWidth) width = kIslandMaxWidth;
+    return width;
 }
 
 // Drives the island from the HUD's frame clock. Defined with the other HUD updaters,
@@ -3383,6 +3409,11 @@ static int g_panelHeight = 0;             // expanded height
 // Resting height of the window: what PlaceWindow and WM_NCHITTEST use. Set only
 // by ComputeGeometry, so both agree with each other at all times.
 static int g_displayHeight = 0;
+// Resting width. It is the panel width normally and the card's target width while a
+// card is up, so window placement and the hit test read one number instead of each
+// deriving their own (design 8: the same rule that g_displayHeight already enforces
+// for height). Only the HUD thread writes it.
+static int g_restWidth = 0;
 // Height the last frame actually painted. The intro animation drives this, and it
 // is deliberately separate from g_displayHeight: writing the animated height back
 // into the geometry value made the window and its hit-test rectangle shrink to
@@ -4015,7 +4046,26 @@ static void BuildRoundedRect(GpPath *path, float x, float y, float w, float h, f
 static void PlaceWindow(HWND hwnd);
 
 static void PaintPanel(HWND hwnd) {
-    int width = g_settings.panelWidth;
+    // Painted width. g_restWidth is what the window and the hit test use; this is only
+    // what is drawn, so an animating width can never move the clickable area -- the
+    // same separation the height rule above describes.
+    int width = g_restWidth > 0 ? g_restWidth : g_settings.panelWidth;
+    if (g_settings.islandEnabled && g_islandCardValid && g_islandView.state != IS_IDLE &&
+        g_restWidth > 0) {
+        const DWORD elapsed = GetTickCount() - g_islandView.phaseStarted;
+        const DWORD span = g_islandView.state == IS_COLLAPSING ? kIslandCollapseMs : kIslandPopMs;
+        double t = span == 0 ? 1.0 : (double)elapsed / (double)span;
+        if (t > 1.0) t = 1.0;
+        // Smoothstep: no new easing surface, and no overshoot to reason about while the
+        // geometry is still settling (design 7.2 leaves the overshoot to the transform).
+        const double eased = t * t * (3.0 - 2.0 * t);
+        const double baseW = (double)g_settings.panelWidth;
+        const double cardW = (double)g_restWidth;
+        const double from = g_islandView.state == IS_COLLAPSING ? cardW : baseW;
+        const double to = g_islandView.state == IS_COLLAPSING ? baseW : cardW;
+        width = (int)(from + (to - from) * eased + 0.5);
+        if (width < 1) width = 1;
+    }
     bool collapsed = !g_expanded;
 
     // The intro drives the *painted* height. g_displayHeight is left alone: it is
@@ -4474,18 +4524,21 @@ static bool ForceTopmost(HWND hwnd);
 static void PlaceWindow(HWND hwnd) {
     if (g_anchorIndex < 0 || g_anchorIndex >= g_monitorCount) return;
     const RECT &rect = g_monitors[g_anchorIndex].rect;
-    int x = rect.left + (rect.right - rect.left - g_settings.panelWidth) / 2;
+    // A zero here would mean a zero-width window, so the resting width falls back to
+    // the configured panel width until UpdateIsland sets a card's target.
+    if (g_restWidth <= 0) g_restWidth = g_settings.panelWidth;
+    int x = rect.left + (rect.right - rect.left - g_restWidth) / 2;
     int y = rect.top + kPanelTopOffset;
 
     if (g_visible) {
-        SetWindowPos(hwnd, HWND_TOPMOST, x, y, g_settings.panelWidth, g_displayHeight,
+        SetWindowPos(hwnd, HWND_TOPMOST, x, y, g_restWidth, g_displayHeight,
                      SWP_NOACTIVATE | SWP_SHOWWINDOW);
         // PlaceWindow is where the geometry is decided, so the topmost state is
         // re-established here rather than assumed to have survived the move.
         ForceTopmost(hwnd);
         g_lastTopmostAssert = GetTickCount();
     } else {
-        SetWindowPos(hwnd, HWND_TOPMOST, x, y, g_settings.panelWidth, g_displayHeight,
+        SetWindowPos(hwnd, HWND_TOPMOST, x, y, g_restWidth, g_displayHeight,
                      SWP_NOACTIVATE);
         ForceTopmost(hwnd);
         ShowWindow(hwnd, SW_HIDE);
@@ -4706,6 +4759,19 @@ static void UpdateIsland() {
         if (!g_expanded && g_window) SetExpanded(g_window, true);
     }
 
+    // The card's target width, decided here so that PlaceWindow, the hit test and the
+    // painter all read one number: the user's minimum, or as wide as the text wants,
+    // never wider than the cap.
+    IslandMetrics metrics = {};
+    metrics.titleChars = (int)wcslen(g_islandCard.title);
+    metrics.bodyChars = (int)wcslen(g_islandCard.body);
+    const int wantWidth =
+        cardUp ? ComputeIslandCardWidth(metrics, g_settings) : g_settings.panelWidth;
+    if (wantWidth != g_restWidth) {
+        g_restWidth = wantWidth;
+        if (g_window) PlaceWindow(g_window);
+    }
+
     if (next != was && g_islandLogs < 8) {
         Wh_Log(L"EXT island: %s -> %s (queued=%d, showing=%d%s)", IslandStateName(was),
                IslandStateName(next), count, (int)g_islandView.showing,
@@ -4811,10 +4877,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         int x = cursor.x - rect.left;
         int y = cursor.y - rect.top;
         float r = (float)MinInt(g_settings.cornerRadius,
-                                MinInt(g_settings.panelWidth, g_displayHeight) / 2);
+                                MinInt(g_restWidth, g_displayHeight) / 2);
         float dx = 0.0f, dy = 0.0f;
         if (x < r) dx = r - x;
-        else if (x > g_settings.panelWidth - r) dx = x - (g_settings.panelWidth - r);
+        else if (x > g_restWidth - r) dx = x - (g_restWidth - r);
         if (y < r) dy = r - y;
         else if (y > g_displayHeight - r) dy = y - (g_displayHeight - r);
         bool inside = true;
@@ -4853,7 +4919,7 @@ static DWORD WINAPI HudThreadProc(LPVOID) {
 
     ComputeGeometry();
     HWND hwnd = CreateWindowExW(exStyle, kClassName, L"Endfield Info Windhawk", WS_POPUP,
-                                0, 0, g_settings.panelWidth, g_displayHeight,
+                                0, 0, g_restWidth, g_displayHeight,
                                 nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!hwnd) {
         Wh_Log(L"CreateWindowExW failed: %lu", GetLastError());

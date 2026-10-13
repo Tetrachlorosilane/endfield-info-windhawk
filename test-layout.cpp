@@ -1437,6 +1437,30 @@ int main() {
                   "severity picks the accent: fixed for warn/critical, the theme's text for info");
         }
 
+        // The card's target width: the configured minimum is a floor, text widens it,
+        // and it is capped (design 12: it must not grow without bound).
+        {
+            ModSettings cfg = {};
+            cfg.rowHeight = 30;
+            cfg.islandMinWidth = 260;
+            IslandMetrics narrow = {};
+            narrow.titleChars = 4;
+            Check(ComputeIslandCardWidth(narrow, cfg) == 260,
+                  "a short card is never narrower than the configured minimum");
+            IslandMetrics wide = {};
+            wide.titleChars = 200;
+            Check(ComputeIslandCardWidth(wide, cfg) == kIslandMaxWidth,
+                  "a long title is capped instead of growing the window without bound");
+            IslandMetrics mid = {};
+            mid.titleChars = 30;
+            const int midWidth = ComputeIslandCardWidth(mid, cfg);
+            Check(midWidth > 260 && midWidth < kIslandMaxWidth,
+                  "in between, the width follows the text");
+            cfg.islandMinWidth = 600;
+            Check(ComputeIslandCardWidth(narrow, cfg) == 600,
+                  "raising the minimum raises the floor for the same card");
+        }
+
         // The pipe's DACL has to actually admit this user. Getting it wrong is
         // invisible until a real client is refused, so a pipe built with the very
         // same descriptor is opened here -- but only where the environment allows

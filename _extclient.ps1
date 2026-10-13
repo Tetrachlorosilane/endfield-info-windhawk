@@ -19,7 +19,9 @@ param(
     [int]$Ttl = 600000,
     [string]$Text = 'Now Playing: Blue Hour',
     [string]$Raw = '',
-    [switch]$Event
+    [switch]$Event,
+    [ValidateSet('info', 'warn', 'critical')]
+    [string]$Severity = 'info'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -27,7 +29,7 @@ $name = 'endfield-info-windhawk'
 
 $lines = if ($Raw) { @($Raw) } elseif ($Event) {
     # In event mode -Text is the card's title and -Key is unused.
-    @("HELLO 1 $Provider", "EVENT $Provider info $Ttl $Text")
+    @("HELLO 1 $Provider", "EVENT $Provider $Severity $Ttl $Text")
 } else {
     @("HELLO 1 $Provider", "SET $Provider $Key $Ttl $Text")
 }
