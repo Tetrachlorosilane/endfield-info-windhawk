@@ -592,7 +592,7 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 - **mod 的日志格式串**用测试宿主查过：`-Wformat` 指向 `endfield-info-windhawk.wh.cpp`
   的警告为 0（本地 mod build 检查不了这项，见 §3）。
 - 外部数据的**服务端路径**（`ExtHandleLine`：HELLO → SET → 存储 → 查找、换行框架与边缘空格裁剪、
-  允许名单拒绝）有断言覆盖，共 251 条。
+  允许名单拒绝）有断言覆盖（总数见上文，不再重复一个会过期的数字）。
 - **真机整链验证（用户环境，2026-10-13）**：mod 的开机自检两帧被服务端完整收到
   （`self-test sent 2 frames` → `recv bytes=17/33` → `hello provider=selftest` → `set … key=ok`），
   且自检值在行里**显示了出来**——传输、存储、展开、绘制四段都成立；随后用
