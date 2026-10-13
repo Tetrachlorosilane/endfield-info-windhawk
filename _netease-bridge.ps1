@@ -207,12 +207,23 @@ function Get-LyricLines {
             continue
         }
         if ($DumpJson) { Write-Host "lyric -> $($json | ConvertTo-Json -Depth 3 -Compress)" }
-        if ($json.lrc -and $json.lrc.lyric) { return ConvertFrom-Lrc -Text ([string]$json.lrc.lyric) }
+        if ($json.lrc -and $json.lrc.lyric) {
+            $parsed = @(ConvertFrom-Lrc -Text ([string]$json.lrc.lyric))
+            # 纯音乐：接口在 lrc 里放的是「作曲/编曲」这类制作信息 + 一句「纯音乐，请欣赏」。
+            # 把制作信息当歌词滚动是错的，所以只留那最后一句（没有就用末行兜底）。
+            if ($json.pureMusic) {
+                Write-Diag ("这是纯音乐曲目（pureMusic=true），只显示最后一行的说明")
+                $pure = @($parsed | Where-Object { $_.Text -match '纯音乐' })
+                if ($pure.Count -gt 0) { return $pure }
+                if ($parsed.Count -gt 0) { return @($parsed[-1]) }
+            }
+            return $parsed
+        }
 
         Write-Diag ("歌词返回里没有 lrc.lyric：id={0} code={1} 有 lrc={2} 有 tlyric={3} " +
-            "nolyric={4} uncollected={5} 响应={6}" -f $id, $json.code, ($null -ne $json.lrc),
-            ($null -ne $json.tlyric), ($null -ne $json.nolyric), ($null -ne $json.uncollected),
-            (Get-Brief $json))
+            "nolyric={4} uncollected={5} pureMusic={6} 响应={7}" -f $id, $json.code,
+            ($null -ne $json.lrc), ($null -ne $json.tlyric), ($null -ne $json.nolyric),
+            ($null -ne $json.uncollected), ($null -ne $json.pureMusic), (Get-Brief $json))
     }
     @()
 }
