@@ -1265,6 +1265,29 @@ int main() {
             Check(ExtLookup(L"ext.probe.nl", (int)wcslen(L"ext.probe.nl"), &stored) == ER_VALUE &&
                       stored && wcscmp(stored, L"line two") == 0,
                   "framing and edge spaces are trimmed before the screen");
+            // The shape a real client sends: every line is newline framed, and the
+            // provider name is a *slice* of that line. Anything that copies it has
+            // to stop at providerLen: copying from the pointer swallows whatever
+            // follows (the newline), the stored name then differs in length from the
+            // provider a row asks for, and the row renders "--" forever. This is
+            // the bug the first version of these assertions missed, because they
+            // drove the handler with an unframed line.
+            ExtSession framed;
+            Check(ExtHandleLine(INVALID_HANDLE_VALUE, &ov, L"HELLO 1 framed\n", framed) == 0 &&
+                      framed.slot >= 0,
+                  "a newline framed HELLO allocates a slot");
+            Check(ExtHandleLine(INVALID_HANDLE_VALUE, &ov, L"SET framed k - v\n", framed) == 0,
+                  "a newline framed SET is accepted");
+            Check(ExtLookup(L"ext.framed.k", (int)wcslen(L"ext.framed.k"), &stored) == ER_VALUE &&
+                      stored && wcscmp(stored, L"v") == 0,
+                  "a newline framed provider is addressable as {ext.framed.k}");
+            // And a second HELLO for the same provider must reuse the slot, not
+            // burn another one because the stored name carries a newline.
+            ExtSession again;
+            Check(ExtHandleLine(INVALID_HANDLE_VALUE, &ov, L"HELLO 1 framed\n", again) == 0 &&
+                      again.slot == framed.slot,
+                  "reconnecting reuses the provider slot");
+
             // A provider outside the allowlist must be refused and must not get a
             // slot: accepting it silently is the failure that hides behind "--".
             EnterCriticalSection(&g_settingsLock);

@@ -1684,8 +1684,15 @@ static int ExtFindProvider(const WCHAR *name, int len, bool create, int maxProvi
     if (!create) return -1;
     for (int i = 0; i < limit; i++) {
         if (!g_ext[i].name[0]) {
-            wcsncpy(g_ext[i].name, name, kExtProviderChars);
-            g_ext[i].name[kExtProviderChars] = L'\0';
+            // Copy by LENGTH: "name" is a slice of the frame line, so wcsncpy from
+            // the pointer swallows whatever follows it -- in practice the newline
+            // that framed the line. The stored name would then be one character
+            // longer than the provider a row asks for, ExtNameEq would never match,
+            // and the row would render "--" forever. It also made every reconnect
+            // allocate a fresh slot instead of reusing the provider's own.
+            int copy = len < kExtProviderChars ? len : kExtProviderChars;
+            wcsncpy(g_ext[i].name, name, copy);
+            g_ext[i].name[copy] = L'\0';
             g_ext[i].count = 0;
             g_ext[i].drops = 0;
             g_ext[i].lastSeenAt = GetTickCount();
