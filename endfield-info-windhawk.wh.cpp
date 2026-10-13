@@ -1531,6 +1531,7 @@ static int              g_extThreadCount = 0;
 static HANDLE           g_extStopEvent = nullptr;
 static bool             g_extStartAttempted = false;
 static int              g_extBusyLogs = 0;     // bounded: "all instances busy" messages
+static int              g_extStallLogs = 0;    // bounded: "the read never completed" messages
 
 // Does this name select the external namespace at all? Full validation happens in
 // ExtLookup, so a malformed {ext...} still reaches the "unknown" path and keeps
@@ -4675,6 +4676,12 @@ static DWORD WINAPI SamplerThread(LPVOID) {
 // ---------------------------------------------------------------------------
 static const DWORD kExtProto = 1;
 static const WCHAR kExtPipeName[] = L"\\\\.\\pipe\\endfield-info-windhawk";
+// Overlapped operations are waited for with a timeout, never INFINITE. A
+// completion that never arrives must not park a pipe thread forever: with a
+// timeout the loop can notice, ask the pipe whether the data is really there, and
+// either keep waiting (a quiet client is normal) or recover and say so. 500 ms is
+// short enough that ExtStop's join still finishes promptly.
+static const DWORD kExtIoTimeoutMs = 500;
 
 enum ExtCmd { EC_NONE = 0, EC_HELLO, EC_SET, EC_DEL, EC_EVENT, EC_BYE };
 
@@ -4774,11 +4781,13 @@ static bool ExtParseTtl(const WCHAR *ttl, int len, DWORD fallback, DWORD *out) {
 }
 
 // Waits for a posted overlapped operation while staying responsive to the stop
-// event. 1 = completed, 0 = frame too long, -1 = stopped or failed.
+// event. 1 = completed, 0 = frame too long, -1 = stopped or failed, -2 = still
+// pending after the timeout (the caller decides whether that is normal).
 static int ExtWaitIo(HANDLE pipe, OVERLAPPED *ov, DWORD *bytes) {
     HANDLE waits[2] = { ov->hEvent, g_extStopEvent };
     DWORD count = g_extStopEvent ? 2 : 1;
-    DWORD which = WaitForMultipleObjects(count, waits, FALSE, INFINITE);
+    DWORD which = WaitForMultipleObjects(count, waits, FALSE, kExtIoTimeoutMs);
+    if (which == WAIT_TIMEOUT) return -2;
     if (count == 2 && which == WAIT_OBJECT_0 + 1) {
         // Cancel, then WAIT for the cancellation: returning while the kernel
         // still owns this OVERLAPPED would let it write to dead stack.
@@ -4805,21 +4814,67 @@ static bool ExtConnect(HANDLE pipe, OVERLAPPED *ov) {
     // as failure is the classic bug in this sequence.
     if (err == ERROR_PIPE_CONNECTED) return true;
     if (err != ERROR_IO_PENDING) return false;
-    DWORD bytes = 0;
-    return ExtWaitIo(pipe, ov, &bytes) == 1;
+    // Nobody connected yet. Waiting here is this thread's whole job, so a timeout
+    // must not be read as failure -- it just means "still listening".
+    for (;;) {
+        DWORD bytes = 0;
+        int wait = ExtWaitIo(pipe, ov, &bytes);
+        if (wait == 1) return true;
+        if (wait != -2) return false;          // stopped (already cancelled) or failed
+    }
 }
 
 // 1 = one frame read, 0 = the frame is larger than the buffer, -1 = stopped or broken.
+//
+// The wait is bounded (kExtIoTimeoutMs) and a timeout is not an error:
+//   * an empty buffer means the client is simply quiet, so the *same* pending read
+//     keeps waiting -- cancelling and re-posting there would burn CPU for nothing;
+//   * data queued while the completion has not arrived means the completion was
+//     lost. That is worth a log line and a re-post, because the bytes are still
+//     there (a cancelled read consumes nothing).
 static int ExtReadFrame(HANDLE pipe, OVERLAPPED *ov, char *buffer, DWORD cap, DWORD *got) {
-    *got = 0;
-    ResetEvent(ov->hEvent);
-    if (ReadFile(pipe, buffer, cap, got, ov)) return 1;
-    DWORD err = GetLastError();
-    // Message mode reports an over-long frame this way instead of truncating it:
-    // this is the over-long-frame detector, not a generic failure.
-    if (err == ERROR_MORE_DATA) return 0;
-    if (err != ERROR_IO_PENDING) return -1;
-    return ExtWaitIo(pipe, ov, got);
+    for (int attempt = 0; attempt < 4; attempt++) {
+        *got = 0;
+        ResetEvent(ov->hEvent);
+        if (ReadFile(pipe, buffer, cap, got, ov)) return 1;
+        DWORD err = GetLastError();
+        // Message mode reports an over-long frame this way instead of truncating it:
+        // this is the over-long-frame detector, not a generic failure.
+        if (err == ERROR_MORE_DATA) return 0;
+        if (err != ERROR_IO_PENDING) return -1;
+
+        DWORD started = GetTickCount();
+        bool warned = false;
+        for (;;) {
+            int wait = ExtWaitIo(pipe, ov, got);
+            if (wait != -2) return wait;
+
+            DWORD available = 0;
+            if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) return -1;
+            if (available == 0) {
+                // Nothing queued yet. If that goes on, say so once: a connected
+                // client whose bytes never arrive must not look like a mystery.
+                if (!warned && GetTickCount() - started >= 2000 && g_extStallLogs < 4) {
+                    Wh_Log(L"EXT: no frame for 2s and the pipe buffer is empty "
+                           L"(nothing this instance can see)");
+                    g_extStallLogs++;
+                    warned = true;
+                }
+                continue;
+            }
+
+            if (g_extStallLogs < 4) {
+                Wh_Log(L"EXT: read completion never arrived with %lu bytes queued; re-posting",
+                       available);
+                g_extStallLogs++;
+            }
+            CancelIoEx(pipe, ov);
+            DWORD ignored = 0;
+            GetOverlappedResult(pipe, ov, &ignored, TRUE);
+            break;                             // re-post; the queued bytes are untouched
+        }
+    }
+    return -1;
 }
 
 static void ExtWriteLine(HANDLE pipe, OVERLAPPED *ov, const WCHAR *text) {
@@ -4833,8 +4888,13 @@ static void ExtWriteLine(HANDLE pipe, OVERLAPPED *ov, const WCHAR *text) {
     if (GetLastError() != ERROR_IO_PENDING) return;
     DWORD got = 0;
     // A client that never reads its replies fills the out buffer. That must not
-    // take the server down with it, so the outcome is deliberately ignored.
-    ExtWaitIo(pipe, ov, &got);
+    // take the server down with it, so the outcome is deliberately ignored -- but
+    // the OVERLAPPED still has to be left clean for the next operation.
+    if (ExtWaitIo(pipe, ov, &got) == -2) {
+        CancelIoEx(pipe, ov);
+        DWORD ignored = 0;
+        GetOverlappedResult(pipe, ov, &ignored, TRUE);
+    }
 }
 
 static void ExtReplyErr(HANDLE pipe, OVERLAPPED *ov, int code) {
@@ -4975,17 +5035,30 @@ static void ExtServeClient(HANDLE pipe, OVERLAPPED *ov, ExtSession &ses) {
     // buffer is sized from the byte cap rather than from half of it.
     WCHAR line[kExtMaxLineBytes + 1];
     int frames = 0;
+    int reads = 0;
     for (;;) {
         if (InterlockedCompareExchange(&g_extStop, 0, 0)) break;
         DWORD got = 0;
         int read = ExtReadFrame(pipe, ov, frame, (DWORD)sizeof(frame), &got);
+        // Bounded per-connection trace of the read outcomes: this is the line that
+        // says whether frames arrive at all, which is what separates "connected but
+        // nothing happened" from "nothing was ever sent".
+        if (++reads <= 4) Wh_Log(L"EXT read#%d result=%d got=%lu", reads, read, got);
         if (read < 0) break;
         if (read == 0) {
             Wh_Log(L"EXT err code=402: frame larger than %d bytes", kExtMaxLineBytes);
             ExtReplyErr(pipe, ov, 402);
             break;
         }
-        if (got == 0) continue;
+        if (got == 0) {
+            // A zero-length message is legal and carries nothing. Looping silently
+            // here would look exactly like a stall, so say it once.
+            if (g_extStallLogs < 4) {
+                Wh_Log(L"EXT: zero-length frame ignored");
+                g_extStallLogs++;
+            }
+            continue;
+        }
         // The first frames of each connection are logged so "the client connected
         // but nothing happened" can be told apart from "nothing arrived at all".
         if (++frames <= 2) Wh_Log(L"EXT recv bytes=%lu", got);
@@ -5142,7 +5215,7 @@ static void ExtStop() {
     InterlockedExchange(&g_extStop, 1);
     if (g_extStopEvent) SetEvent(g_extStopEvent);
     if (g_extThreadCount > 0) {
-        WaitForMultipleObjects((DWORD)g_extThreadCount, g_extThreads, TRUE, 2000);
+        WaitForMultipleObjects((DWORD)g_extThreadCount, g_extThreads, TRUE, 3000);
         for (int i = 0; i < g_extThreadCount; i++) {
             CloseHandle(g_extThreads[i]);
             g_extThreads[i] = nullptr;

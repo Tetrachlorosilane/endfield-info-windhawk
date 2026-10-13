@@ -135,6 +135,9 @@ $wc = 'D:\Program Files\Windhawk\Compiler'
 > （连"完全不给安全描述符"的对照管道也打不开，`err=5`），所以 DACL 那条会打印
 > `this environment refuses pipe clients ... the DACL check is skipped here`。
 > **跳过不等于通过**——要验证 DACL 得在普通终端里跑一次。
+> 实测边界：**只读**打开可以（`GENERIC_READ` → `opened=1`），而 `GENERIC_WRITE`、
+> `FILE_WRITE_DATA`、`GENERIC_ALL` 全部 `err=5`。因此宿主**没法**做管道端到端测试
+> （客户端要写），管道读写路径只能靠真机日志——§10 的"未验证"里也记着这条。
 
 > **mod 的日志格式串是在这里被检查的**：宿主打桩了一个真的 `Wh_Log`，所以 mod 里每个
 > `Wh_Log(L"...%s", ...)` 都会被真的编译并走 `-Wformat`。**不要给这条命令加
@@ -335,6 +338,13 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   传 1 会让第一个线程占满额度、其余线程以 `ERROR_PIPE_BUSY (231)` 退出——表面上"serving 4
   instances"，实际只有一个客户端能连。**231 是瞬态**（实例都被占着），要等一会儿重试，
   不能把线程退掉；其他错误码才是永久的。
+- **I/O 等待必须有上界，且超时不是错误。** 读与连接都**不**用 `INFINITE` 等完成事件：
+  一旦完成事件丢失，线程会永久停在等待里，而它**连"我卡住了"都打不出来**（所有出口日志
+  都在那行等待之后），从外面看就是"客户端连上后彻底静默"。现在的规则（`kExtIoTimeoutMs`）：
+  — 缓冲为空 → 继续等**同一笔**操作（客户端安静是正常的，取消重投只会白烧 CPU）；
+  — 缓冲里**有数据却没收到完成** → 记一行 `read completion never arrived ...; re-posting`，
+     取消并重投（取消不消费数据，字节还在）；
+  — 连接等待超时同理：没客户端就继续听，不算失败。
 
 ---
 
@@ -363,6 +373,7 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 | 管道 DACL 写成 `CO`（creator owner） | **每个客户端都被拒绝**（`PermissionError` / `ERROR_ACCESS_DENIED`），连启动 mod 的用户自己都连不上 | 用同一个 SD 建管道、让当前用户连上：`test-layout.cpp` 的 "the pipe DACL admits the user running the mod" |
 | 提供者名从帧行拷贝时未按长度截断 | 客户端连上、`SET` 被接受，行**永远显示 `--`**；且每次重连占一个新槽位，8 次后 `HELLO` 开始回 403 | 用**带换行**的 `HELLO`/`SET` 驱动 handler，断言 `{ext.provider.key}` 查得到（旧代码下红两条） |
 | `CreateNamedPipe` 的 `nMaxInstances` 传 1 而线程数是 4 | 日志写着 `serving 4 pipe instance(s)`，实际 3 个线程以 `CreateNamedPipe failed: 231` 当场退出，只支持 1 个并发客户端 | **没有断言能覆盖**（这是 API 调用点的常量错，宿主里没有真管道）；判别依据是错误码语义——**断言覆盖不到的地方，日志就是防线** |
+| 读用 `INFINITE` 等完成事件，完成事件一旦丢失线程就永久停住 | 客户端**连上了**（`ExtLogClient` 有），之后日志**完全静默**——连 `client done` 都没有，行永远 `--` | 等待加 500 ms 上界 + `PeekNamedPipe` 判定；缓冲有数据却没完成就重投。判别日志：`EXT read#1 result=… got=…`、`read completion never arrived with N bytes queued`、`no frame for 2s and the pipe buffer is empty` |
 
 ### 排查心法：先分类，再定位
 
@@ -415,6 +426,12 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
    修法是把框架按客户端的形状写进断言（带 `\n`），旧代码下立刻红两条。
    **判据：测试的输入要和真实调用的输入同形**。这是第 8 条的第三面：
    打在真东西上、喂真输入、改回去要变红。
+10. **没有上界的等待会把诊断能力一起吃掉。** 管道读用 `INFINITE` 等完成事件，
+    于是"完成事件丢失"这个故障的表现是**整个线程静默停住**：我加的所有日志
+    （`recv`、`err`、`client done`）全都在那行等待的**后面**，一条也打不出来——
+    从外面看，"卡住了"和"什么都没发生"完全一样，而这两者的排查方向相反。
+    **判据：凡是可能永远等下去的地方，都要有超时和一个能说出"我还在等什么"的出口**
+    （这里是 `PeekNamedPipe`），否则你连该看哪一行都不知道。
 
 ---
 
