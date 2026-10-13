@@ -669,16 +669,38 @@ $script:CdpProbeExpression = @'
     }
     var req = window.__ei_probe_require__;
     o.store.requireCaptured = !!req;
-    var st = req(12).a.getStore().getState();
-    o.store.slices = Object.keys(st).slice(0, 40);
-    var p = st.playing || {};
-    o.store.playingKeys = Object.keys(p).slice(0, 60);
-    o.store.playingPick = {};
-    ['playingState', 'playingMode', 'playProgress', 'playingProgress', 'currentTime',
-     'progress', 'duration', 'curPlaying'].forEach(function (k) {
-      if (k in p) { try { o.store.playingPick[k] = ('' + JSON.stringify(p[k])).slice(0, 200); } catch (x) { } }
-    });
-    o.store.lyricSlices = Object.keys(st).filter(function (k) { return /lyric|word/i.test(k); });
+    // 真机结论（2026-10-13）：webpack require 能拿到 ✓，但 `req(12).a.getStore` 在你这台客户端上
+    // **不是函数** ✗ —— 模块 id 随版本变（cloudmusic-desktop-mcp 钉死的是 12，那是对它测试的版本 ✓）。
+    // 所以这里**不猜 id**，而是扫 webpack 的**缓存**（req.c = 已实例化的模块 ✓）：
+    //   · **不执行任何模块** ✗（req(id) 可能会跑初始化代码）——只读缓存里的 exports ✓；
+    //   · 找导出里带 getStore（或同时带 getState+dispatch）的那个 ✓。
+    var hits = [];
+    var cache = (req && req.c) || {};
+    for (var id in cache) {
+      try {
+        var ex = cache[id] && cache[id].exports;
+        if (!ex) continue;
+        var cands = [ex, ex.a, ex.default, ex.exports];
+        for (var ci = 0; ci < cands.length; ci++) {
+          var c = cands[ci];
+          if (c && typeof c.getStore === 'function') { hits.push({ id: id, at: ci, kind: 'getStore' }); break; }
+          if (c && typeof c.getState === 'function' && typeof c.dispatch === 'function') { hits.push({ id: id, at: ci, kind: 'redux' }); break; }
+        }
+      } catch (x) { }
+    }
+    o.store.cacheSize = Object.keys(cache).length;
+    o.store.hits = hits.slice(0, 20);
+    // 找到了就顺手把切片名与 playing 的键名列出来（只看结构，不取值 ✗）
+    if (hits.length) {
+      try {
+        var c0 = [cache[hits[0].id].exports, cache[hits[0].id].exports.a, cache[hits[0].id].exports.default][hits[0].at];
+        var store0 = (typeof c0.getStore === 'function') ? c0.getStore() : c0;
+        var st = store0.getState();
+        o.store.slices = Object.keys(st).slice(0, 40);
+        var p = st.playing || {};
+        o.store.playingKeys = Object.keys(p).slice(0, 60);
+      } catch (x2) { o.store.probeError = '' + x2; }
+    }
   } catch (x) { o.store.error = '' + x; }
   return JSON.stringify(o);
 })()
