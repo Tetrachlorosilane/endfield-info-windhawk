@@ -70,6 +70,10 @@ param(
     [switch]$ProbeCdp,
     # 依次尝试的 CDP 端口（两个成熟项目分别用 9229 / 9223，9222 是通用默认）
     [int[]]$CdpPorts = @(9229, 9223, 9222),
+    # 歌词来源：auto = 先用 CDP store（若开着调试端口）再退回"LRC + 位置选行"；
+    # store = 只用 CDP store（精确到客户端自己的当前行 ✓）；lrc = 只用接口 LRC + 位置
+    [ValidateSet('auto', 'store', 'lrc')]
+    [string]$LyricSource = 'auto',
     # 位置扫描器路径，缺省用同目录的 _netease-lyric-scan.ps1
     [string]$ScannerPath = '',
     # 位置助手脚本，缺省用同目录的 _netease-position.ps1
@@ -633,6 +637,62 @@ function Get-CdpPositionMs {
     try { $o = ($m.Groups[1].Value -replace '\\"', '"') | ConvertFrom-Json } catch { return $null }
     if ($null -eq $o -or $null -eq $o.t) { return $null }
     try { return [int]([double]$o.t * 1000) } catch { return $null }
+}
+
+# ---------------------------------------------------------------------------
+# CDP store：首选歌词来源（真机结论 2026-10-13）
+# ---------------------------------------------------------------------------
+# 当前行 = `async:lyric.lyricLines[playing.playingLyricLineNumber]` ✓✓
+# —— 客户端自己维护的行号，**拖动进度条 / 暂停 / 切歌天然正确** ✓，不需要位置、不需要时间推算 ✓。
+# 访问方式照 cloudmusic-desktop-mcp 的做法（server.py:283-287）：往 webpackJsonp 塞一个模块，
+# 把 webpack 的 `require` 存到 window 上，再 `getStore()`（**不调 getState** ✓，见 server.py:339-346）。
+#
+# **规则化的探查**（用户要求保留）：模块 id **随客户端版本变** ✗（这台是 11，MCP 钉的是 12），
+# 所以这里**不写死 id** ✓ —— 运行期扫 webpack 的**缓存** `req.c`（只含已实例化模块 ✓，**不执行任何模块** ✗）
+# 找导出里带 `getStore` 的那个 ✓，并把结果缓存在页面上（`window.__ei_store_id__` ✓），
+# 客户端升级后若失效会自己再找一次 ✓ -ProbeCdp 同样走这条自寻址的路 ✓。
+# 单位陷阱（同一首歌、同一切片里三种单位 ✗）：`lyricLines[i].time` 是**秒** ✓、
+# `curTrack.duration` 是**毫秒** ✓、`playing.resourceDuration` 是**秒** ✓。
+function Get-CdpStoreState {
+    if (-not (Get-CdpTab)) { return $null }
+    $expr = @'
+(function(){
+  try{
+    if(!window.__ei_probe_require__){
+      webpackJsonp.push([[987661],{987661:function(m,e,require){window.__ei_probe_require__=require;}},[[987661]]]);
+    }
+    var req=window.__ei_probe_require__, cache=req.c||{}, id=window.__ei_store_id__;
+    if(!id){
+      for(var k in cache){
+        try{
+          var ex=cache[k]&&cache[k].exports; if(!ex) continue;
+          var cd=[ex,ex.a,ex.default];
+          for(var i=0;i<cd.length;i++){ if(cd[i]&&typeof cd[i].getStore==='function'){ id=k; window.__ei_store_id__=k; break; } }
+        }catch(e){}
+        if(id) break;
+      }
+    }
+    if(!id) return JSON.stringify({ok:false,why:'no store module in webpack cache'});
+    var h=[cache[id].exports,cache[id].exports.a,cache[id].exports.default].filter(function(x){return x&&typeof x.getStore==='function';})[0];
+    var g=h.getStore(), st=(g&&typeof g.getState==='function')?g.getState():g;
+    var p=(st&&st.playing)||{}, a=(st&&st['async:lyric'])||{};
+    var L=a.lyricLines||[], T=a.tlyricLines||[], i=p.playingLyricLineNumber;
+    var ok=(typeof i==='number'&&i>=0&&i<L.length);
+    return JSON.stringify({ok:true,moduleId:id,name:p.resourceName||'',trackId:p.resourceTrackId||'',
+      state:p.playingState,durationMs:(p.curTrack&&p.curTrack.duration)||0,
+      lines:L.length,index:i,offset:a.offset,usedLyric:a.currentUsedLyric,
+      line:ok?(L[i].lyric||L[i].text||''):'',lineTimeSec:ok?L[i].time:null,
+      trans:(typeof i==='number'&&i>=0&&i<T.length)?(T[i].lyric||T[i].text||''):''});
+  }catch(x){ return JSON.stringify({ok:false,why:''+x}); }
+})()
+'@
+    $raw = Invoke-CdpExpression -Expression $expr
+    if (-not $raw) { return $null }
+    $m = [regex]::Match($raw, '"value"\s*:\s*"((?:[^"\\]|\\.)*)"', 'Singleline')
+    if (-not $m.Success) { return $null }
+    # 双层解析：CDP 把返回值当**字符串**给出来，里面才是 JSON ✓（上一版手工替换转义引号把它弄坏过 ✗）
+    try { return (('"' + $m.Groups[1].Value + '"') | ConvertFrom-Json) | ConvertFrom-Json }
+    catch { return $null }
 }
 
 # 探测表达式：只读、无副作用，一次把"页面里有什么"尽量问全，避免来回猜。
