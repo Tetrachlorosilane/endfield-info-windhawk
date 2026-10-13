@@ -38,7 +38,7 @@ endfield-info-windhawk/
 ├── _settings.py                       校验 mod 头部的设置块结构
 ├── _preview.py                        渲染 assets/panel-preview.png
 ├── _extclient.py                      外部数据管道的冒烟客户端（Python）
-├── _extclient.ps1                     同一件事的第二客户端（.NET）：分辨"客户端没写"还是"传输坏了"
+├── _extclient.ps1                     第二客户端（.NET）——**真机验证过的是这一个**
 └── assets/panel-preview.png           版面预览（README 引用）
 ```
 
@@ -566,6 +566,16 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   的警告为 0（本地 mod build 检查不了这项，见 §3）。
 - 外部数据的**服务端路径**（`ExtHandleLine`：HELLO → SET → 存储 → 查找、换行框架与边缘空格裁剪、
   允许名单拒绝）有断言覆盖，共 251 条。
+- **真机整链验证（用户环境，2026-10-13）**：mod 的开机自检两帧被服务端完整收到
+  （`self-test sent 2 frames` → `recv bytes=17/33` → `hello provider=selftest` → `set … key=ok`），
+  且自检值在行里**显示了出来**——传输、存储、展开、绘制四段都成立；随后用
+  `_extclient.ps1`（.NET）发布的值也**在面板上显示**。管道参数同时被记录：
+  `flags=0xd`（服务端 + message 类型 + 拒绝远程）、`curInstances=4`（4 个实例都是本进程的，
+  没有第二个进程抢同名管道）。
+- **`_extclient.py` 尚未在真机上被观察到写入**：那个环境里它连上后同一毫秒即断开、零帧，
+  而脚本自身的时序（写完两行后至少 1 秒才关闭）与之不符——怀疑当时跑的并非本仓库这一份。
+  要用客户端验证时**优先用 `_extclient.ps1`**，或先确认 `python -c "import os;print(os.path.abspath('_extclient.py'))"`
+  指向本仓库的文件。
 
 **未验证**（需要真实运行环境）：
 
