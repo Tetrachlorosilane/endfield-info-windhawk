@@ -730,6 +730,28 @@ $script:CdpProbeExpression = @'
         try { o.store.curTrackKeys = Object.keys(p.curTrack || {}).slice(0, 40); } catch (x6) { }
         try { o.store.curPlayingKeys = Object.keys(p.curPlaying || {}).slice(0, 40); } catch (x7) { }
         try { o.store.playingLyricLineNumber = p.playingLyricLineNumber; } catch (x8) { }
+        o.store.curTrackName = (p.curTrack && p.curTrack.name) || null;
+        o.store.curTrackDuration = (p.curTrack && p.curTrack.duration) || null;
+        o.store.curPlayingText = (p.curPlaying && typeof p.curPlaying.text === 'string')
+          ? p.curPlaying.text.slice(0, 80) : null;
+        // 真机发现（2026-10-13）：`playingLyric` 是**空数组** ✗（只在歌词界面激活时才有内容）。
+        // 而 stateKeys 里有 **`async:lyric`** ✓ 与 **`async:decorationDesktop`** ✓（dva 动态模型 ✓）——
+        // "当前歌词行"最可能在这两个切片里。只回报它们的**键 + 标量 + 短字符串** ✓。
+        o.store.lyricSlices = {};
+        var names = ['async:lyric', 'async:decorationDesktop'];
+        for (var ni = 0; ni < names.length; ni++) {
+          try {
+            var sl = st[names[ni]];
+            if (!sl) { o.store.lyricSlices[names[ni]] = 'missing'; continue; }
+            var scal = {};
+            for (var k2 in sl) {
+              var v2 = sl[k2];
+              if (typeof v2 === 'number') scal[k2] = v2;
+              else if (typeof v2 === 'string' && v2.length <= 80) scal[k2] = v2;
+            }
+            o.store.lyricSlices[names[ni]] = { keys: Object.keys(sl).slice(0, 40), scalars: scal };
+          } catch (x9) { o.store.lyricSlices[names[ni]] = 'err'; }
+        }
       } catch (x2) { o.store.probeError = '' + x2; }
     }
   } catch (x) { o.store.error = '' + x; }
