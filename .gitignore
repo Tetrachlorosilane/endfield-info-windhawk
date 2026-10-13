@@ -1,0 +1,3 @@
+# Local byproducts of the development tools (none of these ship with the mod).
+__pycache__/
+*.pyc

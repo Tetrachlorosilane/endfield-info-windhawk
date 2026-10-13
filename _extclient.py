@@ -28,7 +28,7 @@ import time
 PIPE = r"\\.\pipe\endfield-info-windhawk"
 
 
-def send(lines, timeout=1.0):
+def send(lines, timeout=1.0, verbose=True):
     """Writes the lines, returns whatever the server answered within timeout."""
     replies = []
     try:
@@ -69,7 +69,18 @@ def send(lines, timeout=1.0):
         thread = threading.Thread(target=reader, daemon=True)
         thread.start()
         for line in lines:
-            pipe.write((line + "\n").encode("utf-8"))
+            payload = (line + "\n").encode("utf-8")
+            # os.write on the raw descriptor instead of pipe.write on the buffered
+            # object, and the byte count is printed. That count is what separates "the
+            # client never wrote" from "the transport lost it" when the mod's log
+            # reports an empty pipe buffer after a connection.
+            try:
+                written = os.write(fileno, payload)
+            except OSError as exc:
+                print("-> %s  FAILED: %s" % (line, exc))
+                break
+            if verbose:
+                print("-> %s  (%d/%d bytes)" % (line, written, len(payload)))
         thread.join(timeout)
     return replies
 
@@ -99,9 +110,9 @@ def main():
 
     if not args.quiet:
         for line in lines:
-            print("-> %s" % line)
+            print("writing: %s" % line)
     started = time.monotonic()
-    replies = send(lines)
+    replies = send(lines, verbose=not args.quiet)
     if replies is None:
         return 1
     for reply in replies:
