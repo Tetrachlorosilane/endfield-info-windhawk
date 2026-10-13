@@ -306,6 +306,14 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   以 `g_intro.active` 为唯一状态。
 - **收回时窗口必须逐帧跟随收缩**（收缩路径每帧调 `PlaceWindow`）。
   否则展开高度的位图会被裁进 8px 窗口。
+- **但绝不能在收起开始时先把窗口缩到标签高度。** 曾经的顺序是「`SetExpanded(false)` 先把窗口缩到
+  8px → `PaintPanel` 再把它长回动画高度才画」，同一拍内 168→8→168 的往返里存在
+  「窗口 8px 高、却没有任何位图与之匹配」的一瞬间，合成器只能给出一条切片——**那就是收起时的
+  闪烁**。规矩：**窗口尺寸的变化必须与它提交的位图在同一帧内一致**。展开方向可以先定位
+  （面板长进一片本来什么都没有的空间），收起方向必须由绘制侧逐帧跟随内容
+  （`if (expanded) PlaceWindow(hwnd);`）。绘制分支里那句 *"SetExpanded already shrank the window
+  to the resting (tab) height, so the frame has to grow it back"* 正是这个往返的补偿——
+  **补偿存在，说明顺序错了**。
 - **展开与收回刻意不对称**：展开先生长定型、再让内容分层浮现；收回贯穿整段、时长为一半。
 - **方向判定用 `start = fromHeight`、`end = toHeight`**，方向由两者大小自然决定。
   曾按方向重排 start/end → 收回时高度反而在增长。
@@ -391,6 +399,7 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 | 提供者名从帧行拷贝时未按长度截断 | 客户端连上、`SET` 被接受，行**永远显示 `--`**；且每次重连占一个新槽位，8 次后 `HELLO` 开始回 403 | 用**带换行**的 `HELLO`/`SET` 驱动 handler，断言 `{ext.provider.key}` 查得到（旧代码下红两条） |
 | `CreateNamedPipe` 的 `nMaxInstances` 传 1 而线程数是 4 | 日志写着 `serving 4 pipe instance(s)`，实际 3 个线程以 `CreateNamedPipe failed: 231` 当场退出，只支持 1 个并发客户端 | **没有断言能覆盖**（这是 API 调用点的常量错，宿主里没有真管道）；判别依据是错误码语义——**断言覆盖不到的地方，日志就是防线** |
 | 读用 `INFINITE` 等完成事件，完成事件一旦丢失线程就永久停住 | 客户端**连上了**（`ExtLogClient` 有），之后日志**完全静默**——连 `client done` 都没有，行永远 `--` | 等待加 500 ms 上界 + `PeekNamedPipe` 判定；缓冲有数据却没完成就重投。判别日志：`EXT read#1 result=… got=…`、`read completion never arrived with N bytes queued`、`no frame for 2s and the pipe buffer is empty` |
+| 收起时先把窗口缩到标签高度、再长回来画（`SetExpanded` 里那次 `PlaceWindow`） | 收起瞬间闪出一条"切片"，极短、难复现；鼠标离开检测区延迟后触发 | **无法断言**（这是分层窗口的帧内顺序，不是数值）。判据是流程：窗口尺寸必须与**同一帧提交的位图**一致；收起方向由绘制侧逐帧跟随内容（`if (expanded) PlaceWindow(hwnd);`） |
 
 ### 排查心法：先分类，再定位
 
@@ -455,6 +464,14 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
     时序，它连红两次才暴露出来（当时看起来像是我改坏了）。修法是直接把条目的
     `updatedAt` 挪到过去：**构造"时间过去了"这个状态，而不是等它发生**。
     判据：断言里的 `Sleep` 都是可疑的，除非你断言的就是"睡眠会持续"。
+12. **分层窗口的「尺寸—位图」一致性是逐帧不变量，而补偿代码是它出问题的气味。** 收起闪烁我先后在
+    **宽度**上改了四轮（宽度动画 → 撤销动画 → 跳变 → 干脆固定宽度），全都没用；真正的原因在**高度**
+    路径的一次既有往返：先缩窗口、再长回来才画。识别它的线索正是绘制分支里那句补偿注释
+    （*"SetExpanded already shrank the window to the resting (tab) height, so the frame has to grow
+    it back"*）——**当你需要一段代码去撤销上一段代码刚做的事，顺序就是错的**。
+    定位方法也不是按层猜，而是**把事件流程读出来**：谁在什么时候调 `PlaceWindow`、谁调
+    `PaintPanel`、一拍之内两者的先后。用户一句"检查鼠标离开检测区后的渲染事件流程"比我自己
+    猜四轮都有效——**症状说不清层的时候，去读调用顺序，而不是继续调参数**。
 
 ---
 
