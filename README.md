@@ -429,7 +429,8 @@ pwsh -File _netease-bridge.ps1 -Event -Ttl 600000
 | `-TtlMs` | 推过去的值的寿命，默认 600000（歌在播，给长一点，别让行里闪 `--`） |
 | `-Event` | 换歌时发一条 `EVENT`，让灵动岛弹一次 |
 | `-SongId` | 手工指定歌曲 id，跳过搜索（接口查不到时的兜底） |
-| `-PositionSource` | 播放位置来源：`auto`（默认，依次试 `memory` → `media` → 推算时钟）/ `memory` / `media` / `clock`。`memory` 直接读客户端内存里的播放毫秒，**拖动进度条与暂停都能跟上**，只读、且每个客户端进程只发现一次 |
+| `-LyricSource` | 歌词来源：`auto`（默认，先用 CDP store，失败退回 LRC）/ `store`（只读客户端页面里的状态，**精确到客户端自己的当前行**，拖动进度条与暂停天然正确 ✓）/ `lrc`（只读歌词接口 + 位置选行）。`store` 需要你自己给快捷方式加调试端口（见 `-ProbeCdp`） |
+| `-PositionSource` | 播放位置来源：`auto`（默认，依次试 `memory` → `cdp` → `media` → 推算时钟）/ `memory` / `media` / `clock`。`memory` 直接读客户端内存里的播放毫秒，**拖动进度条与暂停都能跟上**，只读、且每个客户端进程只发现一次 |
 | `-ProbePosition` | 探测位置来源（媒体会话那条）；`-ProbeCdp` 探测 CDP 调试端口（需要你手动给快捷方式加 `--remote-debugging-port=9229`，脚本会打印步骤） |
 | `-DryRun` / `-SelfTest` / `-DumpJson` | 不发送 / 离线自检 / 打印接口返回的 JSON |
 
