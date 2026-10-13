@@ -55,7 +55,9 @@ param(
     # 跑一轮就退出
     [switch]$Once,
     # 直接指定歌曲 id（跳过搜索），用于接口查不到时手工兜底
-    [int]$SongId = 0
+    [int]$SongId = 0,
+    # 取不到歌词时多久重试一次。只在启动时查一次的话，接口抖一下整首歌就都没有歌词
+    [int]$LyricRetryMs = 20000
 )
 
 $ErrorActionPreference = 'Stop'
@@ -250,6 +252,8 @@ if (-not $DryRun) {
 $started = Get-Date
 $lastRaw = $track.Raw
 $announced = $false
+$lyricAttemptAt = Get-Date
+$lyricMisses = 0
 
 try {
     while ($true) {
@@ -262,6 +266,8 @@ try {
             $lastRaw = $now.Raw
             $started = Get-Date
             $script:Sent.Clear()
+            $lyricAttemptAt = Get-Date
+            $lyricMisses = 0
             try { $lyricLines = @(Get-LyricLines -Title $track.Title -Artist $track.Artist) }
             catch { $lyricLines = @() }
             Write-Host ("换歌：{0} — {1}（{2} 行 LRC）" -f $track.Title, $track.Artist, $lyricLines.Count)
@@ -273,6 +279,30 @@ try {
         }
 
         if ($now) {
+            # 没有歌词就隔一会儿再试。只在启动时查一次的话，接口抖动一下、或者网易云
+            # 刚起来网络还没就绪，整首歌都会没有歌词——行里就一直是 --，而且看不出原因。
+            if ($lyricLines.Count -eq 0 -and
+                ((Get-Date) - $lyricAttemptAt).TotalMilliseconds -ge $LyricRetryMs) {
+                $lyricAttemptAt = Get-Date
+                try {
+                    $lyricLines = @(Get-LyricLines -Title $now.Title -Artist $now.Artist)
+                    if ($lyricLines.Count -gt 0) {
+                        $lyricMisses = 0
+                        Write-Host ("取到歌词：{0} 行" -f $lyricLines.Count)
+                    }
+                    elseif ($lyricMisses -lt 3) {
+                        # 有界：说三次就够，之后安静重试，不刷屏
+                        $lyricMisses++
+                        Write-Host "（接口没给歌词，继续重试；用 -DumpJson 看原始返回、-SongId 手工指定）"
+                    }
+                }
+                catch {
+                    if ($lyricMisses -lt 3) {
+                        $lyricMisses++
+                        Write-Host ("（歌词接口失败：{0}）" -f $_.Exception.Message)
+                    }
+                }
+            }
             $elapsedMs = [int]((Get-Date) - $started).TotalMilliseconds
             $line = Select-LrcLine $lyricLines $elapsedMs
 
