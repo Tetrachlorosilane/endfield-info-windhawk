@@ -1105,7 +1105,16 @@ int main() {
               "an invalid key character stays literal");
 
         ExtStoreValue(slot, L"short", L"x", 1, 128);      // 1 ms
-        Sleep(10);
+        // Age the entry by hand rather than sleeping: GetTickCount advances in steps of
+        // about 15.6 ms, so Sleep(10) may not cross a tick at all and "is it expired
+        // yet" then depends on scheduling. That made this assertion flap (it went red
+        // twice in a row when unrelated logging shifted the timing). Moving the
+        // timestamp constructs "time passed" instead of waiting for it.
+        for (int i = 0; i < g_ext[slot].count; i++) {
+            if (_wcsicmp(g_ext[slot].entries[i].key, L"short") == 0) {
+                g_ext[slot].entries[i].updatedAt -= 1000;
+            }
+        }
         Check(ExtLookup(L"ext.music.short", (int)wcslen(L"ext.music.short"), &text) == ER_EXPIRED,
               "a value past its ttl renders as unavailable");
 

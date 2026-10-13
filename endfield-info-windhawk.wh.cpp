@@ -1755,6 +1755,46 @@ static void ExtLogRowReferences(const ModSettings &s) {
     if (!logged) Wh_Log(L"EXT no row references {ext.*}; the pipe will not be created");
 }
 
+// Diagnostic only: the last lookup status seen for a few external names, so a row
+// that renders "--" can be attributed in the log. "expired" means the store had the
+// name and its value ran out of time; "value" means the text is being rendered (so a
+// blank row would be downstream, in layout or paint); "unknown" means the name is
+// malformed or the provider never registered. It logs on *change* only, which keeps
+// it bounded no matter how often the panel repaints, and the value text is never
+// logged.
+static const int kExtStatusSlots = 8;
+struct ExtStatusSeen {
+    WCHAR name[64];
+    int   len;
+    int   status;         // 1 = value, 0 = expired, -1 = malformed or unregistered
+};
+static ExtStatusSeen g_extStatusSeen[kExtStatusSlots];
+
+static const WCHAR *ExtStatusName(int status) {
+    return status > 0 ? L"value" : (status == 0 ? L"expired" : L"unknown");
+}
+
+static void ExtLogStatus(const WCHAR *name, int nameLen, int status) {
+    if (nameLen <= 0 || nameLen > 63) return;
+    int free = -1;
+    for (int i = 0; i < kExtStatusSlots; i++) {
+        if (g_extStatusSeen[i].len == nameLen &&
+            _wcsnicmp(g_extStatusSeen[i].name, name, nameLen) == 0) {
+            if (g_extStatusSeen[i].status == status) return;
+            g_extStatusSeen[i].status = status;
+            Wh_Log(L"EXT %s -> %s", g_extStatusSeen[i].name, ExtStatusName(status));
+            return;
+        }
+        if (free < 0 && g_extStatusSeen[i].len == 0) free = i;
+    }
+    if (free < 0) return;                  // table full: stay quiet rather than spam
+    wcsncpy(g_extStatusSeen[free].name, name, 63);
+    g_extStatusSeen[free].name[63] = L'\0';
+    g_extStatusSeen[free].len = nameLen;
+    g_extStatusSeen[free].status = status;
+    Wh_Log(L"EXT %s -> %s", g_extStatusSeen[free].name, ExtStatusName(status));
+}
+
 // Writes one value. Takes the lock itself, so the pipe thread cannot forget to.
 static void ExtStoreValue(int slot, const WCHAR *key, const WCHAR *text, DWORD ttlMs, int maxChars) {
     if (slot < 0 || slot >= kMaxExtProviders) return;
@@ -2678,6 +2718,7 @@ static LookupResult ResolveToken(const WCHAR *name, int nameLen, const WCHAR *sp
     if (ExtIsExtToken(name, nameLen)) {
         const WCHAR *text = nullptr;
         ExtResult result = ExtLookup(name, nameLen, &text);
+        ExtLogStatus(name, nameLen, result == ER_VALUE ? 1 : (result == ER_EXPIRED ? 0 : -1));
         if (result == ER_NONE) return LR_UNKNOWN;
         if (result == ER_EXPIRED) return LR_UNAVAILABLE;
         wcsncpy(out, text ? text : L"", outCount - 1);
