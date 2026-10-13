@@ -636,15 +636,24 @@ function Get-CdpPositionMs {
 }
 
 # 探测表达式：只读、无副作用，一次把"页面里有什么"尽量问全，避免来回猜。
+# 真机结论（2026-10-13）：这个页面**没有 audio/video 元素** ✗，所以位置不可能来自媒体元素；
+# 于是改成问三类东西，并**带上类名**（我们要的是锚点，不是猜）：
+#   ① 文本形如 m:ss 的节点        → 播放时间（当前 / 总长）
+#   ② style 里带 width 的节点     → 进度条（百分比可换算成位置）
+#   ③ 含中文的**叶子**节点        → 歌词行（叶子才能避免把整页 dump 出来）
 $script:CdpProbeExpression = @'
 (function(){
-  var o = { title: document.title, url: location.href, audio: [], cands: [] };
-  var a = document.querySelectorAll('audio,video');
-  for (var i = 0; i < a.length; i++) o.audio.push({ t: a[i].currentTime, d: a[i].duration, p: a[i].paused });
-  var s = ['.title', '.author', '.m-playbar', '#g_player', '[class*=progress]', '[class*=lyric]', '[class*=bar]'];
-  for (var j = 0; j < s.length; j++) {
-    var e = document.querySelector(s[j]);
-    if (e) o.cands.push(s[j] + ' = ' + ((e.innerText || e.textContent || '') + '').slice(0, 120));
+  function cls(e){ try { return ('' + (e.className || '')).slice(0, 60); } catch (x) { return ''; } }
+  var o = { title: document.title, timeTexts: [], widths: [], cjk: [] };
+  var all = document.querySelectorAll('*');
+  for (var i = 0; i < all.length; i++) {
+    var e = all[i];
+    var t = ('' + (e.innerText || e.textContent || '')).trim();
+    if (o.timeTexts.length < 8 && /^\d{1,2}:\d{2}$/.test(t)) o.timeTexts.push({ c: cls(e), t: t });
+    var st = (e.getAttribute && e.getAttribute('style')) || '';
+    if (o.widths.length < 8 && /width\s*:\s*[\d.]+/.test(st)) o.widths.push({ c: cls(e), s: st.slice(0, 80) });
+    if (o.cjk.length < 12 && !e.children.length && t.length >= 2 && t.length <= 200 &&
+        /[\u4e00-\u9fff]/.test(t)) o.cjk.push({ c: cls(e), t: t.slice(0, 60) });
   }
   return JSON.stringify(o);
 })()
