@@ -681,17 +681,19 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   `--remote-debugging-port=9229` 的快捷方式启动时可用 ✓；插件负责**把改快捷方式的步骤讲清楚**
   （`Show-CdpShortcutGuidance` ✓，内存读取失败时自动打印 ✓）和 `-ProbeCdp` 探测 ✓，
   **不会**替用户启动或重启音乐软件 ✓（全文唯一的 `Start-Process` 是启动我们自己的 SMTC 位置助手 ✓）。
-  **CDP 的实测结论（2026-10-13，真机三次探测，全部负面）**：端口 9229 确实是 CDP（`Chrome/91.0.4472.169` ✓）、
-  `Runtime.evaluate` 可用 ✓、`.author` 在"正在播放"视图能读到歌手 ✓ —— **但这个客户端在页面里既不给位置
-  也不给歌词** ✗：DOM 里**没有 `audio/video` 元素** ✗；`m:ss` 文本**全是歌单里每首的时长**（不是播放时钟 ✗）；
-  `style` 里的宽度是列表行与缩略图（**没有进度条** ✗）；含中文的叶子节点是导航与歌单名（**没有歌词** ✗）；
-  而且 `window` 上**没有任何带 `getState` 的对象**（Redux store 不可达 ✗）。两个成熟项目的"读 store /
-  派发内部 action"是**版本钉死的深度集成** ✗（它们的 README 里也写着"客户端更新可能改变结构"），
-  **不复刻** ✗。**CDP 到此止步** ✓：保留 `-ProbeCdp`（端口 ✓ + 一次只读求值 ✓）与改快捷方式的指导 ✓；
-  位置继续走**内存来源** ✓（已真机验证：拖动 ✓、暂停 ✓、切歌 ✓）。`-PositionSource` 里 `cdp` 取值保留
-  （将来有人把这台客户端的锚点找出来可直接接上 ✓），实际可用的是 `auto|memory|media|clock` ✓。
-  `Get-CdpPositionMs` 目前用通用锚点（`audio.currentTime`），在这台机器上取不到值 ✗ → 会安静返回空、
-  继续降级 ✓（不误报 ✓）。自检 23 项 ✓（含位置候选行解析 ✓、两拍播放/暂停判定 ✓、切歌粗校验 ✓）。
+  **CDP 的实测与修正（2026-10-13，真机三次探测 + 精读本地 `cloudmusic-desktop-mcp` 的实现）**：
+  端口 9229 确实是 CDP（`Chrome/91.0.4472.169` ✓）、`Runtime.evaluate` 可用 ✓ —— **但 DOM 路确实不通** ✗：
+  页面里**没有 `audio/video` 元素** ✗、`m:ss` 文本全是**歌单每首的时长** ✗、`style` 里的宽度是列表行与
+  缩略图（**没有进度条** ✗）、含中文的叶子节点是导航与歌单名（**没有歌词** ✗）。
+  ⚠️ **但"store 不可达"是我下早了的结论 ✗**：我扫的是 `window` 上带 `getState` 的对象（结果为空 ✗），
+  而 `cloudmusic-desktop-mcp/server.py:283-287` 的做法是**往 `webpackJsonp` 塞一个模块，把 webpack 的
+  `require` 存到 window 上**，再 `require(12).a.getStore()` 拿 store ✓✓（`server.py:336-347` 读
+  `s.playing.playingState/curPlaying`、`s.playingList.curPlayingList`、`s.setting.showLyric` ✓）。
+  **教训**：探测要打在"实现真正使用的那条路上"，而不是想当然的 `window` 全局上 ✗；
+  项目就在本地 `C:\Users\HP\source\gitclone\cloudmusic-desktop-mcp` ✓，**先读它再下结论** ✓。
+  因此 `-ProbeCdp` 的表达式已改为**照同一条路**（自己的空闲模块号 987661 ✓、只列键与短值 ✓、全程 try/catch ✓），
+  下一步据其输出固化"位置 + 当前歌词行" ✓。`Get-CdpPositionMs` 现有的通用锚点（`audio.currentTime`）
+  在 DOM 路下取不到值 ✗ → 会安静返回空、继续降级 ✓（不误报 ✓）。自检 23 项 ✓。
 - **mod 侧「外部发布器」包装（M4 第一片，已实现）**：设置项 `External publisher command` 里写一条命令行，
   mod 就替你启动它 ✓。要点（每条都有理由）：
   · **只启动用户写的那条命令** ✓，**绝不启动/重启任何第三方应用**（含音乐客户端）✗——那属于改变用户

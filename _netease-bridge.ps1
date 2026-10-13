@@ -655,20 +655,31 @@ $script:CdpProbeExpression = @'
     if (o.cjk.length < 12 && !e.children.length && t.length >= 2 && t.length <= 200 &&
         /[\u4e00-\u9fff]/.test(t)) o.cjk.push({ c: cls(e), t: t.slice(0, 60) });
   }
-  // 真机结论（2026-10-13）：DOM 里既没有当前时间也没有进度条，更没有歌词 ✗
-  // （找到的 m:ss 全是歌单每首的时长；那个页面此刻是首页视图）。两个成熟项目走的是
-  // **读页面里的 React store**（Redux：带 getState ✓）而不是抠 DOM ✓，所以这里补上这一步：
-  // 列出 window 上带 getState 的对象，以及它 state 顶层的键名（只列键，不 dump 内容）。
-  o.stores = {};
-  for (var k in window) {
-    try {
-      var v = window[k];
-      if (v && typeof v.getState === 'function') {
-        var s = v.getState();
-        o.stores[k] = s ? Object.keys(s).slice(0, 24) : [];
-      }
-    } catch (x) { }
-  }
+  // 真机结论（2026-10-13，读过 cloudmusic-desktop-mcp 的实现后修正）：
+  // **Redux store 不在 window 上** ✗（所以"扫 getState"必然为空 ✗），它要通过 **webpack 运行时**拿：
+  // cloudmusic-desktop-mcp 先往 webpackJsonp 里塞一个模块，把 webpack 的 require 存到 window 上，
+  // 再 `require(12).a.getStore()` 拿到 store ✓。这里照同一条路，但：
+  //   · 用**自己的**空闲模块号（987661），不占用别人的 ✓；
+  //   · 只**列键名**与少量短值（不外传任何可识别内容 ✓）；
+  //   · 全程 try/catch，失败也只回报错误文本 ✓。
+  o.store = {};
+  try {
+    if (!window.__ei_probe_require__) {
+      webpackJsonp.push([[987661], { 987661: function (m, e, require) { window.__ei_probe_require__ = require; } }, [[987661]]]);
+    }
+    var req = window.__ei_probe_require__;
+    o.store.requireCaptured = !!req;
+    var st = req(12).a.getStore().getState();
+    o.store.slices = Object.keys(st).slice(0, 40);
+    var p = st.playing || {};
+    o.store.playingKeys = Object.keys(p).slice(0, 60);
+    o.store.playingPick = {};
+    ['playingState', 'playingMode', 'playProgress', 'playingProgress', 'currentTime',
+     'progress', 'duration', 'curPlaying'].forEach(function (k) {
+      if (k in p) { try { o.store.playingPick[k] = ('' + JSON.stringify(p[k])).slice(0, 200); } catch (x) { } }
+    });
+    o.store.lyricSlices = Object.keys(st).filter(function (k) { return /lyric|word/i.test(k); });
+  } catch (x) { o.store.error = '' + x; }
   return JSON.stringify(o);
 })()
 '@
