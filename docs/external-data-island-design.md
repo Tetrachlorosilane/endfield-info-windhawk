@@ -280,8 +280,142 @@ struct ExtProvider {
   所以 IPC 线程写入后置一个 `volatile LONG g_extDirty`，采样线程既有的 **50 ms 切片 sleep**
   （[4178](../endfield-info-windhawk.wh.cpp#L4178)）看到它就提前结束等待、立即再采一次并清标志
   → 实际延迟约 50 ms，且天然合并（一批 `SET` 只触发一次采样、一次重绘）。
-- `EVENT` 走另一条路：它不进 `{ext.…}`，卡片直接显示事件自带文本，
-  所以 IPC 线程直接 `PostMessage(g_window, kMsgExtEvent)` → HUD 立刻重绘，**完全不等**采样周期。
+- `EVENT` 走另一条路：它不进 `{ext.…}`，卡片直接显示事件自带文本，所以 IPC 线程
+  `PostThreadMessage(g_hudThreadId, kMsgExtEvent, …)` → HUD 立刻处理、**完全不等**采样周期。
+  用**线程消息**而不是 `PostMessage(g_window, …)`：后者要读 `g_window`，而它由 HUD 线程在
+  退出时置空、HWND 还可能被系统回收给别的窗口（§5.6.3 R5）。
+
+### 5.5 一条 `SET` 的完整路径与延迟预算
+
+```
+客户端 write("SET music title - Now Playing\n")
+ ① IPC 线程 ReadFile（消息模式：一次 ReadFile 正好一条消息）      ~0 ms
+ ② MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS)          失败 → ERR 400
+ ③ ExtParseLine / ExtSanitize / ExtParseNumber                 纯函数，µs
+ ④ 取设置快照（g_settingsLock）→ 校验允许名单、限额、速率        见 §5.6.1 规则 1
+ ⑤ Enter(g_extLock) → ExtStoreValue(...) → Leave                µs
+ ⑥ InterlockedExchange(&g_extDirty, 1)                         ← 只置标志，不重绘
+ ⑦ 应答 OK（写失败忽略，见 §4.2）
+ ⑧ sampler 的 50 ms 切片循环看到 g_extDirty → 立即采一次         ≤ 50 ms
+ ⑨ PublishRows: Enter(g_extLock) 展开所有行 → Leave              µs
+     展开时顺便算 ExtNextDeadline() → InterlockedExchange(&g_extDeadlineMs)
+ ⑩ Enter(g_valuesLock) 换入 g_rowState / g_values → Leave
+ ⑪ PostMessage(g_window, kMsgRatesReady) → HUD：PaintPanel       1–3 ms
+```
+
+| 路径 | 最坏延迟 | 说明 |
+| :-- | :-- | :-- |
+| 无 `g_extDirty`（只靠采样周期） | `UpdateMs`：默认 1000 ms，用户可设到 10000 ms | 推一条通知要等一秒以上，不可接受 |
+| 有 `g_extDirty` | 50 ms + 展开 + 重绘 ≈ **60 ms 量级** | 一次突发只多采一次：标志是 test-and-clear，天然合并 |
+| `EVENT`（M2） | 线程消息 → 16 ms 帧时钟 ≈ **≤ 32 ms** | 不进模板展开，绕开采样周期 |
+| 值过期变 `--` | ≤ 40 ms(tick) + 50 ms(切片) + 重绘 ≈ **≤ 100 ms** | 机制见 §5.6.2，**与 `UpdateMs` 无关** |
+
+**给提供者的约束**（写进协议文档）：`ttl` 应 ≥ `2 × Update interval`，否则值会在两次采样之间
+反复"有效—失效"，屏幕看起来在闪。
+
+### 5.6 锁序与竞态清单
+
+#### 5.6.1 锁清单与三条硬规则
+
+| 锁 | 写侧 | 读侧 |
+| :-- | :-- | :-- |
+| `g_valuesLock` | sampler（`PublishRows`） | HUD（`PaintPanel`） |
+| `g_settingsLock` | loader（换入快照，见 R1） | sampler、IPC |
+| `g_extLock`（新） | IPC（写入/删除） | sampler（展开行文本期间） |
+
+1. **同一次操作里只持有一把锁。** 展开时先 `Leave(g_extLock)` 再 `Enter(g_valuesLock)`；
+   IPC 先取设置快照并释放，再拿 `g_extLock`。三把锁之间没有嵌套，**环在结构上不可能形成**。
+2. **`g_extLock` 只由 IPC 线程与 sampler 线程获取**，HUD 线程**永不**触碰它
+   （避免引入 HUD → `g_extLock` 这条边）。
+3. **纯函数不加锁**（`ExtLookup` / `ExtSanitize` / `ExtParseNumber` / `ExtNextDeadline`），
+   锁由调用方持有。这同时是测试宿主能直接调用它们的前提：宿主不走 `WhTool_ModInit`，
+   临界区根本没初始化（见 R11）。
+
+#### 5.6.2 更正：到期时"只重绘"是不够的
+
+上一轮的提法（到期时 `PaintPanel` 一次）**不成立**：`g_rowState` 里存的是**已经展开好的文本**
+（[2341](../endfield-info-windhawk.wh.cpp#L2341)），token 早就不在了。重绘只会把同一段陈旧文字
+再画一遍，`--` 永远不会出现。正确做法是**让 sampler 重新展开一次**，而且 deadline 必须由
+**sampler** 维护（只有它知道下次什么时候会重新展开）：
+
+```c
+// 纯函数：最早的到期时刻（0 = 当前没有有效的外部值）。调用方持 g_extLock。
+static DWORD ExtNextDeadline(const ExtProvider *table, int count);
+
+// sampler：展开行文本时顺手发布（此刻它正持着 g_extLock，读到的一定是一致的表）
+InterlockedExchange(&g_extDeadlineMs, (LONG)ExtNextDeadline(g_ext, kMaxExtProviders));
+
+// HUD：40 ms 的 tick（[3911]）只做一次原子读，到期不是"重绘"而是"再要一次采样"
+case WM_TIMER:
+    if (wParam == kTimerTick) {
+        LONG deadline = InterlockedCompareExchange(&g_extDeadlineMs, 0, 0);
+        if (deadline && (LONG)(GetTickCount() - (DWORD)deadline) >= 0) {
+            InterlockedExchange(&g_extDeadlineMs, 0);   // 先清：万一这次没采成也不会空转
+            InterlockedExchange(&g_extDirty, 1);        // sampler 重算并把该值展开成 --
+        }
+        UpdateProximity(hwnd);
+        UpdateIntro(hwnd);
+        ReassertTopmost(hwnd);
+    }
+```
+
+为什么这样就闭合：每个 `SET` 都置 `g_extDirty` → sampler 至少重采一次 → **每次采样都重算 deadline**；
+deadline 到期 → HUD 再置一次 dirty → sampler 再采一次（此时该值已过期，展开成 `--`）→ 重算 deadline
+（通常为 0，HUD 停止戳）。**没有新的锁边、没有新线程、没有新定时器。**
+
+用线程消息还要改一处消息循环（线程消息的 `hwnd` 是 `NULL`，`DispatchMessage` 不会把它送进
+`WindowProc`，必须显式处理）：
+
+```c
+while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+    if (msg.hwnd == nullptr) {                       // 线程消息
+        if (msg.message == kMsgQuit) break;
+        if (msg.message == kMsgExtEvent) { ExtOnEvent(); continue; }
+        continue;
+    }
+    TranslateMessage(&msg);
+    DispatchMessageW(&msg);
+}
+```
+
+#### 5.6.3 竞态清单与逐条处置
+
+| # | 竞态 | 严重度 | 处置 |
+| :-- | :-- | :-- | :-- |
+| **R1** | **既有缺陷**：`WhTool_ModSettingsChanged` 裸写 `g_settings`（[4285](../endfield-info-windhawk.wh.cpp#L4285)），而 sampler 是在 `g_settingsLock` 里拷它（[4138](../endfield-info-windhawk.wh.cpp#L4138)）→ 可能拷到"半新半旧"的一份（`rowCount` 与 `rows[]` 不一致、文字错乱一个刷新周期） | 中（可见，不越界） | 先写临时变量、再**加锁换入**：`ModSettings fresh; ReadSettings(fresh); Enter(g_settingsLock); g_settings = fresh; Leave;`，并把 `PushSettings` 改用 `fresh.updateMs` |
+| **R1b** | 同类：`WhTool_ModSettingsChanged` 还调 `ReadCpuStatic()`（[4286](../endfield-info-windhawk.wh.cpp#L4286)），裸写 `g_cpuName`/`g_cpuGhzMax`/`g_cpuCores`/`g_cpuThreads`，而 `ReadCpu` 在 sampler 上读 | 低（一帧内文字错乱） | 把写入**收敛到 sampler 线程**：loader 不再调；sampler 在既有的"设置版本变了"分支（[4143](../endfield-info-windhawk.wh.cpp#L4143)）里调一次 |
+| R2 | `g_extDirty` 丢失唤醒（`SET` 正好落在 sampler 检查与 `Sleep` 之间） | — | 不存在：标志只由 sampler test-and-clear，置上就一定会被处理 |
+| R3 | IPC 读限额/允许名单时与 loader 写 `g_settings` 抢 | 中 | 每条命令**先在 `g_settingsLock` 内取一份快照**再校验；限额不缓存进全局（连带消灭这条本身） |
+| R4 | HUD 读 `g_extDeadlineMs` 与 sampler 写抢 | 低 | 只用 `InterlockedExchange` / `InterlockedCompareExchange`（对齐 `LONG`）；HUD 不做多字段读 |
+| R5 | IPC 线程 `PostMessage(g_window, …)` 时 `g_window` 正被 HUD 置空/销毁，甚至 HWND 被回收 | 低（自定义消息会被忽略） | **改用 `PostThreadMessage(g_hudThreadId, …)`**：不过窗口句柄，回收问题不存在；消息循环本来就是 `GetMessageW(&msg, nullptr, 0, 0)`（[4072](../endfield-info-windhawk.wh.cpp#L4072)），能收线程消息（需按 §5.6.2 显式处理）。另加 `if (g_extStop) return;` 守卫 |
+| R6 | `ExtStoreValue` 淘汰与 `ExtLookup` 并发 | — | 两者都在 `g_extLock` 内（IPC 写 / sampler 读），不并发 |
+| R7 | `InitializeCriticalSection` / `DeleteCriticalSection` 与使用它的线程 | **高**（顺序错会崩） | 按 §5.6.4 的顺序；用 `g_extLockReady` 保证只删已初始化的 |
+| R8 | `EVENT` 洪泛导致重绘风暴（M2） | 中 | 队列上限 + 同源合并（§7.3）；16 ms 帧时钟本身限流 |
+| R9 | `g_sampleCount` / `g_paintCount` 是 `unsigned long long`，sampler 自增、HUD 读 | 极低 | **接受不修**：纯诊断计数，撕裂只让某行日志数字略偏；要精确可换 `InterlockedIncrement64` |
+| R10 | `g_activeGroups` sampler 写、HUD 读（`[perf]` 行） | 极低 | **接受**：对齐 `unsigned` 的读写在此平台是原子的，值是建议性的 |
+| R11 | 测试宿主直接调 `ExtLookup` 而临界区未初始化 | 中（会崩） | 靠 §5.6.1 规则 3：纯函数不加锁，只有跨线程写路径才碰锁 |
+
+#### 5.6.4 停机顺序（精确，R7 的实现依据）
+
+```
+1. InterlockedExchange(&g_stopSampler, 1)          // 让 sampler 的切片循环尽快退出
+2. InterlockedExchange(&g_extStop, 1)
+3. SetEvent(g_extStopEvent)                        // 唤醒 IPC 的 overlapped 等待
+4. WaitForSingleObject(g_extThread, 2000) → CloseHandle      // IPC 先走
+5. WaitForSingleObject(g_samplerThread, 2000) → CloseHandle
+6. PostThreadMessage(g_hudThreadId, kMsgQuit, 0, 0) → 等 HUD 退出（由它销毁窗口）
+7. if (g_extLockReady) DeleteCriticalSection(&g_extLock)     // 此时两个使用者都不在了
+8. DeleteCriticalSection(&g_valuesLock / &g_settingsLock)
+9. DisposeIconImage() → GdiplusShutdown                      // 既有顺序不变
+```
+
+**为什么 IPC 必须排在 sampler 前面**：IPC 是 `g_extLock` 的写者、sampler 是读者。
+先停写者，读者随后自然结束；反过来就会出现"写者还在跑、锁已经被删"的窗口。
+
+#### 5.6.5 明确"接受不修"的部分
+
+- R9 / R10：只影响日志里的计数，修它的代价（额外原子操作）大于收益。
+- `Wh_Log`（`OutputDebugString`）本身线程安全，多线程打日志不需要加锁。
 
 ---
 
@@ -433,8 +567,9 @@ IslandRect ComputeIslandRect(const IslandState &s, const ContentMetrics &m,
 | :-- | :-- |
 | 无 `{ext.…}` 引用 | **0**：不建管道、不建线程、不占内存（延续 `RequiredGroups` 设计） |
 | 有引用、空闲 | 1 个管道实例 + 1 个阻塞在 `WaitForMultipleObjects` 的线程（不可测） |
-| 每条 `SET` | 解析 + 定长槽位线性查找（≤ 8×32 项）+ 一次 `PostMessage`（不重绘，等下一个 tick 或事件） |
-| 每个 `EVENT` | 一次 `PostMessage` + 一次立即重绘（动画期间 16 ms 帧时钟，空闲 40 ms，见 [3842](../endfield-info-windhawk.wh.cpp#L3842)/[3890](../endfield-info-windhawk.wh.cpp#L3890)） |
+| 每条 `SET` | 解析 + 取一次设置快照（`g_settingsLock`）+ 定长槽位线性查找（≤ 8×32 项）+ 置 `g_extDirty`（**不重绘**）；由 sampler 合并成一次采样与一次重绘 |
+| 每个 `EVENT` | 一次 `PostThreadMessage` + 一次立即重绘（动画期间 16 ms 帧时钟，空闲 40 ms，见 [3842](../endfield-info-windhawk.wh.cpp#L3842)/[3890](../endfield-info-windhawk.wh.cpp#L3890)） |
+| 静止时的到期检查 | 每 40 ms tick 一次原子读（`InterlockedCompareExchange`），可忽略；只在**到期那一刻**多触发一次采样 + 一次重绘（§5.6.2） |
 | 重绘成本 | 与现在相同量级：整帧 DIB + GDI+ + `UpdateLayeredWindow`（[3682](../endfield-info-windhawk.wh.cpp#L3682)）。**事件不应高于 ~10 次/秒**，否则面板会持续占 CPU；超过就合并（§7.3） |
 
 ---
@@ -445,11 +580,12 @@ IslandRect ComputeIslandRect(const IslandState &s, const ContentMetrics &m,
 
 | 纯函数 | 断言（`test-layout.cpp`） |
 | :-- | :-- |
-| `ParseExtLine` | 命令/参数切分；缺参 → 400；未知命令 → 400；`SET p k - 含 空格 的文本` 文本完整保留；`#` 注释；空行 |
-| `SanitizeExtText` | 去 `\r\n`、`\t`→空格、去 C0/C1；截断到上限且**末尾加 `…`**；`{cpu}` **原样保留**（负对照：若实现里加了展开，此断言必须变红） |
-| `ExtParseNumber` | `42`/`-1.5`/`.5`?/`1e3`? → 明确取舍并断言；`73%`、` 42`、`4 2` → non-numeric |
-| `ExtLookup` | 未过期 → RESOLVED；过期 → UNAVAILABLE；不存在 → UNAVAILABLE；`ext.` 后格式非法 → UNKNOWN |
-| `AllocExtSlot` | 容量满时淘汰"最早过期"；同 ttl 淘汰最久未更新 |
+| `ExtParseLine` | 命令/参数切分；缺参 → 400；未知命令 → 400；`SET p k - 含 空格 的文本` 文本完整保留；`#` 注释；空行 |
+| `ExtSanitize` | 去 `\r\n`、`\t`→空格、去 C0/C1；截断到上限且**末尾加 `…`**；`{cpu}` **原样保留**（负对照：若实现里加了展开，此断言必须变红） |
+| `ExtParseNumber` | `42`/`-1.5` → true；`73%`、` 42`、`4 2`、`.`、空 → false（**明确不接受** `.5` 与 `1e3`，并断言） |
+| `ExtLookup` | 未过期 → `ER_VALUE`；过期 → `ER_EXPIRED`；不存在 → `ER_EXPIRED`；`ext.` 后格式非法 → `ER_NONE` |
+| `ExtStoreValue` | 容量满时淘汰"最早过期"；同 ttl 淘汰最久未更新；溢出计 `drops` |
+| `ExtNextDeadline` | 多条取**最小**到期时刻；无有效条目 → 0；`ttl=0` 的 `SET` 按 `DEL` 处理、**不**产生 deadline（否则 HUD 会空转戳） |
 | `RequiredGroups` | 含 `{ext.p.k}` → 置 `G_EXT`；`{ext.}` 非法 → **不**置位 |
 | `StepIsland` | 抢占（critical 抢 info）；同 provider 替换；2 s 内同标题合并计数；队列满丢最低优先级；ttl 到期回 Idle |
 | `ComputeIslandRect` | 各状态下矩形正确；**超宽文本不引起宽度无界增长**（必须钳到屏宽上限） |
@@ -466,12 +602,16 @@ IslandRect ComputeIslandRect(const IslandState &s, const ContentMetrics &m,
 
 | 里程碑 | 内容 | 验收 |
 | :-- | :-- | :-- |
-| **M1 数据面** | `G_EXT` + 槽位表 + 管道线程 + `{ext.p.k}` + ttl/消毒/限速 + 设置项 | 关掉开关时空闲成本为 0；`{ext.p.k}` 能显示；提供者退出后 5 s 内变 `--`；`test-layout.cpp` 全绿 + `_settings.py` `no structural problems found` + `build.ps1` 只剩那 2 条已知警告 |
+| **M1 数据面** | `G_EXT` + 槽位表 + 管道线程 + `{ext.p.k}` + ttl/消毒/限速 + 设置项 + **§5.6.3 的 R1/R1b/R3/R5/R7** | 关掉开关时空闲成本为 0；`{ext.p.k}` 能显示；提供者退出后 **≤100 ms** 变 `--`（§5.6.2）；推 100 条 `SET` 后 `[perf]` 里 `paints` 只涨 1–2（合并生效）；`test-layout.cpp` 全绿 + `_settings.py` `no structural problems found` + `build.ps1` 只剩那 2 条已知警告 |
 | **M2 事件面** | `EVENT` + 队列/优先级/合并 + `Popping/Card/Collapsing` + width 动画通道 | 连点同 provider 只弹一次；critical 抢 info；ttl 到期收回；收回后基础面板仍可点 |
 | **M3 卡片与交互** | `ComputeIslandRect` + 区域表 + 本地按钮 + 悬停态 | 动画期间"看得见的都能点"；圆角外仍穿透；**不**出现"窗口缩到 8px"回归 |
 | **M4 打磨** | 提供者图标（内置字形白名单）、每提供者配色档、诊断页 | 文档与 AGENTS 更新；`_extclient.py` 进仓库 |
 
 **M1 与 M2 之间是可交付的独立状态**：M1 完成后即使不做灵动岛，也已经解决了"显示外部文本"这个原始需求。
+
+**M1 完成前必须逐条核对 §5.6.3**：R1 / R1b（锁的写侧）、R3（设置快照）、R5（线程消息）、
+R7（停机顺序）是必做项；R9 / R10 明确接受不修，并在代码注释里写明理由——"接受"必须是有据的，
+不能是没人看见。
 
 ---
 
@@ -588,3 +728,121 @@ with open(r'\\.\pipe\endfield-info-windhawk', 'wb', buffering=0) as h:
 | `WM_NCHITTEST` 圆角判定 | [3987](../endfield-info-windhawk.wh.cpp#L3987) | 扩成区域表；圆角外穿透不变 |
 | `ReadSettings` + `ClampInt` | [1089](../endfield-info-windhawk.wh.cpp#L1089) | 新增设置项照此校验 |
 | `test-layout.cpp` 打桩宿主 | — | 所有纯函数直接进断言 |
+
+---
+
+## 附录 C：M1 落点、函数清单与设置项原文
+
+### C.1 落点
+
+| 改动 | 位置 | 备注 |
+| :-- | :-- | :-- |
+| 设置项 9 条 | 设置块内，`HideDelayMs` 之后、`*/`（[240](../endfield-info-windhawk.wh.cpp#L240)）之前 | 顶格 `- Key:`，两空格 `$name` |
+| `ModSettings` 字段 + `ReadSettings` | [1044](../endfield-info-windhawk.wh.cpp#L1044) / [1089](../endfield-info-windhawk.wh.cpp#L1089) | 全部走 `ClampInt` |
+| `G_EXT` | `enum Group`，[1303](../endfield-info-windhawk.wh.cpp#L1303) | 只加一个位 |
+| **新段落**：外部值存储 + 纯函数 | 插在 `Values` 之后、`// CPU`（[1399](../endfield-info-windhawk.wh.cpp#L1399)）之前 | 与 "Collected values" 平级 |
+| `RequiredGroups` / `ResolveToken` | [1343](../endfield-info-windhawk.wh.cpp#L1343) / [2257](../endfield-info-windhawk.wh.cpp#L2257) | 见 C.4 |
+| **新段落**：管道服务线程 | 插在 `// Sampler` 之后、`// Loader-thread settings plumbing`（[4189](../endfield-info-windhawk.wh.cpp#L4189)）之前 | 与采集线程并列 |
+| 采样循环 `g_extDirty` + deadline | [4177](../endfield-info-windhawk.wh.cpp#L4177) | 见 §5.6.2 |
+| tick 到期分支 | `WM_TIMER` 的 `kTimerTick`（[3911](../endfield-info-windhawk.wh.cpp#L3911)） | 见 §5.6.2 |
+| 启停 | [4206](../endfield-info-windhawk.wh.cpp#L4206) / [4292](../endfield-info-windhawk.wh.cpp#L4292) | 顺序见 §5.6.4 |
+| 断言 | `test-layout.cpp` | 见 §12 |
+
+`kVariables[]`（[1318](../endfield-info-windhawk.wh.cpp#L1318)）**一个字都不改**：静态表 + 运行期槽位表双轨。
+
+### C.2 纯函数清单（全部无锁，可直接被测试宿主调用）
+
+```c
+enum ExtResult { ER_NONE, ER_VALUE, ER_EXPIRED };
+
+static bool      ExtIsExtToken(const WCHAR *name, int len);            // "ext." 前缀
+static bool      ExtNameValid(const WCHAR *s, int len, bool provider);  // [a-z0-9_-] / [a-z0-9_.-]
+static int       ExtParseLine(const WCHAR *line, ExtCommand *out);      // 0 = OK，否则错误码
+static void      ExtSanitize(const WCHAR *src, WCHAR *dst, int cap);    // 单行 + 去控制字符 + 截断
+static bool      ExtParseNumber(const WCHAR *text, double &out);        // 严格 [+-]?digits[.digits]?
+static ExtResult ExtLookup(const WCHAR *name, int len, const WCHAR **text, double *number);
+static void      ExtStoreValue(int provider, const WCHAR *key, const WCHAR *text, DWORD ttlMs);
+static void      ExtInvalidate(const WCHAR *name, int len);
+static DWORD     ExtNextDeadline(const ExtProvider *table, int count);  // 0 = 没有有效值
+```
+
+### C.3 设置项原文（可直接粘贴）
+
+```yaml
+- ExternalData: Off
+  $name: 'External data'
+  $description: 'Allows other programs to publish text into the panel through the named pipe \\.\pipe\endfield-info-windhawk. Off by default; nothing is created unless a row contains an {ext.provider.key} token.'
+  $options:
+    - Off: No external data
+    - On: Accept external providers
+- ExtProviders: ""
+  $name: 'Allowed external providers'
+  $description: 'Semicolon separated provider names, for example: music;discord. Empty allows any name, which is still logged and rate limited. Matched case-insensitively.'
+- ExtValueTtlMs: 30000
+  $name: 'External value lifetime (ms)'
+  $description: '100-600000. How long a value stays valid when the provider sends "-" as its ttl. An expired value renders as --.'
+- ExtMaxValue: 128
+  $name: 'External value length (chars)'
+  $description: '16-512. Longer values are truncated with a trailing ellipsis. 128 keeps four values plus template text inside one row buffer.'
+- ExtMaxProviders: 8
+  $name: 'External provider limit'
+  $description: '1-8. Providers beyond this are rejected with an error; existing ones keep their slots.'
+- ExtMaxUpdates: 100
+  $name: 'External updates per second'
+  $description: '1-1000, per connection. Updates beyond this are dropped and counted; the connection is not closed.'
+- ExtEventMs: 6000
+  $name: 'External event duration (ms)'
+  $description: '1000-60000. How long an external event card stays on screen when the provider sends "-" as its ttl.'
+- ExtEventQueue: 4
+  $name: 'External event queue'
+  $description: '1-8. Events waiting behind the one on screen. When full, the lowest priority and oldest event is dropped.'
+- IslandEnabled: Off
+  $name: 'Notification island'
+  $description: 'Turns an external event into a temporary card instead of only setting {ext...} values.'
+  $options:
+    - Off: Values only
+    - On: Show event cards
+```
+
+**为什么开关用字符串枚举而不是 `0/1`**：这个 mod 的设置块里所有非数值选择都是字符串枚举
+（`Theme` / `ClickAction` / `Monitor` / `IntroStyle`），代码侧也全是 `Wh_GetStringSetting` + `wcscmp`
+（[1104](../endfield-info-windhawk.wh.cpp#L1104)）。跟着既有风格走，就不必赌 Windhawk 的布尔类型怎么解析。
+`_settings.py` 的规则同时满足：`$name` / `$description` 单引号，数值项不加引号。
+
+### C.4 三处接线的精确形状
+
+```c
+// (a) Group
+enum Group : unsigned { /* ... */ G_SYS = 1 << 4, G_EXT = 1 << 5 };
+
+// (b) RequiredGroups：静态表认不出运行期键，必须单独判前缀
+if (ExtIsExtToken(p + 1, nameLen)) groups |= G_EXT;
+else groups |= GroupForName(p + 1, nameLen);
+
+// (c) ResolveToken：早于 IsKnownNumberVariable
+if (ExtIsExtToken(name, nameLen)) {
+    const WCHAR *text = nullptr; double number = 0;
+    ExtResult r = ExtLookup(name, nameLen, &text, &number);
+    if (r == ER_EXPIRED) return LR_UNAVAILABLE;   // 合法但没值/过期 → 画 --
+    if (r == ER_NONE)    return LR_UNKNOWN;       // 格式非法 → 保留字面
+    wcsncpy(out, text, outCount - 1); out[outCount - 1] = L'\0';
+    if (specLen > 0) ApplySpecFromNumber(spec, specLen, number, out, outCount);
+    return LR_RESOLVED;
+}
+```
+
+`ApplySpec`（[1960](../endfield-info-windhawk.wh.cpp#L1960)）现在需要 `const Values &` 才能给数值变量套
+`|0` / `|int`，所以要加一个只吃 `double` 的重载（推荐）；否则 `{ext.music.progress|0}` 与
+`[[ring:{ext.p.k}]]` 都用不了。
+
+### C.5 验证判据
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File build.ps1   # 只剩那 2 条已知警告
+python _settings.py                                       # no structural problems found
+# 回归宿主：编译 + 运行 → PASSED (0 failure(s))，断言数从 193 增加
+```
+
+**新增 API 全部落在已链接的 DLL 里**：管道与进程查询在 kernel32（默认链接）；
+`OpenProcessToken` / `GetTokenInformation`（§14 Q1 的可选开关）在 advapi32，而 `@compilerOptions`
+与测试宿主的链接行**都已有** `-ladvapi32` → **不需要改任何链接参数**，AGENTS §10 的依赖清单保持不变。
