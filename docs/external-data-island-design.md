@@ -604,7 +604,7 @@ IslandRect ComputeIslandRect(const IslandState &s, const ContentMetrics &m,
 | 里程碑 | 内容 | 验收 |
 | :-- | :-- | :-- |
 | **M1 数据面** | **已实现**：`G_EXT` + 槽位表 + 管道线程 + `{ext.p.k}` + ttl/消毒/限速 + 设置项 + §5.6.3 的 R1/R1b/R3/R7 | 关掉开关时空闲成本为 0；`{ext.p.k}` 能显示；提供者退出后 **≤100 ms** 变 `--`（§5.6.2）；推 100 条 `SET` 后 `[perf]` 里 `paints` 只涨 1–2（合并生效）；`test-layout.cpp` 全绿 + `_settings.py` `no structural problems found` + `build.ps1` 只剩那 2 条已知警告 |
-| **M2 事件面** | `EVENT` + 队列/优先级/合并 + `Popping/Card/Collapsing` + width 动画通道 | 连点同 provider 只弹一次；critical 抢 info；ttl 到期收回；收回后基础面板仍可点 |
+| **M2 事件面** | **已实现**：`EVENT` + 队列/优先级/合并 + `Popping/Card/Collapsing` + width 动画通道 + 卡片绘制（accent/主行/副行/重复徽标）。两处与本文的偏离：① 宽度用纯函数 `ComputeIslandCardWidth`（含用户可配的最小宽度与"屏幕宽度"上限），而不是完整的 `ComputeIslandRect`——位置与高度仍由既有静止几何给出；② "动画期间取并集"的规则已落成 `UnionPanelRect`，但在没有按钮之前它只会把目标变宽，真正的用处在 M3 | 连点同 provider 只弹一次（✓ 断言）；critical 抢 info（✓ 断言）；ttl 到期收回（✓ 断言）；收回后基础面板仍可点（✓ 命中仍用静止几何） |
 | **M3 卡片与交互** | `ComputeIslandRect` + 区域表 + 本地按钮 + 悬停态 | 动画期间"看得见的都能点"；圆角外仍穿透；**不**出现"窗口缩到 8px"回归 |
 | **M4 打磨** | 提供者图标（内置字形白名单）、每提供者配色档、诊断页 | 文档与 AGENTS 更新；`_extclient.py` 进仓库 |
 

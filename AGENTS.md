@@ -352,6 +352,16 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   出现了，缺值就是客户端没写。同时每连接打一行
   `pipe flags=… curInstances=… maxInstances=…` —— **同名管道若被第二个进程也建了实例，
   客户端会被抢走**（本进程只会一直等一个永远不来的字节），这一行会把它暴露出来。
+- **事件队列有自己的一把锁**（`g_islandLock`）：管道线程入队、HUD 取事件，**永不与
+  `g_extLock` 嵌套**（HUD 从不碰值表）。唤醒 HUD 用 `PostThreadMessage(g_hudThreadId, …)`，
+  绝不用窗口句柄——句柄可能已经没了（设计 §5.6.3 R5）。
+- **宽度与高度同一条规则**：`g_restWidth` 是"静止宽度"（窗口与命中都读它），
+  画出来的宽度是在面板宽 ↔ 卡片宽之间插值的结果。**动画不得写回静止几何**——
+  这条对高度早已成立（§5.4），对宽度同样成立；`PlaceWindow` 在它还是 0 时回落到面板宽，
+  否则会得到一个 0 宽的窗口。
+- **卡片宽度必须钳到屏幕**（`ComputeIslandCardWidth` 同时受用户配置的
+  `Island minimum width` 与屏幕宽度约束），且**动画期间的可点区域取 from/to 的并集**
+  （`UnionPanelRect`，设计 §8）——现在没有按钮，这条只是把规则先写下来。
 
 ---
 
@@ -589,6 +599,10 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   卸载时有在途消息时的收尾。
 - **管道读写路径本身**：本机沙箱拒绝一切带写权限的管道打开（见 §3），所以宿主连不上真管道；
   这块只能靠 mod 的开机自检（`ExtSelfTest` 的两帧是否被服务端记录）与真机日志来验证。
+- **事件面（M2）**：队列规则（替换/合并/优先级/丢弃）、状态机（`StepIsland`）、
+  卡片内容模型（`PlanIslandCard`）、severity 配色（`ResolveSeverityColor`）、
+  卡片宽度（`ComputeIslandCardWidth`）与动画并集（`UnionPanelRect`）都有断言，共 284 条；
+  卡片**绘制**本身与宽度动画通道属于"机器上才看得见"的部分，仍列在未验证之内。
 
 **已知的残留警告**：`ApplyPanelTransform` 在主 mod 中未被调用（只服务于测试），
 会报 `unused function`。要么给它加 `__attribute__((unused))`，要么把它挪进测试文件。

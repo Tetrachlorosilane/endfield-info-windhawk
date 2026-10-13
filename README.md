@@ -244,7 +244,7 @@ RAM [[ring:{mem}]]   [[ring:{ext.music.progress}:1:5:FF6FB3E0]]
 
 默认**关闭**。启用三步：
 
-1. 设置里把 `External data` 改成 `On`；
+1. 设置里把 `External data` 改成 `On`（想用事件卡片，再把 `Notification island` 也改成 `On`）；
 2. 在任意一行写一个 `{ext.提供者.键}`——**没有这一行，管道根本不会被创建**（刻意的省资源设计，没引用就不加载）；
 3. 推数据：
 
@@ -381,7 +381,8 @@ Windhawk 不支持动态下拉框，所以字体需要手输。拼错了就去�
 | `External updates per second` | 100 | 1-1000，每连接；超限丢弃并计数，不断开连接 |
 | `External event duration` | 6000 | 1000-60000 ms；事件卡片的时长（事件通道尚未实现） |
 | `External event queue` | 4 | 1-8；事件排队深度（事件通道尚未实现） |
-| `Notification island` | `Off` | 把外部事件做成临时卡片（**尚未实现**，现在只有变量） |
+| `Notification island` | `Off` | 把外部事件（`EVENT`）做成临时卡片：主行 + 可选副行 + severity 配色 + 重复计数徽标。卡片在时盖住行列表，消失后行列表原样回来。用 `pwsh -File _extclient.ps1 -Event -Severity critical -Text "标题 副行"` 试 |
+| `Island minimum width` | `260` | `120–640`。事件卡片的最小宽度；卡片会随文字变宽，但不小于这个值，也不超过屏幕宽度与 640 中较小者 |
 
 ---
 

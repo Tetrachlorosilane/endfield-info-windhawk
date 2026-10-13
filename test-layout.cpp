@@ -1438,27 +1438,37 @@ int main() {
         }
 
         // The card's target width: the configured minimum is a floor, text widens it,
-        // and it is capped (design 12: it must not grow without bound).
+        // and it is capped by the screen rather than growing without bound (design 12).
         {
             ModSettings cfg = {};
             cfg.rowHeight = 30;
             cfg.islandMinWidth = 260;
             IslandMetrics narrow = {};
             narrow.titleChars = 4;
-            Check(ComputeIslandCardWidth(narrow, cfg) == 260,
+            Check(ComputeIslandCardWidth(narrow, cfg, 0) == 260,
                   "a short card is never narrower than the configured minimum");
             IslandMetrics wide = {};
             wide.titleChars = 200;
-            Check(ComputeIslandCardWidth(wide, cfg) == kIslandMaxWidth,
+            Check(ComputeIslandCardWidth(wide, cfg, 0) == kIslandMaxWidth,
                   "a long title is capped instead of growing the window without bound");
+            Check(ComputeIslandCardWidth(wide, cfg, 400) == 400 - 24,
+                  "on a narrow monitor the card is clamped to the screen, not the 640 default");
             IslandMetrics mid = {};
             mid.titleChars = 30;
-            const int midWidth = ComputeIslandCardWidth(mid, cfg);
+            const int midWidth = ComputeIslandCardWidth(mid, cfg, 0);
             Check(midWidth > 260 && midWidth < kIslandMaxWidth,
                   "in between, the width follows the text");
             cfg.islandMinWidth = 600;
-            Check(ComputeIslandCardWidth(narrow, cfg) == 600,
+            Check(ComputeIslandCardWidth(narrow, cfg, 0) == 600,
                   "raising the minimum raises the floor for the same card");
+
+            // Hits during an animation: the union of the two states, so nothing that is
+            // visible is ever unclickable (design 8).
+            PanelRect from = {0, 0, 100, 50};
+            PanelRect to = {10, -5, 200, 60};
+            PanelRect unioned = UnionPanelRect(from, to);
+            Check(unioned.x == 0 && unioned.y == -5 && unioned.w == 210 && unioned.h == 60,
+                  "the animated hit target is the union of where it was and where it goes");
         }
 
         // The pipe's DACL has to actually admit this user. Getting it wrong is

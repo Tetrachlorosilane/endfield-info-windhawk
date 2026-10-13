@@ -2041,13 +2041,39 @@ struct IslandMetrics {
 // decidable before anything is drawn.
 static const int kIslandMaxWidth = 640;
 
-static int ComputeIslandCardWidth(const IslandMetrics &m, const ModSettings &cfg) {
+static int ComputeIslandCardWidth(const IslandMetrics &m, const ModSettings &cfg,
+                                  int monitorWidth) {
     int chars = m.titleChars > m.bodyChars ? m.titleChars : m.bodyChars;
     if (chars < 0) chars = 0;
     int width = 26 + chars * (cfg.rowHeight / 2);      // padding, accent bar, glyphs
     if (width < cfg.islandMinWidth) width = cfg.islandMinWidth;
-    if (width > kIslandMaxWidth) width = kIslandMaxWidth;
+    // Design 12: a long title must not grow the window without bound. Design 8 wants
+    // that bound to be the screen rather than an arbitrary number, so the cap is
+    // whichever is smaller -- a narrow monitor beats the 640 default.
+    int cap = kIslandMaxWidth;
+    if (monitorWidth > 0 && monitorWidth - 24 < cap) cap = monitorWidth - 24;
+    if (cap < 120) cap = 120;                         // keep it inside the setting's range
+    if (width > cap) width = cap;
     return width;
+}
+
+// The clickable rectangle: while a phase animates, the union of where the panel was
+// and where it is going, so everything visible stays clickable (design 8). With no
+// buttons yet this can only widen the target -- M3's region table is what makes it do
+// real work -- but the rule is written down here so it cannot be forgotten later.
+struct PanelRect { int x, y, w, h; };
+
+static PanelRect UnionPanelRect(const PanelRect &a, const PanelRect &b) {
+    PanelRect out = {};
+    const int left = a.x < b.x ? a.x : b.x;
+    const int top = a.y < b.y ? a.y : b.y;
+    const int right = (a.x + a.w) > (b.x + b.w) ? (a.x + a.w) : (b.x + b.w);
+    const int bottom = (a.y + a.h) > (b.y + b.h) ? (a.y + a.h) : (b.y + b.h);
+    out.x = left;
+    out.y = top;
+    out.w = right - left;
+    out.h = bottom - top;
+    return out;
 }
 
 // Drives the island from the HUD's frame clock. Defined with the other HUD updaters,
@@ -4765,8 +4791,31 @@ static void UpdateIsland() {
     IslandMetrics metrics = {};
     metrics.titleChars = (int)wcslen(g_islandCard.title);
     metrics.bodyChars = (int)wcslen(g_islandCard.body);
-    const int wantWidth =
-        cardUp ? ComputeIslandCardWidth(metrics, g_settings) : g_settings.panelWidth;
+    // The monitor the card has to live on: the width cap is the screen, not a constant
+    // (design 8). PlaceWindow centres inside the same monitor, so the two agree.
+    int monitorWidth = 0;
+    if (g_window) {
+        HMONITOR monitor = MonitorFromWindow(g_window, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO info = {};
+        info.cbSize = sizeof(info);
+        if (monitor && GetMonitorInfoW(monitor, &info)) {
+            monitorWidth = (int)(info.rcMonitor.right - info.rcMonitor.left);
+        }
+    }
+    int wantWidth = g_settings.panelWidth;
+    if (cardUp) {
+        IslandMetrics metrics2 = {};
+        metrics2.titleChars = (int)wcslen(g_islandCard.title);
+        metrics2.bodyChars = (int)wcslen(g_islandCard.body);
+        const int cardWidth = ComputeIslandCardWidth(metrics2, g_settings, monitorWidth);
+        // The union rule from design 8, doing real work: while a phase animates, the
+        // resting width is the union of the two states, so the clickable area always
+        // contains what is visible. Both states are centred, so the union's width is
+        // simply the wider of the two; when the phase settles it becomes the target.
+        PanelRect baseRect = {0, 0, g_settings.panelWidth, 0};
+        PanelRect cardRect = {0, 0, cardWidth, 0};
+        wantWidth = UnionPanelRect(baseRect, cardRect).w;
+    }
     if (wantWidth != g_restWidth) {
         g_restWidth = wantWidth;
         if (g_window) PlaceWindow(g_window);
