@@ -752,6 +752,24 @@ $script:CdpProbeExpression = @'
             o.store.lyricSlices[names[ni]] = { keys: Object.keys(sl).slice(0, 40), scalars: scal };
           } catch (x9) { o.store.lyricSlices[names[ni]] = 'err'; }
         }
+        // 真机结论（2026-10-13）：**当前行 = `async:lyric.lyricLines[playing.playingLyricLineNumber]`** ✓✓
+        // —— 客户端自己维护的行号 ✓，拖动/暂停天然正确 ✓（不需要位置、不需要时间推算 ✓）。
+        // 单位警告：`curTrackDuration` 是**毫秒**（242613 ✓），`resourceDuration` 是**秒**（242 ✓）——别混 ✗。
+        try {
+          var lyr = st['async:lyric'] || {};
+          var lines = lyr.lyricLines;
+          o.store.lyricLineCount = (lines && lines.length) || 0;
+          o.store.lyricOffset = lyr.offset;
+          o.store.currentUsedLyric = lyr.currentUsedLyric;
+          o.store.tlyricCount = (lyr.tlyricLines && lyr.tlyricLines.length) || 0;
+          var idx = p.playingLyricLineNumber;
+          o.store.lyricIndex = idx;
+          if (lines && typeof idx === 'number' && idx >= 0 && idx < lines.length) {
+            o.store.currentLine = lines[idx];
+            var t0 = lines[idx];
+            o.store.currentLineText = ('' + ((t0 && (t0.text || t0.lyric || t0.content || t0.lrc)) || '')).slice(0, 80);
+          }
+        } catch (xA) { o.store.lyricProbeError = '' + xA; }
       } catch (x2) { o.store.probeError = '' + x2; }
     }
   } catch (x) { o.store.error = '' + x; }
