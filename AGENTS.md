@@ -694,6 +694,27 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   因此 `-ProbeCdp` 的表达式已改为**照同一条路**（自己的空闲模块号 987661 ✓、只列键与短值 ✓、全程 try/catch ✓），
   下一步据其输出固化"位置 + 当前歌词行" ✓。`Get-CdpPositionMs` 现有的通用锚点（`audio.currentTime`）
   在 DOM 路下取不到值 ✗ → 会安静返回空、继续降级 ✓（不误报 ✓）。自检 23 项 ✓。
+- **store 路已打通（2026-10-13 真机实测，读过本地 `cloudmusic-desktop-mcp` 的实现之后）** ✓✓：
+  ① **访问方式**：往 `webpackJsonp` 塞一个模块，把 webpack 的 `require` 存到 `window` ✓ → `getStore()` ✓。
+  **不要调 `getState`** ✗ —— `server.py:339-346` 是拿到后**直接用 `s.playing` / `s.playingList` / `s.setting`** ✓；
+  我多调了一次，报 "getState is not a function" ✗（这条弯路值得记 ✓）。
+  ② **模块 id 随客户端版本变** ✗（这台是 **11** ✓，MCP 钉的是 **12** ✗，只对它测过的构建成立 ✗）→
+  所以**运行期自寻址** ✓：扫 webpack 的**缓存** `req.c`（只含已实例化模块 ✓，`req(id)` 会执行初始化代码，
+  所以**不调它** ✗）找导出（或其 `.a`/`.default`）里带 `getStore` 的那个 ✓，结果缓存在
+  `window.__ei_store_id__` ✓，**客户端升级后自己重找** ✓；`-ProbeCdp` 走同一条自寻址路 ✓
+  ——**这就是"规则化的探查"**：升级后重锚定就用它 ✓。
+  ③ **当前行 = `async:lyric.lyricLines[playing.playingLyricLineNumber]`** ✓✓（真机实测：第 **10/64** 行，
+  文本与界面显示一致 ✓，行对象形状 `{time: <秒>, lyric: "<文本>"}` ✓）→ **不需要位置、不需要时间推算** ✓，
+  拖动进度条 / 暂停 / 切歌**按构造就是对的** ✓（那是客户端为自己界面维护的状态 ✓）。顺带可读
+  `tlyricLines`（翻译 ✓，实测 64 行 ✓）、`yrcInfo`（逐字 ✓）、`offset`（歌词偏移 ✓）、
+  `playingState`（播放状态 ✓）、`curTrack.artists/album` ✓。
+  ④ **三种时间单位混在同一切片里，千万别混** ✗：`lyricLines[i].time` 是**秒** ✓（35.84）、
+  `curTrack.duration` 是**毫秒** ✓（242613）、`playing.resourceDuration` 是**秒** ✓（242）。
+  ⑤ **集成**：`-LyricSource auto|store|lrc` ✓，`auto` **首选 store** ✓（失败退回"LRC + 位置选行" ✓，
+  无调试端口的机器行为不变 ✓）；位置仍走 `-PositionSource`（memory ✓ → media → clock）；
+  `store` 只读 ✓ —— **只读状态、不派发任何 action** ✗（两个成熟项目里有写操作，我们不学 ✓）。
+  ⑥ **仍未验证** ✗：客户端**升级之后** store 是否还能被自寻址到（要等下次升级实测 ✓）、
+  以及 `store` 路在**暂停/拖动**时的实际表现（这次只验证了"与界面一致" ✓，尚无双性质对照 ✓）。
 - **mod 侧「外部发布器」包装（M4 第一片，已实现）**：设置项 `External publisher command` 里写一条命令行，
   mod 就替你启动它 ✓。要点（每条都有理由）：
   · **只启动用户写的那条命令** ✓，**绝不启动/重启任何第三方应用**（含音乐客户端）✗——那属于改变用户
@@ -742,8 +763,8 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   同样有断言（`{cpu}`、`{cpu.name}`、`{cpu.ghz.max}` 都不得触发——`{cpu.ghz.max}` 是最容易
   被前缀误判的那个）。查询是**惰性创建、永不销毁**（`PdhCloseQuery` 不归还内存），
   与 GPU 后端一致；它**不能**搭在 GPU 那条查询上，否则 `{cpu.ghz}` 会依赖 `{gpu}` 是否在显示。
-  **未验证**：本机无法确认真实机器上比值是否给出合理的动态值——需要用户看 `{cpu.ghz}` 是否随负载
-  在标称~睿频之间变化；若它恒等于标称，日志里会有一行 `CPU clock: … status=0x…` 指出是哪一步不可用。
+  **真机已验证（2026-10-13）** ✓：用户确认 `{cpu.ghz}` 显示**正确** ✓ —— 动态频率合理、标称取自电源
+  API 的 **2.20 GHz** ✓（注册表 `~MHz` 的 2.42 已被正确忽略 ✓）。这条从"未验证"移到"已验证" ✓。
 - **标称频率有两个来源，且会不一致**：注册表的 `~MHz` 是 ACPI/BIOS 报的值（实测把 2.20 GHz 的标称
   报成 2.42），电源 API 的 `PROCESSOR_POWER_INFORMATION.MaxMhz` 才是 Windows 自己当作标称的那个
   ——所以**API 优先、注册表兜底**。多核取值取**各处理器的最大 MaxMhz**（混合架构的效率核报得更低，
