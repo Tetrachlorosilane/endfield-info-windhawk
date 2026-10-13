@@ -39,6 +39,7 @@ endfield-info-windhawk/
 ├── _preview.py                        渲染 assets/panel-preview.png
 ├── _extclient.py                      外部数据管道的冒烟客户端（Python）
 ├── _extclient.ps1                     第二客户端（.NET）——**真机验证过的是这一个**
+├── _netease-bridge.ps1                示例发布器：网易云正在播放的曲名 + 当前歌词行
 └── assets/panel-preview.png           版面预览（README 引用）
 ```
 
@@ -625,6 +626,11 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   而脚本自身的时序（写完两行后至少 1 秒才关闭）与之不符——怀疑当时跑的并非本仓库这一份。
   要用客户端验证时**优先用 `_extclient.ps1`**，或先确认 `python -c "import os;print(os.path.abspath('_extclient.py'))"`
   指向本仓库的文件。
+- **`_netease-bridge.ps1`（示例发布器）**：**只有离线部分被验证过**——LRC 解析（元信息行、纯时间戳行、
+  `.xx` 与 `.xxx` 两种小数、一行多标签）与按位置选行，9 条自检全绿；参数解析干净；
+  没有网易云窗口时给出可诊断的退出并列出所有有标题的进程。**未验证**：搜索/歌词两个网络接口的
+  返回形状（本机无法访问）、窗口标题在真实客户端上的格式、以及"按看到它的时刻推算歌词行"这个
+  时钟的漂移（暂停时会继续走，这是设计上已知的取舍，要精确同步得上 SMTC）。
 
 **未验证**（需要真实运行环境）：
 

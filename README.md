@@ -386,6 +386,47 @@ Windhawk 不支持动态下拉框，所以字体需要手输。拼错了就去�
 
 ---
 
+## 示例：把网易云音乐正在播放的歌推上面板
+
+`_netease-bridge.ps1` 是一个**示例程序**（不是 mod 的一部分），演示外部程序怎么把"现在在听什么"
+送进面板与灵动岛。它的做法刻意选了两条最稳的路：
+
+1. **曲名**：读网易云 PC 版（Electron）的主窗口标题——它是「歌名 - 歌手」。不注入、不加调试端口、
+   不依赖任何私有协议。
+2. **歌词**：用歌名+歌手调网易云的公开歌词接口拿 LRC，再按"这首歌被看到的时刻"推算当前行。
+   **已知限制：这个时钟会漂**——暂停时它仍在往前走；要按真实播放位置选行需要用 SMTC
+   （Windows 媒体会话），那是下一步的事。
+
+```powershell
+# 离线自检：LRC 解析与选行（不联网、不连管道）
+pwsh -File _netease-bridge.ps1 -SelfTest
+
+# 先看不发：把要发的帧打印出来
+pwsh -File _netease-bridge.ps1 -DryRun -Once
+
+# 真发：{ext.netease.title} / {ext.netease.lyric}
+pwsh -File _netease-bridge.ps1 -Ttl 600000
+
+# 换歌时顺带弹一次岛（正文是第一句歌词）
+pwsh -File _netease-bridge.ps1 -Event -Ttl 600000
+```
+
+| 参数 | 作用 |
+| :-- | :-- |
+| `-Provider` | 提供者名，默认 `netease`（面板里写 `{ext.netease.title}`） |
+| `-ProcessName` | 进程名匹配，默认 `cloudmusic`；找不到窗口时脚本会列出所有有标题的进程供你抄 |
+| `-TtlMs` | 推过去的值的寿命，默认 600000（歌在播，给长一点，别让行里闪 `--`） |
+| `-Event` | 换歌时发一条 `EVENT`，让灵动岛弹一次 |
+| `-SongId` | 手工指定歌曲 id，跳过搜索（接口查不到时的兜底） |
+| `-DryRun` / `-SelfTest` / `-DumpJson` | 不发送 / 离线自检 / 打印接口返回的 JSON |
+
+**它只在内容变化时才发**：一秒一次地重复同一句歌词没有意义，管道限速会丢，但更好的做法是根本不发。
+
+> 面板侧要做的只有两件事：设置里 `External data` 打开，然后**在一行里引用** `{ext.netease.title}`
+> 或 `{ext.netease.lyric}`（没有引用就不会建管道，这是刻意的）。
+
+---
+
 ## 资源占用
 
 **只有被你引用到的采集通路才会加载。** 这不只是省 CPU，主要是省内存：
