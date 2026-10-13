@@ -58,10 +58,19 @@ param(
     [long]$SongId = 0,
     # 取不到歌词时多久重试一次。只在启动时查一次的话，接口抖一下整首歌就都没有歌词
     [int]$LyricRetryMs = 20000,
-    # 位置来源：media = 媒体会话（真实位置，拖动进度条与暂停都跟得上）；clock = 推算时钟；
-    # auto = 先试 media，不可用就退回 clock
-    [ValidateSet('auto', 'media', 'clock')]
+    # 位置来源：memory = 从客户端内存读播放位置（毫秒 int32，差分发现）；
+    # media = 媒体会话（SMTC，真实位置）；clock = 推算时钟；
+    # auto = 依次尝试 memory → media → clock
+    [ValidateSet('auto', 'memory', 'media', 'clock')]
     [string]$PositionSource = 'auto',
+    # 内存发现时两次采样的间隔（秒）——这段时间里必须在播放
+    [int]$MemoryGapSeconds = 12,
+    # 只探一次 CDP（不读位置）：列出端口与调试目标，供下一步确定取值表达式
+    [switch]$ProbeCdp,
+    # 依次尝试的 CDP 端口（两个成熟项目分别用 9229 / 9223，9222 是通用默认）
+    [int[]]$CdpPorts = @(9229, 9223, 9222),
+    # 位置扫描器路径，缺省用同目录的 _netease-lyric-scan.ps1
+    [string]$ScannerPath = '',
     # 位置助手脚本，缺省用同目录的 _netease-position.ps1
     [string]$PositionHelper = '',
     # 超过这么久没有新采样就当成不可用（毫秒）
@@ -344,7 +353,242 @@ function Get-PositionSample {
     $sample
 }
 
+# ---------------------------------------------------------------------------
+# 位置来源「memory」：从客户端内存读播放位置（毫秒 int32）
+# ---------------------------------------------------------------------------
+# 依据（真机实测，见 AGENTS §10）：客户端把文本存成 UTF-8；"当前歌词行"不是会变化的字符串
+# （文本差分原理上无效）；而**播放位置是 int32 毫秒**，可以用"两次采样恰好增加一个间隔"的
+# 差分扫描定位。地址是绝对的、受 ASLR 影响 → 所以：**先试缓存地址、不成立才重新发现**，
+# 绝不写死地址。只读（PROCESS_QUERY_INFORMATION | PROCESS_VM_READ）。
+$script:PosAddrFile = Join-Path ([System.IO.Path]::GetTempPath()) 'endfield-netease-posaddr.txt'
+$script:MemReaderReady = $false
+
+function Enable-MemReader {
+    if ($script:MemReaderReady) { return $true }
+    try {
+        Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class NpMem {
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(int a, bool i, int pid);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool ReadProcessMemory(IntPtr h, IntPtr a, byte[] b, IntPtr n, out IntPtr r);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    const int QI = 0x0400, VM = 0x0010;
+    // 返回十进制字符串；失败返回 "-" 或 "err<码>"（把错误码带出来，便于判别）
+    public static string ReadOne(int pid, long addr) {
+        IntPtr h = OpenProcess(QI | VM, false, pid);
+        if (h == IntPtr.Zero) return "err" + Marshal.GetLastWin32Error();
+        byte[] b = new byte[4];
+        IntPtr read;
+        bool ok = ReadProcessMemory(h, (IntPtr)addr, b, (IntPtr)4, out read) && (long)read == 4;
+        CloseHandle(h);
+        if (!ok) return "-";
+        return (b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)).ToString();
+    }
+}
+"@
+        $script:MemReaderReady = $true
+        return $true
+    }
+    catch {
+        Write-Host ("  ! 内存读取器编译失败：{0}" -f $_.Exception.Message)
+        return $false
+    }
+}
+
+function Get-NeteasePid {
+    $p = Get-Process -Name cloudmusic -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $p) {
+        $p = Get-Process -ErrorAction SilentlyContinue |
+             Where-Object { $_.ProcessName -like '*cloudmusic*' } | Select-Object -First 1
+    }
+    if ($p) { return $p.Id }
+    return 0
+}
+
+# 纯函数：解析扫描器给出的一行候选（`0x…|int32ms|51800 -> 67070  (+15270ms)`）
+function ConvertFrom-ScanCandidate {
+    param([string]$Line)
+    if (-not $Line) { return $null }
+    $m = [regex]::Match($Line, '^\s*(0x[0-9A-Fa-f]+)\|int32ms\|\s*(\d+)\s*->\s*(\d+)')
+    if (-not $m.Success) { return $null }
+    [pscustomobject]@{
+        Addr   = $m.Groups[1].Value
+        Before = [int]$m.Groups[2].Value
+        After  = [int]$m.Groups[3].Value
+    }
+}
+
+# 纯函数：用两拍读数判断"是否在播放"（增长≈两拍间隔 → 播放；几乎不动 → 暂停）
+function Test-Playing {
+    param([int]$Prev, [int]$Now, [double]$ElapsedSeconds, [int]$ToleranceMs = 1500)
+    $d = $Now - $Prev
+    return ($d -ge ([int]($ElapsedSeconds * 1000) - $ToleranceMs))
+}
+
+# 进程身份：pid + 进程启动时间。地址是堆地址、受 ASLR 影响，**客户端一重启就变**（已实测：
+# 老地址重启后不可访问）。所以缓存必须以"进程实例"为键，重启即自然作废。
+function Get-NeteaseProcInfo {
+    $p = Get-Process -Name cloudmusic -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $p) {
+        $p = Get-Process -ErrorAction SilentlyContinue |
+             Where-Object { $_.ProcessName -like '*cloudmusic*' } | Select-Object -First 1
+    }
+    if (-not $p) { return $null }
+    $start = 0
+    try { $start = $p.StartTime.Ticks } catch { $start = 0 }
+    return [pscustomobject]@{ Pid = $p.Id; Start = $start }
+}
+
+function Read-PosCache {
+    param($Proc)
+    if (-not $Proc -or -not (Test-Path $script:PosAddrFile)) { return 0 }
+    $s = Get-Content $script:PosAddrFile -First 1 -ErrorAction SilentlyContinue
+    if (-not $s) { return 0 }
+    $m = [regex]::Match($s.Trim(), '^(\d+)\|(\d+)\|(0x[0-9A-Fa-f]{4,15})$')
+    if (-not $m.Success) { return 0 }
+    if ([int]$m.Groups[1].Value -ne $Proc.Pid) { return 0 }
+    if ([int64]$m.Groups[2].Value -ne $Proc.Start) { return 0 }    # 换了进程实例 → 作废
+    try {
+        $u = [System.Convert]::ToUInt64($m.Groups[3].Value.Substring(2), 16)
+        return [System.BitConverter]::ToInt64([System.BitConverter]::GetBytes($u), 0)
+    }
+    catch { return 0 }
+}
+
+function Write-PosCache {
+    param($Proc, [int64]$Addr)
+    if (-not $Proc -or $Addr -eq 0) { return }
+    try {
+        ('{0}|{1}|0x{2:X}' -f $Proc.Pid, $Proc.Start, $Addr) |
+            Set-Content -Path $script:PosAddrFile -Encoding ascii -ErrorAction Stop
+    }
+    catch { }
+}
+
+# 读一次原始值；不可用返回 $null
+function Get-PosValue {
+    param([int]$Pid, [int64]$Addr)
+    if ($Pid -le 0 -or $Addr -eq 0) { return $null }
+    $s = [NpMem]::ReadOne($Pid, $Addr)
+    if ($s -notmatch '^\d+$') { return $null }
+    return [int]$s
+}
+
+# 纯函数：切歌时的"粗校验"——曲名变了，位置应当回落到开头或明显跳变（而不是继续原样累加）
+function Test-PosAfterTrackChange {
+    param([int]$Prev, [int]$Now)
+    if ($Now -lt $Prev) { return $true }                    # 归零/回落 ✓
+    if ([math]::Abs($Now - $Prev) -gt 3000) { return $true } # 明显跳变 ✓
+    return $false                                            # 几乎原样 → 可疑 ✗
+}
+
+function Test-PosAddrAlive {
+    param([int]$Pid, [int64]$Addr)
+    $a = Get-PosValue -Pid $Pid -Addr $Addr
+    if ($null -eq $a -or $a -lt 1000) { return $false }
+    Start-Sleep -Milliseconds 1000
+    $b = Get-PosValue -Pid $Pid -Addr $Addr
+    if ($null -eq $b) { return $false }
+    return (Test-Playing -Prev $a -Now $b -ElapsedSeconds 1.0 -ToleranceMs 700)
+}
+
+# 差分发现：调用扫描器（发现逻辑只有那一处实现）。**有界**：每个客户端进程实例最多 3 次，
+# 只在"确实在播放"时做，两次之间至少隔 60 秒；**绝不因为"值不再增长"而重扫**（用户定的策略：
+# 进程活着就不要轻易全局扫描，值停住先靠切歌粗校验）。
+$script:PosAttempts = 0
+$script:PosLastAttempt = [datetime]::MinValue
+$script:PosAttemptMax = 3
+$script:PosAttemptSpacingSec = 60
+$script:PosDisabled = $false
+
+function Find-PosAddr {
+    param($Proc, [switch]$TrackPlaying)
+    if ($script:PosDisabled -or -not $Proc) { return 0 }
+    if (-not $TrackPlaying) { return 0 }         # 没在播就没法差分（增长是判据），留到下次
+    if ($script:PosAttempts -ge $script:PosAttemptMax) { return 0 }
+    if (((Get-Date) - $script:PosLastAttempt).TotalSeconds -lt $script:PosAttemptSpacingSec) { return 0 }
+    if (-not $ScannerPath) { $ScannerPath = Join-Path $PSScriptRoot '_netease-lyric-scan.ps1' }
+    if (-not (Test-Path $ScannerPath)) { Write-Host '  ! 找不到位置扫描器，内存来源不可用'; return 0 }
+
+    $script:PosAttempts++
+    $script:PosLastAttempt = Get-Date
+    Write-Host ("  内存位置：第 {0}/{1} 次差分发现（间隔 {2} 秒，请保持播放）…" -f `
+            $script:PosAttempts, $script:PosAttemptMax, $MemoryGapSeconds)
+
+    $out = & pwsh -NoProfile -ExecutionPolicy Bypass -File $ScannerPath `
+        -WholeProcess -FindClock -GapSeconds $MemoryGapSeconds -MaxMb 512 -TargetPid $Proc.Pid 2>&1
+    foreach ($line in $out) {
+        $c = ConvertFrom-ScanCandidate $line
+        if (-not $c) { continue }
+        $addr = 0
+        try {
+            $addr = [System.BitConverter]::ToInt64(
+                [System.BitConverter]::GetBytes([System.Convert]::ToUInt64($c.Addr.Substring(2), 16)), 0)
+        }
+        catch { continue }
+        if ($addr -ne 0 -and (Test-PosAddrAlive -Pid $Proc.Pid -Addr $addr)) {
+            Write-PosCache -Proc $Proc -Addr $addr
+            return $addr
+        }
+    }
+    Write-Host '  ! 这一轮没找到可用的位置地址（保持播放、稍后会再试一次；期间用推算时钟）'
+    return 0
+}
+
+# CDP 探测：只列端口与目标，**不读位置**（取值表达式要先在你机器上看清客户端暴露了什么，
+# 不猜）。CRD/CDP 的 /json/version 是规范 JSON，所以这里可以用普通 HTTP 客户端（与端口
+# 20017 那个"只发头就关"的私有服务不同）。
+function Invoke-CdpProbe {
+    foreach ($port in $CdpPorts) {
+        try {
+            $v = Invoke-RestMethod -Uri "http://127.0.0.1:$port/json/version" -TimeoutSec 2 -ErrorAction Stop
+            Write-Host ("  ✓ 端口 {0} 是 CDP：{1}" -f $port, ('' + $v.Browser -replace '\s+', ' '))
+            try {
+                $list = Invoke-RestMethod -Uri "http://127.0.0.1:$port/json/list" -TimeoutSec 2 -ErrorAction Stop
+                if ($list) {
+                    foreach ($t in $list) {
+                        Write-Host ("      target: type={0}  title='{1}'" -f $t.type, $t.title)
+                        Write-Host ("              url={0}" -f $t.url)
+                    }
+                }
+                else { Write-Host '      （/json/list 为空）' }
+            }
+            catch { Write-Host '      （/json/list 读取失败）' }
+            return $true
+        }
+        catch {
+            Write-Host ("  · 端口 {0} 无响应（{1}）" -f $port, ('' + $_.Exception.Message -replace '\s+', ' '))
+        }
+    }
+    return $false
+}
+
+if ($ProbeCdp) {
+    Write-Host '探测 CDP（需要客户端是"带调试端口的快捷方式"启动的）：'
+    if (-not (Invoke-CdpProbe)) {
+        Write-Host '  没找到 CDP 端口 —— 说明客户端不是带调试参数启动的。'
+        # 注意顺序：这个分支在文件里执行得较早，Show-CdpShortcutGuidance 可能还没定义
+        # （PowerShell 自上而下执行）。真正的降级路径（内存失败时）在文件后段调用它，那里已定义。
+        if (Get-Command Show-CdpShortcutGuidance -ErrorAction SilentlyContinue) {
+            Show-CdpShortcutGuidance
+        }
+        else {
+            Write-Host '  改快捷方式的步骤：右键快捷方式 → 属性 → 「目标」→ 在引号内 exe 路径后追加'
+            Write-Host '  --remote-debugging-port=9229 → 保存 → 完全退出客户端再启动 → 重跑 -ProbeCdp'
+            Write-Host '  （本插件不会替你启动或重启音乐软件。）'
+        }
+    }
+    else {
+        Write-Host '  端口可用 ✓。下一步：把上面 target 的输出发我，我据此定"取位置与当前歌词行"的表达式，'
+        Write-Host '  再把它接成 -PositionSource cdp（本插件仍然不会替你启动音乐软件）。'
+    }
+    exit 0
+}
+
 if ($ProbePosition) {
+
+
     if (-not $PositionHelper) { $PositionHelper = Join-Path $PSScriptRoot '_netease-position.ps1' }
     $exe = Get-PowerShell51
     Write-Host ("探测位置来源：{0} -Probe" -f $PositionHelper)
@@ -353,8 +597,96 @@ if ($ProbePosition) {
 }
 
 # ---------------------------------------------------------------------------
-# -SelfTest：不联网、不连管道，只验证解析与选行
+# 位置来源「memory」的对外入口 + 「cdp」的手动启动指导
 # ---------------------------------------------------------------------------
+# 设计取舍（用户明确要求）：**插件绝不自己启动音乐软件**。CDP 只在客户端"已经被用户用
+# 带调试端口的快捷方式启动"时才可用；我们要做的是**把怎么改快捷方式讲清楚**，而不是替他启动。
+function Show-CdpShortcutGuidance {
+    Write-Host ''
+    Write-Host '  想要精确同步（拖动进度条、暂停都能跟上），有两条路，任选其一：'
+    Write-Host '  ① 内存位置（默认）：本脚本会在客户端进程启动后自动发现一次，无需你做任何事；'
+    Write-Host '  ② CDP（当内存读取被安全软件拦下、或你想彻底不碰内存时）：需要你手动给快捷方式加一个参数——'
+    Write-Host '     · 右键网易云音乐的快捷方式 → 属性 → 「目标」'
+    Write-Host '     · 在引号中的 exe 路径后面追加一个空格和：--remote-debugging-port=9229'
+    Write-Host '       例如："D:\Program Files\NetEase\CloudMusic\cloudmusic.exe" --remote-debugging-port=9229'
+    Write-Host '     · 保存后完全退出客户端再启动（改完第一次需要重启客户端才生效）'
+    Write-Host '     · 之后跑一次：pwsh -File _netease-bridge.ps1 -ProbeCdp  验证端口可用'
+    Write-Host '  说明：本插件**不会**替你启动或重启音乐软件（那属于改动你的使用习惯），只读取状态。'
+    Write-Host ''
+}
+
+# 内存位置：返回毫秒；不可用返回 $null（调用方会继续往下降级）
+$script:PosAddr = 0
+$script:PosPid = 0
+$script:PosStart = 0
+$script:PosLastValue = $null
+$script:PosLastAt = $null
+$script:PosLastTitle = ''
+$script:PosWarned = $false
+
+function Get-MemoryPosition {
+    param($Now)
+    if ($script:PosDisabled) { return $null }
+    if (-not (Enable-MemReader)) { return $null }
+    $info = Get-NeteaseProcInfo
+    if (-not $info) { return $null }
+
+    # 进程实例换了（客户端重启）→ 缓存与地址一起作废，本生命周期重新发现一次
+    if ($info.Pid -ne $script:PosPid -or $info.Start -ne $script:PosStart) {
+        $script:PosPid = $info.Pid
+        $script:PosStart = $info.Start
+        $script:PosAddr = Read-PosCache -Proc $info
+        $script:PosLastValue = $null
+        $script:PosLastAt = $null
+        $script:PosLastTitle = ''
+        $script:PosAttempts = 0
+        $script:PosDisabled = $false
+        if ($script:PosAddr -ne 0) { Write-Host ('  位置：内存（沿用本进程实例的缓存地址 0x{0:X}）' -f $script:PosAddr) }
+    }
+    if ($script:PosAddr -eq 0) {
+        # 只在"确实在播放"时发现（差分需要增长）；有界重试，绝不因为"值不增"而重扫
+        $script:PosAddr = Find-PosAddr -Proc $info -TrackPlaying:($null -ne $Now)
+        if ($script:PosAddr -ne 0) { Write-Host ('  位置：内存（发现成功，地址 0x{0:X}；本进程实例内不再扫描）' -f $script:PosAddr) }
+        else { return $null }
+    }
+
+    $v = Get-PosValue -Pid $info.Pid -Addr $script:PosAddr
+    if ($null -eq $v) {
+        if (-not $script:PosWarned) {
+            $script:PosWarned = $true
+            Write-Host '  ! 内存位置读取失败（地址已失效或被安全软件拦下）——本次生命周期不再扫描，改用降级来源'
+            Show-CdpShortcutGuidance
+        }
+        $script:PosDisabled = $true
+        return $null
+    }
+
+    # 切歌粗校验：曲名变了，位置应当回落或明显跳变；否则判该地址失效（只禁用，不重扫）
+    if ($Now -and $script:PosLastTitle -and $Now.Title -ne $script:PosLastTitle -and $null -ne $script:PosLastValue) {
+        if (-not (Test-PosAfterTrackChange -Prev $script:PosLastValue -Now $v)) {
+            Write-Host '  ! 切歌后位置未重置或未跳变——内存来源判定失效，本次生命周期改用降级来源'
+            $script:PosDisabled = $true
+            $script:PosAddr = 0
+            return $null
+        }
+    }
+    if ($Now) { $script:PosLastTitle = $Now.Title }
+
+    # 暂停判定：两拍之间几乎不动 → 位置冻结（不推进）
+    if ($null -ne $script:PosLastValue -and $null -ne $script:PosLastAt) {
+        $elapsed = ((Get-Date) - $script:PosLastAt).TotalSeconds
+        if (-not (Test-Playing -Prev $script:PosLastValue -Now $v -ElapsedSeconds $elapsed -ToleranceMs 900)) {
+            $script:PosLastValue = $v
+            $script:PosLastAt = Get-Date
+            return [int]$v          # 暂停：直接给当前值，不外推
+        }
+    }
+    $script:PosLastValue = $v
+    $script:PosLastAt = Get-Date
+    return [int]$v
+}
+
+
 if ($SelfTest) {
     $fixture = @"
 [ti:示例]
@@ -381,6 +713,12 @@ if ($SelfTest) {
         @{ Name = '播放时按采样年龄外推'; Ok = ((Get-PositionMs -Sample (ConvertFrom-PositionLine 'position=30 status=Playing') -AgeSeconds 0.5) -eq 30500) }
         @{ Name = '采样过旧视为不可用'; Ok = (-not (Test-PositionFresh -Sample (ConvertFrom-PositionLine 'position=1 status=Playing') -WrittenAt (Get-Date).AddSeconds(-10) -Now (Get-Date) -StaleMs 3000)) }
         @{ Name = '采样新鲜则可用'; Ok = (Test-PositionFresh -Sample (ConvertFrom-PositionLine 'position=1 status=Playing') -WrittenAt (Get-Date) -Now (Get-Date) -StaleMs 3000) }
+        @{ Name = '位置候选行：正常'; Ok = ((ConvertFrom-ScanCandidate '  0x80014BFB08|int32ms|51800 -> 67070  (+15270ms)').Addr -eq '0x80014BFB08') }
+        @{ Name = '位置候选行：垃圾与空一律不可用'; Ok = (-not (ConvertFrom-ScanCandidate 'nonsense')) -and (-not (ConvertFrom-ScanCandidate '')) }
+        @{ Name = '两拍判定：增长≈间隔 = 播放'; Ok = (Test-Playing -Prev 1000 -Now 2000 -ElapsedSeconds 1.0 -ToleranceMs 400) }
+        @{ Name = '两拍判定：几乎不动 = 暂停'; Ok = (-not (Test-Playing -Prev 1000 -Now 1000 -ElapsedSeconds 1.0 -ToleranceMs 400)) }
+        @{ Name = '切歌粗校验：回落或明显跳变 = 有效'; Ok = (Test-PosAfterTrackChange -Prev 60000 -Now 1200) -and (Test-PosAfterTrackChange -Prev 60000 -Now 20000) }
+        @{ Name = '切歌粗校验：几乎原样 = 可疑'; Ok = (-not (Test-PosAfterTrackChange -Prev 60000 -Now 60200)) }
     )
     $bad = 0
     foreach ($c in $checks) {
@@ -502,9 +840,12 @@ try {
                     }
                 }
             }
-            # 位置：媒体会话给真位置（拖动、暂停都跟得上）；没有就退回推算时钟
+            # 位置降级链：memory（默认，进程存活期内只发现一次）→ media → clock
             $positionMs = $null
-            if ($positionMode -eq 'media') {
+            if ($PositionSource -in 'auto', 'memory') {
+                $positionMs = Get-MemoryPosition -Now $now
+            }
+            if ($null -eq $positionMs -and $positionMode -eq 'media') {
                 $sample = Get-PositionSample
                 if ($sample) {
                     $positionMs = Get-PositionMs -Sample $sample `
