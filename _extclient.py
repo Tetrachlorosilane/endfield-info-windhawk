@@ -38,6 +38,20 @@ def send(lines, timeout=1.0):
         print("the mod only creates it when 'External data' is On and a row")
         print("contains an {ext.provider.key} token")
         return None
+    except PermissionError:
+        # Two very different causes look identical from here:
+        #   * a sandbox that forbids opening pipes for writing (the DSH shell is
+        #     one: even a pipe with no security descriptor is refused), and
+        #   * the mod's pipe DACL not granting this user.
+        # The mod's log distinguishes them: it prints
+        #   "EXT: pipe DACL grants SYSTEM, Administrators and <sid>"
+        # so compare that SID with `whoami /user`.
+        print("access denied opening %s" % PIPE)
+        print("the pipe exists, so either this shell is sandboxed (run it from a")
+        print("normal terminal) or the mod's DACL does not include this user.")
+        print("Check the Windhawk log for 'EXT: pipe DACL grants ... <sid>' and")
+        print("compare the SID with the one from: whoami /user")
+        return None
 
     with pipe:
         fileno = pipe.fileno()

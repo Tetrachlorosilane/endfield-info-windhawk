@@ -1228,6 +1228,63 @@ int main() {
             g_stubIntCount = 0;
         }
 
+        // The pipe's DACL has to actually admit this user. Getting it wrong is
+        // invisible until a real client is refused, so a pipe built with the very
+        // same descriptor is opened here -- but only where the environment allows
+        // a pipe client at all. A confined sandbox denies that for *every*
+        // descriptor, including no descriptor at all, so a control pipe decides
+        // whether the comparison means anything. (Same shape as the GDI+ section
+        // that prints "section skipped" instead of failing.)
+        {
+            const WCHAR controlName[] = L"\\\\.\\pipe\\endfield-info-windhawk-control";
+            HANDLE controlServer = CreateNamedPipeW(controlName, PIPE_ACCESS_DUPLEX,
+                                                    PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE |
+                                                        PIPE_WAIT,
+                                                    1, 1024, 1024, 0, nullptr);
+            DWORD controlErr = 0;
+            bool writable = false;
+            if (controlServer != INVALID_HANDLE_VALUE) {
+                HANDLE control = CreateFileW(controlName, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                             OPEN_EXISTING, 0, nullptr);
+                writable = control != INVALID_HANDLE_VALUE;
+                controlErr = writable ? 0 : GetLastError();
+                if (writable) CloseHandle(control);
+                DisconnectNamedPipe(controlServer);
+                CloseHandle(controlServer);
+            } else {
+                controlErr = GetLastError();
+            }
+
+            if (!writable) {
+                printf("  this environment refuses pipe clients (err=%lu); "
+                       "the DACL check is skipped here\n", controlErr);
+            } else {
+                PSECURITY_DESCRIPTOR sd = ExtPipeSecurityDescriptor();
+                SECURITY_ATTRIBUTES sa = {};
+                sa.nLength = sizeof(sa);
+                sa.lpSecurityDescriptor = sd;
+                const WCHAR name[] = L"\\\\.\\pipe\\endfield-info-windhawk-acl-test";
+                HANDLE server = CreateNamedPipeW(name, PIPE_ACCESS_DUPLEX,
+                                                 PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE |
+                                                     PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                                                 1, 4096, 4096, 0, &sa);
+                Check(server != INVALID_HANDLE_VALUE, "the pipe descriptor builds a pipe");
+                if (server != INVALID_HANDLE_VALUE) {
+                    HANDLE client = CreateFileW(name, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                                OPEN_EXISTING, 0, nullptr);
+                    DWORD err = client == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+                    printf("  same-user client on our own DACL: opened=%d err=%lu\n",
+                           client != INVALID_HANDLE_VALUE ? 1 : 0, err);
+                    Check(client != INVALID_HANDLE_VALUE,
+                          "the pipe DACL admits the user running the mod");
+                    if (client != INVALID_HANDLE_VALUE) CloseHandle(client);
+                    DisconnectNamedPipe(server);
+                    CloseHandle(server);
+                }
+                if (sd) LocalFree(sd);
+            }
+        }
+
         DeleteCriticalSection(&g_extLock);
         g_extLockReady = false;
     }

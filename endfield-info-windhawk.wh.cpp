@@ -4921,17 +4921,56 @@ static void ExtServeClient(HANDLE pipe, OVERLAPPED *ov, ExtSession &ses) {
     }
 }
 
+// The pipe's DACL: SYSTEM, Administrators and the user this process runs as.
+//
+// The user's SID has to be spelled out. "CO" (creator owner) is a placeholder
+// that is only substituted in *inheritable* ACEs on container objects; in a
+// pipe's object DACL it is compared literally, matches nobody, and every client
+// -- including the user who started the mod -- gets ERROR_ACCESS_DENIED. That is
+// the bug this function used to have, and the regression test builds a pipe from
+// this descriptor and connects to it so it cannot come back.
 static PSECURITY_DESCRIPTOR ExtPipeSecurityDescriptor() {
-    PSECURITY_DESCRIPTOR sd = nullptr;
-    // SYSTEM, Administrators and the creating user (owner). Everything else is
-    // denied, and the pipe itself refuses remote clients outright.
-    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;CO)", SDDL_REVISION_1, &sd, nullptr)) {
-        return sd;
+    WCHAR sidText[200] = L"";
+    HANDLE token = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        BYTE info[256] = {};
+        DWORD size = 0;
+        if (GetTokenInformation(token, TokenUser, info, sizeof(info), &size)) {
+            LPWSTR text = nullptr;
+            if (ConvertSidToStringSidW(((TOKEN_USER *)info)->User.Sid, &text)) {
+                wcsncpy(sidText, text, 199);
+                sidText[199] = L'\0';
+                LocalFree(text);
+            }
+        }
+        CloseHandle(token);
     }
-    Wh_Log(L"EXT: could not build the pipe DACL (%lu); using the process default",
-           GetLastError());
-    return nullptr;
+    if (!sidText[0]) {
+        // Falling back to the process default DACL errs on the permissive side:
+        // it grants this user by construction instead of locking them out.
+        Wh_Log(L"EXT: could not resolve the process user SID (%lu); using the "
+               L"process default DACL", GetLastError());
+        return nullptr;
+    }
+
+    // Built by concatenation rather than swprintf: what "%s" means in a wide
+    // format depends on __USE_MINGW_ANSI_STDIO, and this particular string is a
+    // security descriptor. It must not depend on which stdio the toolchain picked.
+    WCHAR sddl[256];
+    wcscpy(sddl, L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;");
+    size_t used = wcslen(sddl);
+    wcsncat(sddl, sidText, sizeof(sddl) / sizeof(sddl[0]) - used - 2);
+    wcsncat(sddl, L")", 1);
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &sd,
+                                                              nullptr)) {
+        Wh_Log(L"EXT: could not build the pipe DACL from \"%s\" (%lu); using the "
+               L"process default", sddl, GetLastError());
+        return nullptr;
+    }
+    // The granted SID is the discriminator to look at if a client is ever refused.
+    Wh_Log(L"EXT: pipe DACL grants SYSTEM, Administrators and %s", sidText);
+    return sd;
 }
 
 static DWORD WINAPI ExtPipeThread(LPVOID) {

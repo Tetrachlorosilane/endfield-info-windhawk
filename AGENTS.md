@@ -108,14 +108,25 @@ python _settings.py
 
 ```powershell
 $wc = 'D:\Program Files\Windhawk\Compiler'
+# -D__USE_MINGW_ANSI_STDIO=0 与 Windhawk 的真实参数（compile_flags.txt）一致。
+# 少了它，宿主用的是 ISO stdio：宽格式里的 %s 会被当成窄字符串，于是 mod 里
+# 所有 Wh_Log(L"...%s", 宽字符串) 在宿主里都打印成垃圾——**宿主就成了另一套语义**，
+# 测出来的结论不能代表产品。加界断言前就被这个坑咬过一次（管道 DACL 的 SDDL 被
+# swprintf 截成了 "D"）。
 & "$wc\bin\clang++.exe" -target x86_64-w64-mingw32 -std=c++23 -O0 -DUNICODE -D_UNICODE `
-  -DWINVER=0x0A00 -D_WIN32_WINNT=0x0A00 -DNTDDI_VERSION=0x0A000008 -Wno-pragma-pack `
+  -DWINVER=0x0A00 -D_WIN32_WINNT=0x0A00 -DNTDDI_VERSION=0x0A000008 -D__USE_MINGW_ANSI_STDIO=0 `
+  -Wno-pragma-pack `
   -luser32 -lgdi32 -lpdh -liphlpapi -lpsapi -ladvapi32 `
   -o "$env:TEMP\layouttest.exe" test-layout.cpp
 & "$env:TEMP\layouttest.exe"
 ```
 
 期望最后一行 `PASSED (0 failure(s))`。
+
+> **受限沙箱会跳过一条断言**：命名管道客户端在 DSH 的受限模式下被拒绝
+> （连"完全不给安全描述符"的对照管道也打不开，`err=5`），所以 DACL 那条会打印
+> `this environment refuses pipe clients ... the DACL check is skipped here`。
+> **跳过不等于通过**——要验证 DACL 得在普通终端里跑一次。
 
 **宿主原理**：`test-layout.cpp` 把 Windhawk API（`Wh_GetIntSetting` / `Wh_GetStringSetting` /
 `Wh_Log` / `Wh_SetFunctionHook`）打桩，然后 `#include "endfield-info-windhawk.wh.cpp"`。
@@ -332,6 +343,7 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 | 图片载入失败不回退字形 | 只剩空盘，像"图标变纯白" | 失败必须回退字形 |
 | 行 `StringFormat` 少了 `NoWrap` | **第一行文字不在一条直线上**（该段首行上浮） | 超宽文本仍是 1 行；真 GDI+ 断言 |
 | 关掉换行后文本不截断 | 文字压到后面的环上 | 每段都落在自己的预算内 |
+| 管道 DACL 写成 `CO`（creator owner） | **每个客户端都被拒绝**（`PermissionError` / `ERROR_ACCESS_DENIED`），连启动 mod 的用户自己都连不上 | 用同一个 SD 建管道、让当前用户连上：`test-layout.cpp` 的 "the pipe DACL admits the user running the mod" |
 
 ### 排查心法：先分类，再定位
 
