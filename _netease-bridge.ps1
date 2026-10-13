@@ -61,7 +61,8 @@ param(
     # 位置来源：memory = 从客户端内存读播放位置（毫秒 int32，差分发现）；
     # media = 媒体会话（SMTC，真实位置）；clock = 推算时钟；
     # auto = 依次尝试 memory → media → clock
-    [ValidateSet('auto', 'memory', 'media', 'clock')]
+    # cdp = 通过调试端口读页面里的实际播放时间（需要用户自己给快捷方式加调试参数）；
+    [ValidateSet('auto', 'memory', 'cdp', 'media', 'clock')]
     [string]$PositionSource = 'auto',
     # 内存发现时两次采样的间隔（秒）——这段时间里必须在播放
     [int]$MemoryGapSeconds = 12,
@@ -616,6 +617,24 @@ function Invoke-CdpExpression {
     finally { if ($ws) { try { $ws.Dispose() } catch { } } }
 }
 
+# CDP 位置：读页面里 audio/video 元素的 currentTime。
+# 刻意用"通用锚点"而不是猜出来的私有选择器：-ProbeCdp 已把页面里有什么打印出来，真正的表达式
+# 等那份输出回来再固化；在那之前这条能取到就用、取不到就返回 $null 继续降级 ✓。
+function Get-CdpPositionMs {
+    if (-not (Get-CdpTab)) { return $null }
+    $expr = "(function(){var a=document.querySelector('audio,video');" +
+            "if(!a||isNaN(a.currentTime))return '';" +
+            "return JSON.stringify({t:a.currentTime,d:a.duration,p:a.paused});})()"
+    $raw = Invoke-CdpExpression -Expression $expr
+    if (-not $raw) { return $null }
+    $m = [regex]::Match($raw, '"value"\s*:\s*"(\{.*?\})"')
+    if (-not $m.Success) { return $null }
+    $o = $null
+    try { $o = ($m.Groups[1].Value -replace '\\"', '"') | ConvertFrom-Json } catch { return $null }
+    if ($null -eq $o -or $null -eq $o.t) { return $null }
+    try { return [int]([double]$o.t * 1000) } catch { return $null }
+}
+
 # 探测表达式：只读、无副作用，一次把"页面里有什么"尽量问全，避免来回猜。
 $script:CdpProbeExpression = @'
 (function(){
@@ -922,6 +941,9 @@ try {
             $positionMs = $null
             if ($PositionSource -in 'auto', 'memory') {
                 $positionMs = Get-MemoryPosition -Now $now
+            }
+            if ($null -eq $positionMs -and $PositionSource -in 'auto', 'cdp') {
+                $positionMs = Get-CdpPositionMs
             }
             if ($null -eq $positionMs -and $positionMode -eq 'media') {
                 $sample = Get-PositionSample
