@@ -416,6 +416,12 @@ pwsh -File _netease-bridge.ps1 -Ttl 600000
 pwsh -File _netease-bridge.ps1 -Event -Ttl 600000
 ```
 
+> **也可以让 mod 替你启动它**：设置里把 `External publisher command` 填成
+> `pwsh -NoProfile -File <本仓库路径>\_netease-bridge.ps1` 即可 —— 只有**某一行真的引用了
+> `{ext.*}`** 且 `External data` 打开时才会启动 ✓；卸载 mod 时它会被一起收掉（作业对象，
+> 连它自己拉起的子进程也一起 ✓）；意外退出最多重启 5 次 ✓。
+> **mod 不会启动或重启你的音乐客户端** ✓——那是你自己的软件，怎么启动由你决定。
+
 | 参数 | 作用 |
 | :-- | :-- |
 | `-Provider` | 提供者名，默认 `netease`（面板里写 `{ext.netease.title}`） |
@@ -423,6 +429,8 @@ pwsh -File _netease-bridge.ps1 -Event -Ttl 600000
 | `-TtlMs` | 推过去的值的寿命，默认 600000（歌在播，给长一点，别让行里闪 `--`） |
 | `-Event` | 换歌时发一条 `EVENT`，让灵动岛弹一次 |
 | `-SongId` | 手工指定歌曲 id，跳过搜索（接口查不到时的兜底） |
+| `-PositionSource` | 播放位置来源：`auto`（默认，依次试 `memory` → `media` → 推算时钟）/ `memory` / `media` / `clock`。`memory` 直接读客户端内存里的播放毫秒，**拖动进度条与暂停都能跟上**，只读、且每个客户端进程只发现一次 |
+| `-ProbePosition` | 探测位置来源（媒体会话那条）；`-ProbeCdp` 探测 CDP 调试端口（需要你手动给快捷方式加 `--remote-debugging-port=9229`，脚本会打印步骤） |
 | `-DryRun` / `-SelfTest` / `-DumpJson` | 不发送 / 离线自检 / 打印接口返回的 JSON |
 
 **它只在内容变化时才发**：一秒一次地重复同一句歌词没有意义，管道限速会丢，但更好的做法是根本不发。
