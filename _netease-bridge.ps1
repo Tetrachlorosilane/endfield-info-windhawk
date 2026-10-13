@@ -655,20 +655,53 @@ $script:CdpProbeExpression = @'
     if (o.cjk.length < 12 && !e.children.length && t.length >= 2 && t.length <= 200 &&
         /[\u4e00-\u9fff]/.test(t)) o.cjk.push({ c: cls(e), t: t.slice(0, 60) });
   }
-  // 真机结论（2026-10-13）：DOM 里既没有当前时间也没有进度条，更没有歌词 ✗
-  // （找到的 m:ss 全是歌单每首的时长；那个页面此刻是首页视图）。两个成熟项目走的是
-  // **读页面里的 React store**（Redux：带 getState ✓）而不是抠 DOM ✓，所以这里补上这一步：
-  // 列出 window 上带 getState 的对象，以及它 state 顶层的键名（只列键，不 dump 内容）。
-  o.stores = {};
-  for (var k in window) {
-    try {
-      var v = window[k];
-      if (v && typeof v.getState === 'function') {
-        var s = v.getState();
-        o.stores[k] = s ? Object.keys(s).slice(0, 24) : [];
-      }
-    } catch (x) { }
-  }
+  // 真机结论（2026-10-13，读过 cloudmusic-desktop-mcp 的实现后修正）：
+  // **Redux store 不在 window 上** ✗（所以"扫 getState"必然为空 ✗），它要通过 **webpack 运行时**拿：
+  // cloudmusic-desktop-mcp 先往 webpackJsonp 里塞一个模块，把 webpack 的 require 存到 window 上，
+  // 再 `require(12).a.getStore()` 拿到 store ✓。这里照同一条路，但：
+  //   · 用**自己的**空闲模块号（987661），不占用别人的 ✓；
+  //   · 只**列键名**与少量短值（不外传任何可识别内容 ✓）；
+  //   · 全程 try/catch，失败也只回报错误文本 ✓。
+  o.store = {};
+  try {
+    if (!window.__ei_probe_require__) {
+      webpackJsonp.push([[987661], { 987661: function (m, e, require) { window.__ei_probe_require__ = require; } }, [[987661]]]);
+    }
+    var req = window.__ei_probe_require__;
+    o.store.requireCaptured = !!req;
+    // 真机结论（2026-10-13）：webpack require 能拿到 ✓，但 `req(12).a.getStore` 在你这台客户端上
+    // **不是函数** ✗ —— 模块 id 随版本变（cloudmusic-desktop-mcp 钉死的是 12，那是对它测试的版本 ✓）。
+    // 所以这里**不猜 id**，而是扫 webpack 的**缓存**（req.c = 已实例化的模块 ✓）：
+    //   · **不执行任何模块** ✗（req(id) 可能会跑初始化代码）——只读缓存里的 exports ✓；
+    //   · 找导出里带 getStore（或同时带 getState+dispatch）的那个 ✓。
+    var hits = [];
+    var cache = (req && req.c) || {};
+    for (var id in cache) {
+      try {
+        var ex = cache[id] && cache[id].exports;
+        if (!ex) continue;
+        var cands = [ex, ex.a, ex.default, ex.exports];
+        for (var ci = 0; ci < cands.length; ci++) {
+          var c = cands[ci];
+          if (c && typeof c.getStore === 'function') { hits.push({ id: id, at: ci, kind: 'getStore' }); break; }
+          if (c && typeof c.getState === 'function' && typeof c.dispatch === 'function') { hits.push({ id: id, at: ci, kind: 'redux' }); break; }
+        }
+      } catch (x) { }
+    }
+    o.store.cacheSize = Object.keys(cache).length;
+    o.store.hits = hits.slice(0, 20);
+    // 找到了就顺手把切片名与 playing 的键名列出来（只看结构，不取值 ✗）
+    if (hits.length) {
+      try {
+        var c0 = [cache[hits[0].id].exports, cache[hits[0].id].exports.a, cache[hits[0].id].exports.default][hits[0].at];
+        var store0 = (typeof c0.getStore === 'function') ? c0.getStore() : c0;
+        var st = store0.getState();
+        o.store.slices = Object.keys(st).slice(0, 40);
+        var p = st.playing || {};
+        o.store.playingKeys = Object.keys(p).slice(0, 60);
+      } catch (x2) { o.store.probeError = '' + x2; }
+    }
+  } catch (x) { o.store.error = '' + x; }
   return JSON.stringify(o);
 })()
 '@
