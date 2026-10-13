@@ -54,8 +54,8 @@ param(
     [switch]$SelfTest,
     # 跑一轮就退出
     [switch]$Once,
-    # 直接指定歌曲 id（跳过搜索），用于接口查不到时手工兜底
-    [int]$SongId = 0,
+    # 直接指定歌曲 id（跳过搜索），用于接口查不到时手工兜底。id 是 64 位的
+    [long]$SongId = 0,
     # 取不到歌词时多久重试一次。只在启动时查一次的话，接口抖一下整首歌就都没有歌词
     [int]$LyricRetryMs = 20000
 )
@@ -166,6 +166,8 @@ function Get-SongId {
         "https://music.163.com/api/search/get/web?s=$query&type=1&offset=0&limit=1",
         "https://music.163.com/api/search/get?s=$query&type=1&offset=0&limit=1"
     )
+    $lastBrief = '<无响应>'
+    $lastCode = 0
     foreach ($url in $urls) {
         try {
             $json = Invoke-RestMethod -Uri $url -TimeoutSec 8 -Headers $script:Headers
@@ -179,11 +181,16 @@ function Get-SongId {
         $songs = $null
         if ($json.result -and $json.result.songs) { $songs = $json.result.songs }
         elseif ($json.result -and $json.result.song) { $songs = $json.result.song }
-        if ($songs -and $songs.Count -gt 0) { return [int]$songs[0].id }
+        # id 是 64 位的：3342981041 这种一放进 [int] 就抛异常（而搜索其实是成功的）
+        if ($songs -and $songs.Count -gt 0) { return [long]$songs[0].id }
 
-        # 没命中时必须说清楚：是风控、还是形状变了（-DumpJson 看全文）
-        Write-Diag ("搜索没命中：code={0} 有 result={1} 响应={2}" -f `
-                $json.code, ($null -ne $json.result), (Get-Brief $json))
+        $lastBrief = Get-Brief $json
+        $lastCode = $json.code
+    }
+    # 所有端点都没给出可用列表时说清楚长什么样，别让它看起来像"歌词的问题"
+    Write-Diag ("搜索在所有端点上都没命中：code={0} 响应={1}" -f $lastCode, $lastBrief)
+    if ($lastBrief -match '"abroad":true') {
+        Write-Diag "响应带 abroad=true（加密载荷），改用 -SongId 手工指定最省事"
     }
     0
 }
