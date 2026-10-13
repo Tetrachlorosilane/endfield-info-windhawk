@@ -91,6 +91,14 @@ libc++）编译，并打印导出符号表。
 
 **如果出现别的警告，要处理掉。**
 
+> **本地编不出"安装版"**：`compile_flags.txt` 带 `-DWH_EDITING`，而在这个宏下
+> `windhawk_api.h` 把 `Wh_Log` 定义成空的内联函数、`WH_MOD_ID` 变成占位符、
+> 也不引入 `windhawk_api_internal.h`。所以本地 build **是语法/类型门，不是与安装版逐位一致的产物**：
+> 日志调用连同它们的格式串在本地被编译掉，DLL 里搜不到任何日志字符串——我为此白排查过一轮
+> （"DLL 里没有新日志"其实什么也没证明）。去掉 `-DWH_EDITING` 也救不了：那会引用
+> `InternalWh_*`，而它们由 Windhawk 自己提供，本地链接不过。
+> **要检查日志格式串，用测试宿主**（它打桩了一个真的 `Wh_Log`，会走 `-Wformat`）。
+
 ### 设置块校验（改过设置项就跑）
 
 ```powershell
@@ -127,6 +135,11 @@ $wc = 'D:\Program Files\Windhawk\Compiler'
 > （连"完全不给安全描述符"的对照管道也打不开，`err=5`），所以 DACL 那条会打印
 > `this environment refuses pipe clients ... the DACL check is skipped here`。
 > **跳过不等于通过**——要验证 DACL 得在普通终端里跑一次。
+
+> **mod 的日志格式串是在这里被检查的**：宿主打桩了一个真的 `Wh_Log`，所以 mod 里每个
+> `Wh_Log(L"...%s", ...)` 都会被真的编译并走 `-Wformat`。**不要给这条命令加
+> `-Wno-format`**，那会把这项检查一起关掉（加过一次，等于把唯一的日志类型检查关了）。
+> 宿主自己那 15 条 `%08X` 收 `DWORD` 的警告是它自己的 printf，与 mod 无关。
 
 **宿主原理**：`test-layout.cpp` 把 Windhawk API（`Wh_GetIntSetting` / `Wh_GetStringSetting` /
 `Wh_Log` / `Wh_SetFunctionHook`）打桩，然后 `#include "endfield-info-windhawk.wh.cpp"`。
@@ -499,13 +512,17 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   （头顺序 + `ApplyPanelTransform` 未使用）。
 - 7 个导出入口齐全。
 - 依赖仅系统 DLL：`USER32 / GDI32 / PDH / IPHLPAPI / PSAPI / ADVAPI32 / msvcrt / KERNEL32`。
-- 回归测试全绿（241 条断言，含一段**真启动 GDI+** 的排版断言：
+- 回归测试全绿（247 条断言，含一段**真启动 GDI+** 的排版断言：
   文字不折行、且在预算内）。
 - GDI+ 缩放管线用**已知内容**的图验证过（含透明底、纯 RGB、索引色、灰度+alpha、
   16 位、隔行 PNG）。
-- 外部数据（M1）：编译只剩上面那两条已知警告；回归 **241 条断言**全绿，其中 48 条是这一版新增；
+- 外部数据（M1）：编译只剩上面那两条已知警告；回归 **247 条断言**全绿，其中 54 条是这一版新增；
   并做了**负对照**——把展开改成递归后，注入断言确实变红（不是"看着像在守"）。
 - 设置块 46 项 / 10 个选项组，`_settings.py` 报 `no structural problems found`。
+- **mod 的日志格式串**用测试宿主查过：`-Wformat` 指向 `endfield-info-windhawk.wh.cpp`
+  的警告为 0（本地 mod build 检查不了这项，见 §3）。
+- 外部数据的**服务端路径**（`ExtHandleLine`：HELLO → SET → 存储 → 查找、换行框架与边缘空格裁剪、
+  允许名单拒绝）有断言覆盖，共 247 条。
 
 **未验证**（需要真实运行环境）：
 

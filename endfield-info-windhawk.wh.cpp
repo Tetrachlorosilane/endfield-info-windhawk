@@ -372,7 +372,7 @@ static bool ParseRing(const WCHAR *body, int bodyLen, const Values &v,
                       const ModSettings &settings, RingSpec &out);
 // Defined with the external-data section, but RequiredGroups needs it first.
 static bool ExtIsExtToken(const WCHAR *name, int len);
-static void ExtStart();
+static void ExtStart(const ModSettings &snap);
 static void ExtStop();
 
 // ---------------------------------------------------------------------------
@@ -1712,6 +1712,37 @@ static bool ExtProviderAllowed(const ModSettings &s, const WCHAR *name, int len)
         p = *end ? end + 1 : end;
     }
     return false;
+}
+
+// What do the rows actually ask for? "The panel shows --" has three very
+// different causes -- the provider never sent that key, the name is spelled
+// differently, or no row references {ext.*} at all -- and they look identical on
+// screen. One bounded line per settings change (and once at startup) separates
+// them. It prints the names the rows reference, which is what the user wrote, not
+// any value a provider sent.
+static void ExtLogRowReferences(const ModSettings &s) {
+    int logged = 0;
+    for (int r = 0; r < s.rowCount && logged < 8; r++) {
+        const WCHAR *p = s.rows[r];
+        while (*p && logged < 8) {
+            if (*p != L'{') { p++; continue; }
+            const WCHAR *end = wcschr(p + 1, L'}');
+            if (!end) break;
+            const WCHAR *bar = p + 1;
+            while (bar < end && *bar != L'|') bar++;
+            int len = (int)(bar - (p + 1));
+            if (ExtIsExtToken(p + 1, len)) {
+                WCHAR name[64];
+                int copy = len < 63 ? len : 63;
+                wcsncpy(name, p + 1, copy);
+                name[copy] = L'\0';
+                Wh_Log(L"EXT row%d wants %s", r + 1, name);
+                logged++;
+            }
+            p = end + 1;
+        }
+    }
+    if (!logged) Wh_Log(L"EXT no row references {ext.*}; the pipe will not be created");
 }
 
 // Writes one value. Takes the lock itself, so the pipe thread cannot forget to.
@@ -4564,6 +4595,8 @@ static void SamplerIteration() {
         // thread used to refresh them on a settings change, which raced with this
         // thread reading them (docs/external-data-island-design.md 5.6.3 R1b).
         ReadCpuStatic();
+        // A row edit changes which external names are wanted, so say so in the log.
+        ExtLogRowReferences(settings);
         EnterCriticalSection(&g_valuesLock);
         g_publishedRows = 0;
         LeaveCriticalSection(&g_valuesLock);
@@ -4576,7 +4609,7 @@ static void SamplerIteration() {
     // "off" free of cost.
     if ((groups & G_EXT) && settings.externalData && !g_extStartAttempted) {
         g_extStartAttempted = true;
-        ExtStart();
+        ExtStart(settings);
     }
 
     Values v;
@@ -4818,12 +4851,40 @@ static void ExtLogClient(HANDLE pipe) {
     Wh_Log(L"EXT: client pid=%lu image=%s", pid, path);
 }
 
+static const WCHAR *ExtCmdName(ExtCmd cmd) {
+    switch (cmd) {
+    case EC_HELLO: return L"HELLO";
+    case EC_SET: return L"SET";
+    case EC_DEL: return L"DEL";
+    case EC_EVENT: return L"EVENT";
+    case EC_BYE: return L"BYE";
+    default: return L"?";
+    }
+}
+
+// Every refusal is logged with its code and the command it came from. A silent
+// refusal is indistinguishable from "the client never sent anything", which is
+// exactly the confusion this caused once: the client saw ERR 405 while the log
+// showed nothing but a successful connect.
+static int ExtRefuse(HANDLE pipe, OVERLAPPED *ov, int code, const ExtCommand &cmd,
+                     const ExtSession &ses) {
+    Wh_Log(L"EXT err code=%d cmd=%s provider=%s keyLen=%d", code, ExtCmdName(cmd.cmd),
+           ses.provider[0] ? ses.provider : (cmd.provider ? L"(unregistered)" : L"(none)"),
+           cmd.keyLen);
+    ExtReplyErr(pipe, ov, code);
+    return code;
+}
+
 static int ExtHandleLine(HANDLE pipe, OVERLAPPED *ov, const WCHAR *line, ExtSession &ses) {
     ExtCommand cmd;
     int code = ExtParseLine(line, cmd);
     if (code == 0 && cmd.cmd == EC_NONE) return 0;
-    if (code != 0) { ExtReplyErr(pipe, ov, code); return code; }
-    if (cmd.cmd == EC_BYE) { ExtWriteLine(pipe, ov, L"OK bye"); return 0; }
+    if (code != 0) return ExtRefuse(pipe, ov, code, cmd, ses);
+    if (cmd.cmd == EC_BYE) {
+        Wh_Log(L"EXT bye provider=%s", ses.provider[0] ? ses.provider : L"(none)");
+        ExtWriteLine(pipe, ov, L"OK bye");
+        return 0;
+    }
 
     // One snapshot per command, taken under the lock the loader writes with.
     // Nothing is cached in a global, so a saved setting applies from the next
@@ -4833,26 +4894,26 @@ static int ExtHandleLine(HANDLE pipe, OVERLAPPED *ov, const WCHAR *line, ExtSess
     snap = g_settings;
     LeaveCriticalSection(&g_settingsLock);
 
-    if (!snap.externalData) { ExtReplyErr(pipe, ov, 405); return 405; }
-    if (!ExtNameValid(cmd.provider, cmd.providerLen, true)) { ExtReplyErr(pipe, ov, 400); return 400; }
+    if (!snap.externalData) return ExtRefuse(pipe, ov, 405, cmd, ses);
+    if (!ExtNameValid(cmd.provider, cmd.providerLen, true)) return ExtRefuse(pipe, ov, 400, cmd, ses);
     if (!ExtProviderAllowed(snap, cmd.provider, cmd.providerLen)) {
-        ExtReplyErr(pipe, ov, 405);
-        return 405;
+        return ExtRefuse(pipe, ov, 405, cmd, ses);
     }
 
     if (cmd.cmd == EC_HELLO) {
         EnterCriticalSection(&g_extLock);
         ses.slot = ExtFindProvider(cmd.provider, cmd.providerLen, true, snap.extMaxProviders);
         LeaveCriticalSection(&g_extLock);
-        if (ses.slot < 0) { ExtReplyErr(pipe, ov, 403); return 403; }
+        if (ses.slot < 0) return ExtRefuse(pipe, ov, 403, cmd, ses);
         wcsncpy(ses.provider, cmd.provider, cmd.providerLen);
         ses.provider[cmd.providerLen] = L'\0';
+        Wh_Log(L"EXT hello provider=%s slot=%d", ses.provider, ses.slot);
         ExtWriteLine(pipe, ov, L"OK");
         return 0;
     }
 
-    if (ses.slot < 0) { ExtReplyErr(pipe, ov, 401); return 401; }   // SET before HELLO
-    if (!ExtNameValid(cmd.key, cmd.keyLen, false)) { ExtReplyErr(pipe, ov, 400); return 400; }
+    if (ses.slot < 0) return ExtRefuse(pipe, ov, 401, cmd, ses);   // SET before HELLO
+    if (!ExtNameValid(cmd.key, cmd.keyLen, false)) return ExtRefuse(pipe, ov, 400, cmd, ses);
 
     WCHAR key[kExtKeyChars + 1];
     wcsncpy(key, cmd.key, cmd.keyLen);
@@ -4880,8 +4941,7 @@ static int ExtHandleLine(HANDLE pipe, OVERLAPPED *ov, const WCHAR *line, ExtSess
 
     DWORD ttl = 0;
     if (!ExtParseTtl(cmd.ttl, cmd.ttlLen, (DWORD)snap.extValueTtlMs, &ttl)) {
-        ExtReplyErr(pipe, ov, 400);
-        return 400;
+        return ExtRefuse(pipe, ov, 400, cmd, ses);
     }
     if (ttl == 0) {                            // "publish nothing" is a delete
         ExtInvalidate(ses.slot, key);
@@ -4906,19 +4966,32 @@ static void ExtServeClient(HANDLE pipe, OVERLAPPED *ov, ExtSession &ses) {
     // 4 KB of UTF-8 can decode to at most that many UTF-16 units, so the wide
     // buffer is sized from the byte cap rather than from half of it.
     WCHAR line[kExtMaxLineBytes + 1];
+    int frames = 0;
     for (;;) {
         if (InterlockedCompareExchange(&g_extStop, 0, 0)) break;
         DWORD got = 0;
         int read = ExtReadFrame(pipe, ov, frame, (DWORD)sizeof(frame), &got);
         if (read < 0) break;
-        if (read == 0) { ExtReplyErr(pipe, ov, 402); break; }
+        if (read == 0) {
+            Wh_Log(L"EXT err code=402: frame larger than %d bytes", kExtMaxLineBytes);
+            ExtReplyErr(pipe, ov, 402);
+            break;
+        }
         if (got == 0) continue;
+        // The first frames of each connection are logged so "the client connected
+        // but nothing happened" can be told apart from "nothing arrived at all".
+        if (++frames <= 2) Wh_Log(L"EXT recv bytes=%lu", got);
         int wide = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, frame, (int)got, line,
                                        kExtMaxLineBytes);
-        if (wide <= 0) { ExtReplyErr(pipe, ov, 400); continue; }
+        if (wide <= 0) {
+            Wh_Log(L"EXT err code=400: frame is not valid UTF-8 (bytes=%lu)", got);
+            ExtReplyErr(pipe, ov, 400);
+            continue;
+        }
         line[wide] = L'\0';
         ExtHandleLine(pipe, ov, line, ses);
     }
+    Wh_Log(L"EXT client done: frames=%d sets=%u dropped=%u", frames, ses.setLogs, ses.dropped);
 }
 
 // The pipe's DACL: SYSTEM, Administrators and the user this process runs as.
@@ -5009,7 +5082,7 @@ static DWORD WINAPI ExtPipeThread(LPVOID) {
     return 0;
 }
 
-static void ExtStart() {
+static void ExtStart(const ModSettings &snap) {
     InitializeCriticalSection(&g_extLock);
     g_extLockReady = true;
     g_extStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -5018,6 +5091,13 @@ static void ExtStart() {
                GetLastError());
         return;
     }
+    // One bounded line saying what this server will accept. Without it a refused
+    // provider (405) is invisible: the client sees an error code, the log says
+    // nothing, and the panel just shows "--".
+    Wh_Log(L"EXT: limits ttl=%d maxValue=%d providers=%d updates/s=%d allowlist=\"%s\"",
+           snap.extValueTtlMs, snap.extMaxValue, snap.extMaxProviders, snap.extMaxUpdates,
+           snap.extProviders[0] ? snap.extProviders : L"(any)");
+    ExtLogRowReferences(snap);
     for (int i = 0; i < kExtInstances; i++) {
         g_extThreads[i] = CreateThread(nullptr, 0, ExtPipeThread, nullptr, 0, nullptr);
         if (!g_extThreads[i]) {

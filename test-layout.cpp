@@ -1228,6 +1228,60 @@ int main() {
             g_stubIntCount = 0;
         }
 
+        // The frame -> value path, without a pipe. ExtHandleLine is what the pipe
+        // thread calls once per line, so driving it here covers tokenising, the
+        // HELLO/SET dispatch and the store -- the layer where "the client
+        // connected but the panel still says --" actually lives. Replies go to an
+        // invalid handle on purpose: writing them is allowed to fail.
+        {
+            InitializeCriticalSection(&g_settingsLock);
+            EnterCriticalSection(&g_settingsLock);
+            g_settings.externalData = true;
+            g_settings.extProviders[0] = L'\0';
+            g_settings.extMaxUpdates = 100;
+            g_settings.extMaxProviders = kMaxExtProviders;
+            g_settings.extValueTtlMs = 30000;
+            g_settings.extMaxValue = 128;
+            LeaveCriticalSection(&g_settingsLock);
+
+            OVERLAPPED ov = {};
+            ov.hEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            ExtSession ses;
+            Check(ExtHandleLine(INVALID_HANDLE_VALUE, &ov, L"HELLO 1 probe", ses) == 0 &&
+                      ses.slot >= 0,
+                  "HELLO through the handler allocates a slot");
+            Check(ExtHandleLine(INVALID_HANDLE_VALUE, &ov, L"SET probe now - hello from a frame",
+                                ses) == 0,
+                  "SET through the handler is accepted");
+            const WCHAR *stored = nullptr;
+            Check(ExtLookup(L"ext.probe.now", (int)wcslen(L"ext.probe.now"), &stored) == ER_VALUE &&
+                      stored && wcscmp(stored, L"hello from a frame") == 0,
+                  "what the handler stored is what a row will read");
+            // A real client frames every line with a newline; the sanitiser has to
+            // swallow the framing and the surrounding spaces, or the screen shows
+            // them.
+            Check(ExtHandleLine(INVALID_HANDLE_VALUE, &ov, L"SET probe nl -  line two \n", ses) == 0,
+                  "a newline framed line is accepted");
+            Check(ExtLookup(L"ext.probe.nl", (int)wcslen(L"ext.probe.nl"), &stored) == ER_VALUE &&
+                      stored && wcscmp(stored, L"line two") == 0,
+                  "framing and edge spaces are trimmed before the screen");
+            // A provider outside the allowlist must be refused and must not get a
+            // slot: accepting it silently is the failure that hides behind "--".
+            EnterCriticalSection(&g_settingsLock);
+            wcsncpy(g_settings.extProviders, L"music", kExtProviderListChars - 1);
+            LeaveCriticalSection(&g_settingsLock);
+            ExtSession other;
+            Check(ExtHandleLine(INVALID_HANDLE_VALUE, &ov, L"HELLO 1 discord", other) == 405 &&
+                      other.slot < 0,
+                  "a provider outside the allowlist is refused");
+            EnterCriticalSection(&g_settingsLock);
+            g_settings.extProviders[0] = L'\0';
+            g_settings.externalData = false;
+            LeaveCriticalSection(&g_settingsLock);
+            if (ov.hEvent) CloseHandle(ov.hEvent);
+            DeleteCriticalSection(&g_settingsLock);
+        }
+
         // The pipe's DACL has to actually admit this user. Getting it wrong is
         // invisible until a real client is refused, so a pipe built with the very
         // same descriptor is opened here -- but only where the environment allows
