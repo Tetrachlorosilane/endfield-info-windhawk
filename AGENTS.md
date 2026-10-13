@@ -40,6 +40,7 @@ endfield-info-windhawk/
 ├── _extclient.py                      外部数据管道的冒烟客户端（Python）
 ├── _extclient.ps1                     第二客户端（.NET）——**真机验证过的是这一个**
 ├── _netease-bridge.ps1                示例发布器：网易云正在播放的曲名 + 当前歌词行
+├── _netease-position.ps1              位置助手（SMTC，必须由 Windows PowerShell 5.1 运行）
 └── assets/panel-preview.png           版面预览（README 引用）
 ```
 
@@ -631,6 +632,14 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   没有网易云窗口时给出可诊断的退出并列出所有有标题的进程。**未验证**：搜索/歌词两个网络接口的
   返回形状（本机无法访问）、窗口标题在真实客户端上的格式、以及"按看到它的时刻推算歌词行"这个
   时钟的漂移（暂停时会继续走，这是设计上已知的取舍，要精确同步得上 SMTC）。
+- **`_netease-position.ps1`（位置助手，SMTC）**：与主脚本**分开成两个进程是有原因的**——SMTC 是
+  WinRT，而 WinRT 投影只在 **Windows PowerShell 5.1** 里可用（pwsh 7 读不到）。所以位置由 5.1 宿主
+  产生、写成一个每秒刷新的采样文件，主脚本读最后一行。**实测（本机）**：5.1 下 `-ProbePosition`
+  返回 `PROBE none (no active media session)`（这台机器没有媒体会话 = 有效的负结果），
+  pwsh 7 下返回 `PROBE unsupported-host`（正是分进程的理由）。**离线可断言的部分全绿**（17 项自检）：
+  采样行解析（正常 / 暂停 / 无会话 / 垃圾 / 空）、**暂停不推进**、播放时按采样年龄外推、
+  采样过旧视为不可用。**未验证**：真实机器上有会话时位置是否跟得上拖动与暂停——需要用户跑
+  `-ProbePosition` 看有没有会话，再拖动进度条实测歌词是否立刻跟上。
 
 **未验证**（需要真实运行环境）：
 

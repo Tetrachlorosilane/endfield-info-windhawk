@@ -57,7 +57,17 @@ param(
     # 直接指定歌曲 id（跳过搜索），用于接口查不到时手工兜底。id 是 64 位的
     [long]$SongId = 0,
     # 取不到歌词时多久重试一次。只在启动时查一次的话，接口抖一下整首歌就都没有歌词
-    [int]$LyricRetryMs = 20000
+    [int]$LyricRetryMs = 20000,
+    # 位置来源：media = 媒体会话（真实位置，拖动进度条与暂停都跟得上）；clock = 推算时钟；
+    # auto = 先试 media，不可用就退回 clock
+    [ValidateSet('auto', 'media', 'clock')]
+    [string]$PositionSource = 'auto',
+    # 位置助手脚本，缺省用同目录的 _netease-position.ps1
+    [string]$PositionHelper = '',
+    # 超过这么久没有新采样就当成不可用（毫秒）
+    [int]$PositionStaleMs = 3000,
+    # 只探一次位置来源并打印结论
+    [switch]$ProbePosition
 )
 
 $ErrorActionPreference = 'Stop'
@@ -257,6 +267,92 @@ function Publish {
 }
 
 # ---------------------------------------------------------------------------
+# 播放位置：媒体会话（真实位置）优先，推算时钟兜底
+# ---------------------------------------------------------------------------
+# 为什么是"助手进程 + 文件"而不是管道：SMTC 是 WinRT，只有 Windows PowerShell 5.1 读得到
+# （pwsh 7 不行），所以位置必须由另一个宿主进程产生；而在 PowerShell 里做事件式异步读
+# 很容易把两边一起卡死——写文件、读最后一行、再加上新鲜度判定，简单且不会互相阻塞。
+function ConvertFrom-PositionLine {
+    param([string]$Line)
+    if (-not $Line) { return $null }
+    $m = [regex]::Match($Line.Trim(), '^position=(-?\d+(?:\.\d+)?|-) status=(\w+)$')
+    if (-not $m.Success) { return $null }
+    if ($m.Groups[1].Value -eq '-') { return $null }          # 没有会话
+    [pscustomobject]@{ Position = [double]$m.Groups[1].Value; Status = $m.Groups[2].Value }
+}
+
+function Test-PositionFresh {
+    param($Sample, [datetime]$WrittenAt, [datetime]$Now, [int]$StaleMs)
+    if (-not $Sample) { return $false }
+    return (($Now - $WrittenAt).TotalMilliseconds -le $StaleMs)
+}
+
+# 暂停/缓冲时不推进——这正是"暂停"和"拖动后停住"能被跟上的原因；
+# 播放时按采样年龄外推，保证两次采样之间也是连续的。
+function Get-PositionMs {
+    param($Sample, [double]$AgeSeconds)
+    if (-not $Sample) { return $null }
+    $seconds = $Sample.Position
+    if ($Sample.Status -eq 'Playing') { $seconds += $AgeSeconds }
+    [int]([math]::Max(0.0, $seconds) * 1000)
+}
+
+$script:PositionProc = $null
+$script:PositionFile = Join-Path ([System.IO.Path]::GetTempPath()) 'endfield-netease-position.txt'
+
+function Get-PowerShell51 {
+    $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (Test-Path $exe) { return $exe }
+    return 'powershell.exe'
+}
+
+function Start-PositionHelper {
+    if (-not $PositionHelper) { $PositionHelper = Join-Path $PSScriptRoot '_netease-position.ps1' }
+    if (-not (Test-Path $PositionHelper)) { return $false }
+    Remove-Item $script:PositionFile -ErrorAction SilentlyContinue
+    try {
+        $script:PositionProc = Start-Process -FilePath (Get-PowerShell51) -WindowStyle Hidden -PassThru `
+            -RedirectStandardOutput $script:PositionFile `
+            -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PositionHelper,
+                            '-IntervalMs', '500')
+    }
+    catch {
+        Write-Host ("  ! 位置助手启动失败：{0}" -f $_.Exception.Message)
+        return $false
+    }
+    return $true
+}
+
+function Stop-PositionHelper {
+    if ($script:PositionProc) {
+        try { if (-not $script:PositionProc.HasExited) { $script:PositionProc.Kill() } } catch { }
+        $script:PositionProc = $null
+    }
+}
+
+function Get-PositionSample {
+    if (-not (Test-Path $script:PositionFile)) { return $null }
+    try {
+        $info = Get-Item $script:PositionFile
+        $line = Get-Content $script:PositionFile -Tail 1 -ErrorAction Stop
+    }
+    catch { return $null }
+    $sample = ConvertFrom-PositionLine -Line $line
+    if (-not (Test-PositionFresh -Sample $sample -WrittenAt $info.LastWriteTime -Now (Get-Date) `
+                -StaleMs $PositionStaleMs)) { return $null }
+    $sample | Add-Member -NotePropertyName At -NotePropertyValue $info.LastWriteTime -Force
+    $sample
+}
+
+if ($ProbePosition) {
+    if (-not $PositionHelper) { $PositionHelper = Join-Path $PSScriptRoot '_netease-position.ps1' }
+    $exe = Get-PowerShell51
+    Write-Host ("探测位置来源：{0} -Probe" -f $PositionHelper)
+    & $exe -NoProfile -ExecutionPolicy Bypass -File $PositionHelper -Probe
+    exit $LASTEXITCODE
+}
+
+# ---------------------------------------------------------------------------
 # -SelfTest：不联网、不连管道，只验证解析与选行
 # ---------------------------------------------------------------------------
 if ($SelfTest) {
@@ -278,6 +374,13 @@ if ($SelfTest) {
         @{ Name = '65.5s 选第三句'; Ok = ((Select-LrcLine $lines 65500) -eq '第三句') }
         @{ Name = '早于首行时也给第一句'; Ok = ((Select-LrcLine $lines -5000) -eq '第一句') }
         @{ Name = '空歌词给空串'; Ok = ((Select-LrcLine @() 1000) -eq '') }
+        @{ Name = '位置行：正常采样'; Ok = ((ConvertFrom-PositionLine 'position=12.34 status=Playing').Position -eq 12.34) }
+        @{ Name = '位置行：暂停状态可读'; Ok = ((ConvertFrom-PositionLine 'position=0 status=Paused').Status -eq 'Paused') }
+        @{ Name = '位置行：无会话/垃圾/空一律不可用'; Ok = (-not (ConvertFrom-PositionLine 'position=- status=none')) -and (-not (ConvertFrom-PositionLine 'garbage')) -and (-not (ConvertFrom-PositionLine '')) }
+        @{ Name = '暂停时位置不推进（拖完停住也不会漂）'; Ok = ((Get-PositionMs -Sample (ConvertFrom-PositionLine 'position=30 status=Paused') -AgeSeconds 5) -eq 30000) }
+        @{ Name = '播放时按采样年龄外推'; Ok = ((Get-PositionMs -Sample (ConvertFrom-PositionLine 'position=30 status=Playing') -AgeSeconds 0.5) -eq 30500) }
+        @{ Name = '采样过旧视为不可用'; Ok = (-not (Test-PositionFresh -Sample (ConvertFrom-PositionLine 'position=1 status=Playing') -WrittenAt (Get-Date).AddSeconds(-10) -Now (Get-Date) -StaleMs 3000)) }
+        @{ Name = '采样新鲜则可用'; Ok = (Test-PositionFresh -Sample (ConvertFrom-PositionLine 'position=1 status=Playing') -WrittenAt (Get-Date) -Now (Get-Date) -StaleMs 3000) }
     )
     $bad = 0
     foreach ($c in $checks) {
@@ -314,6 +417,27 @@ catch { $lyricNote = "（歌词接口失败：$($_.Exception.Message)）" }
 Write-Host ("歌词：{0}" -f $lyricNote)
 
 $writer = $null
+$positionMode = 'clock'
+
+# 位置来源：先试媒体会话（真实位置），拿不到就退回推算时钟
+if ($PositionSource -ne 'clock') {
+    if (Start-PositionHelper) {
+        $deadline = (Get-Date).AddSeconds(3)
+        while ((Get-Date) -lt $deadline -and -not (Get-PositionSample)) { Start-Sleep -Milliseconds 200 }
+        if (Get-PositionSample) { $positionMode = 'media' }
+    }
+    if ($positionMode -eq 'media') {
+        Write-Host '位置：媒体会话（真实位置——拖动进度条、暂停都跟得上）'
+    }
+    elseif ($PositionSource -eq 'media') {
+        Write-Host '位置：媒体会话不可用，且已要求只用它——歌词不会推进（先跑 -ProbePosition 看原因）'
+        Stop-PositionHelper
+    }
+    else {
+        Write-Host '位置：媒体会话不可用，退回推算时钟（手动拖动进度条后会失准，暂停时它也会继续走）'
+        Stop-PositionHelper
+    }
+}
 if (-not $DryRun) {
     $client = New-Object System.IO.Pipes.NamedPipeClientStream('.', $Pipe, [System.IO.Pipes.PipeDirection]::InOut)
     $client.Connect(3000)
@@ -378,8 +502,19 @@ try {
                     }
                 }
             }
-            $elapsedMs = [int]((Get-Date) - $started).TotalMilliseconds
-            $line = Select-LrcLine $lyricLines $elapsedMs
+            # 位置：媒体会话给真位置（拖动、暂停都跟得上）；没有就退回推算时钟
+            $positionMs = $null
+            if ($positionMode -eq 'media') {
+                $sample = Get-PositionSample
+                if ($sample) {
+                    $positionMs = Get-PositionMs -Sample $sample `
+                        -AgeSeconds ((Get-Date) - $sample.At).TotalSeconds
+                }
+            }
+            if ($null -eq $positionMs) {
+                $positionMs = [int]((Get-Date) - $started).TotalMilliseconds
+            }
+            $line = Select-LrcLine $lyricLines $positionMs
 
             [void](Publish $writer 'title' ("{0} - {1}" -f $now.Title, $now.Artist))
             if ($line) { [void](Publish $writer 'lyric' $line) }
@@ -393,6 +528,7 @@ try {
     }
 }
 finally {
+    Stop-PositionHelper
     if ($writer) {
         Write-Frame $writer 'BYE'
         $writer.Dispose()
