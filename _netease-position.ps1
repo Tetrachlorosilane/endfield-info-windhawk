@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     把当前媒体会话的播放位置与状态按行吐出来，供 _netease-bridge.ps1 使用。
 

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     示例：把网易云音乐正在播放的曲名与歌词推进 endfield-info-windhawk 的命名管道。
 
