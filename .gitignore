@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 # The smoke client's captured output, written when a run has to be inspected later.
 _extclient-last.txt
+# Local notes about where to look for answers. Kept out of the repository on purpose:
+# they name paths on this machine, and the maintainer's own notes are not the project's.
+*.local.md
