@@ -655,6 +655,20 @@ $script:CdpProbeExpression = @'
     if (o.cjk.length < 12 && !e.children.length && t.length >= 2 && t.length <= 200 &&
         /[\u4e00-\u9fff]/.test(t)) o.cjk.push({ c: cls(e), t: t.slice(0, 60) });
   }
+  // 真机结论（2026-10-13）：DOM 里既没有当前时间也没有进度条，更没有歌词 ✗
+  // （找到的 m:ss 全是歌单每首的时长；那个页面此刻是首页视图）。两个成熟项目走的是
+  // **读页面里的 React store**（Redux：带 getState ✓）而不是抠 DOM ✓，所以这里补上这一步：
+  // 列出 window 上带 getState 的对象，以及它 state 顶层的键名（只列键，不 dump 内容）。
+  o.stores = {};
+  for (var k in window) {
+    try {
+      var v = window[k];
+      if (v && typeof v.getState === 'function') {
+        var s = v.getState();
+        o.stores[k] = s ? Object.keys(s).slice(0, 24) : [];
+      }
+    } catch (x) { }
+  }
   return JSON.stringify(o);
 })()
 '@
