@@ -374,6 +374,7 @@ Windhawk 不支持动态下拉框，所以字体需要手输。拼错了就去�
 | `Hot-zone depth` | 8 | 2-64，顶部热区向下延伸的像素 |
 | `Hide delay` | 700 | 0-10000 ms，`Proximity` 模式下鼠标离开后的延迟 |
 | `External data` | `Off` | 打开命名管道，允许别的进程推 `{ext.提供者.键}` |
+| `External publisher command` | 空 | 可选。填一条命令行，mod 会在用到 `{ext.*}` 时替你启动它（例如 `pwsh -NoProfile -File C:\…\_netease-bridge.ps1`）。卸载 mod 时该进程会被收掉；它意外退出时最多重启 5 次。**mod 不会启动或重启你的其他软件**（包括音乐客户端） |
 | `Allowed external providers` | 空 | 分号分隔的允许名单；空 = 都允许（仍会记录与限速） |
 | `External value lifetime` | 30000 | 100-600000 ms；提供者写 `-` 时用的默认寿命 |
 | `External value length` | 128 | 16-512 字符；更长的会被截断并加 `…` |
