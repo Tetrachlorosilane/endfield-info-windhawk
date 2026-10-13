@@ -605,11 +605,11 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   （头顺序 + `ApplyPanelTransform` 未使用）。
 - 7 个导出入口齐全。
 - 依赖仅系统 DLL：`USER32 / GDI32 / PDH / IPHLPAPI / PSAPI / ADVAPI32 / msvcrt / KERNEL32`。
-- 回归测试全绿（302 条断言，含一段**真启动 GDI+** 的排版断言：
+- 回归测试全绿（316 条断言，含一段**真启动 GDI+** 的排版断言：
   文字不折行、且在预算内）。
 - GDI+ 缩放管线用**已知内容**的图验证过（含透明底、纯 RGB、索引色、灰度+alpha、
   16 位、隔行 PNG）。
-- 外部数据（M1）：编译只剩上面那两条已知警告；回归 **302 条断言**全绿（M1、M2 与 M3 共新增 151 条）；
+- 外部数据（M1）：编译只剩上面那两条已知警告；回归 **316 条断言**全绿（M1、M2、M3 与 CPU 频率共新增 165 条）；
   并做了**负对照**——把展开改成递归后，注入断言确实变红（不是"看着像在守"）。
 - 设置块 46 项 / 10 个选项组，`_settings.py` 报 `no structural problems found`。
 - **mod 的日志格式串**用测试宿主查过：`-Wformat` 指向 `endfield-info-windhawk.wh.cpp`
