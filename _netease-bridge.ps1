@@ -133,18 +133,59 @@ function Get-PlayingTrack {
 # ---------------------------------------------------------------------------
 $script:LyricCache = @{}
 
+# 网易云对"不像浏览器的请求"会给风控（code=-460）或干脆空结果，所以带上 UA 与 Referer。
+$script:Headers = @{
+    Referer      = 'https://music.163.com/'
+    'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+}
+# 诊断说三次就够，之后安静重试（有界计数器，不刷屏）
+$script:DiagLeft = 3
+
+function Write-Diag {
+    param([string]$Text)
+    if ($script:DiagLeft -le 0) { return }
+    $script:DiagLeft--
+    Write-Host "  ! $Text"
+}
+
+function Get-Brief {
+    param($Value, [int]$Max = 180)
+    if ($null -eq $Value) { return '<null>' }
+    $s = ($Value | ConvertTo-Json -Depth 4 -Compress)
+    if ($null -eq $s) { return '<empty>' }
+    $s = $s -replace '\s+', ' '
+    if ($s.Length -gt $Max) { return $s.Substring(0, $Max) + '…' }
+    $s
+}
+
 function Get-SongId {
     param([string]$Title, [string]$Artist)
     $query = [uri]::EscapeDataString("$Title $Artist")
-    $url = "https://music.163.com/api/search/get/web?s=$query&type=1&offset=0&limit=1"
-    $json = Invoke-RestMethod -Uri $url -TimeoutSec 8 -Headers @{ Referer = 'https://music.163.com/' }
-    if ($DumpJson) { Write-Host "search -> $($json | ConvertTo-Json -Depth 4 -Compress)" }
+    # 两个已知端点都试：老接口与新 web 接口在某些网络下表现不同
+    $urls = @(
+        "https://music.163.com/api/search/get/web?s=$query&type=1&offset=0&limit=1",
+        "https://music.163.com/api/search/get?s=$query&type=1&offset=0&limit=1"
+    )
+    foreach ($url in $urls) {
+        try {
+            $json = Invoke-RestMethod -Uri $url -TimeoutSec 8 -Headers $script:Headers
+        }
+        catch {
+            Write-Diag ("搜索请求抛错：{0}" -f $_.Exception.Message)
+            continue
+        }
+        if ($DumpJson) { Write-Host "search -> $($json | ConvertTo-Json -Depth 4 -Compress)" }
 
-    $songs = $null
-    if ($json.result -and $json.result.songs) { $songs = $json.result.songs }
-    elseif ($json.result -and $json.result.song) { $songs = $json.result.song }
-    if (-not $songs -or $songs.Count -eq 0) { return 0 }
-    [int]$songs[0].id
+        $songs = $null
+        if ($json.result -and $json.result.songs) { $songs = $json.result.songs }
+        elseif ($json.result -and $json.result.song) { $songs = $json.result.song }
+        if ($songs -and $songs.Count -gt 0) { return [int]$songs[0].id }
+
+        # 没命中时必须说清楚：是风控、还是形状变了（-DumpJson 看全文）
+        Write-Diag ("搜索没命中：code={0} 有 result={1} 响应={2}" -f `
+                $json.code, ($null -ne $json.result), (Get-Brief $json))
+    }
+    0
 }
 
 function Get-LyricLines {
@@ -153,11 +194,27 @@ function Get-LyricLines {
     else { $id = Get-SongId -Title $Title -Artist $Artist }
     if ($id -le 0) { return @() }
 
-    $url = "https://music.163.com/api/song/lyric?id=$id&lv=-1&kv=-1&tv=-1"
-    $json = Invoke-RestMethod -Uri $url -TimeoutSec 8 -Headers @{ Referer = 'https://music.163.com/' }
-    if ($DumpJson) { Write-Host "lyric -> $($json | ConvertTo-Json -Depth 3 -Compress)" }
-    if (-not $json.lrc -or -not $json.lrc.lyric) { return @() }
-    ConvertFrom-Lrc -Text ([string]$json.lrc.lyric)
+    $urls = @(
+        "https://music.163.com/api/song/lyric?id=$id&lv=-1&kv=-1&tv=-1",
+        "https://music.163.com/api/song/lyric?os=pc&id=$id&lv=-1&kv=-1&tv=-1"
+    )
+    foreach ($url in $urls) {
+        try {
+            $json = Invoke-RestMethod -Uri $url -TimeoutSec 8 -Headers $script:Headers
+        }
+        catch {
+            Write-Diag ("歌词请求抛错：{0}" -f $_.Exception.Message)
+            continue
+        }
+        if ($DumpJson) { Write-Host "lyric -> $($json | ConvertTo-Json -Depth 3 -Compress)" }
+        if ($json.lrc -and $json.lrc.lyric) { return ConvertFrom-Lrc -Text ([string]$json.lrc.lyric) }
+
+        Write-Diag ("歌词返回里没有 lrc.lyric：id={0} code={1} 有 lrc={2} 有 tlyric={3} " +
+            "nolyric={4} uncollected={5} 响应={6}" -f $id, $json.code, ($null -ne $json.lrc),
+            ($null -ne $json.tlyric), ($null -ne $json.nolyric), ($null -ne $json.uncollected),
+            (Get-Brief $json))
+    }
+    @()
 }
 
 # ---------------------------------------------------------------------------
