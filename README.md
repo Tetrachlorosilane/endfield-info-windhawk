@@ -121,7 +121,7 @@ CPU 12%  RAM 73%  GPU 33%  NET 1.2 MB/s  DISK 68%…     （面板放不下时�
 | 变量 | 含义 |
 | :-- | :-- |
 | `{cpu}` `{cpu.user}` `{cpu.kernel}` | CPU 总占用 / 用户态 / 内核态（%） |
-| `{cpu.ghz}` `{cpu.ghz.max}` | 当前频率 / 基准频率（GHz） |
+| `{cpu.ghz}` `{cpu.ghz.max}` | 当前频率（实际使用中的时钟）/ 标称频率（GHz）。当前频率来自 PDH 的 `% Processor Performance`——Windows 只提供"相对标称的比值"，>100% 即睿频。**只有行里引用了 `{cpu.ghz}` 才会开这条查询**；计数器不可用（虚拟机、被禁用）时回退显示标称频率，日志会说明原因 |
 | `{cpu.name}` `{cpu.cores}` `{cpu.threads}` | CPU 型号、物理核数、逻辑核数 |
 | `{mem}` | 内存占用（%） |
 | `{mem.used}` `{mem.total}` `{mem.free}` | 内存用量（GB） |

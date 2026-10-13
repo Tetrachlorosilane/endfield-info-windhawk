@@ -1546,6 +1546,33 @@ int main() {
             g_islandView = savedView;
         }
 
+        // Effective CPU clock: Windows exposes a *ratio* (PDH "% Processor
+        // Performance"), so the conversion is the part that can be checked here.
+        {
+            Check(ComputeEffectiveGhz(4.0, 100.0) == 4.0,
+                  "100% of nominal is the nominal clock");
+            Check(ComputeEffectiveGhz(4.0, 125.0) == 5.0, "turbo scales it up");
+            Check(ComputeEffectiveGhz(4.0, 50.0) == 2.0, "and idling scales it down");
+            Check(ComputeEffectiveGhz(4.0, 0.0) == 0.0,
+                  "a counter with nothing to report says so instead of inventing a value");
+            Check(ComputeEffectiveGhz(4.0, -5.0) == 0.0, "and so does a negative reading");
+            Check(ComputeEffectiveGhz(0.0, 100.0) == 0.0,
+                  "without a nominal clock there is nothing to scale");
+            Check(ComputeEffectiveGhz(4.0, 100000.0) == 0.0,
+                  "an absurd ratio is treated as unusable rather than displayed");
+
+            // Only {cpu.ghz} may open the PDH query -- the coarser tokens must not pay
+            // for it, and {cpu.ghz.max} must not be mistaken for it.
+            Check(!RowUsesEffectiveClock(L"{cpu} {cpu.name} {cpu.ghz.max}"),
+                  "{cpu}, {cpu.name} and {cpu.ghz.max} must not open the PDH query");
+            Check(RowUsesEffectiveClock(L"now {cpu.ghz} GHz"),
+                  "{cpu.ghz} on its own does");
+            Check(RowUsesEffectiveClock(L"{cpu.ghz:0.2} GHz {cpu.ghz.max}"),
+                  "so does {cpu.ghz} with a format");
+            Check(!RowUsesEffectiveClock(L"nothing here"),
+                  "and text without the token does not");
+        }
+
         // The pipe's DACL has to actually admit this user. Getting it wrong is
         // invisible until a real client is refused, so a pipe built with the very
         // same descriptor is opened here -- but only where the environment allows

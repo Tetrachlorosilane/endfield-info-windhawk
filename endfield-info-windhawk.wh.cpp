@@ -2174,7 +2174,140 @@ static void ReadCpuStatic() {
     if (g_cpuCores <= 0) g_cpuCores = g_cpuThreads > 1 ? g_cpuThreads / 2 : g_cpuThreads;
 }
 
-static void ReadCpu(Values &v) {
+// ---------------------------------------------------------------------------
+// Effective CPU clock
+// ---------------------------------------------------------------------------
+// Windows does not hand out a frequency; what it exposes is the *ratio* of the clock
+// actually in use to the nominal one -- PDH's "\Processor Information(_Total)\%
+// Processor Performance" (100 = nominal, >100 = turbo). That is the counter Task
+// Manager's "Speed" reads. The alternative, CallNtPowerInformation(ProcessorInformation),
+// would report CurrentMhz/MaxMhz directly, but it would add powrprof to the import list
+// and its value is refreshed far more coarsely on several systems; PDH is already
+// linked, so this costs no new dependency.
+//
+// The query is created only when some row really references {cpu.ghz}, and -- because
+// PdhCloseQuery does not give its memory back (AGENTS 8) -- it is never torn down once
+// created, exactly like the GPU backend's.
+//
+// It cannot ride on the GPU backend's query: that one only exists while the GPU group is
+// in use, so sharing it would make {cpu.ghz} depend on {gpu} being displayed.
+struct CpuClockBackend {
+    PDH_HQUERY query = nullptr;
+    PDH_HCOUNTER perfCounter = nullptr;
+    bool tried = false;             // one attempt only; a failure is not retried forever
+    int logBudget = 4;              // bounded diagnostics, never per-sample
+};
+
+static CpuClockBackend g_cpuClock;
+
+// Pure, so the arithmetic and the "unusable reading" decision can be asserted:
+// ratio <= 0 means the counter gave us nothing (virtual machines and disabled
+// performance counters do this), and returning 0 lets the caller fall back to the
+// nominal clock instead of inventing a number.
+static double ComputeEffectiveGhz(double baseGhz, double processorPerformance) {
+    if (baseGhz <= 0.0) return 0.0;
+    if (processorPerformance <= 0.0) return 0.0;
+    double ghz = baseGhz * processorPerformance / 100.0;
+    // A ratio far outside anything a CPU does is treated as unusable rather than shown.
+    if (ghz > baseGhz * 4.0) return 0.0;
+    return ghz;
+}
+
+static void CpuClockLog(PCWSTR format, ...) {
+    if (g_cpuClock.logBudget <= 0) return;
+    g_cpuClock.logBudget--;
+    va_list args;
+    va_start(args, format);
+    WCHAR line[192];
+    wcsncpy(line, L"CPU clock: ", 11);
+    _vsnwprintf(line + 11, 180, format, args);
+    va_end(args);
+    line[191] = L'\0';
+    Wh_Log(L"%s", line);
+}
+
+static void CpuClockEnsure() {
+    if (g_cpuClock.query || g_cpuClock.tried) return;
+    g_cpuClock.tried = true;
+
+    PDH_HQUERY query = nullptr;
+    PDH_STATUS status = PdhOpenQueryW(nullptr, 0, &query);
+    if (status != ERROR_SUCCESS) {
+        CpuClockLog(L"PdhOpenQuery failed status=0x%08X; reporting the nominal clock",
+                    (unsigned)status);
+        return;
+    }
+    PDH_HCOUNTER counter = nullptr;
+    status = PdhAddEnglishCounterW(
+        query, L"\\Processor Information(_Total)\\% Processor Performance", 0, &counter);
+    if (status != ERROR_SUCCESS) {
+        CpuClockLog(L"no %% Processor Performance status=0x%08X; reporting the nominal clock",
+                    (unsigned)status);
+        PdhCloseQuery(query);
+        return;
+    }
+    PdhCollectQueryData(query);     // first collect only primes the counter
+    g_cpuClock.query = query;
+    g_cpuClock.perfCounter = counter;
+    CpuClockLog(L"measuring the effective clock (percentage of the nominal one)");
+}
+
+// Returns false whenever the counter cannot be trusted; the caller then reports the
+// nominal clock, which is what {cpu.ghz.max} shows.
+static bool CpuClockRead(double baseGhz, double *outGhz) {
+    if (!g_cpuClock.query || !outGhz) return false;
+    PDH_STATUS status = PdhCollectQueryData(g_cpuClock.query);
+    if (status != ERROR_SUCCESS) {
+        CpuClockLog(L"PdhCollectQueryData failed status=0x%08X", (unsigned)status);
+        return false;
+    }
+    PDH_FMT_COUNTERVALUE value = {};
+    status = PdhGetFormattedCounterValue(g_cpuClock.perfCounter, PDH_FMT_DOUBLE, nullptr,
+                                        &value);
+    if (status != ERROR_SUCCESS) {
+        CpuClockLog(L"PdhGetFormattedCounterValue failed status=0x%08X", (unsigned)status);
+        return false;
+    }
+    if (value.CStatus != PDH_CSTATUS_VALID_DATA && value.CStatus != PDH_CSTATUS_NEW_DATA) {
+        CpuClockLog(L"counter status=0x%08X is not valid data", (unsigned)value.CStatus);
+        return false;
+    }
+    const double ghz = ComputeEffectiveGhz(baseGhz, value.doubleValue);
+    if (ghz <= 0.0) {
+        CpuClockLog(L"reading %.1f%% of nominal is not usable", value.doubleValue);
+        return false;
+    }
+    *outGhz = ghz;
+    return true;
+}
+
+// Costs a PDH query, so it is opened only for the token that needs it: {cpu} and
+// {cpu.name} must not pay for it. Same rule RequiredGroups applies to whole groups,
+// one level finer, because the group is coarser than the cost.
+// Does this one row reference {cpu.ghz}? The scan is its own function so the token
+// matching can be asserted without building a whole ModSettings.
+static bool RowUsesEffectiveClock(const WCHAR *row) {
+    const WCHAR *p = row;
+    while (*p) {
+        if (*p == L'{') {
+            const WCHAR *end = wcschr(p + 1, L'}');
+            if (!end) break;
+            // The name ends at ':' (format), '|' (alternative) or the brace; a plain
+            // prefix test would also match {cpu.ghz.max}, so the character after the
+            // name has to be a delimiter.
+            if (end - (p + 1) >= 7 && wcsncmp(p + 1, L"cpu.ghz", 7) == 0) {
+                const WCHAR next = *(p + 1 + 7);
+                if (next == L'}' || next == L':' || next == L'|') return true;
+            }
+            p = end + 1;
+        } else {
+            p++;
+        }
+    }
+    return false;
+}
+
+static void ReadCpu(Values &v, bool wantEffectiveClock) {
     FILETIME idleFt, kernelFt, userFt;
     if (GetSystemTimes(&idleFt, &kernelFt, &userFt)) {
         ULARGE_INTEGER i, k, u;
@@ -2202,11 +2335,18 @@ static void ReadCpu(Values &v) {
     // Effective clock: Windows exposes it through PDH "Processor Performance",
     // but that means a PDH query. The registry base clock is free, so report it.
     wcsncpy(v.cpuName, g_cpuName, 63);
+    // {cpu.ghz} is the clock actually in use; {cpu.ghz.max} is the nominal one. Only
+    // the former costs a PDH query, and only when a row references it.
     v.cpuName[63] = L'\0';
     v.cores = g_cpuCores;
     v.threads = g_cpuThreads;
     v.cpuGhzMax = g_cpuGhzMax;
     v.cpuGhz = g_cpuGhzMax;
+    if (wantEffectiveClock) {
+        CpuClockEnsure();
+        double effective = 0;
+        if (CpuClockRead(g_cpuGhzMax, &effective)) v.cpuGhz = effective;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5353,7 +5493,13 @@ static void SamplerIteration() {
     Values v;
     FillSystemFields(v);
 
-    if (groups & G_CPU) ReadCpu(v);
+    if (groups & G_CPU) {
+        bool wantEffectiveClock = false;
+        for (int r = 0; r < settings.rowCount && !wantEffectiveClock; r++) {
+            wantEffectiveClock = RowUsesEffectiveClock(settings.rows[r]);
+        }
+        ReadCpu(v, wantEffectiveClock);
+    }
     if (groups & G_MEM) ReadMemory(v);
     if (groups & G_NET) ReadNetwork(v);
     if (groups & G_GPU) {
