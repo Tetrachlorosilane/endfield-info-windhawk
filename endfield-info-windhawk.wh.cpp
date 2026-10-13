@@ -1532,6 +1532,7 @@ static HANDLE           g_extStopEvent = nullptr;
 static bool             g_extStartAttempted = false;
 static int              g_extBusyLogs = 0;     // bounded: "all instances busy" messages
 static int              g_extStallLogs = 0;    // bounded: "the read never completed" messages
+static int              g_extConnLogs = 0;     // bounded: per-connection "what is this pipe" lines
 
 // Does this name select the external namespace at all? Full validation happens in
 // ExtLookup, so a malformed {ext...} still reaches the "unknown" path and keeps
@@ -4903,6 +4904,23 @@ static void ExtReplyErr(HANDLE pipe, OVERLAPPED *ov, int code) {
     ExtWriteLine(pipe, ov, text);
 }
 
+// What this pipe actually is, as the OS sees it. Message mode is what the protocol
+// assumes, and curInstances is how a *second* server process holding instances of
+// the same name would show up -- such a process would steal clients while this one
+// waits for bytes that never arrive. Bounded: a few lines per connection.
+static void ExtLogPipeState(HANDLE pipe) {
+    DWORD state = 0;
+    DWORD curInstances = 0;
+    DWORD flags = 0;
+    DWORD outSize = 0;
+    DWORD inSize = 0;
+    DWORD maxInstances = 0;
+    GetNamedPipeHandleStateW(pipe, &state, &curInstances, nullptr, nullptr, nullptr, 0);
+    GetNamedPipeInfo(pipe, &flags, &outSize, &inSize, &maxInstances);
+    Wh_Log(L"EXT: pipe flags=0x%lx curInstances=%lu maxInstances=%lu out=%lu in=%lu",
+           flags, curInstances, maxInstances, outSize, inSize);
+}
+
 static void ExtLogClient(HANDLE pipe) {
     ULONG pid = 0;
     if (!GetNamedPipeClientProcessId(pipe, &pid)) return;
@@ -5171,6 +5189,10 @@ static DWORD WINAPI ExtPipeThread(LPVOID) {
         }
         if (!ExtConnect(pipe, &ov)) { CloseHandle(pipe); break; }
         ExtLogClient(pipe);
+        if (g_extConnLogs < 4) {
+            g_extConnLogs++;
+            ExtLogPipeState(pipe);
+        }
         ExtSession ses;                        // per connection: provider + rate window
         ExtServeClient(pipe, &ov, ses);
         // No FlushFileBuffers before disconnecting: it blocks until the client has
@@ -5182,6 +5204,40 @@ static DWORD WINAPI ExtPipeThread(LPVOID) {
     if (sd) LocalFree(sd);
     CloseHandle(ov.hEvent);
     return 0;
+}
+
+// A one-shot self-test: the mod connects to its own pipe and publishes a value.
+//
+// The pipe read path cannot be exercised in a sandbox (a client needs write access,
+// which confined environments refuse), so the machine running the mod proves it
+// instead. If the server logs the self-test's HELLO/SET, the transport works and a
+// missing value is the client's doing; if it does not, the read path is at fault and
+// its own logs (recv / read result / the 2s watchdog) say where. Bounded: 10 x 50 ms
+// of connection retries, once per load.
+static void ExtSelfTest() {
+    HANDLE client = INVALID_HANDLE_VALUE;
+    DWORD lastErr = 0;
+    for (int attempt = 0; attempt < 10; attempt++) {
+        client = CreateFileW(kExtPipeName, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                             OPEN_EXISTING, 0, nullptr);
+        if (client != INVALID_HANDLE_VALUE) break;
+        lastErr = GetLastError();
+        Sleep(50);
+    }
+    if (client == INVALID_HANDLE_VALUE) {
+        Wh_Log(L"EXT: self-test could not connect to its own pipe (err=%lu)", lastErr);
+        return;
+    }
+    // Two separate writes: one message per line is what the protocol relies on, so
+    // that is the part worth testing rather than a single byte stream.
+    const char line1[] = "HELLO 1 selftest\n";
+    const char line2[] = "SET selftest ok - pipe self-test\n";
+    DWORD written = 0;
+    BOOL sent1 = WriteFile(client, line1, (DWORD)sizeof(line1) - 1, &written, nullptr);
+    BOOL sent2 = WriteFile(client, line2, (DWORD)sizeof(line2) - 1, &written, nullptr);
+    CloseHandle(client);
+    Wh_Log(L"EXT: self-test sent 2 frames (wrote=%d/%d); the lines above say whether "
+           L"they arrived", sent1 ? 1 : 0, sent2 ? 1 : 0);
 }
 
 static void ExtStart(const ModSettings &snap) {
@@ -5209,6 +5265,8 @@ static void ExtStart(const ModSettings &snap) {
         g_extThreadCount++;
     }
     Wh_Log(L"EXT: serving %d pipe instance(s) on %s", g_extThreadCount, kExtPipeName);
+    // The instances exist now, so prove the whole path once on this machine.
+    ExtSelfTest();
 }
 
 static void ExtStop() {

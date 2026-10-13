@@ -37,7 +37,8 @@ endfield-info-windhawk/
 ├── test-gdiplus-scale.cpp             GDI+ 缩放探针（独立 exe）
 ├── _settings.py                       校验 mod 头部的设置块结构
 ├── _preview.py                        渲染 assets/panel-preview.png
-├── _extclient.py                      外部数据管道的冒烟客户端
+├── _extclient.py                      外部数据管道的冒烟客户端（Python）
+├── _extclient.ps1                     同一件事的第二客户端（.NET）：分辨"客户端没写"还是"传输坏了"
 └── assets/panel-preview.png           版面预览（README 引用）
 ```
 
@@ -345,6 +346,12 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   — 缓冲里**有数据却没收到完成** → 记一行 `read completion never arrived ...; re-posting`，
      取消并重投（取消不消费数据，字节还在）；
   — 连接等待超时同理：没客户端就继续听，不算失败。
+- **传输必须由 mod 自己证明。** 开机自检 `ExtSelfTest()` 用本进程连自己的管道、发
+  `HELLO 1 selftest` + `SET selftest ok - pipe self-test`：宿主与沙箱都验证不了管道读写
+  （见 §3），于是让**跑 mod 的那台机器**验证。两帧若没出现在日志里，问题在读路径本身；
+  出现了，缺值就是客户端没写。同时每连接打一行
+  `pipe flags=… curInstances=… maxInstances=…` —— **同名管道若被第二个进程也建了实例，
+  客户端会被抢走**（本进程只会一直等一个永远不来的字节），这一行会把它暴露出来。
 
 ---
 
@@ -564,6 +571,8 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 - **外部数据的端到端行为**（无法在本机自动验证，必须真跑 Windhawk）：客户端连接/断开/重连、
   多个提供者并发、50 ms 唤醒的实际延迟、到期 → `--` 的实测时间、非管理员账户下管道 DACL 的行为、
   卸载时有在途消息时的收尾。
+- **管道读写路径本身**：本机沙箱拒绝一切带写权限的管道打开（见 §3），所以宿主连不上真管道；
+  这块只能靠 mod 的开机自检（`ExtSelfTest` 的两帧是否被服务端记录）与真机日志来验证。
 
 **已知的残留警告**：`ApplyPanelTransform` 在主 mod 中未被调用（只服务于测试），
 会报 `unused function`。要么给它加 `__attribute__((unused))`，要么把它挪进测试文件。
