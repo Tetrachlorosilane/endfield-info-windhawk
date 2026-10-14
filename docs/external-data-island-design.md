@@ -869,3 +869,105 @@ python _settings.py                                       # no structural proble
 **新增 API 全部落在已链接的 DLL 里**：管道与进程查询在 kernel32（默认链接）；
 `OpenProcessToken` / `GetTokenInformation`（§14 Q1 的可选开关）在 advapi32，而 `@compilerOptions`
 与测试宿主的链接行**都已有** `-ladvapi32` → **不需要改任何链接参数**，AGENTS §10 的依赖清单保持不变。
+
+---
+
+## 命名管道不变量（原 AGENTS §5.6，2026-10-14 搬来）
+
+> 搬到这里的原因是 **AGENTS.md 受 64 KB 指令预算限制、超出会被静默截断**；这一节是改管道/岛/卡片代码时
+> 必须遵守的规矩，所以它需要一个不会被截断的家。AGENTS 只留指针。
+
+- **只在有行引用 `{ext.*}` 且设置打开时才创建管道**：没有引用就是零成本
+  （不建线程、不建表）。这条和 `RequiredGroups` 的按需加载是同一个设计。
+- **展开行文本时持 `g_extLock`，且绝不给锁嵌套**：先放 `g_extLock` 再拿 `g_valuesLock`。
+  HUD 线程**永不**触碰 `g_extLock`——它只读两个原子（`g_extDeadlineMs`、`g_extDirty`），
+  这是锁图能保持无环的原因。
+- **值过期不能只重绘**：`g_rowState` 存的是**已展开的文本**，token 早就不在了，
+  只有 sampler 再展开一次，`--` 才会出现。所以 deadline 由 sampler 发布（`ExtNextDeadline`），
+  40 ms 的 tick 到期时只是**再要一次采样**。
+- **外部文本不被二次展开**（注入不成立）。这条由结构保证——`ExpandTokens` 只对模板做单向扫描，
+  替换出来的文本不会被重新扫描——并且有断言钉住：把展开改成递归，
+  `test-layout.cpp` 里 "a pushed value that looks like a token stays literal" 必须变红（已实测）。
+- **停机顺序：IPC 先于 sampler**（写者先于读者），最后才 `DeleteCriticalSection(&g_extLock)`。
+  同理，**删 `g_valuesLock` 之前必须确认 sampler 真的停了**：等待结果不能丢
+  （`ValuesLockCanBeReleased` 只认 `WAIT_OBJECT_0`）。超时就把锁留给进程退出——
+  在"另一条线程可能还握着它"的时候删锁是未定义行为，而超时正是这个等待要防的情形。
+- **`CreateNamedPipe` 的 `nMaxInstances` 必须等于实例线程数**（每线程建一个实例）。
+  传 1 会让第一个线程占满额度、其余线程以 `ERROR_PIPE_BUSY (231)` 退出——表面上"serving 4
+  instances"，实际只有一个客户端能连。**231 是瞬态**（实例都被占着），要等一会儿重试，
+  不能把线程退掉；其他错误码才是永久的。
+- **I/O 等待必须有上界，且超时不是错误。** 读与连接都**不**用 `INFINITE` 等完成事件：
+  一旦完成事件丢失，线程会永久停在等待里，而它**连"我卡住了"都打不出来**（所有出口日志
+  都在那行等待之后），从外面看就是"客户端连上后彻底静默"。现在的规则（`kExtIoTimeoutMs`）：
+  — 缓冲为空 → 继续等**同一笔**操作（客户端安静是正常的，取消重投只会白烧 CPU）；
+  — 缓冲里**有数据却没收到完成** → 记一行 `read completion never arrived ...; re-posting`，
+     取消并重投（取消不消费数据，字节还在）；
+  — 连接等待超时同理：没客户端就继续听，不算失败。
+- **传输必须由 mod 自己证明。** 开机自检 `ExtSelfTest()` 用本进程连自己的管道、发
+  `HELLO 1 selftest` + `SET selftest ok - pipe self-test`：宿主与沙箱都验证不了管道读写
+  （见 §3），于是让**跑 mod 的那台机器**验证。两帧若没出现在日志里，问题在读路径本身；
+  出现了，缺值就是客户端没写。同时每连接打一行
+  `pipe flags=… curInstances=… maxInstances=…` —— **同名管道若被第二个进程也建了实例，
+  客户端会被抢走**（本进程只会一直等一个永远不来的字节），这一行会把它暴露出来。
+- **事件队列有自己的一把锁**（`g_islandLock`）：管道线程入队、HUD 取事件，**永不与
+  `g_extLock` 嵌套**（HUD 从不碰值表）。唤醒 HUD 用 `PostThreadMessage(g_hudThreadId, …)`，
+  绝不用窗口句柄——句柄可能已经没了（设计 §5.6.3 R5）。
+- **卡片宽度是静态的，不做动画。** `g_restWidth` 是静止宽度（窗口与命中都读它）：卡片在时等于
+  `ComputeIslandCardWidth` 的结果，否则等于面板宽度，**同一状态下它不逐帧变化**。曾经的宽度动画
+  （以及"先把窗口改成目标宽、再插值"）已移除——**只要窗口宽度会在帧间变化，就必然存在
+  "窗口已改、位图未提"的那一帧**，这与 §5.4 的收起闪烁是同一类问题，表现为极短闪烁且无法靠
+  调参数消除。现在宽度由 `PaintPanel` 在**创建位图之前**设定
+  （`if (width != g_restWidth) { g_restWidth = width; PlaceWindow(hwnd); }`），
+  所以任一帧内窗口与提交的位图尺寸永远一致。
+- **`PlaceWindow` 在静止宽度还是 0 时回落到面板宽**，否则会得到一个 0 宽的窗口。
+- **卡片宽度必须钳到屏幕**（`ComputeIslandCardWidth` 同时受用户配置的
+  `Island minimum width` 与屏幕宽度约束，上限取"屏宽 − 24"与 640 中较小者）。
+- **卡片几何 / 区域 / 命中是"单一来源"**（M3 第一片已落地）：`ComputeIslandRect` 给出卡片矩形
+  （宽度、屏幕钳位、居中），`ComputeIslandCloseRect` 由它派生出关闭按钮的方块，
+  `BuildIslandRegions` 按"后写在上"的顺序产出区域表，`IslandHitTest` 返回**最后一个**命中的区域——
+  **这个顺序本身就是"看得见的都能点"那条规则**（断言逐像素验证：卡片内不存在 `IR_NONE` 像素）。
+  绘制侧调用同一批函数（画片的位图**就是**卡片，所以只取宽度，局部原点恒为 (0,0)），
+  点击侧以窗口矩形作屏幕坐标；两侧不许各算一套几何。
+- **逐帧成本点只有这些**（性能纪律：**没东西要用就不开通路**，和 `RequiredGroups` 的按需加载、
+  "没有 `{ext.*}` 引用就不建管道"是同一条）：定时器是 40 ms 的廉价轮询（`kCursorPollMs`），
+  **只有面板高度动画或岛上某个相位在跑时才是 16 ms**（`DesiredTickMs` / `ApplyTickRate`，
+  而且只在答案变化时才调 `SetTimer`）。悬停**不占定时器**：由 `WM_MOUSEMOVE` 驱动、
+  用 `TrackMouseEvent` 注册 `WM_MOUSELEAVE` 收尾，**并且只在热态翻转的那一次重绘**——
+  指针静止时连一条消息都不会来。岛上真正的每拍成本是：一次 `GetTickCount`、一次状态机步进，
+  以及状态非 Idle 时在锁内复制一份队列快照；**关掉岛时只剩一个比较与返回**。
+  顺带修好的一处：卡片自己的 Pop/Collapse 相位以前跑在 40 ms 轮询上（只有 `StartIntro` 会提到
+  16 ms），所以淡出只有两三帧；现在相位与高度动画共用同一个决策点。
+- **关闭卡片与 ttl 到期走同一条路**（`IslandDismiss` → `COLLAPSING`），所以淡出与状态机不会分叉；
+  它**幂等**，第二次点击不会重启淡出。**卡片在屏时长由 `IslandCardDuration` 决定**：`ExtEventMs` 是
+  默认值，提供者给的 ttl 只是上限（封顶 `kIslandMaxCardMs`）——值寿命不是展示时长。
+- **合并窗口内"同一件事又来了"只加计数，但 `severity` 必须取两者中更高的那个。** 否则
+  "同一个标题，现在变成 critical"这条**升级会被窗口整个吞掉**：条目留在原级别 → 状态机看不到
+  `criticalWaiting` → 卡片一直停在 warn。文本取最新的一条（同标题的最新读数是更准的），
+  而**窗口从最后一次出现算起**（每次重复都刷新它，断了两倍窗口才算新事件）。
+  断言不只查队列字段，还直接驱动 `StepIsland`：屏幕上正显示的 warn 卡必须为它让位。
+- **关闭按钮不得比卡片大。** 卡片可以只有一行（`rowHeight` 下限 18）而按钮默认 22 px，
+  这时**没有任何位置能同时满足上下两个钳位**：旧代码先把 y 抬到卡片上沿、再被下钳位推出卡片
+  （实测 y = card.y − 4），于是卡片之外多出一个可点区域。按钮按卡片尺寸收缩是唯一解。
+- **卡片在时，点击要么关卡片、要么被卡片吃掉，绝不落到面板行为上。** 规则抽成纯函数
+  `IslandClickActionFor(hit, dismissable)`：按钮命中 → 可淡出就淡出，**正在淡出也要吃掉**
+  （旧代码要求 `IslandDismiss()` 返回 true 才算处理，于是淡出期间再点 × 会切换面板——
+  看起来像"× 把面板关掉了"）；卡片命中 → 吃掉（点卡片读它不该切换面板）；只有卡片之外才归面板。
+- **"动画期间取两态并集"这条规则仍然不在代码里**：它服务于已移除的宽度动画。现在没有动画窗口期，
+  区域表本身就是完整的可点范围；等 M3 的悬停态落地时再回来看是否需要它。
+- **推送只重发，不重采**（`SamplerWakeIsLight` + `RepublishRows`）：`g_extDirty` 叫醒采样线程后，
+  被叫醒的必须是轻路径（只按手上的 `g_values` 重展开文本）；**间隔到期仍要真采样**，否则话多的
+  发布器会让系统行永远不再被重读。`PublishRows` 返回"是否真的变了"，没变不重绘——比较对象必须是
+  `BuildRowLayout` 的输出（它剥掉环标记），拿带标记的文本比会永远判定"变了"。详见 §6 对应三行。
+- **发布器重启预算是"连续"而不是"累计"**（`PublisherEarnedBackRestarts`）：跑满 60 s 就把预算还回来，
+  否则 5 次启动（包括用户重启音乐客户端、或手动踢掉发布器）之后永久禁用，只有重载 mod 能救。
+- **一个值一个发布者，发布只发生在一处。** 客户端把同一个 key 在一帧里写两次时，mod 先应用
+  第一条再应用第二条——正常情况两次落在同一 burst、被 sampler 合并成一次重绘，所以看不出来；
+  **服务端一旦被拖慢（下一条），两个值就一拍一拍地交替可见**。真机症状：标题在"歌名"与
+  "歌名 - 歌手"之间闪（`resourceName` 没有作者）、歌词隔一拍跳回客户端那个会冻结的
+  `playingLyricLineNumber` 行。规矩：来源只提供数据，发布只在桥的 `Get-PublishPlan` 一处
+  （返回有序字典 = 结构上不可能重复 key），详见 [_netease-bridge.md](_netease-bridge.md)。
+- **不读回复的客户端不许拖慢服务端。** 回复写不出去时 mod 只丢结果，但**每次超时付
+  `kExtIoTimeoutMs`（500 ms）**；out 缓冲约 1300 条回复、每秒 4 帧，五六分钟后开始超时，
+  管道线程于是每帧白等半秒——这就是上一条的放大器。连续两次超时就认定该客户端不读
+  （`ExtReplyTimeoutsAfter`，纯函数 + 断言）并不再回复它；读回复的客户端照旧拿得到。
+  协议细节见 [external-data-island-design.md](docs/external-data-island-design.md) §4.2。

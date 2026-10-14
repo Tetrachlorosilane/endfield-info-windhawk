@@ -38,3 +38,20 @@ Python 即可（只 import `re` / `sys` / `pathlib`）。本机 `python` 若是 
   所以"宿主全绿"对日志格式串什么也没证明，必须跑这个脚本。
 - 它是语法级检查，不是编译器：判定不了就如实列在 `not decidable` 里，不猜。
   所以那个数字变大不等于出问题，但值得看一眼多出来的是什么。
+
+---
+
+## 为什么这个脚本存在（原 AGENTS §3 的实测记录，2026-10-14 搬来）
+
+> **mod 的日志格式串不在这里检查——而且编译器根本查不了宽格式。** 这一段曾经写着
+> "宿主打桩了真的 `Wh_Log`，所以每个 `Wh_Log(L"...%s", ...)` 都会走 `-Wformat`"，
+> 那是**错的**：`Wh_Log` 是自造的变参函数，clang 只对带 format 属性的函数或 printf 家族
+> 做检查。2026-10-14 实测（Windhawk clang 20）四条路全堵：
+> `format(printf,1,2)` 挂在 `wchar_t*` 格式参数上是**硬错误**（`format argument not a string type`）；
+> `ms_printf` / `wprintf` 不被这个 target 支持（`-Wignored-attributes`）；
+> `-fms-compatibility` 会把编译器自己的头文件打崩；连 MinGW 的 `swprintf` 也不查
+> （`swprintf(b,0,L"%s",1)` 无任何诊断，所以 mod 自己的缓冲格式化同样无人检查）。
+> 那次实测还证明：同一文件里 `printf` 的两处错型各报 1 条，而自造桩的错型 **0 条**。
+> **替代检查**：`python _logfmt.py`（105 个调用点/元数 + 可判定的错型；负对照实测会红）。
+> 宿主**自己的** printf 现在也是干净的：那 15 条 `%08X` 收 `DWORD` 的警告（它在 MinGW 上是
+> `unsigned long`）已经改成 `%08lX`，所以宿主可以在 `-Wformat=2` 下零警告编译——多一条守得住的线。
