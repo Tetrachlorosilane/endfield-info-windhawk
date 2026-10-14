@@ -1124,9 +1124,28 @@ try {
                     }
                 }
             }
-            # 位置降级链：memory（默认，进程存活期内只发现一次）→ media → clock
+            # 首选来源：CDP store —— 精确到客户端自己的当前行 ✓；它的行时间顺便当位置 ✓
+            # （用户实测：内存扫描极不稳定 ✗ → CDP/store 优先 ✓、内存降为次选 ✓。
+            #   注意：store 的 lineTimeSec 是**行起始时间** ✓，会按行跳变；要连续毫秒仍需内存/SMTC ✓）
             $positionMs = $null
-            if ($PositionSource -in 'auto', 'memory') {
+            $storeLine = $null
+            if ($LyricSource -in 'auto', 'store') {
+                $ss = Get-CdpStoreState
+                if ($ss -and $ss.ok) {
+                    if ($ss.name) { [void](Publish $writer 'title' ('' + $ss.name)) }
+                    if ($ss.line) {
+                        $storeLine = '' + $ss.line
+                        [void](Publish $writer 'lyric' $storeLine)
+                    }
+                    if ($ss.trans) { [void](Publish $writer 'translation' ('' + $ss.trans)) }
+                    if ($null -ne $ss.lineTimeSec) { $positionMs = [int]([double]$ss.lineTimeSec * 1000) }
+                }
+            }
+            # 位置降级链：cdp → memory → media → clock（store 没给出位置才往下走 ✓）
+            if ($null -eq $positionMs -and $PositionSource -in 'auto', 'cdp') {
+                $positionMs = Get-CdpPositionMs
+            }
+            if ($null -eq $positionMs -and $PositionSource -in 'auto', 'memory') {
                 $positionMs = Get-MemoryPosition -Now $now
             }
             if ($null -eq $positionMs -and $PositionSource -in 'auto', 'cdp') {
@@ -1141,20 +1160,6 @@ try {
             }
             if ($null -eq $positionMs) {
                 $positionMs = [int]((Get-Date) - $started).TotalMilliseconds
-            }
-            # 首选歌词来源：CDP store —— 客户端自己的当前行 ✓（拖动/暂停/切歌天然正确 ✓，不需要位置推算 ✓）
-            $storeLine = $null
-            if ($LyricSource -in 'auto', 'store') {
-                $ss = Get-CdpStoreState
-                if ($ss -and $ss.ok) {
-                    if ($ss.name) { [void](Publish $writer 'title' ('' + $ss.name)) }
-                    if ($ss.line) {
-                        $storeLine = '' + $ss.line
-                        [void](Publish $writer 'lyric' $storeLine)
-                    }
-                    if ($ss.trans) { [void](Publish $writer 'translation' ('' + $ss.trans)) }
-                    if ($null -ne $ss.lineTimeSec) { $positionMs = [int]([double]$ss.lineTimeSec * 1000) }
-                }
             }
             # 兜底：接口 LRC + 位置选行（store 不可用时才走这条 ✓）
             $line = if ($storeLine) { $storeLine } else { Select-LrcLine $lyricLines $positionMs }
