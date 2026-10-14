@@ -60,8 +60,10 @@ param(
     [int]$LyricRetryMs = 20000,
     # 位置来源：memory = 从客户端内存读播放位置（毫秒 int32，差分发现）；
     # media = 媒体会话（SMTC，真实位置）；clock = 推算时钟；
-    # auto = 依次尝试 memory → media → clock
     # cdp = 通过调试端口读页面里的实际播放时间（需要用户自己给快捷方式加调试参数）；
+    # **auto 的实际顺序**（见主循环）：迷你条 DOM 的真 currentTime → store 当前行的起始时间
+    # → CDP 其它位置 → 内存差分 → 媒体会话 → 推算时钟。每一步失败就静默降级，
+    # 所以"到底用了哪个"由发出去的 `pos` key 回答（`{ext.netease.pos}`）。
     [ValidateSet('auto', 'memory', 'cdp', 'media', 'clock')]
     [string]$PositionSource = 'auto',
     # 内存发现时两次采样的间隔（秒）——这段时间里必须在播放
@@ -414,6 +416,24 @@ function Get-PositionMs {
     $seconds = $Sample.Position
     if ($Sample.Status -eq 'Playing') { $seconds += $AgeSeconds }
     [int]([math]::Max(0.0, $seconds) * 1000)
+}
+
+# 位置来源的标签（纯函数，-SelfTest 覆盖）。**这一行的"当前歌词"是算出来的**——用位置在
+# 行时间戳上选行——所以"位置是哪来的"就是它准不准的全部答案。以前这个只能靠猜：链路上
+# 每一步都可能失败并静默降级。现在把它当一个 key 发出去，面板上写 `{ext.netease.pos}`
+# 就能看到（`dom 41.3s` = 迷你条的真 currentTime；`storeline 29.5s` = store 当前行的起始
+# 时间（按行跳变）；`mem`/`cdp` = 内存差分 / CDP 其它位置；`clock` = 推算时钟，会漂）。
+function Format-PositionSource {
+    param([string]$Source, [int]$PositionMs)
+    $name = switch ($Source) {
+        'media' { 'media' }
+        'dom' { 'dom' }
+        'storeline' { 'storeline' }
+        'cdp' { 'cdp' }
+        'memory' { 'mem' }
+        default { 'clock' }
+    }
+    return ("{0} {1:0.0}s" -f $name, ($PositionMs / 1000.0))
 }
 
 $script:PositionProc = $null
@@ -1306,6 +1326,11 @@ if ($SelfTest) {
         @{ Name = '曲目标题：空标题与空数组都不算'; Ok = ($null -eq (Select-SongTitle @('', '   ')) -and $null -eq (Select-SongTitle @())) }
         # 活的枚举：网易云在跑就必须至少看到一个顶层窗口（不在跑则这条无意义，视为通过）
         @{ Name = '窗口枚举：网易云在跑时能看到它的顶层窗口'; Ok = ((@(Get-NeteaseWindowTitles).Count -gt 0) -or (-not (Get-NeteasePid))) }
+        # 位置来源标签：面板上的"当前歌词"是算出来的，所以这一行必须能说清位置是哪来的
+        @{ Name = '位置来源标签：迷你条 DOM（真 currentTime）'; Ok = ((Format-PositionSource -Source dom -PositionMs 41300) -eq 'dom 41.3s') }
+        @{ Name = '位置来源标签：store 当前行起始时间'; Ok = ((Format-PositionSource -Source storeline -PositionMs 29521) -eq 'storeline 29.5s') }
+        @{ Name = '位置来源标签：内存差分 / 媒体会话'; Ok = ((Format-PositionSource -Source memory -PositionMs 1000) -eq 'mem 1.0s') -and ((Format-PositionSource -Source media -PositionMs 0) -eq 'media 0.0s') }
+        @{ Name = '位置来源标签：未知来源按推算时钟算'; Ok = ((Format-PositionSource -Source nonsense -PositionMs 500) -eq 'clock 0.5s') }
     )
     $bad = 0
     # 活体证据：判定用的是这一份窗口列表，打出来省得下一个人再猜一次
@@ -1448,9 +1473,13 @@ try {
             # 首选位置来源：迷你条 DOM 的"已播 / 总长" —— 客户端**自己显示**的真 currentTime
             # （用户在 DevTools 里找到的控件；不锚哈希类名，理由见 Get-CdpDomTime 的注释）
             $positionMs = $null
+            $posSrc = 'clock'
             if ($PositionSource -in 'auto', 'cdp') {
                 $domTime = Get-CdpDomTime
-                if ($domTime -and $domTime.ok) { $positionMs = [int]$domTime.curS * 1000 }
+                if ($domTime -and $domTime.ok) {
+                    $positionMs = [int]$domTime.curS * 1000
+                    $posSrc = 'dom'
+                }
             }            # 首选来源：CDP store —— 精确到客户端自己的当前行 ✓；它的行时间顺便当位置 ✓
             # （用户实测：内存扫描极不稳定 ✗ → CDP/store 优先 ✓、内存降为次选 ✓。
             #   注意：store 的 lineTimeSec 是**行起始时间** ✓，会按行跳变；要连续毫秒仍需内存/SMTC ✓）
@@ -1467,28 +1496,36 @@ try {
                         [void](Publish $writer 'lyric' $storeLine)
                     }
                     if ($ss.trans) { [void](Publish $writer 'translation' ('' + $ss.trans)) }
-                    if ($null -eq $positionMs -and $null -ne $ss.lineTimeSec) { $positionMs = [int]([double]$ss.lineTimeSec * 1000) }
+                    if ($null -eq $positionMs -and $null -ne $ss.lineTimeSec) {
+                        $positionMs = [int]([double]$ss.lineTimeSec * 1000)
+                        $posSrc = 'storeline'
+                    }
                 }
             }
             # 位置降级链：cdp → memory → media → clock（store 没给出位置才往下走 ✓）
             if ($null -eq $positionMs -and $PositionSource -in 'auto', 'cdp') {
                 $positionMs = Get-CdpPositionMs
+                if ($null -ne $positionMs) { $posSrc = 'cdp' }
             }
             if ($null -eq $positionMs -and $PositionSource -in 'auto', 'memory') {
                 $positionMs = Get-MemoryPosition -Now $now
+                if ($null -ne $positionMs) { $posSrc = 'memory' }
             }
             if ($null -eq $positionMs -and $PositionSource -in 'auto', 'cdp') {
                 $positionMs = Get-CdpPositionMs
+                if ($null -ne $positionMs) { $posSrc = 'cdp' }
             }
             if ($null -eq $positionMs -and $positionMode -eq 'media') {
                 $sample = Get-PositionSample
                 if ($sample) {
                     $positionMs = Get-PositionMs -Sample $sample `
                         -AgeSeconds ((Get-Date) - $sample.At).TotalSeconds
+                    if ($null -ne $positionMs) { $posSrc = 'media' }
                 }
             }
             if ($null -eq $positionMs) {
                 $positionMs = [int]((Get-Date) - $started).TotalMilliseconds
+                $posSrc = 'clock'
             }
             # 当前行：用位置在 store 的 times 上选（不再用那个冻结的 playingLyricLineNumber）
             # times 只在换歌时取一次（纯数字）；文本/翻译只在行号变化时按需取。
@@ -1521,6 +1558,12 @@ try {
 
             [void](Publish $writer 'title' ("{0} - {1}" -f $now.Title, $now.Artist))
             if ($line) { [void](Publish $writer 'lyric' $line) }
+            # 位置来源：这是"当前歌词算得准不准"的全部答案，所以发出去而不是只打在看不见的
+            # stdout 上（面板写 `{ext.netease.pos}` 即可）。变化时才有帧（Publish 会去重）。
+            if ($null -ne $positionMs) {
+                [void](Publish $writer 'pos' (Format-PositionSource -Source $posSrc `
+                            -PositionMs ([int]$positionMs)))
+            }
             if ($Event -and -not $announced -and $writer) {
                 Write-Frame $writer "EVENT $Provider info $TtlMs $($now.Title) - $($now.Artist)  $line"
                 $announced = $true
