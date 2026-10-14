@@ -456,4 +456,7 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 | 发布器重启预算按"累计"计 | 5 次启动后**永久**不再拉起（日志 `gave up after 5 restarts`）：曲名与歌词停止更新，只有重载 mod 能救 | `PublisherEarnedBackRestarts` 的 5 条边界断言（61/60/59 s、已死、从未启动） |
 | 卡片把"值的寿命"当"展示时长"用 | 桥把 `-TtlMs`（值的寿命，600 000 ms）当 `EVENT` 的 ttl 发出、mod 照收：一张卡占住岛十分钟，8 格队列堵几十分钟，**密集歌词看起来像坏了** | `IslandCardDuration` 的 4 条边界断言 + 那组 `StepIsland`（10 分钟 ttl 的卡片必须过了 `kIslandMaxCardMs` 就收） |
 | 队列只有深度上限、没有时效 | 歌词每秒一行时队列里 8 条**都是过期歌词**，岛在讲一分钟前那句 | `IslandDropStale`：9 s 的 info 留、11 s 的 info 丢、11 s 的 critical 留（`IslandStaleBoundMs`）、41 s 的 critical 也丢 |
+| 画不出来的 `[[ring:...]]` 被"消费掉但不产出" | 写错的环连同它周围的读数一起从屏幕上消失——而消失的那几个字符正是唯一能解释"为什么没有环"的线索（`ParseRing` 的注释一直写的是"调用方回退到原文"，代码却没有回退） | `T=[[ring:nonsense]]C` 必须原样显示（`expanded text, spaces preserved`） |
+| 未注册的 `[[font:...]]` 标签同样被消费掉 | 族名写错/没装的标签会把它包住的文字起点一起吞掉，屏幕上留下一段没有提示的错位文本 | 六个标签容错用例：`[[font:]]`、`[[fonts:…]]`、缺 `]]`、未安装族名各留下原文，且每行"可见字符都归属于某个段" |
+| `AcquireRowFont` 在有**空槽**时仍驱逐 LRU | 两个字号交替绘制时每帧重建字体对象——缓存等于没有，正是它要避免的开销（2026-10-14 由新断言 `a different size is a different, live object` 抓到，未发布） | `AcquireRowFont` 的空槽优先 + `releasing the caches really empties them` |
 

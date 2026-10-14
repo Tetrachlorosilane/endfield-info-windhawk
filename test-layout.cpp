@@ -113,6 +113,36 @@ static void Skip(const char *label) {
     g_skips++;
 }
 
+// ---- injectable font coverage ---------------------------------------------
+// A fake glyph table plus the counter that makes the *number* of coverage questions
+// assertable. "It picked the right family" is only half of the fallback contract; the other
+// half is how much it had to ask to get there, and that is the half a regression would break
+// silently -- the panel would still look right, just cost more every frame.
+static int g_fakeQueries = 0;
+
+static bool FakeCovers(const WCHAR *family, WCHAR ch) {
+    g_fakeQueries++;
+    if (_wcsicmp(family, L"LatinOnly") == 0) return ch < 0x80;
+    if (_wcsicmp(family, L"Everything") == 0) return true;
+    return false;
+}
+
+// A one- or two-name chain built without the parser, so the picking assertions do not depend
+// on the parser being right.
+static FontChain MakeChain(const WCHAR *first, const WCHAR *second) {
+    FontChain chain;
+    if (first) wcscpy(chain.names[chain.count++], first);
+    if (second) wcscpy(chain.names[chain.count++], second);
+    return chain;
+}
+
+// PickFontFamily hands back a pointer into whichever chain it chose, so results are compared
+// by name. Comparing pointers would compare addresses of *different* chains that happen to
+// hold the same string -- and the assertions that do that pass or fail for the wrong reason.
+static bool FamilyIs(const WCHAR *picked, const WCHAR *name) {
+    return picked && wcscmp(picked, name) == 0;
+}
+
 int main() {
     printf("=== theme vs custom colour precedence ===\n");
     {
@@ -1175,6 +1205,11 @@ int main() {
         {L"GPU {gpu|0}%  [[ring:{gpu}]]", 1, true, L"GPU 9%  "},
         {L"[[ring:{cpu}]]", 1, false, L""},
         {L"A 12 [[ring:{cpu}]] B", 1, true, L"A 12  B"},
+        // A gauge that cannot be built used to be consumed and dropped, so the text simply
+        // vanished -- and the vanished text was the only clue about what the row asked for.
+        // ParseRing's contract has always been "the caller falls back to the raw text"; this
+        // is that fallback, and the malformed-ring row is what pins it.
+        {L"T=[[ring:nonsense]]C", 0, false, L"T=[[ring:nonsense]]C"},
     };
 
     for (const Case &c : cases) {
@@ -1196,6 +1231,308 @@ int main() {
         Check(ringCount == c.expectRings, "ring count");
         Check(state.inlineRing[0] == c.expectInline, "inline flag");
         Check(wcscmp(state.text[0], c.expectText) == 0, "expanded text, spaces preserved");
+    }
+
+    printf("\n=== font chains and the multi-font cost gate ===\n");
+    {
+        // The feature is two settings-shaped pieces of data (a global candidate list and one
+        // chain per [[font:...]] tag) plus a rule about when neither is consulted. The rule is
+        // the part worth the most: an unconfigured panel must do exactly what it did before
+        // the feature existed, and that is asserted here rather than assumed.
+        g_stubStrings = nullptr;
+        g_stubStringCount = 0;
+        g_stubInts = nullptr;
+        g_stubIntCount = 0;
+        // Mirrors WhTool_ModInit: the installed list has to exist before any name is
+        // validated, or every family would look uninstalled and the filter would hide bugs.
+        EnumerateFonts();
+
+        // --- the gate itself ---
+        printf("  tag/no-tag x global-list/no-global-list\n");
+        Check(!RowNeedsFontPath(false, false),
+              "a row with no tag and no global list needs no multi-font path");
+        Check(RowNeedsFontPath(true, false), "a tagged row does need it");
+        Check(RowNeedsFontPath(false, true), "and so does any row once a global list exists");
+        Check(RowNeedsFontPath(true, true), "both together do too");
+
+        // --- the list parser ---
+        struct ChainCase {
+            const WCHAR *text;
+            int expectCount;
+            int expectRejected;
+            const WCHAR *expectKey;
+        };
+        const ChainCase chains[] = {
+            {L"Consolas; Arial", 2, 0, L"Consolas;Arial"},
+            {L"  Consolas  ;\tArial\t;", 2, 0, L"Consolas;Arial"},
+            {L"Consolas;;   ;consolas", 1, 0, L"Consolas"},
+            {L"", 0, 0, L""},
+            {L"   ;  ;\t", 0, 0, L""},
+            {L"A;B;C;D", 4, 0, L"A;B;C;D"},
+            {L"A;B;C;D;E;F", 4, 2, L"A;B;C;D"},
+            {L"this family name is far too long to be a real one at all", 0, 1, L""},
+        };
+        for (const ChainCase &c : chains) {
+            FontChain chain;
+            int rejected = 0;
+            ParseFontChainList(c.text, c.text + wcslen(c.text), chain, &rejected);
+            WCHAR key[kMaxFontKeyChars];
+            FontChainKey(chain, key, kMaxFontKeyChars);
+            wprintf(L"    \"%ls\" -> %d name(s), %d rejected, key=\"%ls\"\n", c.text, chain.count,
+                    rejected, key);
+            Check(chain.count == c.expectCount, "chain length");
+            Check(rejected == c.expectRejected, "surplus/unusable entries are counted, not hidden");
+            Check(wcscmp(key, c.expectKey) == 0, "canonical key");
+        }
+
+        // --- installed-name filtering ---
+        {
+            FontChain mixed;
+            const WCHAR *text = L"Consolas; NoSuchFamilyQZX";
+            ParseFontChainList(text, text + wcslen(text), mixed, nullptr);
+            int dropped = 0;
+            FilterChainToInstalled(mixed, &dropped);
+            wprintf(L"    \"%ls\" -> %d kept, %d dropped\n", text, mixed.count, dropped);
+            Check(mixed.count == 1 && _wcsicmp(mixed.names[0], L"Consolas") == 0,
+                  "an uninstalled family is dropped, the rest survives");
+            Check(dropped == 1, "and it is reported as dropped");
+
+            FontChain bogus;
+            const WCHAR *bogusText = L"NoSuchFamilyQZX;AlsoMissingQZX";
+            ParseFontChainList(bogusText, bogusText + wcslen(bogusText), bogus, nullptr);
+            FilterChainToInstalled(bogus, nullptr);
+            Check(bogus.count == 0, "a chain of nothing but typos is empty (the tag stays visible)");
+        }
+
+        // --- tag collection from a raw row ---
+        struct TagCase {
+            const WCHAR *row;
+            int expectHonoured;
+            int expectChains;
+            const WCHAR *expectKey;
+        };
+        const TagCase tags[] = {
+            {L"[[font:Consolas]]CPU[[/font]]", 1, 1, L"Consolas"},
+            {L"[[font:Consolas]]A[[/font]] [[font:Consolas]]B[[/font]]", 2, 1, L"Consolas"},
+            {L"[[font:Consolas; Arial]]x[[/font]]", 1, 1, L"Consolas;Arial"},
+            {L"[[font:Consolas]]unclosed run to the end", 1, 1, L"Consolas"},
+            {L"[[font:]]x[[/font]]", 0, 0, L""},
+            {L"[[font:NoSuchFamilyQZX]]x[[/font]]", 0, 0, L""},
+            {L"[[fonts:Consolas]]x[[/fonts]]", 0, 0, L""},   // a typo is not a tag
+            {L"[[font:Consolas]x[[/font]]", 0, 0, L""},      // no closing brackets
+            {L"[[font:]]", 0, 0, L""},
+        };
+        for (const TagCase &c : tags) {
+            FontTag table[kMaxFontChains];
+            int count = 0;
+            int rejected = 0;
+            const int honoured = CollectRowFontTags(c.row, table, &count, &rejected);
+            wprintf(L"    \"%ls\" -> honoured=%d chains=%d rejected=%d\n", c.row, honoured, count,
+                    rejected);
+            Check(honoured == c.expectHonoured, "tags honoured");
+            Check(count == c.expectChains, "distinct chains registered");
+            if (c.expectChains > 0) {
+                Check(wcscmp(table[0].key, c.expectKey) == 0, "registered key");
+            }
+        }
+
+        // More distinct chains than the table holds: the surplus tags stay visible as text.
+        {
+            FontTag table[kMaxFontChains];
+            int count = 0;
+            int rejected = 0;
+            const WCHAR *many = L"[[font:Consolas]]a[[/font]][[font:Arial]]b[[/font]]"
+                                L"[[font:Consolas;Arial]]c[[/font]][[font:Arial;Consolas]]d[[/font]]"
+                                L"[[font:Courier New]]e[[/font]][[font:Tahoma]]f[[/font]]"
+                                L"[[font:Verdana]]g[[/font]]";
+            const int honoured = CollectRowFontTags(many, table, &count, &rejected);
+            printf("    seven distinct tags -> honoured=%d chains=%d rejected=%d\n", honoured,
+                   count, rejected);
+            Check(count == kMaxFontChains, "the chain table stops at its documented limit");
+            Check(rejected == 1, "and the tag that did not fit is counted");
+        }
+
+        // --- which family a run is drawn in ---
+        //
+        // The coverage question is injected, so every branch is reachable without a font, and
+        // the counter is what makes the performance promise assertable: the *number* of
+        // coverage questions is part of the contract.
+        g_fakeQueries = 0;
+
+        const FontChain latin = MakeChain(L"LatinOnly", nullptr);
+        const FontChain everything = MakeChain(L"Everything", nullptr);
+        const FontChain two = MakeChain(L"LatinOnly", L"Everything");
+        const FontChain neither = MakeChain(L"LatinOnly", L"NothingHere");
+        const FontChain noChain;
+
+        Check(!PickFontFamily(nullptr, 0, L"LatinOnly", noChain, noChain, FakeCovers) &&
+                  g_fakeQueries == 0,
+              "an empty run is the main font and asks nothing");
+
+        g_fakeQueries = 0;
+        Check(FamilyIs(PickFontFamily(L"CPU", 3, L"LatinOnly", latin, noChain, FakeCovers),
+                       L"LatinOnly") &&
+                  g_fakeQueries == 0,
+              "an ASCII run in a tagged run uses the tag outright, with no query");
+
+        g_fakeQueries = 0;
+        Check(!PickFontFamily(L"\u4e2d", 1, L"LatinOnly", latin, noChain, FakeCovers) &&
+                  g_fakeQueries == 1,
+              "a tag whose family has no glyph for the run is not forced on it");
+
+        g_fakeQueries = 0;
+        Check(FamilyIs(PickFontFamily(L"\u4e2d", 1, L"LatinOnly", two, noChain, FakeCovers),
+                       L"Everything") &&
+                  g_fakeQueries == 2,
+              "a tag naming several families asks about each until one covers the run");
+
+        g_fakeQueries = 0;
+        Check(FamilyIs(PickFontFamily(L"\u4e2d", 1, L"LatinOnly", latin, everything, FakeCovers),
+                       L"Everything"),
+              "a tag that covers nothing falls through to the global list");
+
+        g_fakeQueries = 0;
+        Check(!PickFontFamily(L"\u4e2d", 1, L"LatinOnly", neither, noChain, FakeCovers) &&
+                  g_fakeQueries == 2,
+              "and with nothing anywhere covering it, it is the main font");
+
+        // The gate, at the level of a single run.
+        g_fakeQueries = 0;
+        Check(!PickFontFamily(L"CPU 12%  RAM 73%", 15, L"LatinOnly", noChain, latin, FakeCovers) &&
+                  g_fakeQueries == 0,
+              "an ASCII run never consults the global list -- this is the cost gate");
+
+        g_fakeQueries = 0;
+        const WCHAR *picked =
+            PickFontFamily(L"\u4e2d", 1, L"Everything", noChain, latin, FakeCovers);
+        printf("    CJK run, main=Everything, list=LatinOnly -> %ls (%d queries)\n",
+               picked ? picked : L"(main font)", g_fakeQueries);
+        Check(!picked, "a run the main family covers stays in the main family");
+        Check(g_fakeQueries == 1, "and only the main family was asked -- the list was not probed");
+
+        g_fakeQueries = 0;
+        picked = PickFontFamily(L"\u4e2d", 1, L"LatinOnly", noChain, everything, FakeCovers);
+        printf("    CJK run, main=LatinOnly, list=Everything -> %ls (%d queries)\n",
+               picked ? picked : L"(main font)", g_fakeQueries);
+        Check(FamilyIs(picked, L"Everything"),
+              "a run the main family cannot draw goes to the list");
+
+        g_fakeQueries = 0;
+        Check(!PickFontFamily(L"\u4e2d", 1, L"LatinOnly", noChain, noChain, FakeCovers) &&
+                  g_fakeQueries == 0,
+              "with no chain configured at all there is nothing to ask");
+
+        // --- the real coverage query, and its cache ---
+        //
+        // The injected callback above proves the policy; this proves the implementation the
+        // policy is handed on a real machine: a real GDI glyph lookup, and a cache that makes
+        // the second identical question free.
+        {
+            const DWORD before = g_coverQueryCount;
+            const bool consolasA = FontFamilyCovers(L"Consolas", L'A');
+            const DWORD afterFirst = g_coverQueryCount;
+            const bool consolasAAgain = FontFamilyCovers(L"Consolas", L'A');
+            const DWORD afterSecond = g_coverQueryCount;
+            printf("    Consolas 'A': %d then %d; real queries %lu -> %lu -> %lu\n", consolasA,
+                   consolasAAgain, (unsigned long)before, (unsigned long)afterFirst,
+                   (unsigned long)afterSecond);
+            Check(consolasA, "the real query finds a Latin glyph in a Latin font");
+            Check(afterFirst == before + 1, "and it ran the real lookup once");
+            Check(afterSecond == afterFirst, "a repeated question is answered from the cache");
+
+            const DWORD beforeCjk = g_coverQueryCount;
+            const bool consolasCjk = FontFamilyCovers(L"Consolas", 0x4E2D);
+            printf("    Consolas '\u4e2d': %d (queries %lu -> %lu)\n", consolasCjk,
+                   (unsigned long)beforeCjk, (unsigned long)g_coverQueryCount);
+            Check(!consolasCjk,
+                  "a Latin-only family reports no coverage for CJK (that is what drives fallback)");
+        }
+
+        // --- ReadSettings wiring ---
+        //
+        // The parser is asserted above; this is the part that only the real reader can show:
+        // that "Fallback fonts" reaches fallbackFonts, that a row's tag reaches rowFontTag, and
+        // that an empty setting leaves both switched off.
+        {
+            const StubSetting withFonts[] = {
+                {L"FallbackFonts", L"Consolas; NoSuchFamilyQZX"},
+                {L"Row1", L"[[font:Arial]]CPU[[/font]] 12%"},
+                {L"Row2", L"RAM 73%"},
+            };
+            g_stubStrings = withFonts;
+            g_stubStringCount = (int)(sizeof(withFonts) / sizeof(withFonts[0]));
+            ModSettings s;
+            ReadSettings(s);
+            printf("    \"Fallback fonts\"=Consolas;NoSuch -> %d kept; row1 tag=%d chains=%d\n",
+                   s.fallbackFonts.count, s.rowFontTag[0] ? 1 : 0, s.tagFontCount);
+            Check(s.fallbackFonts.count == 1, "the installed name is kept");
+            Check(s.rowFontTag[0], "row 1 carries a tag");
+            Check(!s.rowFontTag[1], "row 2 does not");
+            Check(s.tagFontCount == 1 && wcscmp(s.tagFonts[0].key, L"Arial") == 0,
+                  "the tag's chain is registered and keyed by its text");
+
+            const StubSetting noFonts[] = {
+                {L"Row1", L"CPU 12%"},
+                {L"Row2", L"RAM 73%"},
+            };
+            g_stubStrings = noFonts;
+            g_stubStringCount = (int)(sizeof(noFonts) / sizeof(noFonts[0]));
+            ReadSettings(s);
+            Check(s.fallbackFonts.count == 0, "an empty setting is an empty chain");
+            Check(s.tagFontCount == 0, "and no tags were registered");
+            Check(!s.rowFontTag[0] && !s.rowFontTag[1], "so nothing needs the multi-font path");
+        }
+
+        // --- a tagged row, end to end: expansion, markers, segments ---
+        {
+            const StubSetting tagged[] = {
+                {L"FallbackFonts", L"Consolas"},
+                {L"Row1", L"[[font:Arial]]CPU[[/font]] 12%"},
+                {L"Row2", L"A[[font:Arial]]B[[/font]]C"},
+                {L"Row3", L"[[font:NoSuchFamilyQZX]]typo[[/font]]"},
+                {L"Row4", L"[[font:Arial]no closing brackets"},
+            };
+            g_stubStrings = tagged;
+            g_stubStringCount = (int)(sizeof(tagged) / sizeof(tagged[0]));
+            ModSettings s;
+            ReadSettings(s);
+
+            struct RowCase {
+                const WCHAR *row;
+                const WCHAR *expectText;
+                int expectSegments;
+                int expectFirstChain;
+            };
+            const RowCase rows[] = {
+                {s.rows[0], L"CPU 12%", 2, 1},          // "CPU" tagged, " 12%" not
+                {s.rows[1], L"ABC", 3, 0},              // untagged, tagged, untagged
+                {s.rows[2], L"[[font:NoSuchFamilyQZX]]typo", 1, 0},   // tag stays visible
+                {s.rows[3], L"[[font:Arial]no closing brackets", 1, 0},
+            };
+            for (const RowCase &c : rows) {
+                WCHAR marked[640];
+                RingSpec rings[kMaxRingsPerRow];
+                int ringCount = 0;
+                ExpandTokensAndRings(c.row, Values(), s, marked, 640, rings, &ringCount,
+                                     kMaxRingsPerRow);
+                RowState state;
+                BuildRowLayout(marked, ringCount, state, 0);
+                wprintf(L"    \"%ls\" -> text=\"%ls\" segs=%d\n", c.row, state.text[0],
+                        state.segmentCount[0]);
+                Check(wcscmp(state.text[0], c.expectText) == 0, "tag is stripped, text survives");
+                Check(state.segmentCount[0] == c.expectSegments, "segment count");
+                Check(state.segments[0][0].tagChain == c.expectFirstChain,
+                      "first segment's chain");
+                // The tolerance rule in its strongest form: no form of a broken tag may eat
+                // text. The stripped text must still account for every visible character.
+                int covered = 0;
+                for (int i = 0; i < state.segmentCount[0]; i++) {
+                    if (state.segments[0][i].offset >= 0) covered += state.segments[0][i].length;
+                }
+                Check(covered == (int)wcslen(state.text[0]),
+                      "every visible character belongs to a segment");
+            }
+        }
     }
 
     printf("\n=== real GDI+ text fitting (skipped when GDI+ is unavailable) ===\n");
@@ -1253,6 +1590,34 @@ int main() {
                 Check(format != nullptr, "CreateRowStringFormat builds the row format");
 
                 if (font && format) {
+                    // Font objects are cached by (family, size), so a row that keeps asking for
+                    // the same fallback family gets the same GpFont back instead of a new one
+                    // per frame. The second half of the check is the lifecycle: a settings
+                    // change has to drop them, or a size change would keep drawing the old
+                    // metrics (the same trap the ellipsis-width cache fell into).
+                    {
+                        GpFont *first = AcquireRowFont(graphics, L"Consolas", 15);
+                        GpFont *second = AcquireRowFont(graphics, L"Consolas", 15);
+                        GpFont *other = AcquireRowFont(graphics, L"Consolas", 24);
+                        Check(first != nullptr, "a fallback font can be created");
+                        Check(first == second, "asking again for the same one returns the same object");
+                        Check(other != nullptr && other != first,
+                              "a different size is a different, live object");
+                        ReleaseFontResources();
+                        // Asserting on the slot table, not on the next pointer GDI+ hands back:
+                        // a freed object's address can legitimately be reused, so "the new
+                        // pointer differs" would be a check that passes for the wrong reason and
+                        // fails on a different allocator.
+                        bool anySlotUsed = false;
+                        for (int i = 0; i < kFontCacheSlots; i++) {
+                            if (g_fontCache[i].used) anySlotUsed = true;
+                        }
+                        Check(!anySlotUsed, "releasing the caches really empties them");
+                        GpFont *afterRelease = AcquireRowFont(graphics, L"Consolas", 15);
+                        Check(afterRelease != nullptr, "and they can be built again afterwards");
+                        ReleaseFontResources();
+                    }
+
                     const float boxHeight = 30.0f;
                     // One row's worth of segments: text, ring, then more text. Each
                     // segment is fitted to its own budget, exactly as PaintPanel does.

@@ -48,6 +48,21 @@ after text sits inline on that row. A variable that is known but unreadable on
 this machine (a GPU with no temperature sensor, say) renders as `--` rather than
 as a plausible-looking zero.
 
+## Fonts
+
+`Font family` sets the main face. `Fallback fonts` is a semicolon-separated list
+of candidates for the characters that face cannot draw, so a Chinese song title
+or an emoji next to a Segoe UI panel no longer turns into boxes. Leaving it empty
+is free: the panel then never asks the system which glyphs a font has.
+
+A single run can also be given its own family with `[[font:Name]]...[[/font]]`
+(names may be a list: `[[font:Consolas;Arial]]`), and a row may switch as often as
+you like. A run is drawn in one family, so a run that mixes scripts uses the first
+candidate that covers all of it. A tag that is mis-spelt, names a family that is
+not installed, or is one of more than six distinct chains is drawn as ordinary
+text rather than silently changing the typeface. The same applies to a
+`[[ring:...]]` that cannot be built: you see what you wrote.
+
 ## Rings, icons and themes
 
 * Ring gauges are drawn where you write them: right-docked by default, or inline
@@ -166,6 +181,9 @@ deliberate trade for accuracy, and it only happens when you asked for it.
 - FontFamily: Segoe UI
   $name: 'Font family'
   $description: 'Any installed family name, for example Segoe UI, Consolas, Microsoft YaHei UI or JetBrains Mono. A name that is not installed falls back to Segoe UI and is reported in the log.'
+- FallbackFonts: ""
+  $name: 'Fallback fonts'
+  $description: 'Semicolon-separated candidates for characters the main family cannot draw, for example Microsoft YaHei UI;Segoe UI Emoji. Empty means no fallback, which is also the cheapest: the panel then never asks which glyphs a font has. A single run is drawn in one family, so a run that mixes scripts uses the first candidate that covers all of it.'
 - TextColor: ""
   $name: 'Text colour (Custom theme only)'
   $description: 'AARRGGBB. Used only when Theme is Custom; otherwise the theme decides. Leave empty for the Endfield default.'
@@ -1159,6 +1177,209 @@ static IntroFrame EvaluateIntro() {
     return f;
 }
 
+// ---------------------------------------------------------------------------
+// Font chains: the global fallback list and the per-run [[font:...]] override
+//
+// A chain is an ordered list of candidate family names. Two kinds exist:
+//
+//   * the global list from "Fallback fonts", which every row may consult, and
+//   * one per [[font:...]] tag written in a row, which overrides the main family for
+//     the run the tag wraps.
+//
+// The load-bearing half of this design is what happens when *neither* is configured:
+// no coverage query, no second font object, no extra segments -- the painter builds
+// one font and draws everything with it, exactly as it did before the feature
+// existed. That gate is RowNeedsFontPath(), decided from the settings, never per
+// frame (docs/font-and-row-metrics-design.md 1).
+// ---------------------------------------------------------------------------
+static const int kMaxFontFamilies = 4;      // candidates per chain
+static const int kMaxFontFamilyChars = 48;
+static const int kMaxFontChains = 6;        // [[font:...]] chains; the global one is separate
+static const int kMaxFontKeyChars = kMaxFontFamilies * kMaxFontFamilyChars;
+
+struct FontChain {
+    WCHAR names[kMaxFontFamilies][kMaxFontFamilyChars] = {};
+    int count = 0;
+};
+
+// The chain used for a text run that has no tag of its own and no global list to consult.
+static const FontChain kNoFontChain;
+
+// One registered [[font:...]] tag: the name list as it was written (canonicalised into
+// `key`) plus the chain that will actually be used for it. The key is what a row's own tag
+// is matched against when it is expanded -- so the tag text is parsed once here and never
+// re-validated on the sampler thread.
+struct FontTag {
+    WCHAR key[kMaxFontKeyChars] = {};
+    FontChain chain;
+};
+
+// Copies [begin,end) with leading and trailing spaces and tabs removed. Returns false when
+// nothing is left or when the name does not fit: a family name that is too long is dropped,
+// never truncated, because half a name is a different font and GDI+ would substitute one.
+static bool CopyTrimmedName(const WCHAR *begin, const WCHAR *end, WCHAR *out, int outCount) {
+    while (begin < end && (*begin == L' ' || *begin == L'\t')) begin++;
+    while (end > begin && (end[-1] == L' ' || end[-1] == L'\t')) end--;
+    const int length = (int)(end - begin);
+    if (length <= 0 || length >= outCount) return false;
+    wcsncpy(out, begin, length);
+    out[length] = L'\0';
+    return true;
+}
+
+// Splits a ';'-separated candidate list into a chain, dropping empty entries and
+// case-insensitive duplicates. *rejected counts the entries that had content but were not
+// stored (too long, or past kMaxFontFamilies), so the settings reader can report them once
+// rather than dropping them in silence.
+static int ParseFontChainList(const WCHAR *begin, const WCHAR *end, FontChain &out,
+                              int *rejected) {
+    out.count = 0;
+    if (rejected) *rejected = 0;
+    if (!begin || !end || end <= begin) return 0;
+
+    const WCHAR *p = begin;
+    while (p < end) {
+        const WCHAR *sep = p;
+        while (sep < end && *sep != L';') sep++;
+
+        bool hadContent = false;
+        for (const WCHAR *c = p; c < sep; c++) {
+            if (*c != L' ' && *c != L'\t') hadContent = true;
+        }
+
+        WCHAR name[kMaxFontFamilyChars];
+        bool stored = false;
+        if (CopyTrimmedName(p, sep, name, kMaxFontFamilyChars)) {
+            bool duplicate = false;
+            for (int i = 0; i < out.count; i++) {
+                if (_wcsicmp(out.names[i], name) == 0) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                stored = true;   // already in the list: nothing was lost
+            } else if (out.count < kMaxFontFamilies) {
+                wcscpy(out.names[out.count], name);
+                out.count++;
+                stored = true;
+            }
+        }
+        if (hadContent && !stored && rejected) (*rejected)++;
+
+        if (sep >= end) break;
+        p = sep + 1;
+    }
+    return out.count;
+}
+
+// Canonical text of a parsed chain: its names joined with ';'. Two tags that differ only in
+// spacing -- or that name a family which was dropped as unusable -- share a key, which is
+// what lets a tag written inside a row find the chain ReadSettings registered for it while
+// the tag writers stay free to format it their own way.
+static void FontChainKey(const FontChain &chain, WCHAR *out, int outCount) {
+    if (!out || outCount <= 0) return;
+    out[0] = L'\0';
+    size_t used = 0;
+    for (int i = 0; i < chain.count; i++) {
+        if (i > 0) {
+            if (used + 1 >= (size_t)outCount) break;
+            out[used++] = L';';
+        }
+        const WCHAR *name = chain.names[i];
+        while (*name && used + 1 < (size_t)outCount) out[used++] = *name++;
+    }
+    out[used] = L'\0';
+}
+
+// Drops candidates that are not installed, using the same registry-backed list the main
+// family is validated against. Without this a typo in a fallback name would be handed to
+// GDI+, which substitutes *some* font for an unknown family -- and that substitute would
+// then answer the coverage questions, so the panel could quietly draw a font nobody asked
+// for while claiming the fallback worked.
+static void FilterChainToInstalled(FontChain &chain, int *dropped) {
+    if (dropped) *dropped = 0;
+    int kept = 0;
+    for (int i = 0; i < chain.count; i++) {
+        if (FontIsInstalled(chain.names[i])) {
+            if (kept != i) wcscpy(chain.names[kept], chain.names[i]);
+            kept++;
+        } else if (dropped) {
+            (*dropped)++;
+        }
+    }
+    chain.count = kept;
+}
+
+// The chain registered for a tag's canonical text, or -1 when there is none.
+static int FontTagIndexOf(const FontTag *tags, int tagCount, const WCHAR *key) {
+    for (int i = 0; i < tagCount; i++) {
+        if (_wcsicmp(tags[i].key, key) == 0) return i;
+    }
+    return -1;
+}
+
+// The cost gate, pure so it can be asserted: a row needs the multi-font path only when it
+// carries a font tag of its own or a global fallback list exists. With neither, the painter
+// never builds a second font and never asks GDI which glyphs exist.
+static bool RowNeedsFontPath(bool rowHasTag, bool hasGlobalChain) {
+    return rowHasTag || hasGlobalChain;
+}
+
+// Registers every usable [[font:...]] tag in one raw row and returns how many of them will
+// be honoured -- which is the row's half of the cost gate. A tag whose name is empty, too
+// long, past the chain limit or not installed is deliberately *not* registered: it then
+// draws as ordinary text, so a typo shows up on screen instead of silently changing the
+// typeface. Pairs with ExpandTokensAndRings, which matches tags by this same canonical key.
+static int CollectRowFontTags(const WCHAR *row, FontTag *tags, int *tagCount, int *rejected) {
+    int honoured = 0;
+    if (!row) return 0;
+
+    const WCHAR *p = row;
+    while (*p) {
+        if (p[0] != L'[' || p[1] != L'[') {
+            p++;
+            continue;
+        }
+        const WCHAR *close = wcsstr(p + 2, L"]]");
+        if (!close) break;
+        const WCHAR *body = p + 2;
+        const int bodyLen = (int)(close - body);
+
+        // "[[/font]]" ends a run and needs no registration; anything that is not "font:"
+        // is left for ExpandTokensAndRings to treat as ordinary text.
+        if (bodyLen > 5 && _wcsnicmp(body, L"font:", 5) == 0) {
+            FontChain candidate;
+            int over = 0;
+            ParseFontChainList(body + 5, close, candidate, &over);
+
+            WCHAR key[kMaxFontKeyChars];
+            FontChainKey(candidate, key, kMaxFontKeyChars);
+
+            int index = -1;
+            if (candidate.count > 0) {
+                index = FontTagIndexOf(tags, *tagCount, key);
+                if (index < 0 && *tagCount < kMaxFontChains) {
+                    FontChain usable = candidate;
+                    int gone = 0;
+                    FilterChainToInstalled(usable, &gone);
+                    if (usable.count > 0) {
+                        wcsncpy(tags[*tagCount].key, key, kMaxFontKeyChars - 1);
+                        tags[*tagCount].key[kMaxFontKeyChars - 1] = L'\0';
+                        tags[*tagCount].chain = usable;
+                        index = *tagCount;
+                        (*tagCount)++;
+                    }
+                }
+            }
+            if (index >= 0) honoured++;
+            else if (rejected) (*rejected)++;
+        }
+        p = close + 2;
+    }
+    return honoured;
+}
+
 struct ModSettings {
     WCHAR rows[kMaxRows][256] = {};
     int rowCount = 0;
@@ -1173,6 +1394,13 @@ struct ModSettings {
     int borderThickness = 1;
     int fontSize = 15;
     WCHAR fontFamily[64] = L"Segoe UI";
+    // Global candidate list for characters the main family cannot draw ("Fallback fonts"),
+    // plus the chains registered from [[font:...]] tags found in the rows. A count of zero
+    // means "not configured", which is what keeps the whole multi-font path switched off.
+    FontChain fallbackFonts;
+    FontTag tagFonts[kMaxFontChains];
+    int tagFontCount = 0;
+    bool rowFontTag[kMaxRows] = {};
     DWORD background = 0xE6312F30;
     DWORD border = 0xFFC6CA4C;
     DWORD borderCollapsed = 0xFF6A6C3A;
@@ -1260,6 +1488,43 @@ static void ReadSettings(ModSettings &s) {
         }
     }
     Wh_FreeStringSetting(font);
+
+    // "Fallback fonts": a ';'-separated candidate list, consulted (after the main family)
+    // for the characters the main family cannot draw. An empty list is the default and the
+    // cheapest configuration there is: it is half of the cost gate for the whole feature.
+    PCWSTR fallback = Wh_GetStringSetting(L"FallbackFonts");
+    int fallbackRejected = 0;
+    if (fallback) {
+        ParseFontChainList(fallback, fallback + wcslen(fallback), s.fallbackFonts,
+                           &fallbackRejected);
+    } else {
+        s.fallbackFonts.count = 0;
+    }
+    int fallbackMissing = 0;
+    FilterChainToInstalled(s.fallbackFonts, &fallbackMissing);
+    Wh_FreeStringSetting(fallback);
+    if (fallbackRejected || fallbackMissing) {
+        // Bounded by construction: this runs once per settings change, not per frame.
+        Wh_Log(L"Fallback fonts: kept %d, dropped %d past the %d-name limit, %d not installed",
+               s.fallbackFonts.count, fallbackRejected, kMaxFontFamilies, fallbackMissing);
+    }
+
+    // [[font:...]] tags are collected from the rows themselves, so that expanding a row can
+    // encode its tag as an index instead of a name. Each chain is registered once and shared
+    // by every row that writes it the same way.
+    s.tagFontCount = 0;
+    for (int i = 0; i < kMaxRows; i++) s.rowFontTag[i] = false;
+    int tagRejected = 0;
+    for (int i = 0; i < s.rowCount; i++) {
+        if (CollectRowFontTags(s.rows[i], s.tagFonts, &s.tagFontCount, &tagRejected) > 0) {
+            s.rowFontTag[i] = true;
+        }
+    }
+    if (tagRejected) {
+        Wh_Log(L"%d [[font:...]] tag(s) ignored: unusable or uninstalled name, or more than "
+               L"%d distinct chains; they will draw as ordinary text",
+               tagRejected, kMaxFontChains);
+    }
 
     s.panelWidth = ClampInt((int)Wh_GetIntSetting(L"PanelWidth"), 200, 1600);
     s.rowHeight = ClampInt((int)Wh_GetIntSetting(L"RowHeight"), 18, 80);
@@ -3537,6 +3802,10 @@ static const int kMaxSegments = 12;
 struct TextSeg {
     int offset;
     int length;
+    // Which [[font:...]] chain this run belongs to, as a 1-based index into the settings'
+    // tagFonts, or 0 for "no tag". It is carried per segment rather than per row because a
+    // row may switch family mid-sentence.
+    int tagChain = 0;
 };
 
 struct RowState {
@@ -3555,6 +3824,13 @@ static int g_publishedRows = 0;
 // before anything is measured or drawn.
 static const WCHAR kRingMarkStart = 0xE000;
 static const WCHAR kRingMarkEnd = 0xE001;
+// A [[font:...]] run is marked the same way: the start marker carries the chain index as a
+// digit and is terminated by kRingMarkEnd (the payload terminator is shared, because all it
+// means is "the marker ends here"), and the end marker stands alone. Encoding the tag as an
+// index is what keeps the sampler thread cheap: it never re-validates a family name, and the
+// painter never parses markup -- stripping the markers happens in exactly one place.
+static const WCHAR kFontMarkStart = 0xE002;
+static const WCHAR kFontMarkEnd = 0xE003;
 
 // Expands tokens, swaps each ring token for a marker, and returns the gauges in
 // source order.
@@ -3580,6 +3856,7 @@ static void ExpandTokensAndRings(const WCHAR *source, const Values &v,
                     wcsncpy(rawBody, body + 5, rawLen);
                     rawBody[rawLen] = L'\0';
                     ExpandTokens(rawBody, v, bodyExpanded, 192);
+                    bool drawn = false;
                     if (*ringCount < maxRings) {
                         RingSpec spec;
                         if (ParseRing(bodyExpanded, (int)wcslen(bodyExpanded), v, settings, spec)) {
@@ -3588,8 +3865,49 @@ static void ExpandTokensAndRings(const WCHAR *source, const Values &v,
                             out[written++] = kRingMarkEnd;
                             rings[*ringCount] = spec;
                             (*ringCount)++;
+                            drawn = true;
                         }
                     }
+                    if (drawn) {
+                        p = close + 2;
+                        continue;
+                    }
+                    // Nothing was drawn -- the body did not parse, or the row already has all
+                    // the gauges it may have. Consuming the text here would delete the very
+                    // characters that explain why no gauge appeared, so it falls through and is
+                    // copied as ordinary text (which is what ParseRing's own contract says).
+                }
+                // [[font:Name]] / [[font:A;B]] opens a run in another family, [[/font]]
+                // closes it. The name list was parsed and registered by ReadSettings, so all
+                // this has to do is find it by its canonical text -- a tag that is not in
+                // the table (mis-spelt, uninstalled, past the chain limit, or simply never
+                // registered because the settings changed under it) is left in the text and
+                // draws literally. That is the tolerance rule: a broken tag must never make
+                // a row disappear (docs/font-and-row-metrics-design.md 3).
+                if (bodyLen > 5 && _wcsnicmp(body, L"font:", 5) == 0) {
+                    FontChain candidate;
+                    int over = 0;
+                    ParseFontChainList(body + 5, close, candidate, &over);
+                    WCHAR key[kMaxFontKeyChars];
+                    FontChainKey(candidate, key, kMaxFontKeyChars);
+                    const int chain = FontTagIndexOf(settings.tagFonts, settings.tagFontCount, key);
+                    if (chain >= 0 && written + 4 < outCount) {
+                        out[written++] = kFontMarkStart;
+                        out[written++] = (WCHAR)(L'1' + chain);
+                        out[written++] = kRingMarkEnd;
+                        p = close + 2;
+                        continue;
+                    }
+                    // Not registered: mis-spelt, uninstalled, past the chain limit, or the
+                    // settings changed under this row. It falls through and is copied as
+                    // ordinary text -- eating it here would hide the only visible clue that the
+                    // tag did nothing.
+                }
+                // The closing tag carries no payload, and its index does not matter: the runs
+                // are properly nested by construction, so an end marker inside a run can only
+                // close that run.
+                if (bodyLen == 5 && _wcsnicmp(body, L"/font", 5) == 0) {
+                    if (written + 2 < outCount) out[written++] = kFontMarkEnd;
                     p = close + 2;
                     continue;
                 }
@@ -3629,15 +3947,27 @@ static void BuildRowLayout(const WCHAR *marked, int ringCount, RowState &state, 
     int position = 0;
     size_t out = 0;
     bool sawText = false;
+    // The chain the *next* text segment belongs to. Text before the first tag is chain 0,
+    // which is the global fallback list.
+    int tagChain = 0;
+
+    // A text run ends at a marker, and both markers below flush the run in progress before
+    // moving on. That is what keeps a segment from spanning two font tags -- the run that
+    // follows a tag has to be a segment of its own, or the segment would have no single
+    // family to draw in.
+    auto flushText = [&]() {
+        if (position > textStart && state.segmentCount[row] < kMaxSegments - 1) {
+            TextSeg &seg = state.segments[row][state.segmentCount[row]++];
+            seg.offset = textStart;
+            seg.length = position - textStart;
+            seg.tagChain = tagChain;
+            textStart = position;
+        }
+    };
 
     for (const WCHAR *p = marked; *p; p++) {
         if (*p == kRingMarkStart) {
-            if (position > textStart && state.segmentCount[row] < kMaxSegments - 1) {
-                TextSeg &seg = state.segments[row][state.segmentCount[row]++];
-                seg.offset = textStart;
-                seg.length = position - textStart;
-                textStart = position;
-            }
+            flushText();
             if (ringIndex < ringCount && state.segmentCount[row] < kMaxSegments) {
                 TextSeg &seg = state.segments[row][state.segmentCount[row]++];
                 seg.offset = -1;
@@ -3650,6 +3980,22 @@ static void BuildRowLayout(const WCHAR *marked, int ringCount, RowState &state, 
             if (p[1] == kRingMarkEnd) p++;
             continue;
         }
+        if (*p == kFontMarkStart) {
+            flushText();
+            // The digit is the chain index; anything unexpected leaves the run in the main
+            // font, which is the safe answer for a marker this code did not write.
+            if (p[1] >= L'1' && p[1] <= (WCHAR)(L'0' + kMaxFontChains)) {
+                tagChain = (int)(p[1] - L'0');
+            }
+            while (p[1] && p[1] != kRingMarkEnd) p++;
+            if (p[1] == kRingMarkEnd) p++;
+            continue;
+        }
+        if (*p == kFontMarkEnd) {
+            flushText();
+            tagChain = 0;
+            continue;
+        }
         if (*p == kRingMarkEnd) continue;
         state.text[row][out++] = *p;
         position++;
@@ -3659,6 +4005,7 @@ static void BuildRowLayout(const WCHAR *marked, int ringCount, RowState &state, 
         TextSeg &seg = state.segments[row][state.segmentCount[row]++];
         seg.offset = textStart;
         seg.length = position - textStart;
+        seg.tagChain = tagChain;
     }
     state.text[row][out] = L'\0';
 }
@@ -4690,6 +5037,234 @@ static void ApplyTickRate(HWND hwnd) {
 static bool g_islandCloseHot = false;
 static bool g_islandTrackingLeave = false;
 
+// ---------------------------------------------------------------------------
+// Font fallback: choosing a family, and remembering what was decided
+//
+// Everything here is only ever reached when RowNeedsFontPath() said so. The unconfigured
+// panel builds its one font and never calls into this section at all -- no glyph query, no
+// cache lookup, no second GDI+ object (docs/font-and-row-metrics-design.md 1).
+//
+// Both caches are static and fixed-size, in keeping with the no-allocation discipline: the
+// glyph answers are keyed by (family, character) and the fonts by (family, size).
+// ---------------------------------------------------------------------------
+static const int kCoverCacheSlots = 256;
+static const int kFontCacheSlots = 8;
+
+// Resolved glyph coverage: does `family` have a glyph for `character`?
+struct GlyphCoverSlot {
+    DWORD familyHash;
+    WCHAR character;
+    bool covered;
+    bool used;
+};
+
+static GlyphCoverSlot g_coverCache[kCoverCacheSlots];
+static int g_coverCacheNext = 0;      // round-robin victim; the probe is a plain cache
+static HDC g_coverDc = nullptr;
+static HFONT g_coverFont = nullptr;
+static DWORD g_coverFontHash = 0;
+// Bounded diagnostic: how many times the *real* query had to run. The test host reads it to
+// prove the cache works, and the [perf] line reports it on a real machine, where "did the
+// fallback path start costing anything" is the question worth answering.
+static DWORD g_coverQueryCount = 0;
+
+static DWORD HashFamilyName(const WCHAR *name) {
+    DWORD hash = 2166136261u;                       // FNV-1a, case-insensitive
+    for (; name && *name; name++) {
+        WCHAR c = *name;
+        if (c >= L'A' && c <= L'Z') c = (WCHAR)(c - L'A' + L'a');
+        hash ^= (DWORD)c;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+// True when the family has a glyph for that character.
+//
+// GGI_MARK_NONEXISTING_GLYPHS is what makes this answer a *coverage* answer: without it GDI
+// returns the font's default glyph index for characters it has nothing for, and every font
+// would look like it covers everything.
+static bool QueryGlyphCovered(const WCHAR *family, WCHAR ch) {
+    if (!family || !*family) return false;
+    if (!g_coverDc) {
+        g_coverDc = CreateCompatibleDC(nullptr);
+        if (!g_coverDc) return false;
+    }
+    const DWORD hash = HashFamilyName(family);
+    if (hash != g_coverFontHash || !g_coverFont) {
+        HFONT replacement = CreateFontW(
+            0, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_ONLY_PRECIS,
+            CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, family);
+        if (!replacement) return false;
+        if (g_coverFont) DeleteObject(g_coverFont);
+        g_coverFont = replacement;
+        g_coverFontHash = hash;
+    }
+    HGDIOBJ previous = SelectObject(g_coverDc, g_coverFont);
+    WORD glyph = 0;
+    const DWORD mapped = GetGlyphIndicesW(g_coverDc, &ch, 1, &glyph, GGI_MARK_NONEXISTING_GLYPHS);
+    SelectObject(g_coverDc, previous);
+    g_coverQueryCount++;
+    return mapped != GDI_ERROR && glyph != 0xFFFF;
+}
+
+// Cached front end for QueryGlyphCovered. A linear scan of 256 slots is cheaper than the DC
+// work by orders of magnitude, and the working set is tiny: a handful of families times the
+// distinct non-ASCII characters on screen.
+static bool FontFamilyCovers(const WCHAR *family, WCHAR ch) {
+    const DWORD hash = HashFamilyName(family);
+    for (int i = 0; i < kCoverCacheSlots; i++) {
+        const GlyphCoverSlot &slot = g_coverCache[i];
+        if (slot.used && slot.familyHash == hash && slot.character == ch) return slot.covered;
+    }
+    const bool covered = QueryGlyphCovered(family, ch);
+    GlyphCoverSlot &slot = g_coverCache[g_coverCacheNext];
+    g_coverCacheNext = (g_coverCacheNext + 1) % kCoverCacheSlots;
+    slot.familyHash = hash;
+    slot.character = ch;
+    slot.covered = covered;
+    slot.used = true;
+    return covered;
+}
+
+// The family that should draw one run, or null for the main font.
+//
+// The two chains mean different things, so they are asked in different ways:
+//
+//   * A [[font:...]] tag is an *instruction*. For a run of ASCII its first name wins outright
+//     with no coverage query at all -- that is what makes the common override free, and every
+//     font can be assumed to draw ASCII. Above ASCII the tag's names are asked about in order
+//     (cheaply: the answers are cached), because a family with no glyph for the run would only
+//     produce boxes, and a tag that names several families clearly expects the choice to be
+//     made for it.
+//   * The global "Fallback fonts" list is a *safety net* for characters the main family
+//     cannot draw. So the main family is asked first, and a run that is entirely ASCII never
+//     reaches the list at all. That is the performance gate in its final form: an English
+//     panel with a long fallback list still pays nothing for it.
+//
+// The coverage question is injected so every branch is assertable without a font.
+static const WCHAR *PickFontFamily(const WCHAR *run, int len, const WCHAR *mainFamily,
+                                   const FontChain &explicitChain, const FontChain &fallback,
+                                   bool (*covers)(const WCHAR *family, WCHAR ch)) {
+    if (!run || len <= 0 || !covers) return nullptr;
+
+    bool aboveAscii = false;
+    for (int i = 0; i < len; i++) {
+        if (run[i] > 0x7F) {
+            aboveAscii = true;
+            break;
+        }
+    }
+
+    auto coversRun = [&](const WCHAR *family) {
+        for (int i = 0; i < len; i++) {
+            if (!covers(family, run[i])) return false;
+        }
+        return true;
+    };
+
+    if (explicitChain.count > 0) {
+        if (!aboveAscii) return explicitChain.names[0];
+        for (int i = 0; i < explicitChain.count; i++) {
+            if (coversRun(explicitChain.names[i])) return explicitChain.names[i];
+        }
+    }
+
+    if (fallback.count == 0 || !aboveAscii) return nullptr;
+    if (mainFamily && *mainFamily && coversRun(mainFamily)) return nullptr;
+    for (int i = 0; i < fallback.count; i++) {
+        if (coversRun(fallback.names[i])) return fallback.names[i];
+    }
+    return nullptr;
+}
+
+// A GpFont for (family, size), created on first use and kept. Rebuilt rather than reused
+// across a settings change -- ReleaseFontResources drops the lot, the same way the icon
+// caches are dropped when the icon settings change.
+struct FontCacheSlot {
+    WCHAR family[kMaxFontFamilyChars];
+    int size;
+    GpFontFamily *fontFamily;
+    GpFont *font;
+    unsigned int lastUsed;
+    bool used;
+};
+
+static FontCacheSlot g_fontCache[kFontCacheSlots];
+static unsigned int g_fontCacheClock = 0;
+
+static GpFont *AcquireRowFont(GpGraphics *graphics, const WCHAR *family, int size) {
+    if (!graphics || !family || !*family) return nullptr;
+
+    // An unused slot always wins over the least recently used one: evicting a live font to
+    // make room while an empty slot sits next to it would mean rebuilding it on the next
+    // frame, which is the whole cost this cache exists to avoid.
+    FontCacheSlot *empty = nullptr;
+    FontCacheSlot *lru = nullptr;
+    for (int i = 0; i < kFontCacheSlots; i++) {
+        FontCacheSlot &slot = g_fontCache[i];
+        if (slot.used && slot.size == size && _wcsicmp(slot.family, family) == 0) {
+            slot.lastUsed = ++g_fontCacheClock;
+            return slot.font;   // null is a remembered failure, not a retry
+        }
+        if (!slot.used) {
+            if (!empty) empty = &slot;
+        } else if (!lru || slot.lastUsed < lru->lastUsed) {
+            lru = &slot;
+        }
+    }
+
+    FontCacheSlot *free = empty ? empty : lru;
+    if (!free) return nullptr;
+    if (free->font) {
+        g_gdiplus.DeleteFont(free->font);
+        free->font = nullptr;
+    }
+    if (free->fontFamily) {
+        g_gdiplus.DeleteFontFamily(free->fontFamily);
+        free->fontFamily = nullptr;
+    }
+
+    GpFontFamily *created = nullptr;
+    g_gdiplus.CreateFontFamilyFromName(family, nullptr, &created);
+    GpFont *font = nullptr;
+    if (created) g_gdiplus.CreateFont(created, (float)size, 0, 0, &font);
+    if (!font && created) {
+        g_gdiplus.DeleteFontFamily(created);
+        created = nullptr;
+    }
+
+    free->used = true;
+    free->size = size;
+    free->lastUsed = ++g_fontCacheClock;
+    wcsncpy(free->family, family, kMaxFontFamilyChars - 1);
+    free->family[kMaxFontFamilyChars - 1] = L'\0';
+    free->fontFamily = created;
+    free->font = font;      // may be null: the failed lookup is cached too
+    return font;
+}
+
+// Drops every font object and the GDI coverage DC. Called on a settings change (the sizes and
+// families may all be different) and on unload, in both cases *before* GDI+ shuts down.
+static void ReleaseFontResources() {
+    for (int i = 0; i < kFontCacheSlots; i++) {
+        if (g_fontCache[i].font) g_gdiplus.DeleteFont(g_fontCache[i].font);
+        if (g_fontCache[i].fontFamily) g_gdiplus.DeleteFontFamily(g_fontCache[i].fontFamily);
+        g_fontCache[i] = {};
+    }
+    for (int i = 0; i < kCoverCacheSlots; i++) g_coverCache[i] = {};
+    g_coverCacheNext = 0;
+    if (g_coverFont) {
+        DeleteObject(g_coverFont);
+        g_coverFont = nullptr;
+    }
+    g_coverFontHash = 0;
+    if (g_coverDc) {
+        DeleteDC(g_coverDc);
+        g_coverDc = nullptr;
+    }
+}
+
 static void PaintPanel(HWND hwnd) {
     // Card mode: a static width, applied here and now. The width used to animate, and
     // that is what flickered: resizing from the timer left one frame in which the window
@@ -4915,7 +5490,15 @@ static void PaintPanel(HWND hwnd) {
                     leftInset = kIconLeftMargin + iconDiameter + (float)kIconContentGap;
                 }
 
+                // The cost gate, read from the settings rather than decided per frame: the
+                // global list is one flag, the per-row half is one bool per row (see
+                // RowNeedsFontPath). With both false the loop below never calls into the
+                // fallback section at all.
+                const bool globalFontPath = g_settings.fallbackFonts.count > 0;
+
                 for (int r = 0; r < rows; r++) {
+                    const bool rowFontPath =
+                        RowNeedsFontPath(r < kMaxRows && g_settings.rowFontTag[r], globalFontPath);
                     float top = (float)(r * g_settings.rowHeight);
                     float centerY = top + g_settings.rowHeight / 2.0f;
                     float cursor = leftInset;
@@ -4999,6 +5582,25 @@ static void PaintPanel(HWND hwnd) {
                         wcsncpy(slice, g_rowState.text[r] + seg.offset, length);
                         slice[length] = L'\0';
 
+                        // Fallback fonts: choose this run's family *before* measuring it, so the
+                        // fit is computed with the font it will actually be drawn in. The choice
+                        // is made from the whole run, not from whatever survives the trim: the row
+                        // says which family it wants, not how much of it fits.
+                        GpFont *runFont = font;
+                        if (rowFontPath) {
+                            const FontChain &tagChain =
+                                seg.tagChain > 0 ? g_settings.tagFonts[seg.tagChain - 1].chain
+                                                 : kNoFontChain;
+                            const WCHAR *picked =
+                                PickFontFamily(slice, length, g_settings.fontFamily, tagChain,
+                                               g_settings.fallbackFonts, FontFamilyCovers);
+                            if (picked && _wcsicmp(picked, g_settings.fontFamily) != 0) {
+                                GpFont *fallbackFont =
+                                    AcquireRowFont(graphics, picked, g_settings.fontSize);
+                                if (fallbackFont) runFont = fallbackFont;
+                            }
+                        }
+
                         // How much room this run may use. Right-parked gauges leave the
                         // text whatever they do not need; an inline run has to count the
                         // gauges that still follow it, or a long run pushes them off the
@@ -5020,7 +5622,7 @@ static void PaintPanel(HWND hwnd) {
                         // (including the spaces written before it); a parked run is
                         // drawn in its whole budget instead.
                         float advance = inlineFlow
-                                            ? MeasureAdvance(graphics, font, format, slice,
+                                            ? MeasureAdvance(graphics, runFont, format, slice,
                                                              (float)g_settings.rowHeight)
                                             : budget;
 
@@ -5030,11 +5632,11 @@ static void PaintPanel(HWND hwnd) {
                         // gauge that follows it. The fit is measured through the same
                         // helper used for the advance, so a fitted run costs exactly
                         // what it reports.
-                        bool fitted = FitTextToWidth(graphics, font, format, slice,
+                        bool fitted = FitTextToWidth(graphics, runFont, format, slice,
                                                      sizeof(slice) / sizeof(slice[0]),
                                                      budget, (float)g_settings.rowHeight);
                         if (fitted) {
-                            advance = MeasureAdvance(graphics, font, format, slice,
+                            advance = MeasureAdvance(graphics, runFont, format, slice,
                                                      (float)g_settings.rowHeight);
                         }
 
@@ -5055,7 +5657,7 @@ static void PaintPanel(HWND hwnd) {
                                     ? WithOpacity(g_settings.text, contentAlpha)
                                     : g_settings.text);
                         }
-                        g_gdiplus.DrawString(graphics, slice, -1, font, &layout, format,
+                        g_gdiplus.DrawString(graphics, slice, -1, runFont, &layout, format,
                                              (GpBrush *)textBrush);
                         if (inlineFlow) cursor += advance;
                     }
@@ -5564,9 +6166,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&mem, sizeof(mem));
             unsigned long long elapsed = GetTickCount64() - g_perfBaseTick;
             DBG(L"[perf] up=%llus rows=%d groups=0x%X samples=%llu republish=%llu paints=%llu "
-                   L"cpu=%llums cpu/sample=%.3fms ws=%.1fMB private=%.1fMB visible=%d expanded=%d prox=%d",
+                   L"glyphq=%lu cpu=%llums cpu/sample=%.3fms ws=%.1fMB private=%.1fMB "
+                   L"visible=%d expanded=%d prox=%d",
                    elapsed / 1000ULL, g_visibleRows, g_activeGroups, g_sampleCount, g_republishCount,
-                   g_paintCount,
+                   g_paintCount, (unsigned long)g_coverQueryCount,
                    cpuMs, g_sampleCount ? (double)cpuMs / (double)g_sampleCount : 0.0,
                    mem.WorkingSetSize / 1048576.0, mem.PrivateUsage / 1048576.0,
                    g_visible ? 1 : 0, g_expanded ? 1 : 0, g_modeProximity ? 1 : 0);
@@ -5591,6 +6194,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         // The icon file may have changed, so drop the decoded copy before the
         // next paint re-reads it.
         DisposeIconImage();
+        // Fonts are cached the same way and for the same reason: a size or a family may have
+        // changed, and a stale GpFont would draw the old metrics. This runs on the HUD thread,
+        // which is the only thread that ever touches these caches.
+        ReleaseFontResources();
         PlaceWindow(hwnd);
         PaintPanel(hwnd);
         // Publishing a new version is what tells the sampler to re-evaluate which
@@ -5848,6 +6455,9 @@ static bool RowStateEqual(const RowState &a, const RowState &b, int count) {
         for (int i = 0; i < a.segmentCount[r]; i++) {
             if (a.segments[r][i].offset != b.segments[r][i].offset) return false;
             if (a.segments[r][i].length != b.segments[r][i].length) return false;
+            // Two rows can carry identical text with different tags around it: the markers are
+            // stripped, so without this the family could change without a repaint.
+            if (a.segments[r][i].tagChain != b.segments[r][i].tagChain) return false;
         }
         for (int i = 0; i < a.ringCount[r]; i++) {
             if (!RingSpecsEqual(a.rings[r][i], b.rings[r][i])) return false;
@@ -7309,6 +7919,9 @@ void WhTool_ModUninit() {
     // Must happen before GDI+ shuts down, or the cached image leaks the decoder's
     // resources.
     DisposeIconImage();
+    // Same deadline for the cached fonts and the coverage DC: they are GDI+ / GDI objects and
+    // both are gone the moment GDI+ is.
+    ReleaseFontResources();
     if (g_gdiplusToken) {
         g_gdiplus.Shutdown(g_gdiplusToken);
         g_gdiplusToken = 0;

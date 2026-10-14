@@ -36,3 +36,8 @@ Python 与 **Pillow**（`from PIL import Image, ImageDraw, ImageFont`）。
 - 脚本里有两行专门指向产品的注释：`resolved_style()` 对应 `ResolveIconStyle`（未设字形的行
   继承第一个已配置的字形），`draw_ring()` 对应 `DrawRing`（整圈轨道 + 从 12 点顺时针的弧；
   PIL 的角度从 3 点起算，所以 `start=-90`）。这两处语义漂移最容易看不出来。
+- **这份预览不模拟多字体回退**（`Fallback fonts` 与 `[[font:…]]`，见
+  [docs/font-and-row-metrics-design.md](docs/font-and-row-metrics-design.md)）：它的 `ROWS`
+  存的是**已经展开好**的文本，里面既没有 token 也没有标签，所以不会出现"标签被当文字画出来"的
+  假象；反过来说，预览里那三行永远只用 `segoeui.ttf` 一种字体。要检查回退是否生效，
+  看真机面板与 `[perf]` 的 `glyphq=`，不要看这张图。

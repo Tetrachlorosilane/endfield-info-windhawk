@@ -207,6 +207,46 @@ CPU [[ring:{cpu}]]  DISK [[ring:{disk.system.usage}]]
 2. **`Ring colour` 设置** —— 只在 `Theme` 选 `Custom` 时生效，给所有未单独指定颜色的环统一换色。
 3. **主题的边框色** —— 默认行为。
 
+### 环写错了会怎样
+
+`[[ring:...]]` 里填不出一个能画的环时（量程不是数字、一行超过 4 个环等），
+**这段文字会原样显示在面板上**，也就是你能直接看到自己写的那一串 `[[ring:...]]`。
+这是刻意的：早期版本会把写错的环连同文字一起吃掉，屏幕上少一段读数、却没有任何线索。
+
+---
+
+## 字体：全局回退与逐段覆盖
+
+面板的字体有两层，互不干扰：
+
+| 层 | 设置 / 写法 | 作用 |
+| :-- | :-- | :-- |
+| 主字体 | `Font family` | 整块面板的默认字体 |
+| 全局回退 | `Fallback fonts` | 主字体**画不出来的字符**按顺序交给候选字体 |
+| 逐段覆盖 | `[[font:族名]]…[[/font]]` | 这一段文字改用指定字体（可给多个候选，分号分隔） |
+
+`Fallback fonts` 分号分隔，例如 `Microsoft YaHei UI;Segoe UI Emoji`。它解决的是
+"界面用 Segoe UI，但歌曲名是中文 / emoji" 这类情况：中文与 emoji 会自动交给第一个能画的候选。
+
+```
+CPU 12%                          ← 主字体
+{ext.music.title}                ← 中文部分走 Fallback fonts
+[[font:Consolas]]12,345[[/font]] ← 这一段一定是 Consolas
+[[font:Consolas;Arial]]hello[[/font]] ← 先试 Consolas，画不出再试 Arial
+```
+
+几条需要知道的规则：
+
+- **一段文字只用一种字体。** 回退是按"段"决定的（一段 = 两次 `[[ring:]]` 之间的一串文字），
+  所以一段里混排中英文时，整段会用**第一个能画全这一段的**候选。
+- **没配置就不付代价。** `Fallback fonts` 留空、行里也没有 `[[font:...]]` 时，
+  面板完全不查询字形覆盖，和没有这个功能时一样快。纯英文的行即使配了回退列表也不会去查。
+- **`[[font:...]]` 只影响它包住的那一段。** 不写 `[[/font]]` 就是一直管到行尾。
+- **画不出来的族名不会硬用。** 族名没装、写错、或超过 6 个不同的标签时，
+  这个标签**当作普通文字显示**（你能看见它），并在日志里有一条汇总说明。
+  给多个候选时，第一个画不出这一段的会被跳过，继续试下一个。
+- 标签是"逐段"的，不是"逐行"的：一行里可以换好几次字体。
+
 ---
 
 ## 左侧图标
@@ -333,6 +373,9 @@ Theme=Midnight  bg=E61A1D24 border=FF5AA9E6 collapsed=FF2F5878 text=FFEDF3FA acc
 `Font family` 接受**任意已安装的字体族名**：`Segoe UI`、`Consolas`、`Microsoft YaHei UI`、
 `JetBrains Mono` 等。如果填的字体没装，会回退到 Segoe UI **并在日志里告诉你**，不会静默换字体。
 
+`Fallback fonts` 是"主字体画不出这个字时用谁"的候选列表（分号分隔），
+写法与逐段覆盖见上面的 [字体](#字体全局回退与逐段覆盖) 一节。留空是默认值，也是最快的配置。
+
 Windhawk 不支持动态下拉框，所以字体需要手输。拼错了就去日志看那一行。
 
 ---
@@ -367,6 +410,7 @@ Windhawk 不支持动态下拉框，所以字体需要手输。拼错了就去�
 | `Border thickness` | 1 | 0-8；设为 0 即无边框 |
 | `Font size` | 15 | 9-48 px |
 | `Font family` | `Segoe UI` | 任意已安装字体 |
+| `Fallback fonts` | 空 | 分号分隔的候选链，如 `Microsoft YaHei UI;Segoe UI Emoji`。主字体画不出的字符按顺序交给它们；**留空即关闭这条通路**（也最快） |
 | `Theme` | `Endfield` | `Endfield` / `Midnight` / `Mono` / `Custom` |
 | `Background` | 空 | 仅 `Custom`；AARRGGBB |
 | `Border` | 空 | 仅 `Custom`；展开状态的边框色 |
@@ -535,6 +579,9 @@ mod 会用三重手段强制置顶，并每 100 ms 重申一次。如果日志�
 `samples` 不涨说明数据采集停了，`paints` 不涨说明重绘没被触发。
 
 另外确认 `Update interval` 没被设得过大。
+
+`glyphq=` 是"问过 GDI 这个字有没有字形"的累计次数。没配 `Fallback fonts` 时它应该一直是 0——
+不涨是正常的，涨得很快说明多字体通路正在每次重绘里查询（正常情况下答案会被缓存）。
 
 </details>
 
