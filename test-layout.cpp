@@ -569,16 +569,16 @@ int main() {
         Check(wcslen(tiny) < 8, "a short destination is still terminated");
     }
 
-    printf("\n=== image-only icon slots borrow a glyph to fall back on ===\n");
+    printf("\n=== icon resolution: glyph fallback, explicit None, global image ===\n");
     {
-        // The failure mode: the image cannot be decoded, the painter asks for that
-        // slot's glyph and gets 0, and the row shows an empty plate -- which reads as
-        // "the icon turned white", not as "that path did not load". The borrow used to
-        // happen only when *no* slot anywhere had a glyph, so a mixed configuration
-        // (an image on row 1, a glyph on row 2) still produced the empty plate.
+        // The failure mode behind the fallback: the image cannot be decoded, the painter
+        // asks for that row's glyph and gets 0, and the row shows an empty plate -- which
+        // reads as "the icon turned white", not as "that path did not load".
         const StubSetting *savedStrings = g_stubStrings;
         const int savedStringCount = g_stubStringCount;
         ModSettings s;
+        const WCHAR *global = L"C:\\pics\\global.png";
+        const WCHAR *row2File = L"C:\\pics\\row2.png";
 
         const StubSetting mixed[] = {
             {L"Icon1", L""},
@@ -588,11 +588,10 @@ int main() {
         g_stubStrings = mixed;
         g_stubStringCount = (int)(sizeof(mixed) / sizeof(mixed[0]));
         ReadSettings(s);
-        printf("  Icon1=image only, Icon2=Network -> icon1 style=%d, icon2 style=%d\n",
-               s.icons[0].style, s.icons[1].style);
-        Check(s.icons[0].style == 4, "an image-only slot borrows the configured glyph");
-        Check(ResolveIconStyle(s, 0) == 4, "and the painter is handed that glyph");
-        Check(ResolveIconStyle(s, 1) == 4, "the slot that chose it keeps its own");
+        Check(ResolveIconStyle(s, 0) == 4, "an image-only row falls back to the configured glyph");
+        Check(s.icons[0].style == 0,
+              "and that fallback is resolved, not written into the slot");
+        Check(ResolveIconStyle(s, 1) == 4, "the row that chose it keeps its own");
 
         const StubSetting imageOnly[] = {
             {L"Icon1", L""},
@@ -602,14 +601,87 @@ int main() {
         g_stubStringCount = (int)(sizeof(imageOnly) / sizeof(imageOnly[0]));
         ReadSettings(s);
         Check(ResolveIconStyle(s, 0) == 2,
-              "with no glyph anywhere an image-only slot falls back to Memory");
+              "with no glyph anywhere an image-only row falls back to Memory");
+
+        // An explicit None means "this row has no icon". Measured before the fix:
+        // Icon1=Memory + Icon3=None handed row 3 the Memory glyph, because None was
+        // indistinguishable from "never configured" and fell through to the inherit
+        // branch -- so README's "set it to None to leave a row without an icon" was
+        // simply untrue.
+        const StubSetting noneRow[] = {
+            {L"IconPath", global},
+            {L"Icon1", L"Memory"},
+            {L"Icon3", L"None"},
+        };
+        g_stubStrings = noneRow;
+        g_stubStringCount = (int)(sizeof(noneRow) / sizeof(noneRow[0]));
+        ReadSettings(s);
+        Check(ResolveIconStyle(s, 2) == 0, "an explicit None leaves that row without a glyph");
+        Check(ResolveIconPath(s, 2)[0] == 0, "and without the global image either");
+        Check(ResolveIconSlot(s, 2) == -1, "so it takes no image cache slot");
+        Check(ResolveIconStyle(s, 1) == 2 && ResolveIconStyle(s, 3) == 2,
+              "while the rows around it still inherit the chosen glyph");
+
+        // ... and None must not become the glyph every other row inherits.
+        const StubSetting noneFirst[] = {{L"Icon1", L"None"}, {L"Icon2", L"Network"}};
+        g_stubStrings = noneFirst;
+        g_stubStringCount = (int)(sizeof(noneFirst) / sizeof(noneFirst[0]));
+        ReadSettings(s);
+        Check(ResolveIconStyle(s, 2) == 4,
+              "an unconfigured row inherits the first real glyph, not a None");
+        Check(ResolveIconStyle(s, 0) == 0, "and the row that said None has none");
+
+        // The global image: every row without a file of its own shows it, including the
+        // default configuration where Icon1 chose a glyph, and all of them share one
+        // cache slot so the file is decoded and resampled once.
+        const StubSetting globalOnly[] = {{L"IconPath", global}};
+        g_stubStrings = globalOnly;
+        g_stubStringCount = (int)(sizeof(globalOnly) / sizeof(globalOnly[0]));
+        ReadSettings(s);
+        printf("  global image only -> row1 path=%ls slot=%d, row4 slot=%d\n",
+               ResolveIconPath(s, 0), ResolveIconSlot(s, 0), ResolveIconSlot(s, 3));
+        Check(wcscmp(ResolveIconPath(s, 0), global) == 0,
+              "the global icon applies to a row that has no file of its own");
+        Check(ResolveIconSlot(s, 0) == 0 && ResolveIconSlot(s, 3) == 0,
+              "every row shares one cache slot, so the file is decoded once");
+        Check(AnyIconConfigured(s), "a global icon on its own still means plates are drawn");
+
+        // A row's own file wins over the global one, and a second row that names the same
+        // file as the global shares the global's slot rather than loading it again.
+        const StubSetting mixedPaths[] = {
+            {L"IconPath", global},
+            {L"Icon2Path", row2File},
+            {L"Icon3Path", global},
+        };
+        g_stubStrings = mixedPaths;
+        g_stubStringCount = (int)(sizeof(mixedPaths) / sizeof(mixedPaths[0]));
+        ReadSettings(s);
+        printf("  global + row2 file + row3 repeats global -> slots: %d %d %d %d\n",
+               ResolveIconSlot(s, 0), ResolveIconSlot(s, 1), ResolveIconSlot(s, 2),
+               ResolveIconSlot(s, 3));
+        Check(ResolveIconSlot(s, 1) == 1, "a row's own file gets its own cache slot");
+        Check(ResolveIconSlot(s, 2) == 0, "a row that names the global file shares row 1's slot");
+        Check(ResolveIconSlot(s, 3) == 0,
+              "and so does a row that inherits the global image");
+        Check(wcscmp(ResolveIconPath(s, 0), global) == 0,
+              "the per-row file does not leak to the rows the global covers");
+
+        // Without a global image, the documented per-row inheritance still holds: setting
+        // only row 1's file means every row uses it, and they all share its slot.
+        const StubSetting inheritFile[] = {{L"Icon1Path", row2File}, {L"Icon2", L"Network"}};
+        g_stubStrings = inheritFile;
+        g_stubStringCount = (int)(sizeof(inheritFile) / sizeof(inheritFile[0]));
+        ReadSettings(s);
+        Check(wcscmp(ResolveIconPath(s, 3), row2File) == 0 &&
+                  ResolveIconSlot(s, 3) == 0,
+              "one row's file still covers the rows after it when there is no global image");
 
         const StubSetting noIcons[] = {{L"Icon1", L"None"}};
         g_stubStrings = noIcons;
         g_stubStringCount = (int)(sizeof(noIcons) / sizeof(noIcons[0]));
         ReadSettings(s);
-        Check(s.iconCount == 0 && ResolveIconStyle(s, 0) == 0,
-              "a row with no icon configured stays without one");
+        Check(s.iconCount == 0 && ResolveIconStyle(s, 0) == 0 && !AnyIconConfigured(s),
+              "with nothing configured at all no row gets a plate");
 
         g_stubStrings = savedStrings;
         g_stubStringCount = savedStringCount;

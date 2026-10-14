@@ -227,7 +227,7 @@ through WMI.
   $description: '0-3. Concentric rings expanding from the icon while the panel arrives, as in the original.'
 - IconPath: ""
   $name: 'Custom icon file'
-  $description: 'Full path to a PNG, JPEG, BMP, GIF or TIFF. Overrides the built-in glyph above and is drawn centred on the plate. SVG is not supported because GDI+ has no SVG decoder. Leave empty to use the built-in glyph.'
+  $description: 'Full path to a PNG, JPEG, BMP, GIF or TIFF. Used on every row that has no icon file of its own, and it takes precedence over the built-in glyphs. A row set to None still draws no icon at all. SVG is not supported because GDI+ has no SVG decoder.'
 - UpdateMs: 1000
   $name: 'Update interval (ms)'
   $description: '200-10000. Clocks refresh every second regardless.'
@@ -791,6 +791,11 @@ static const DWORD kGlyphDark = 0xFF141313;
 // ---------------------------------------------------------------------------
 struct IconSpec {
     int style = 0;                  // 0 none, 1 cpu, 2 memory, 3 disk, 4 network, 5 gpu
+    // True when the settings key held a value. Without it an explicit `None` cannot be
+    // told apart from "this row was never configured", so it fell through to the
+    // inherited glyph and README's "set it to None to leave a row without an icon" was
+    // simply untrue (measured: Icon1=Memory + Icon3=None gave row 3 the Memory glyph).
+    bool styleSet = false;
     WCHAR path[MAX_PATH] = L"";     // empty = use the built-in glyph
 };
 
@@ -838,6 +843,7 @@ static int IconStyleFromName(const WCHAR *name) {
 // so setting only Icon1 still produces a plate on every row.
 static int ResolveIconStyle(const ModSettings &settings, int index);
 static const WCHAR *ResolveIconPath(const ModSettings &settings, int index);
+static int ResolveIconSlot(const ModSettings &settings, int index);
 
 
 // Colour presets. The alpha on the background matches the mod's 90% default.
@@ -1161,7 +1167,13 @@ struct ModSettings {
     // Left icon plates and intro animation. One icon per row, row-aligned with the
     // RowN settings.
     IconSpec icons[kMaxRows] = {};
-    int iconCount = 0;             // entries actually configured
+    int iconCount = 0;             // slots that will draw a plate
+    // A custom icon file that applies to every row ("Custom icon file"). A row's own
+    // IconN path wins over it; a row that says None gets no icon at all.
+    WCHAR iconPath[MAX_PATH] = L"";
+    // The glyph an image falls back to when it cannot be decoded: the first glyph the
+    // user chose, or Memory when the icons are images only, or 0 when there are none.
+    int iconFallbackStyle = 0;
     int introStyle = 0;            // 0 slide, 1 fade, 2 none
     int introMs = 1200;
     int rippleCount = 2;
@@ -1238,19 +1250,24 @@ static void ReadSettings(ModSettings &s) {
     }
     Wh_FreeStringSetting(introStyle);
 
-    // Icons are read as a row-aligned list: Icon1/Icon1Path .. Icon{kMaxRows}.
-    // An entry counts as configured when it names a glyph other than None or
+    // Icons are read as a row-aligned list: Icon1/Icon1Path .. Icon{kMaxRows}, plus
+    // one optional file that applies to every row (IconPath). An entry counts as
+    // configured when it names a glyph (including None, which is a choice) or
     // supplies an image path.
     s.iconCount = 0;
     for (int i = 0; i < kMaxRows; i++) {
         IconSpec &slot = s.icons[i];
         slot.style = 0;
+        slot.styleSet = false;
         slot.path[0] = L'\0';
 
         WCHAR key[32];
         swprintf(key, 32, L"Icon%d", i + 1);
         PCWSTR styleName = Wh_GetStringSetting(key);
-        slot.style = IconStyleFromName(styleName);
+        if (styleName && styleName[0]) {
+            slot.styleSet = true;
+            slot.style = IconStyleFromName(styleName);
+        }
         Wh_FreeStringSetting(styleName);
 
         swprintf(key, 32, L"Icon%dPath", i + 1);
@@ -1268,31 +1285,37 @@ static void ReadSettings(ModSettings &s) {
         if (slot.style > 0 || slot.path[0]) s.iconCount++;
     }
 
-    // A slot that supplies only an image needs a glyph to fall back on when that
-    // image cannot be decoded, otherwise the row shows an empty plate -- which reads
-    // as "the icon turned white" and sends the reader off in the wrong direction.
-    //
-    // Borrow the first configured glyph, and Memory when there is none at all. It has
-    // to be resolved to *every* image-only slot, not just to the ones on a config with
-    // no glyph anywhere: with Icon1 set to an image and Icon2 to, say, Network, the
-    // old rule did nothing and ResolveIconStyle() handed the painter style 0, i.e.
-    // nothing at all.
-    int borrowedGlyph = 0;
+    // The global icon file, if any. Read after the slots so the fallback below can tell
+    // whether there is a glyph anywhere to fall back on.
+    {
+        PCWSTR global = Wh_GetStringSetting(L"IconPath");
+        s.iconPath[0] = L'\0';
+        if (global && global[0]) {
+            CopyUserPath(s.iconPath, MAX_PATH, global);
+            if (s.iconPath[0] == L'\0') {
+                Wh_Log(L"Icons: the global icon path is empty after trimming quotes and "
+                       L"spaces; ignoring it");
+            }
+        }
+        Wh_FreeStringSetting(global);
+    }
+
+    // The glyph an image falls back on when it cannot be decoded, otherwise the row shows
+    // an empty plate -- which reads as "the icon turned white" and sends the reader off in
+    // the wrong direction. Resolved here, once, rather than by writing a style into the
+    // image-only slots: the global image does not belong to any slot, so the rule has to
+    // live where both cases can see it.
+    s.iconFallbackStyle = 0;
     for (int i = 0; i < kMaxRows; i++) {
         if (s.icons[i].style > 0) {
-            borrowedGlyph = s.icons[i].style;
+            s.iconFallbackStyle = s.icons[i].style;
             break;
         }
     }
-    if (s.iconCount > 0 && !borrowedGlyph) {
-        borrowedGlyph = 2;   // Memory
-        Wh_Log(L"Icons: no built-in glyph was chosen, so image-only slots fall back "
-               L"to the Memory glyph if their file cannot be loaded");
-    }
-    if (borrowedGlyph) {
-        for (int i = 0; i < kMaxRows; i++) {
-            if (s.icons[i].path[0] && s.icons[i].style <= 0) s.icons[i].style = borrowedGlyph;
-        }
+    if (!s.iconFallbackStyle && (s.iconCount > 0 || s.iconPath[0])) {
+        s.iconFallbackStyle = 2;   // Memory
+        Wh_Log(L"Icons: no built-in glyph was chosen, so an image that cannot be loaded "
+               L"falls back to the Memory glyph");
     }
 
     // Palette resolution. The two sources are mutually exclusive on purpose:
@@ -1398,33 +1421,72 @@ static void ReadSettings(ModSettings &s) {
 
 // Per-row icon resolution.
 //
-// A row with no icon of its own inherits the first configured one. That makes
-// "set Icon1 only" mean "this glyph on every row", which is the obvious reading,
-// while still allowing Icon2..Icon4 to override individual rows.
-static bool SlotIsConfigured(const IconSpec &slot) {
-    return slot.style > 0 || slot.path[0] != L'\0';
-}
+// A row with no icon of its own inherits the first configured one, which makes "set
+// Icon1 only" mean "this glyph on every row", while Icon2..Icon4 override individual
+// rows. On top of that there is one optional global image (`IconPath`) that applies to
+// every row. The rules for the two live in the three functions below, in one place,
+// because they interlock (see ResolveIconPath).
+//
+// "Configured" is deliberately not one predicate: a row can choose a glyph (including
+// `None`, which is a choice -- "this row has no icon" -- and not an absence) and/or name
+// a file, and the two are consulted separately. `IconSpec::styleSet` is what separates an
+// explicit `None` from "never set".
 
+// The glyph a row falls back on when it has no (working) image. Highest first:
+//
+//   1. the glyph the row chose itself (`None` means none, and must not inherit)
+//   2. the shared fallback for an image-only row: the first glyph anywhere, else Memory
+//   3. otherwise the first glyph anywhere, for rows that said nothing at all
+//
+// Resolved rather than written into the slots, so the global image -- which belongs to
+// no slot -- gets the same fallback as a row's own file.
 static int ResolveIconStyle(const ModSettings &settings, int index) {
-    if (index >= 0 && index < kMaxRows && SlotIsConfigured(settings.icons[index])) {
-        // A slot that supplies only an image still needs a style for its glyph
-        // fallback if the image fails to load.
-        return settings.icons[index].style;
+    if (index >= 0 && index < kMaxRows) {
+        const IconSpec &slot = settings.icons[index];
+        if (slot.style > 0 || slot.styleSet) return slot.style;
+        if (slot.path[0]) return settings.iconFallbackStyle;
     }
     for (int i = 0; i < kMaxRows; i++) {
-        if (SlotIsConfigured(settings.icons[i])) return settings.icons[i].style;
+        if (settings.icons[i].style > 0) return settings.icons[i].style;
     }
-    return 0;
+    return settings.iconFallbackStyle;
 }
 
+// The image file a row shows, or "" when it shows a glyph. Highest first:
+//
+//   1. the row's own `Row N icon file`
+//   2. nothing, when the row says `None`: no icon at all, not even the global one
+//   3. the global `IconPath`, which is the panel-wide default for every row
+//   4. a file another row set -- the documented "set Icon1 only and every row uses it"
+//      inheritance, which only comes into play when there is no global image (with one,
+//      the per-row file is the exception, so it must not leak to the other rows)
 static const WCHAR *ResolveIconPath(const ModSettings &settings, int index) {
-    if (index >= 0 && index < kMaxRows && SlotIsConfigured(settings.icons[index])) {
-        return settings.icons[index].path[0] ? settings.icons[index].path : L"";
+    if (index >= 0 && index < kMaxRows) {
+        const IconSpec &slot = settings.icons[index];
+        if (slot.path[0]) return slot.path;
+        if (slot.styleSet && slot.style <= 0) return L"";
     }
+    if (settings.iconPath[0]) return settings.iconPath;
     for (int i = 0; i < kMaxRows; i++) {
-        if (SlotIsConfigured(settings.icons[i])) return settings.icons[i].path;
+        if (settings.icons[i].path[0]) return settings.icons[i].path;
     }
     return L"";
+}
+
+// Which cache slot holds the image for a row. Rows that resolve to the same file share
+// one slot -- the lowest row that wants it -- so a file is decoded and resampled once
+// however many rows show it, which is the normal case for the global icon. The sharing
+// is done at resolution time instead of by adding a slot or by reference counting, so
+// every file still has exactly one owner and the per-slot dispose path is unchanged.
+// Returns -1 when the row shows no image at all.
+static int ResolveIconSlot(const ModSettings &settings, int index) {
+    const WCHAR *path = ResolveIconPath(settings, index);
+    if (!path || !path[0]) return -1;
+    for (int i = 0; i < index && i < kMaxRows; i++) {
+        const WCHAR *earlier = ResolveIconPath(settings, i);
+        if (earlier && earlier[0] && _wcsicmp(earlier, path) == 0) return i;
+    }
+    return index;
 }
 
 // ---------------------------------------------------------------------------
@@ -4167,10 +4229,13 @@ static float IconPlateDiameter(const ModSettings &settings, int slot) {
     return (float)settings.fontSize * (float)kIconPlateRatio;
 }
 
-// True when at least one slot has an icon.
+// True when at least one row will have a plate. Asked through the same function the
+// painter uses for each row, so "is the plate margin needed" and "does this row get a
+// plate" cannot answer differently -- and an explicit `None` on every row is not a
+// configuration that wants a margin.
 static bool AnyIconConfigured(const ModSettings &settings) {
     for (int i = 0; i < kMaxRows; i++) {
-        if (SlotIsConfigured(settings.icons[i])) return true;
+        if (IconPlateDiameter(settings, i) > 0.0f) return true;
     }
     return false;
 }
@@ -4271,13 +4336,19 @@ static void PaintIconPlate(GpGraphics *graphics, const ModSettings &settings,
     // hold the source unchanged, the source is used and this never upsamples it
     // past its natural size.
     bool imageFailed = false;
-    const WCHAR *iconPath = ResolveIconPath(settings, slot);
+    // The image may belong to a different cache slot than this row: rows that resolve to
+    // the same file share one slot, so it is decoded once (see ResolveIconSlot). The
+    // glyph fallback is still this row's own, so a row that said `None` draws nothing.
+    const int imageSlot = ResolveIconSlot(settings, slot);
+    const WCHAR *iconPath = imageSlot >= 0 ? ResolveIconPath(settings, slot) : L"";
     int target = (int)(geometry.plateRadius * 2.0f + 0.5f);
-    GpImage *image = iconPath[0] ? IconImageFor(slot, iconPath, target, &imageFailed) : nullptr;
+    GpImage *image = imageSlot >= 0 ? IconImageFor(imageSlot, iconPath, target, &imageFailed)
+                                    : nullptr;
     if (g_iconDrawLogs < 8) {
         g_iconDrawLogs++;
-        DBG(L"Icon%d draw: plate diameter target=%d  image=%s  built-in glyph=%d",
-               slot + 1, target, image ? L"custom" : L"none", ResolveIconStyle(settings, slot));
+        DBG(L"Icon%d draw: plate diameter target=%d  image=%s  cache slot=%d  built-in glyph=%d",
+               slot + 1, target, image ? L"custom" : L"none", imageSlot,
+               ResolveIconStyle(settings, slot));
     }
     if (image) {
         UINT iw = 0, ih = 0;
