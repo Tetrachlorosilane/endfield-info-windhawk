@@ -1161,26 +1161,6 @@ if ($SelfTest) {
         if ($got -ne $c.want) { $bad++; Write-Host ("  FAIL Select-StoreLineIndex: {0} (got {1}, want {2})" -f $c.d, $got, $c.want) }
         else { Write-Host ("  OK   Select-StoreLineIndex: {0}" -f $c.d) }
     }
-        # --- Select-StoreLineIndex（选行纯函数）---------------------------------
-        # 不假设长度：~80 行、间距不规则的数组也必须正确（用户点名要求）
-        $irr = [object[]]@(0..79 | ForEach-Object { [double]($_ * 2.5) })   # object[]：才能真正放 null
-        $irr[3] = $null                       # 元信息行没有时间戳 → 跳过
-        $okA = (Select-StoreLineIndex -TimesSec $irr -PositionMs 0) -eq 0
-        $okB = (Select-StoreLineIndex -TimesSec $irr -PositionMs 2500) -eq 1
-        $okC = (Select-StoreLineIndex -TimesSec $irr -PositionMs 2501) -eq 1
-        $okD = (Select-StoreLineIndex -TimesSec $irr -PositionMs 5000) -eq 2
-        $okE = (Select-StoreLineIndex -TimesSec $irr -PositionMs 999999) -eq 79
-        $okF = (Select-StoreLineIndex -TimesSec ([double[]]@()) -PositionMs 1000) -eq -1
-        $okG = (Select-StoreLineIndex -TimesSec ([double[]]@(5)) -PositionMs 100) -eq 0
-        $okH = (Select-StoreLineIndex -TimesSec ([double[]](1..2000 | ForEach-Object { [double]$_ })) -PositionMs 1500500) -eq 1500
-        Check ($okA) "Select-StoreLineIndex：位置 0 → 第 0 行（前奏）"
-        Check ($okB) "Select-StoreLineIndex：恰好落在某行起点 → 取该行（闭区间）"
-        Check ($okC) "Select-StoreLineIndex：行间 → 仍取上一行"
-        Check ($okD) "Select-StoreLineIndex：跨过 null 行不崩、仍取最近一行"
-        Check ($okE) "Select-StoreLineIndex：晚于末行 → 钳到末行（不越界）"
-        Check ($okF) "Select-StoreLineIndex：空数组 → -1（调用方据此退回 LRC）"
-        Check ($okG) "Select-StoreLineIndex：单行数组 → 0"
-        Check ($okH) "Select-StoreLineIndex：2000 行数组 → 命中第 1500 行（无固定长度假设）"
     $fixture = @"
 [ti:示例]
 [00:00.00]第一句
