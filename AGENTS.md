@@ -25,25 +25,34 @@
 
 ```
 endfield-info-windhawk/
-├── endfield-info-windhawk.wh.cpp      唯一的交付物（约 308 KB 源码）
-├── README.md                          用户文档
-├── AGENTS.md                          本文
-├── docs/                              规划与设计文档（不是实现说明）
-│   └── external-data-island-design.md 设计：外部数据（M1 数据面、M2 事件面均已实现）
+├── endfield-info-windhawk.wh.cpp      唯一的交付物（含 Windhawk 元数据与注释内 Readme）
+├── README.md                          用户文档（安装、设置、变量、排查）
+├── AGENTS.md                          本文（实现与不变量）
+├── CHANGELOG.md                       版本与变更（发布说明的来源）
+├── LICENSE                            MIT
+├── docs/                              规划、设计与交接文档
+│   ├── external-data-island-design.md 设计：外部数据（M1 数据面、M2 事件面均已实现）
+│   └── state-and-handover.md          验证状态、真机更正、犯错档案、待办
 │
-├── 开发工具（不随 mod 交付）
-├── build.ps1                          本地编译，不用开 Windhawk GUI
-├── test-layout.cpp                    回归测试宿主（打桩 Windhawk API）
-├── test-gdiplus-scale.cpp             GDI+ 缩放探针（独立 exe）
-├── _settings.py                       校验 mod 头部的设置块结构
-├── _logfmt.py                         审计宽格式日志调用点（编译器查不了宽格式，见 §3）
-├── _preview.py                        渲染 assets/panel-preview.png
-├── _extclient.py                      外部数据管道的冒烟客户端（Python）
-├── _extclient.ps1                     第二客户端（.NET）——**真机验证过的是这一个**
-├── _netease-bridge.ps1                示例发布器：网易云正在播放的曲名 + 当前歌词行
-├── _netease-position.ps1              位置助手（SMTC，必须由 Windows PowerShell 5.1 运行）
+├── 开发工具（不随 mod 交付）——**每个都有自己的 .md，讲怎么跑/要什么/输出什么/坑在哪**
+├── build.ps1                  + build.md
+├── test-layout.cpp            + test-layout.md
+├── test-gdiplus-scale.cpp     + test-gdiplus-scale.md
+├── _settings.py               + _settings.md
+├── _logfmt.py                 + _logfmt.md
+├── _deadcode.py               + _deadcode.md
+├── _preview.py                + _preview.md
+├── _extclient.py              + _extclient.md
+├── _extclient.ps1             + _extclient.md（与上面同一个文件：两个客户端一起讲）
+├── _netease-bridge.ps1        + _netease-bridge.md
+├── _netease-position.ps1      + _netease-position.md
+├── _netease-lyric-scan.ps1    + _netease-lyric-scan.md
+├── _netease-lyric-probe.ps1   + _netease-lyric-probe.md
 └── assets/panel-preview.png           版面预览（README 引用）
 ```
+
+分工：**README 讲用户怎么用**，**脚本的 `.md` 讲这个脚本怎么跑**，**AGENTS（本文）讲实现、
+不变量与踩过的坑**。同一个事实不要在三处各写一遍——写在你改代码时需要看到的那一处。
 
 `test-layout.cpp` 与 `test-gdiplus-scale.cpp` 是**开发工具**，不随 mod 交付。
 `_settings.py` 需要 Pillow 与 Python；`_logfmt.py` 只需要 Python。
@@ -67,7 +76,7 @@ endfield-info-windhawk/
   `// ==WindhawkModSettings==` 块里的静态 YAML。字体、图标路径这类只能手输 + 校验。
 
 **约束**：不使用 `new` / `delete` / `std::*` / 异常。原因是**体积**
-（去掉堆分配后 DLL 约 176 KB，2026-10-14 实测 180736 B；静态链接 libc++ 会涨到约 590 KB），
+（去掉堆分配后 DLL 约 178 KB，2026-10-14 实测 182272 B；静态链接 libc++ 会涨到约 590 KB），
 **不是**因为运行时不可用——Windhawk 会自带并注入 `libc++.whl`，堆分配其实能用。
 早先 AGENTS 里"堆分配不可用"的说法是错的，已更正。
 
@@ -84,14 +93,17 @@ pwsh -File build.ps1
 脚本读取 Windhawk 自己的 `compile_flags.txt`，用它的 clang 20 工具链（MinGW x86_64 +
 libc++）编译，并打印导出符号表。
 
-**允许出现的两个警告**：
+**允许出现的唯一警告**：
 
 1. `winsock2.h:15:2: warning: Please include winsock2.h before windows.h` —
    **无法消除**：Windhawk 用 `-include windhawk_api.h` 强制先包含 `windows.h`，
    而该文件第一行就是 `#include <windows.h>`。这是头顺序问题，不是代码问题。
-2. `unused function 'ApplyPanelTransform'` — 已知残留：该函数在主 mod 中未被调用，
-   只服务于回归测试。可以消除（加 `__attribute__((unused))` 或挪进测试文件），
-   见 §10。
+
+> 2026-10-14 之前还有第二条（`unused function 'ApplyPanelTransform'`）。它不是"可以消除的噪声"，
+> 而是**为测试而存在的产品函数**：主 mod 里没人调用它，只有 `test-layout.cpp` 调。
+> 现已删除，断言改成直接打在产品**真正交给 GDI+ 的字段**上（`ComputePanelTransform` 的
+> `active` / `scale` / `dx` / `dy`，以及"面板中心是不动点"这个由两个函数共同保证的关系）。
+> **"只有测试在用"就是死代码**——它会让下一个人以为产品里有这么一条路径。见 §7.7。
 
 **如果出现别的警告，要处理掉。**
 
@@ -173,7 +185,33 @@ $wc = 'D:\Program Files\Windhawk\Compiler'
 > （`swprintf(b,0,L"%s",1)` 无任何诊断，所以 mod 自己的缓冲格式化同样无人检查）。
 > 那次实测还证明：同一文件里 `printf` 的两处错型各报 1 条，而自造桩的错型 **0 条**。
 > **替代检查**：`python _logfmt.py`（105 个调用点/元数 + 可判定的错型；负对照实测会红）。
-> 宿主自己那 15 条 `%08X` 收 `DWORD` 的警告是它自己的窄 printf，与 mod 无关。
+> 宿主**自己的** printf 现在也是干净的：那 15 条 `%08X` 收 `DWORD` 的警告（它在 MinGW 上是
+> `unsigned long`）已经改成 `%08lX`，所以宿主可以在 `-Wformat=2` 下零警告编译——多一条守得住的线。
+
+### 死代码检查（改过结构体或脚本就跑）
+
+```powershell
+python _deadcode.py
+```
+
+编译器只管**符号**（`-Wunused-function` / `-Wunused-variable` / `-Wunused-macros` 都在 build.ps1 里，
+mod 现在只剩 1 条已知警告）。它管不了的三类是：
+
+- **只写不读的结构体字段**（每帧算一遍然后扔掉的量、重构留下的字段），以及**完全没被碰过**的字段；
+- **`#if 0`**；
+- **注释掉的代码**（要求注释以 `;` / `{` / `}` 结尾，否则散文会被误报）；
+- **脚本里定义了却没人引用的函数**（PowerShell / Python 都没有编译器看它们）。
+
+三条刻意的限制，否则一次"干净"没有意义：读计数**跨所有 C++ 文件**（宿主 `#include` 了 mod，
+会读 mod 只写的字段——按单文件扫会误报 `DownscalePlan.steps`）；**先剥注释再统计**（只在注释里
+出现的字段等于没人用）；少量**豁免清单**（`EXTERNAL_READERS` / `EXTERNAL_STRUCTS`）覆盖
+"由 Windows / GDI+ 读，不是由我们读"的结构体镜像，另有"体里有 `{` 的结构体跳过"这条
+（成员函数里的字段可以不带 `this->` 引用，文本扫描看不见）。
+
+2026-10-14 第一次跑就是它找出我们自己的 5 处：`Values.valid`、`IntroFrame.rippleRise`、
+`ExtProvider.lastSeenAt`、`IconGeometry.ringInner`（都只写不读），以及随之失去唯一调用者的
+`Segment` / `EaseSmooth` / `kRippleOffsetY`（这几处编译器也报了）。**每次的判据都一样：
+先看它报什么，再决定是删还是加豁免——豁免要写理由。**
 
 **宿主原理**：`test-layout.cpp` 把 Windhawk API（`Wh_GetIntSetting` / `Wh_GetStringSetting` /
 `Wh_Log` / `Wh_SetFunctionHook`）打桩，然后 `#include "endfield-info-windhawk.wh.cpp"`。
@@ -244,12 +282,14 @@ python _preview.py
 都抽成一个不依赖 GDI+ 状态的纯函数，然后由回归测试直接调用。已有：
 
 `ComputeRowTextMetrics` · `ComputeRowVariables` · `ResolveRingColor` ·
-`ComputePanelTransform` · `ApplyPanelTransform` · `IconPlateDiameter` ·
+`ComputePanelTransform` · `IconPlateDiameter` ·
 `IconPlateCenterForRow` · `ComputeIconGeometry` · `RingRadiusAt` ·
 `PlanDownscale` · `CopyUserPath` · `ResolveIconStyle` / `ResolveIconPath` ·
+`ComputeIconImageDrawSize` · `LayoutWidthFloor` · `PdhValueUsable` ·
 `EvaluateIntro` · `FitCharacterCount` / `FitCharsWithEllipsis`（测量以函数指针注入） ·
 `ExtParseLine` · `ExtSanitize` · `ExtParseNumber` · `ExtLookup` · `ExtNextDeadline` ·
-`ExtEvictIndex` · `ExtProviderAllowed`
+`ExtEvictIndex` · `ExtProviderAllowed` · `IslandEnqueue` / `StepIsland` / `IslandHitTest` /
+`IslandClickActionFor` · `Select-StoreLineIndex` / `Select-SongTitle` / `Get-LeadMs`（脚本侧）
 
 **新增绘制逻辑时照此办理。** 如果一段逻辑无法在测试里调用，它就无法被守住。
 反过来，**测试不应该自己复刻一份产品逻辑**（复刻出来的那份测不到产品）；
@@ -556,9 +596,12 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
    GDI+ 管线、测四种 PNG 编码……最后一行日志显示
    `could not load ""C:\...\image.png""` ——**是路径里的引号**。
    一行日志能省掉全部弯路。
-2. **`ApplyPanelTransform` / 变换类断言要避开不动点。** 我第一版断言比较的是
+2. **变换类断言要避开不动点。** 我第一版断言比较的是
    缩放变换的**不动点**（面板中心），映射前后必然相同，断言恒真、什么也证明不了。
-   要用**偏离中心的点**，并给出"错误做法"的对照数值。
+   要用**偏离中心的点**，并给出"错误做法"的对照数值。现在的写法是断言产品**交给 GDI+ 的字段**：
+   `active` / `scale` / `dx = (1-scale)*W/2`，以及"面板中心在映射下不动"这条把
+   `ComputePanelTransform` 与"GDI+ 怎么映射一个点"绑在一起的关系——它仍然会红
+   （`dx` 少一个 `/2`，或符号反了，都会被它抓住），但不再依赖一个只有测试在用的函数。
 3. **PARGB 下透明像素的 RGB 是 0。** 因此"彩色图案偏淡"与"整片纯白"在浅色盘上
    肉眼无法区分。要区分就必须**测量像素**（`GdipBitmapGetPixel` 采样）。
 4. **测试脚本要防旧产物。** 编译失败时若仍执行上一次的 exe，会得出"改了没效果"的
@@ -569,6 +612,11 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
    而非硬编码 600ms，这样改默认时长后断言依然成立。
 7. **删掉"为文档而存在但未使用"的声明。** 曾声明一组设计令牌常量却全部未使用，
    编译器报 9 个 `unused-variable`。能用的接进渲染路径，不能用的写进注释。
+   **同样适用于"只有测试在用"的函数**：`ApplyPanelTransform` 在主 mod 里没有调用者，
+   只为让宿主能断言变换而存在——它让下一个人以为产品里有这条路径。删掉之后，
+   断言改打在产品真正交给 GDI+ 的字段上（见 §3 的方框），mod 的已知警告从 2 条降到 1 条。
+   **字段级的同类问题编译器看不见**（只写不读、从没被碰过），那是 `python _deadcode.py`
+   的活；2026-10-14 它一次找出 5 处，其中 4 处是纯粹的"算完就扔"。
 8. **断言必须打在"产品代码"上，不是打在测试自己复刻的那份上。** 修"第一行不在一条直线"
    时，我第一版断言在测试里自己调 `CreateStringFormat(kStringFormatNoWrap, …)` 建格式，
    于是把 mod 的 flag 改回 `0` 做负对照时，测试**照样全绿**——它测的是自己。
@@ -706,6 +754,19 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 3. 改实现，跑到 `PASSED (0 failure(s))`。
 4. 同步 `_preview.py`（若涉及版面）。
 5. 若偏离了原项目，把偏离与理由写进注释。
+
+### 收尾检查（任何改动之后）
+
+改完跑这三条，它们各自守一类编译器看不见的东西：
+
+```powershell
+python _settings.py     # 设置块结构（改了设置项就必须跑）
+python _logfmt.py       # 宽格式日志的元数与错型（编译器一条都查不了）
+python _deadcode.py     # 死代码：只写不读的字段、#if 0、注释掉的代码、脚本死函数
+```
+
+**改了结构体字段尤其要跑第三条**：删掉一个字段的写者之后，它可能变成"从没被碰过"，
+而那正是它该被删掉的证据（`Values.valid` 就是这么走完最后一步的）。
 
 ### 报告与调试
 
