@@ -10,6 +10,12 @@ Geometry follows the mod's defaults, so the image and the C++ layout agree:
 
 The backdrop is a checkerboard so the panel's alpha is visible.
 
+**Rows 1-3 are the shipped default rows** (Row1/Row2/Row3 of the settings block),
+with their tokens expanded for one sample (see SAMPLE). Row 4 is an *extra* syntax
+sample, outside the defaults: it shows a `[[icon:file=...]]` image icon (drawn as
+the fallback glyph, because the preview loads no files) and a right-parked gauge.
+`_preview.md` says which is which, and so does the README's caption.
+
 Rows carry real markup -- `[[icon:...]]` tags, the same syntax the mod reads -- and
 `parse_row()` walks it the way `CompileRowText` + `BuildRowPlan` do: every element
 occupies a box, and the ones after it start where it ended. What the preview does
@@ -31,15 +37,31 @@ RING_SIZE = 26
 RING_THICK = 4
 RING_RIGHT_OFFSET = 12
 
-# Row text with its [[icon:...]] tags, [(fraction, colour), ...] and inline?
-# inline=True means the gauge was written after some text, so it flows with the
-# line; inline=False parks the gauges together at the right edge.
+# What the default rows' {tokens} are expanded to in this picture. One sample is
+# unavoidable -- the preview draws pixels, not templates -- so it is written down
+# here instead of being invented silently.
+SAMPLE = "cpu 12%, mem 73%, gpu 9%, gpu.temp 42C, net.down 1.23 MB/s, net.up 128 KB/s"
+
+# (text with its [[icon:...]] tags and its tokens expanded, [(fraction, colour), ...], inline?)
+# inline=True means the gauge was written after some text, so it flows with the line;
+# inline=False parks the gauges together at the right edge.
+#
+# Rows 1-3 mirror the settings block's Row1 / Row2 / Row3 defaults one for one:
+#   [[icon:CPU]]{cpu|0|w3}%  CPU   {mem|0|w3}%  RAM   [[ring:{mem}]]
+#   [[icon:Memory]]GPU {gpu|0|w3}%  {gpu.temp|0|w3}C   NET {net.down}
+#   [[icon:Network]]NET  {net.down}   UP  {net.up}
+# `|w3` right-aligns the number in three characters, which is why the expanded
+# numbers below carry a leading space.
 ROWS = [
-    ("[[icon:Memory]]CPU  12%   MEM  73%  ", [], False),
-    ("[[icon:CPU]]GPU  9%  ", [(0.09, (0xC6, 0xCA, 0x4C))], True),
-    ("[[icon:Disk]]DISK C:  68%   FAN", [(0.68, (0xC6, 0xCA, 0x4C)),
-                                          (0.41, (0x6F, 0xB3, 0xE0))], False),
+    ("[[icon:CPU]] 12%  CPU    73%  RAM   ", [(0.73, (0xC6, 0xCA, 0x4C))], True),
+    ("[[icon:Memory]]GPU   9%   42C   NET 1.23 MB/s", [], False),
+    ("[[icon:Network]]NET  1.23 MB/s   UP  128 KB/s", [], False),
+    # Extra syntax sample (NOT one of the shipped defaults): an image icon, whose file the
+    # preview does not load, plus a right-parked gauge.
+    ("[[icon:file=C:\\pics\\ssd.png]]DISK C:  68%   FAN",
+     [(0.68, (0xC6, 0xCA, 0x4C)), (0.41, (0x6F, 0xB3, 0xE0))], False),
 ]
+DEFAULT_ROWS = 3   # ROWS[:DEFAULT_ROWS] are the shipped defaults; the rest are samples
 
 COL_BG = (0x31, 0x2F, 0x30, 0xE6)
 COL_BORDER = (0xC6, 0xCA, 0x4C, 0xFF)
@@ -250,3 +272,5 @@ canvas.convert("RGB").save(out_path)
 print(f"wrote {out_path}  {W}x{H}  ({len(ROWS)} rows, "
       f"{sum(len(r[1]) for r in ROWS)} rings, "
       f"{sum(1 for r in ROWS for k, _ in parse_row(r[0]) if k == 'icon')} icons)")
+print(f"  rows 1-{DEFAULT_ROWS} = the shipped default rows (tokens expanded: {SAMPLE})")
+print(f"  rows {DEFAULT_ROWS + 1}-{len(ROWS)} = extra syntax sample(s), not in the defaults")

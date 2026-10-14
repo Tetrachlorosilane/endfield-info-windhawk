@@ -10,7 +10,22 @@ python _preview.py
 ```
 
 没有参数。输出固定写到脚本同目录的 `assets\panel-preview.png`（会覆盖旧图）。
-版面数据是写死的：三行 `ROWS`，每行给「**带 `[[icon:…]]` 标签的原文** + [(比例, 颜色)] + 是否内联」。
+版面数据是写死的：`ROWS`，每行给「**带 `[[icon:…]]` 标签的（已展开 token 的）文本**
++ [(比例, 颜色)] + 是否内联」。
+
+## 哪几行是默认配置，哪几行是额外示例
+
+**`ROWS[:DEFAULT_ROWS]`（前三行）就是设置块里 `Row1`/`Row2`/`Row3` 的出厂默认行**，
+只是把 `{变量}` 按 `SAMPLE` 那组值展开成像素（预览画不了模板）。所以图的前三行
+= 默认面板：默认行高 30 px，`PanelRowsHeight` 就是 3 × 30 = **90 px**，与预览图的高度一致
+（`kPanelTopOffset` / `kTabHeight` 不进面板高度，它们是窗口位置与收起态的事）。
+
+`ROWS[DEFAULT_ROWS:]`（第 4 行）是**额外**的语法示例，不在默认配置里：
+`[[icon:file=…]]` 图片图标（预览不载文件，画的是回退字形）加一个**右停靠**的环。
+脚本每次跑都会把这两组打印出来（`rows 1-3 = the shipped default rows …` /
+`rows 4-4 = extra syntax sample(s) …`），README 的图注里也写着，别让读者以为默认有四行。
+
+改默认行时**两边都要改**：设置块里的 `Row1..Row3` 与这里的 `ROWS[:DEFAULT_ROWS]`。
 
 ## 需要什么
 

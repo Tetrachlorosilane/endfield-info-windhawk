@@ -89,6 +89,9 @@ icon, and text before and after it flows around it. By default the **first**
 icon in a row plays the intro ripples; `[[icon:Memory:ripple]]` and
 `[[icon:Memory:noripple]]` override that per icon.
 
+The three shipped rows each start with one (`CPU`, `Memory`, `Network`), which is
+also the shortest way to see how a name is written. Erase the tag to lose the icon.
+
 ## Rings, icons and themes
 
 * Ring gauges are drawn where you write them: right-docked by default, or inline
@@ -156,13 +159,13 @@ deliberate trade for accuracy, and it only happens when you asked for it.
 
 // ==WindhawkModSettings==
 /*
-- Row1: "{cpu|0|w3}%  CPU   {mem|0|w3}%  RAM   [[ring:{mem}]]"
+- Row1: "[[icon:CPU]]{cpu|0|w3}%  CPU   {mem|0|w3}%  RAM   [[ring:{mem}]]"
   $name: 'Row 1'
-  $description: 'Text with {variable} tokens. Format specs chain with a bar: {cpu|2} decimals, |w4 pad to 4, |pad0 pad with zeros. [[ring:VALUE:MAX:THICK:COLOR]] draws a gauge, and one placed after text sits inline.'
-- Row2: "GPU {gpu|0|w3}%  {gpu.temp|0|w3}C   NET {net.down}"
+  $description: 'Text with {variable} tokens, and an optional leading [[icon:NAME]] (CPU / Memory / RAM / Disk / Network / Net / GPU). Format specs chain with a bar: {cpu|2} decimals, |w4 pad to 4, |pad0 pad with zeros. [[ring:VALUE:MAX:THICK:COLOR]] draws a gauge, and one placed after text sits inline.'
+- Row2: "[[icon:Memory]]GPU {gpu|0|w3}%  {gpu.temp|0|w3}C   NET {net.down}"
   $name: 'Row 2'
   $description: 'Same syntax as row 1. Speed and byte totals are pre-formatted, so only the digit spec applies to them.'
-- Row3: ""
+- Row3: "[[icon:Network]]NET  {net.down}   UP  {net.up}"
   $name: 'Row 3'
   $description: 'Same syntax as row 1.'
 - Row4: ""
@@ -6137,11 +6140,14 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
         }
         const float budget = LayoutWidthFloor(limit);
 
-        // The run's own width is what an inline gauge is placed after (including the spaces
-        // written before it); a parked run is drawn in its whole budget instead.
-        float advance = inlineFlow ? MeasureAdvance(graphics, runFont, format, entry.slice,
-                                                    rowHeight)
-                                   : budget;
+        // The run's own width, in pixels: what the next element -- gauge, icon or another run
+        // of text -- is placed after. It is measured for every run, parked or not, because a
+        // parked row is a flow too: only its *gauges* are parked at the right edge. Keeping the
+        // whole budget as a parked run's advance (what this did at first) made the second text
+        // run of `[[ring:x]] A[[font:...]]B` start a full text width further right, i.e. with
+        // its box hanging under the parked gauge; the pre-inline-icon code had the opposite
+        // failure, starting it back at the row's inset on top of the first run.
+        float advance = MeasureAdvance(graphics, runFont, format, entry.slice, rowHeight);
         entry.fitted = FitTextToWidth(graphics, runFont, format, entry.slice,
                                       (int)(sizeof(entry.slice) / sizeof(entry.slice[0])), budget,
                                       rowHeight);
@@ -6150,9 +6156,13 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
         }
         entry.x = cursor;
         entry.advance = advance;
-        entry.boxWidth = LayoutWidthFloor(advance);
-        // Every run leaves the cursor where it ended, parked or not: a row is a flow, and
-        // the runs that follow it -- including an icon -- start where this one stopped.
+        // The box a *parked* run is drawn in is still the rest of the row's text column: the
+        // format is left-aligned, so a wider box draws the same glyphs in the same place, and
+        // the parked path has always sized its box that way. An inline run's box is its own
+        // width, which is what the gauges after it are placed against.
+        entry.boxWidth = inlineFlow ? LayoutWidthFloor(advance) : budget;
+        // Every run leaves the cursor where it ended, parked or not: the runs that follow it
+        // start where this one stopped.
         cursor += advance;
     }
 }

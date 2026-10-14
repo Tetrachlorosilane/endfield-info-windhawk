@@ -2743,6 +2743,15 @@ int main() {
                             s.rowMaxFontSize[0] = rowMaxFont;
                             wcsncpy(s.rows[0], rowText, kRowTextCap - 1);
                             s.rows[0][kRowTextCap - 1] = L'\0';
+                            // One registered chain, so a row below can use [[font:...]] and be
+                            // split into two text runs without consulting the installed fonts
+                            // (CompileRowText only looks a chain up, it never re-validates a
+                            // family name). It changes nothing for rows that have no font tag:
+                            // the cost gate (RowNeedsFontPath) is still closed here.
+                            wcscpy(s.tagFonts[0].key, L"Segoe UI");
+                            wcscpy(s.tagFonts[0].chain.names[0], L"Segoe UI");
+                            s.tagFonts[0].chain.count = 1;
+                            s.tagFontCount = 1;
                             // Compiled into the *same* settings object that is published, which
                             // is what ReadSettings does and what the icon marker's payload
                             // (an element index) depends on.
@@ -2895,6 +2904,62 @@ int main() {
                             Check(!anyIcon, "a row with no tag has no icon element in its plan");
                             Check(plan->segments[0].x == kRowTextLeftInset,
                                   "and its text starts at the row's padding, not after a plate");
+                        }
+
+                        // A **parked** row is still a flow. The gauges are parked at the right
+                        // edge (the tag was written before any text), but the runs of text in it
+                        // are placed one after another, and each run's advance is its own
+                        // measured width -- not the whole text budget. Two ways of getting that
+                        // wrong have both been seen: advancing the cursor only for inline rows
+                        // (`[[ring:x]] A[[font:…]]B` drew "B" back at the row's inset, on top of
+                        // "A"), and advancing a parked run by its whole budget (which pushed "B"
+                        // under the parked gauge, past the right edge of the text column). The
+                        // parked text column is [inset, textRight], and the gauges live to the
+                        // right of textRight, so all three relations are asserted.
+                        {
+                            const RowLayoutPlan *plan = ensureIconPlan(
+                                L"[[ring:40]] A[[font:Segoe UI]]B", 0);
+                            const RowSegmentPlan &ring = plan->segments[0];
+                            const RowSegmentPlan &first = plan->segments[1];
+                            const RowSegmentPlan &second = plan->segments[2];
+                            // From the product, not re-derived here: the right edge the parked
+                            // path reserved for text on this row.
+                            const float textRight =
+                                ComputeRowTextMetrics(planWidth2, 1, g_settings.ringSize,
+                                                      g_settings.ringRightOffset, false)
+                                    .textRight;
+                            printf("    parked: segs=%d  x0=%.1f adv0=%.1f box0=%.1f  x1=%.1f "
+                                   "box1=%.1f  (inset %.1f, textRight %.1f)  ring=%.1f\n",
+                                   plan->segmentCount, (double)first.x, (double)first.advance,
+                                   (double)first.boxWidth, (double)second.x,
+                                   (double)second.boxWidth, (double)kRowTextLeftInset,
+                                   (double)textRight, (double)ring.x);
+                            Check(plan->segmentCount == 3,
+                                  "a parked row with a font tag is one gauge and two text runs");
+                            Check(ring.isRing && !first.isIcon && !second.isIcon,
+                                  "and only the gauge is an element");
+                            Check(!g_rowState.inlineRing[0],
+                                  "the row really is parked (the gauge precedes the text)");
+                            Check(first.x == kRowTextLeftInset,
+                                  "the first run starts at the row's padding");
+                            Check(first.advance > 0.0f, "and it has a real width");
+                            Check(first.advance < first.boxWidth,
+                                  "a parked run's advance is its own width, not its whole budget");
+                            Check(second.x >= first.x + first.advance,
+                                  "the second run starts after the first one, not back at the "
+                                  "row's inset");
+                            Check(second.x != kRowTextLeftInset,
+                                  "so a parked row's runs do not pile up on the left edge");
+                            Check(second.x > first.x,
+                                  "and the row's runs advance left to right");
+                            Check(second.x + second.boxWidth <= textRight + 0.5f,
+                                  "and the runs' boxes stay inside the column reserved for the "
+                                  "text, so nothing lands under the parked gauge");
+                            // The parked gauge is placed from the right edge, so it has to stay
+                            // clear of the text column.
+                            const float ringLeftEdge = ring.x - (float)g_settings.ringSize / 2.0f;
+                            Check(ringLeftEdge >= textRight - 0.5f,
+                                  "the parked gauge sits at or past the text column's right edge");
                         }
 
                         g_settings = savedSettings;
