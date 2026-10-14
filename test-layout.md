@@ -14,8 +14,6 @@ $wc = 'D:\Program Files\Windhawk\Compiler'
 & "$env:TEMP\layouttest.exe"
 ```
 
-产物名由调用方决定（头注释里写的是 `_layouttest.exe`）。
-
 ## 需要什么
 
 Windhawk 的 clang++ 与 Windows，不需要管理员权限。最后一段会真启动 GDI+

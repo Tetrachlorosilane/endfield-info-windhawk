@@ -5,23 +5,19 @@
 
 ## 怎么跑
 
-PowerShell（**真机验证过的是这一个**）：
+PowerShell（**真机验证过的是这一个**）与 Python 版（参数同义：`--provider` / `--key` / `--ttl`，
+`-` 用设置里的值、`0` 表示删除，另有 `--event` / `--raw` / `--quiet`）：
 
 ```powershell
 pwsh -ExecutionPolicy Bypass -File _extclient.ps1
 pwsh -ExecutionPolicy Bypass -File _extclient.ps1 -Key progress -Ttl 60000 -Text 0.42
 pwsh -ExecutionPolicy Bypass -File _extclient.ps1 -Raw 'GARBAGE'      # 看错误码
+python _extclient.py "Now Playing: Blue Hour"
+python _extclient.py --key progress --ttl 60000 0.42
 ```
 
 参数：`-Provider`（默认 `music`）、`-Key`（`title`）、`-Ttl`（`600000`，`[int]`）、`-Text`、`-Raw`、
 `-Event`、`-Severity`（`info` / `warn` / `critical`）；事件模式下 `-Text` 是卡片标题、`-Key` 不用。
-Python 版对应 `--provider` / `--key` / `--ttl`（`-` 用设置里的值，`0` 表示删除）/ `--event` /
-`--raw` / `--quiet`，位置参数是要发布的文本：
-
-```powershell
-python _extclient.py "Now Playing: Blue Hour"
-python _extclient.py --key progress --ttl 60000 0.42
-```
 
 ## 需要什么
 
@@ -41,9 +37,9 @@ python _extclient.py --key progress --ttl 60000 0.42
 ## 坑
 
 - **"打不开管道"和"DACL 不让这个用户连"从客户端看是同一个现象。** Python 版在 `PermissionError` 时把
-  两句都写出来：可能是沙箱禁止任何管道客户端（DSH 受限模式连"完全不给安全描述符"的对照管道都拒），
-  也可能真是 DACL。**判别要用 mod 的日志**：`EXT: pipe DACL grants SYSTEM, Administrators and <sid>`，
-  拿那个 SID 和 `whoami /user` 比对；沙箱场景换普通终端再跑。
+  两句都写出来：可能是沙箱禁止任何管道客户端（受限模式连没有安全描述符的对照管道都拒），也可能真是
+  DACL。**判别要用 mod 的日志**：`EXT: pipe DACL grants SYSTEM, Administrators and <sid>`，拿那个
+  SID 和 `whoami /user` 比对；沙箱场景换普通终端再跑。
 - PowerShell 版每行一次 `WriteLine`（协议是 message 模式），写完 `Start-Sleep -Milliseconds 300` 再
   关闭——这点等待留给服务端把收到的内容写进日志；Python 版把回复放在线程里读、用 `os.write` 直接写
   原始 fd，所以不读也不会卡住，而那个字节数正是区分"客户端没写"和"传输丢了"的证据。
