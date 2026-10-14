@@ -953,6 +953,54 @@ int main() {
         Check(LayoutWidthFloor(120.0f) == 120.0f, "a usable width is left alone");
         Check(LayoutWidthFloor(kMinLayoutWidth) == kMinLayoutWidth,
               "the floor itself passes through unchanged");
+
+        // The PDH rule the CPU path and the GPU array readers now share. Accepting only
+        // ERROR_SUCCESS (as the GPU readers did) drops a counter that has just been
+        // created: its first sample is NEW_DATA, not VALID_DATA.
+        Check(PdhValueUsable(PDH_CSTATUS_VALID_DATA), "a PDH value with valid data is used");
+        Check(PdhValueUsable(PDH_CSTATUS_NEW_DATA),
+              "and so is a counter's first sample (new data)");
+        Check(!PdhValueUsable((PDH_STATUS)0x800007D2), "more-data is not a value");
+        Check(!PdhValueUsable((PDH_STATUS)0xC0000BBA), "an invalid-data status is rejected");
+        Check(!PdhValueUsable((PDH_STATUS)0xC0000BC6), "and so is a missing instance");
+    }
+
+    printf("\n=== icon image size follows the intro scale ===\n");
+    {
+        // A cached image is already exactly plate-sized, so the old branch (which only
+        // applied the intro scale to images *larger* than the plate) never scaled it: a
+        // custom icon faded in while its plate grew.
+        float w = 0.0f, h = 0.0f;
+        const float plateRadius = 11.5f;     // a 23 px plate, the default font's size
+        ComputeIconImageDrawSize(23, 23, plateRadius, 1.0f, &w, &h);
+        Check(w == 23.0f && h == 23.0f, "a plate-sized image draws at plate size");
+        ComputeIconImageDrawSize(23, 23, plateRadius, 0.5f, &w, &h);
+        Check(w == 11.5f && h == 11.5f, "and follows the intro as it scales the plate in");
+        ComputeIconImageDrawSize(23, 23, plateRadius, 0.0f, &w, &h);
+        Check(w == 0.0f && h == 0.0f, "at zero scale it draws at zero size");
+
+        // A source larger than the plate is capped by the plate, keeping its aspect, and
+        // the animation multiplies that cap.
+        ComputeIconImageDrawSize(400, 200, plateRadius, 1.0f, &w, &h);
+        Check(w == 23.0f && h == 11.5f, "a large source is capped at the plate, aspect kept");
+        ComputeIconImageDrawSize(400, 200, plateRadius, 0.25f, &w, &h);
+        Check(w == 5.75f && h == 2.875f, "and the intro scales the capped size too");
+
+        // Smaller than the plate: never upsampled to fill it, but the animation still
+        // shrinks it -- the cap is a ceiling, not a fixed size.
+        ComputeIconImageDrawSize(10, 10, plateRadius, 1.0f, &w, &h);
+        Check(w == 10.0f && h == 10.0f, "a source smaller than the plate is not blown up");
+        ComputeIconImageDrawSize(10, 10, plateRadius, 0.5f, &w, &h);
+        Check(w == 5.0f && h == 5.0f, "while the intro still scales it down");
+
+        // The sampler join decides whether the values lock may be deleted. Only a real
+        // join counts: deleting a critical section a live thread can still be inside is
+        // undefined behaviour, which is exactly what the ignored timeout did.
+        Check(ValuesLockCanBeReleased(WAIT_OBJECT_0),
+              "the values lock is released once the sampler is joined");
+        Check(!ValuesLockCanBeReleased(WAIT_TIMEOUT),
+              "a sampler that did not stop leaves its lock alone");
+        Check(!ValuesLockCanBeReleased(WAIT_FAILED), "and so does a failed wait");
     }
 
     printf("\n=== ComputeRowTextMetrics ===\n");
@@ -1272,6 +1320,61 @@ int main() {
                                bare, padded);
                         Check(padded > bare + 1.0f,
                               "trailing spaces advance the run (that is what the sentinel buys)");
+                    }
+
+                    // The ellipsis width used to be cached "once per process" on the claim
+                    // that the font never changes. The painter rebuilds the font from the
+                    // settings on every frame, so after a font-size change the cache held
+                    // the old width and a trimmed run could overshoot its budget by the
+                    // difference -- but only for the budgets where the kept prefix happens
+                    // to fill the (underestimated) reservation, which is why this sweeps
+                    // budgets instead of testing one. The small-font primer is what fills
+                    // the old cache; it is the point of the check, not decoration.
+                    {
+                        GpFont *bigFont = nullptr;
+                        if (family) g_gdiplus.CreateFont(family, 24.0f, 0, 0, &bigFont);
+                        if (bigFont) {
+                            WCHAR primer[640];
+                            wcsncpy(primer, L"Memory utilization is climbing steadily", 639);
+                            primer[639] = L'\0';
+                            const bool primerTrimmed =
+                                FitTextToWidth(graphics, font, format, primer,
+                                               sizeof(primer) / sizeof(primer[0]), 90.0f,
+                                               boxHeight);
+
+                            float worstOver = 0.0f, worstBudget = 0.0f;
+                            int trimmedCount = 0;
+                            for (int budget = 40; budget <= 200; budget++) {
+                                WCHAR run[640];
+                                wcsncpy(run, L"Memory utilization is climbing steadily", 639);
+                                run[639] = L'\0';
+                                if (FitTextToWidth(graphics, bigFont, format, run,
+                                                   sizeof(run) / sizeof(run[0]),
+                                                   (float)budget, boxHeight)) {
+                                    trimmedCount++;
+                                }
+                                const float drawn =
+                                    MeasureAdvance(graphics, bigFont, format, run, boxHeight);
+                                const float over = drawn - ((float)budget + 0.6f);
+                                if (over > worstOver) {
+                                    worstOver = over;
+                                    worstBudget = (float)budget;
+                                }
+                            }
+                            printf("  primer(15 px) trimmed=%d; 24 px font over %d budgets "
+                                   "(40..200): %d trimmed, worst overshoot %.1f px at %.0f\n",
+                                   primerTrimmed ? 1 : 0, 161, trimmedCount, worstOver,
+                                   worstBudget);
+                            Check(primerTrimmed,
+                                  "the small font trims too (this is what primes the cache)");
+                            Check(worstOver <= 0.0f,
+                                  "a trimmed run fits its budget under any second font size");
+                            Check(trimmedCount > 100,
+                                  "and it really is being trimmed at most of those budgets");
+                            g_gdiplus.DeleteFont(bigFont);
+                        } else {
+                            Skip("a second font size can be created (ellipsis cache check)");
+                        }
                     }
                     if (!allInsideBudget)
                         printf("  worst overflow = %.1f px\n", worstOverflow);

@@ -345,6 +345,15 @@ static const INT kPixelFormat32bppPARGB = 0x000E200B;
 #define PDH_CSTATUS_NEW_DATA ((PDH_STATUS)0x00000001L)
 #endif
 
+// A formatted PDH counter value is usable when its status says either "valid data" or
+// "new data". The CPU clock path accepted both; the GPU array readers accepted only
+// ERROR_SUCCESS (the value of VALID_DATA) and therefore threw away counters that had just
+// been created -- the first sample after PdhAddCounter reports NEW_DATA. One rule, asked
+// by all of them.
+static bool PdhValueUsable(PDH_STATUS status) {
+    return status == PDH_CSTATUS_VALID_DATA || status == PDH_CSTATUS_NEW_DATA;
+}
+
 // ---------------------------------------------------------------------------
 // Small helpers. min/max macros are an MSVC convenience that this toolchain does
 // not provide, so they are spelled out here.
@@ -1595,6 +1604,9 @@ struct Values {
 };
 
 static CRITICAL_SECTION g_valuesLock;       // guards g_rowState and g_publishedRows
+// Cleared when the sampler could not be joined at unload, in which case the lock is left
+// to the process exit instead of being deleted under a thread that may still hold it.
+static bool g_valuesLockUsable = true;
 static Values g_values;                     // published snapshot
 static unsigned g_activeGroups = 0;
 
@@ -2465,7 +2477,7 @@ static bool CpuClockRead(double baseGhz, double *outGhz) {
         CpuClockLog(L"PdhGetFormattedCounterValue failed status=0x%08X", (unsigned)status);
         return false;
     }
-    if (value.CStatus != PDH_CSTATUS_VALID_DATA && value.CStatus != PDH_CSTATUS_NEW_DATA) {
+    if (!PdhValueUsable(value.CStatus)) {
         CpuClockLog(L"counter status=0x%08X is not valid data", (unsigned)value.CStatus);
         return false;
     }
@@ -2814,7 +2826,7 @@ static double PdhReadMaxEngine(PDH_HQUERY query, PDH_HCOUNTER counter) {
                                      (PPDH_FMT_COUNTERVALUE_ITEM_W)buffer) == ERROR_SUCCESS) {
         auto *items = (PPDH_FMT_COUNTERVALUE_ITEM_W)buffer;
         for (DWORD i = 0; i < itemCount; i++) {
-            if (items[i].FmtValue.CStatus != ERROR_SUCCESS) continue;
+            if (!PdhValueUsable(items[i].FmtValue.CStatus)) continue;
             double value = items[i].FmtValue.doubleValue;
             if (value > best) best = value;
         }
@@ -2877,7 +2889,7 @@ void GpuBackend::Sample(Values &v) {
                             auto *items = (PPDH_FMT_COUNTERVALUE_ITEM_W)buffer;
                             ULONGLONG best = 0;
                             for (DWORD i = 0; i < itemCount; i++) {
-                                if (items[i].FmtValue.CStatus != ERROR_SUCCESS) continue;
+                                if (!PdhValueUsable(items[i].FmtValue.CStatus)) continue;
                                 ULONGLONG value = (ULONGLONG)items[i].FmtValue.largeValue;
                                 if (value > best) best = value;
                             }
@@ -3298,12 +3310,15 @@ static bool FitTextToWidth(GpGraphics *graphics, GpFont *font, GpStringFormat *f
     if (length <= 0) return false;
     if (MeasureAdvance(graphics, font, format, text, boxHeight) <= available) return false;
 
-    // Width of the ellipsis on its own, measured once per process. The font is fixed
-    // for the lifetime of the panel, so this cannot go stale.
-    static float ellipsisWidth = -1.0f;
-    if (ellipsisWidth < 0.0f) {
-        ellipsisWidth = MeasureAdvance(graphics, font, format, L"\x2026", boxHeight);
-    }
+    // Width of the ellipsis on its own.
+    //
+    // This used to be cached "once per process", on the claim that "the font is fixed for
+    // the lifetime of the panel". It is not: the painter rebuilds the font from the
+    // settings on every frame, so after a font-size change the cache still held the width
+    // for the *old* size and every trimmed run overshot its budget by the difference.
+    // Measuring it here costs one extra MeasureString next to the binary search below,
+    // which is not a price worth a stale global.
+    const float ellipsisWidth = MeasureAdvance(graphics, font, format, L"\x2026", boxHeight);
 
     // A lambda captures nothing it could pass as a C callback, so the measurement is
     // reached through a small context struct instead.
@@ -4316,6 +4331,28 @@ static float RingRadiusAt(const IconGeometry &geometry, int ringIndex, double pr
     return (float)Lerp(geometry.plateRadius, outer, progress);
 }
 
+// The size a cached icon image is drawn at.
+//
+// The intro scales the whole plate in, so the image has to follow it. It did not: the
+// scale was applied only inside the branch for images *larger* than the plate, and a
+// cached image is already exactly plate-sized, so a custom icon merely faded in while its
+// plate grew. The "never upsample past the natural size" rule caps the base size; the
+// animation multiplies that cap, it is not a second cap.
+static void ComputeIconImageDrawSize(int imageW, int imageH, float plateRadius,
+                                     float iconScale, float *outW, float *outH) {
+    float w = (float)imageW;
+    float h = (float)imageH;
+    const float cap = plateRadius * 2.0f;
+    if (w > cap && w > 0.0f) {
+        const float k = cap / w;
+        w = cap;
+        h *= k;
+    }
+    const float scale = iconScale > 0.0f ? iconScale : 0.0f;
+    if (outW) *outW = w * scale;
+    if (outH) *outH = h * scale;
+}
+
 // Draws one plate, at the centre and radius the shared geometry reports.
 static void PaintIconPlate(GpGraphics *graphics, const ModSettings &settings,
                            const IntroFrame &frame, int slot, const IconGeometry &geometry) {
@@ -4374,16 +4411,10 @@ static void PaintIconPlate(GpGraphics *graphics, const ModSettings &settings,
         if (g_gdiplus.GetImageWidth) g_gdiplus.GetImageWidth(image, &iw);
         if (g_gdiplus.GetImageHeight) g_gdiplus.GetImageHeight(image, &ih);
         if (iw > 0 && ih > 0) {
-            // Cached images are already at plate size, so `scale` carries only the
-            // intro animation. A source smaller than the plate is drawn at its own
-            // size rather than blown up, which is the "never upsample past natural
-            // size" rule.
-            float dw = (float)iw;
-            float dh = (float)ih;
-            if (dw > geometry.plateRadius * 2.0f * 1.01f) {
-                dw = geometry.plateRadius * 2.0f * scale;
-                dh = dw * (float)ih / (float)iw;
-            }
+            // Same size rule as the glyph path below: base size capped at the plate, then
+            // the intro's scale on top of it (see ComputeIconImageDrawSize).
+            float dw = 0.0f, dh = 0.0f;
+            ComputeIconImageDrawSize((int)iw, (int)ih, geometry.plateRadius, scale, &dw, &dh);
             g_gdiplus.DrawImageRect(graphics, image, centerX - dw / 2.0f,
                                     centerY - dh / 2.0f, dw, dh);
         }
@@ -7025,6 +7056,15 @@ void WhTool_ModSettingsChanged() {
            fresh.clickToggle ? L"toggle" : L"proximity");
 }
 
+// True when the values critical section may be deleted: only once the sampler thread is
+// really gone. The wait used to be fire-and-forget -- its result was thrown away and the
+// lock was deleted anyway, which is undefined behaviour (freeing a lock another thread can
+// still be inside) in exactly the case the wait exists to catch. This runs on the way out
+// of the process, so leaving the lock alone is the safe answer.
+static bool ValuesLockCanBeReleased(DWORD waitResult) {
+    return waitResult == WAIT_OBJECT_0;
+}
+
 void WhTool_ModUninit() {
     InterlockedExchange(&g_stopSampler, 1);
     // Stop the pipe server first: it writes the external value table and the
@@ -7033,9 +7073,14 @@ void WhTool_ModUninit() {
     // (docs/external-data-island-design.md 5.6.4).
     ExtStop();
     if (g_samplerThread) {
-        WaitForSingleObject(g_samplerThread, 2000);
+        const DWORD samplerWait = WaitForSingleObject(g_samplerThread, 2000);
         CloseHandle(g_samplerThread);
         g_samplerThread = nullptr;
+        if (!ValuesLockCanBeReleased(samplerWait)) {
+            Wh_Log(L"sampler thread did not stop within 2s (wait=%lu); leaving the values "
+                   L"lock to the process exit", (unsigned long)samplerWait);
+            g_valuesLockUsable = false;
+        }
     }
     if (g_hudThreadId) PostThreadMessageW(g_hudThreadId, kMsgQuit, 0, 0);
     if (g_hudThread) {
@@ -7060,7 +7105,7 @@ void WhTool_ModUninit() {
         g_gdiplus.Shutdown(g_gdiplusToken);
         g_gdiplusToken = 0;
     }
-    DeleteCriticalSection(&g_valuesLock);
+    if (g_valuesLockUsable) DeleteCriticalSection(&g_valuesLock);
     DeleteCriticalSection(&g_settingsLock);
     // Only now: the pipe threads and the sampler are both joined, so nothing can
     // be inside the external lock any more.

@@ -271,6 +271,42 @@ function Write-Frame {
     $Writer.Flush()
 }
 
+function Connect-PipeClient {
+    # 管道只在 mod 需要外部数据时存在，而且 mod 重载时它会消失又回来，所以"连不上"
+    # 往往是瞬态的，必须等一等。原来这里是一句裸的 $client.Connect(3000)：瞬时拒绝
+    # 变成未处理异常，脚本当场死掉，mod 的看门狗再把它拉起来——重启预算就烧在
+    # "再等一秒就能连上"的事情上。现在按窗口重试，等不到返回 $null（由调用方决定
+    # 怎么处理），**不抛异常**。
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Pipe,
+        [int]$TimeoutMs = 3000,
+        [int]$WaitSeconds = 60
+    )
+    $deadline = (Get-Date).AddSeconds($WaitSeconds)
+    $announced = $false
+    while ($true) {
+        $client = $null
+        try {
+            $client = New-Object System.IO.Pipes.NamedPipeClientStream('.', $Pipe, [System.IO.Pipes.PipeDirection]::InOut)
+            $client.Connect($TimeoutMs)
+            return $client
+        }
+        catch {
+            if ($client) { $client.Dispose() }
+            if ((Get-Date) -ge $deadline) {
+                Write-Host ("管道 {0} 等满 {1} 秒仍连不上：{2}" -f $Pipe, $WaitSeconds, $_.Exception.Message)
+                return $null
+            }
+            if (-not $announced) {
+                $announced = $true
+                Write-Host ("管道 {0} 暂时连不上（mod 可能正在启动或重载），每 2 秒重试" -f $Pipe)
+            }
+            Start-Sleep -Seconds 2
+        }
+    }
+}
+
 function Publish {
     param($Writer, [string]$Key, [string]$Text)
     if ($script:Sent[$Key] -eq $Text) { return $false }
@@ -1192,6 +1228,7 @@ if ($SelfTest) {
         @{ Name = '两拍判定：几乎不动 = 暂停'; Ok = (-not (Test-Playing -Prev 1000 -Now 1000 -ElapsedSeconds 1.0 -ToleranceMs 400)) }
         @{ Name = '切歌粗校验：回落或明显跳变 = 有效'; Ok = (Test-PosAfterTrackChange -Prev 60000 -Now 1200) -and (Test-PosAfterTrackChange -Prev 60000 -Now 20000) }
         @{ Name = '切歌粗校验：几乎原样 = 可疑'; Ok = (-not (Test-PosAfterTrackChange -Prev 60000 -Now 60200)) }
+        @{ Name = '连不上管道时返回空值（不抛异常）'; Ok = ($null -eq (Connect-PipeClient -Pipe ("endfield-info-windhawk-selftest-{0}" -f [guid]::NewGuid().ToString('N')) -TimeoutMs 200 -WaitSeconds 0)) }
     )
     $bad = 0
     foreach ($c in $checks) {
@@ -1256,8 +1293,13 @@ if ($PositionSource -ne 'clock') {
     }
 }
 if (-not $DryRun) {
-    $client = New-Object System.IO.Pipes.NamedPipeClientStream('.', $Pipe, [System.IO.Pipes.PipeDirection]::InOut)
-    $client.Connect(3000)
+    $client = Connect-PipeClient -Pipe $Pipe
+    if (-not $client) {
+        # 等满窗口还是连不上：说明 mod 根本没在跑（或设置里不需要外部数据）。
+        # 干净退出并说清原因，比抛异常好——看门狗会按它自己的窗口再试。
+        Write-Host ("这次不发布：管道 {0} 不可用" -f $Pipe)
+        exit 0
+    }
     $writer = New-Object System.IO.StreamWriter($client, (New-Object System.Text.UTF8Encoding($false)))
     $writer.AutoFlush = $true
     Write-Frame $writer "HELLO 1 $Provider"
