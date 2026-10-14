@@ -460,6 +460,7 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 | 未注册的 `[[font:...]]` 标签同样被消费掉 | 族名写错/没装的标签会把它包住的文字起点一起吞掉，屏幕上留下一段没有提示的错位文本 | 六个标签容错用例：`[[font:]]`、`[[fonts:…]]`、缺 `]]`、未安装族名各留下原文，且每行"可见字符都归属于某个段" |
 | `AcquireRowFont` 在有**空槽**时仍驱逐 LRU | 两个字号交替绘制时每帧重建字体对象——缓存等于没有，正是它要避免的开销（2026-10-14 由新断言 `a different size is a different, live object` 抓到，未发布） | `AcquireRowFont` 的空槽优先 + `releasing the caches really empties them` |
 | 留空的行让后面的**图标**整体错位 | `Row 2` 留空时 `Icon3` 落到第二个显示出来的行（= `Row 3`）上，`Row 3` 以下每个图标都取自上一行的设置；README 的"`Row N icon` 配 `Row N`"因此不是真的（2026-10-14 加 `rowSlotOf[]` 时发现，未发布） | `the second drawn row (settings Row3) gets Icon3, not Icon2`、`Row3's metrics land on the second drawn row` |
+| 修上一个错位时把**空行的图标槽**一起丢了 | 只设 `Icon1 = Memory`（`Row 1` 留空）时，继承源"第一个已设的图标"随槽位一起消失 → **整块面板没有图标**，真机上看起来就是"Row icon 选项失效"（2026-10-14 用户报，宿主断言复现：`styles = 0, 0`） | `an icon set on an empty row still covers the rows that are drawn`、`so the text column still leaves room for a plate`；图标槽始终按设置行号存（`IconSlotForRow`） |
 | 桥对同一个 key 有两个发布者 | 标题在"歌名"（store 的 `resourceName`，**没有作者**）与"歌名 - 歌手"之间闪；歌词隔一拍跳回 store 那个**会冻结**的 `playingLyricLineNumber` 行（真机 DryRun 实测：两条 `SET title` 一轮） | `Get-PublishPlan` 的 6 条自检（有序字典 = 重复 key 不可能）+ `Publish` 的运行期点名 |
 | 不读回复的客户端让服务端每帧白等 500 ms | out 缓冲约 1300 条回复，按每秒 4 帧算**五六分钟**后写回复开始超时；管道线程跟不上，积压的值一拍一拍地应用——**上面那条缺陷因此才看得见**（"播放一段时间后作者开始闪、歌词对不准位置"） | `ExtReplyTimeoutsAfter` 的 7 条断言（2 次连续超时才放弃、成功即清零、硬失败不算） |
 

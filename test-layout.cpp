@@ -817,6 +817,29 @@ int main() {
                   "and the second drawn row (settings Row3) gets Icon3, not Icon2");
         }
 
+        // An icon configured on a row that is left empty is still a configuration. Dropping it
+        // because the row has no text is how `Icon1 = Memory` alone stopped giving any row a
+        // plate -- the option looked dead on a real machine (2026-10-14), because the
+        // inheritance source ("a row with no icon of its own inherits the first configured
+        // one") had been removed from the table.
+        {
+            const StubSetting emptyFirst[] = {
+                {L"Row1", L""},          // the row that carries the only *configured* icon
+                {L"Row2", L"GPU"},
+                {L"Row3", L"DISK"},
+                {L"Icon1", L"Memory"},
+            };
+            g_stubStrings = emptyFirst;
+            g_stubStringCount = (int)(sizeof(emptyFirst) / sizeof(emptyFirst[0]));
+            ReadSettings(s);
+            printf("  Row1 empty + Icon1 only: rows=%d, styles = %d, %d\n", s.rowCount,
+                   ResolveIconStyle(s, 0), ResolveIconStyle(s, 1));
+            Check(s.rowCount == 2, "the empty first row is skipped");
+            Check(ResolveIconStyle(s, 0) == 2,
+                  "an icon set on an empty row still covers the rows that are drawn");
+            Check(AnyIconConfigured(s), "so the text column still leaves room for a plate");
+        }
+
         g_stubStrings = savedStrings;
         g_stubStringCount = savedStringCount;
     }

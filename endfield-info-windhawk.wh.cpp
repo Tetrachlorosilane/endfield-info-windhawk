@@ -1588,6 +1588,14 @@ struct ModSettings {
     // RowN settings.
     IconSpec icons[kMaxRows] = {};
     int iconCount = 0;             // slots that will draw a plate
+    // Drawn row -> the settings row whose icon slot belongs to it, stored as (settings row + 1),
+    // 0 meaning "no mapping: this row is its own slot". The two orders differ as soon as a row
+    // is left empty, and they must not be conflated: the *settings* are keyed by row number
+    // (`Icon3` belongs to `Row 3`, as the README says), while the painter only knows the drawn
+    // order. A slot that belongs to a row with no text is still a slot -- it is what every
+    // other row inherits from, so dropping it made `Icon1 = Memory` on its own leave the whole
+    // panel without icons.
+    int iconSlotOfRow[kMaxRows] = {};
     // A custom icon file that applies to every row ("Custom icon file"). A row's own
     // IconN path wins over it; a row that says None gets no icon at all.
     WCHAR iconPath[MAX_PATH] = L"";
@@ -1694,6 +1702,9 @@ static void ReadSettings(ModSettings &s) {
             // The prefix tags are gone from the stored text, so anything left in it that looks
             // like [[size:NN]] is an inline run -- and that run may be bigger than the row.
             s.rowMaxFontSize[slot] = MaxInt(s.rowFontSize[slot], MaxInlineRunSize(s.rows[slot]));
+            // Which settings row this drawn row came from, so the icon slots (which are keyed
+            // by settings row number) can be looked up from the drawn order.
+            s.iconSlotOfRow[slot] = i + 1;
             s.rowCount++;
         }
         Wh_FreeStringSetting(value);
@@ -1792,20 +1803,16 @@ static void ReadSettings(ModSettings &s) {
     // configured when it names a glyph (including None, which is a choice) or
     // supplies an image path.
     //
-    // The keys are the settings row numbers, but the slots are the published rows
-    // (rowSlotOf). Pairing IconN with the Nth *drawn* row instead was a real bug: with Row2
-    // left empty, `Icon3` was handed to the second drawn row (which is Row3's) and every icon
-    // below a gap was off by one -- while the README promises "Row N icon goes with Row N".
+    // Every slot is read, including the ones whose row is empty: `Icon3` belongs to `Row 3`
+    // whether or not that row has text, and an empty row's slot is still what the other rows
+    // inherit from (see IconSlotForRow). Which drawn row each slot belongs to is recorded in
+    // the row loop above.
     s.iconCount = 0;
     for (int i = 0; i < kMaxRows; i++) {
-        s.icons[i].style = 0;
-        s.icons[i].styleSet = false;
-        s.icons[i].path[0] = L'\0';
-    }
-    for (int i = 0; i < kMaxRows; i++) {
-        const int published = rowSlotOf[i];
-        if (published < 0) continue;   // an empty row has no icon to describe
-        IconSpec &slot = s.icons[published];
+        IconSpec &slot = s.icons[i];
+        slot.style = 0;
+        slot.styleSet = false;
+        slot.path[0] = L'\0';
 
         WCHAR key[32];
         swprintf(key, 32, L"Icon%d", i + 1);
@@ -1978,6 +1985,17 @@ static void ReadSettings(ModSettings &s) {
 // a file, and the two are consulted separately. `IconSpec::styleSet` is what separates an
 // explicit `None` from "never set".
 
+// The settings slot whose icon belongs to a drawn row, or -1 when there is none.
+//
+// `ReadSettings` records the mapping; a `ModSettings` built by hand (the regression host does
+// that) has none, and then a drawn row is its own slot -- which is also the right answer for
+// every configuration that has no empty row at all.
+static int IconSlotForRow(const ModSettings &settings, int row) {
+    if (row < 0 || row >= kMaxRows) return -1;
+    const int mapped = settings.iconSlotOfRow[row];
+    return mapped > 0 ? mapped - 1 : row;
+}
+
 // The glyph a row falls back on when it has no (working) image. Highest first:
 //
 //   1. the glyph the row chose itself (`None` means none, and must not inherit)
@@ -1987,10 +2005,11 @@ static void ReadSettings(ModSettings &s) {
 // Resolved rather than written into the slots, so the global image -- which belongs to
 // no slot -- gets the same fallback as a row's own file.
 static int ResolveIconStyle(const ModSettings &settings, int index) {
-    if (index >= 0 && index < kMaxRows) {
-        const IconSpec &slot = settings.icons[index];
-        if (slot.style > 0 || slot.styleSet) return slot.style;
-        if (slot.path[0]) return settings.iconFallbackStyle;
+    const int slot = IconSlotForRow(settings, index);
+    if (slot >= 0) {
+        const IconSpec &rowIcon = settings.icons[slot];
+        if (rowIcon.style > 0 || rowIcon.styleSet) return rowIcon.style;
+        if (rowIcon.path[0]) return settings.iconFallbackStyle;
     }
     for (int i = 0; i < kMaxRows; i++) {
         if (settings.icons[i].style > 0) return settings.icons[i].style;
@@ -2007,10 +2026,11 @@ static int ResolveIconStyle(const ModSettings &settings, int index) {
 //      inheritance, which only comes into play when there is no global image (with one,
 //      the per-row file is the exception, so it must not leak to the other rows)
 static const WCHAR *ResolveIconPath(const ModSettings &settings, int index) {
-    if (index >= 0 && index < kMaxRows) {
-        const IconSpec &slot = settings.icons[index];
-        if (slot.path[0]) return slot.path;
-        if (slot.styleSet && slot.style <= 0) return L"";
+    const int slot = IconSlotForRow(settings, index);
+    if (slot >= 0) {
+        const IconSpec &rowIcon = settings.icons[slot];
+        if (rowIcon.path[0]) return rowIcon.path;
+        if (rowIcon.styleSet && rowIcon.style <= 0) return L"";
     }
     if (settings.iconPath[0]) return settings.iconPath;
     for (int i = 0; i < kMaxRows; i++) {
