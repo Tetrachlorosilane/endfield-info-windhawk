@@ -301,8 +301,8 @@ deliberate trade for accuracy, and it only happens when you asked for it.
   $name: 'External updates per second'
   $description: '1-1000, per connection. Updates beyond this are dropped and counted; the connection is not closed.'
 - ExtEventMs: 6000
-  $name: 'External event duration (ms)'
-  $description: '1000-60000. How long an external event card stays on screen when the provider sends - as its ttl. Used from the event milestone onwards.'
+  $name: 'External event card duration (ms)'
+  $description: '1000-60000. How long a card stays on screen. Used as-is when the provider sends - as its ttl; a provider that sends longer is capped here (a value ttl of ten minutes is not a display duration), and a shorter one is honoured.'
 - ExtEventQueue: 4
   $name: 'External event queue'
   $description: '1-8. Events waiting behind the one on screen. When full, the lowest priority and oldest event is dropped.'
@@ -1958,6 +1958,23 @@ static const DWORD  kIslandMergeWindowMs = 2000;
 // numbers so the two cannot disagree about what "settled" means.
 static const DWORD  kIslandPopMs = 220;
 static const DWORD  kIslandCollapseMs = 140;
+// A card's time on screen, and how long an event may wait for its turn.
+//
+// The protocol's ttl on an EVENT is a *display* duration (ExtEventMs documents itself
+// as the default for `-`), but a publisher's value ttl is often minutes and the mod
+// used to take it verbatim: with the bridge sending its 600000 ms value ttl, one card
+// held the island for ten minutes, an 8-slot queue held hours, and the card on screen
+// was minutes behind the music -- which reads as "the island is broken". Publishers
+// that deliberately ask for a short flash keep it; only the runaway upper end is
+// capped. Staleness then bounds the *lag*: a dense stream is dropped, not shown late.
+static const DWORD  kIslandMaxCardMs = 60000;         // matches ExtEventMs's own range
+static const DWORD  kIslandStaleMs = 10000;
+
+static DWORD IslandCardDuration(DWORD eventTtlMs, DWORD defaultMs) {
+    DWORD d = eventTtlMs ? eventTtlMs : defaultMs;
+    if (d > kIslandMaxCardMs) d = kIslandMaxCardMs;
+    return d;
+}
 
 enum ExtSeverity { ES_INFO = 0, ES_WARN = 1, ES_CRITICAL = 2 };
 
@@ -1987,6 +2004,30 @@ static bool             g_islandLockReady = false;
 static unsigned         g_islandDrops = 0;
 static unsigned         g_islandAccepted = 0;
 static unsigned         g_islandWakes = 0;            // HUD-side: wakes actually seen
+
+// Removes events that have waited too long to still be worth showing, and returns the
+// new count. The queue was already bounded by depth; this bounds the *lag*, which is
+// what a fast publisher actually breaks: a lyric line per second arrives far faster
+// than one card per few seconds, so without this the island would be showing lines
+// from a minute ago. Dropped ones are counted, so the log can say how many.
+//
+// A critical event gets a longer window than an info line: a stale lyric is worthless,
+// an alarm is not, and dropping it silently would be the worst of both.
+static DWORD IslandStaleBoundMs(ExtSeverity sev) {
+    return sev == ES_CRITICAL ? kIslandStaleMs * 4 : kIslandStaleMs;
+}
+
+static int IslandDropStale(IslandEvent *queue, int count, DWORD now, unsigned *drops) {
+    int kept = 0;
+    for (int i = 0; i < count; i++) {
+        if ((DWORD)(now - queue[i].queuedAt) > IslandStaleBoundMs(queue[i].severity)) {
+            if (drops) (*drops)++;
+            continue;
+        }
+        queue[kept++] = queue[i];
+    }
+    return kept;
+}
 // HUD thread only: the state machine's view, the card currently on screen, and a
 // bounded log counter. The queue itself stays behind its lock.
 static IslandView      g_islandView;
@@ -2067,7 +2108,7 @@ static int IslandEnqueue(IslandEvent *queue, int count, int cap, const IslandEve
 // clock and whether the current animation phase finished, so every transition is
 // assertable. *popOut receives the queue index to present when a card starts.
 static IslandState StepIsland(IslandView *v, const IslandEvent *queue, int count,
-                              DWORD now, bool phaseDone, int *popOut) {
+                              DWORD now, bool phaseDone, DWORD cardMs, int *popOut) {
     if (popOut) *popOut = -1;
     const int pick = IslandPick(queue, count);
     const bool criticalWaiting = pick >= 0 && queue[pick].severity == ES_CRITICAL;
@@ -2078,7 +2119,7 @@ static IslandState StepIsland(IslandView *v, const IslandEvent *queue, int count
             v->state = IS_POPPING;
             v->phaseStarted = now;
             v->showing = queue[pick].severity;
-            v->cardDeadline = now + queue[pick].ttlMs;
+            v->cardDeadline = now + IslandCardDuration(queue[pick].ttlMs, cardMs);
             if (popOut) *popOut = pick;
         }
         break;
@@ -2108,7 +2149,7 @@ static IslandState StepIsland(IslandView *v, const IslandEvent *queue, int count
                 v->state = IS_POPPING;
                 v->phaseStarted = now;
                 v->showing = queue[pick].severity;
-                v->cardDeadline = now + queue[pick].ttlMs;
+                v->cardDeadline = now + IslandCardDuration(queue[pick].ttlMs, cardMs);
                 if (popOut) *popOut = pick;
             } else {
                 v->state = IS_IDLE;
@@ -3856,6 +3897,11 @@ static DWORD g_lastTopmostAssert = 0;
 
 static unsigned long long g_perfBaseTick = 0, g_perfBaseCpu100ns = 0;
 static unsigned long long g_sampleCount = 0, g_paintCount = 0;
+// Repaints caused by a pushed value re-expanding the rows, as opposed to a real
+// sample. They are counted apart because they must not cost the same: see
+// RepublishRows. Printed by the periodic [perf] line, which is the only way to see
+// from the outside whether a chatty publisher is driving the panel.
+static unsigned long long g_republishCount = 0;
 
 static unsigned long long CpuTime100ns() {
     FILETIME c, e, k, u;
@@ -5438,6 +5484,9 @@ static void UpdateIsland() {
     IslandEvent local[kIslandQueueMax];
     int count = 0;
     EnterCriticalSection(&g_islandLock);
+    // Stale events are dropped here, under the lock, before the snapshot: what the
+    // state machine sees is then never a queue of things that already happened.
+    g_islandCount = IslandDropStale(g_islandQueue, g_islandCount, GetTickCount(), &g_islandDrops);
     count = g_islandCount;
     for (int i = 0; i < count; i++) local[i] = g_islandQueue[i];
     LeaveCriticalSection(&g_islandLock);
@@ -5449,7 +5498,8 @@ static void UpdateIsland() {
 
     int pop = -1;
     const IslandState was = g_islandView.state;
-    const IslandState next = StepIsland(&g_islandView, local, count, now, phaseDone, &pop);
+    const IslandState next = StepIsland(&g_islandView, local, count, now, phaseDone,
+                                        (DWORD)g_settings.extEventMs, &pop);
 
     if (pop >= 0 && pop < count) {
         EnterCriticalSection(&g_islandLock);
@@ -5513,9 +5563,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             mem.cb = sizeof(mem);
             GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&mem, sizeof(mem));
             unsigned long long elapsed = GetTickCount64() - g_perfBaseTick;
-            DBG(L"[perf] up=%llus rows=%d groups=0x%X samples=%llu paints=%llu cpu=%llums "
-                   L"cpu/sample=%.3fms ws=%.1fMB private=%.1fMB visible=%d expanded=%d prox=%d",
-                   elapsed / 1000ULL, g_visibleRows, g_activeGroups, g_sampleCount, g_paintCount,
+            DBG(L"[perf] up=%llus rows=%d groups=0x%X samples=%llu republish=%llu paints=%llu "
+                   L"cpu=%llums cpu/sample=%.3fms ws=%.1fMB private=%.1fMB visible=%d expanded=%d prox=%d",
+                   elapsed / 1000ULL, g_visibleRows, g_activeGroups, g_sampleCount, g_republishCount,
+                   g_paintCount,
                    cpuMs, g_sampleCount ? (double)cpuMs / (double)g_sampleCount : 0.0,
                    mem.WorkingSetSize / 1048576.0, mem.PrivateUsage / 1048576.0,
                    g_visible ? 1 : 0, g_expanded ? 1 : 0, g_modeProximity ? 1 : 0);
@@ -5778,7 +5829,38 @@ static void FillSystemFields(Values &v) {
     v.modCpuMs = (CpuTime100ns() - g_perfBaseCpu100ns) / 10000.0;
 }
 
-static void PublishRows(const Values &v, const ModSettings &settings) {
+// Field by field on purpose: RingSpec carries padding, so memcmp would call two
+// equal gauges different whenever the padding bytes differ.
+static bool RingSpecsEqual(const RingSpec &a, const RingSpec &b) {
+    return a.value == b.value && a.max == b.max && a.thickness == b.thickness &&
+           a.color == b.color && a.hasColor == b.hasColor;
+}
+
+// Everything the painter reads for one set of rows. Segments are derived from the
+// text and the gauges, but they are compared too: a change that only moves where a
+// gauge sits inside a sentence is still a change.
+static bool RowStateEqual(const RowState &a, const RowState &b, int count) {
+    for (int r = 0; r < count; r++) {
+        if (a.segmentCount[r] != b.segmentCount[r]) return false;
+        if (a.ringCount[r] != b.ringCount[r]) return false;
+        if (a.inlineRing[r] != b.inlineRing[r]) return false;
+        if (wcscmp(a.text[r], b.text[r]) != 0) return false;
+        for (int i = 0; i < a.segmentCount[r]; i++) {
+            if (a.segments[r][i].offset != b.segments[r][i].offset) return false;
+            if (a.segments[r][i].length != b.segments[r][i].length) return false;
+        }
+        for (int i = 0; i < a.ringCount[r]; i++) {
+            if (!RingSpecsEqual(a.rings[r][i], b.rings[r][i])) return false;
+        }
+    }
+    return true;
+}
+
+// Publishes the rows and reports whether anything actually changed, so the caller
+// can skip a repaint when nothing did. That matters because a pushed value arrives
+// on its own schedule: the same value repeated, or a sample whose numbers came out
+// identical, used to cost a full layered-window repaint for nothing.
+static bool PublishRows(const Values &v, const ModSettings &settings) {
     int count = settings.rowCount;
     if (count > kMaxRows) count = kMaxRows;
 
@@ -5806,20 +5888,41 @@ static void PublishRows(const Values &v, const ModSettings &settings) {
         LeaveCriticalSection(&g_extLock);
     }
 
-    EnterCriticalSection(&g_valuesLock);
-    g_publishedRows = count;
+    // Lay the new rows out into a scratch copy first. The comparison has to run
+    // against BuildRowLayout's output, not against `marked`: it strips the ring
+    // markers, so the stored text and the marked text are never equal once a row
+    // carries a gauge.
+    RowState staged = {};
     for (int r = 0; r < count; r++) {
         // BuildRowLayout records where each gauge sits inside the text flow, which
         // is what lets a ring be drawn mid-sentence rather than only at the edge.
-        g_rowState.inlineRing[r] = false;
-        BuildRowLayout(marked[r], ringCounts[r], g_rowState, r);
-        for (int i = 0; i < ringCounts[r]; i++) g_rowState.rings[r][i] = rings[r][i];
+        BuildRowLayout(marked[r], ringCounts[r], staged, r);
+        for (int i = 0; i < ringCounts[r]; i++) staged.rings[r][i] = rings[r][i];
+    }
+
+    EnterCriticalSection(&g_valuesLock);
+    const bool changed = (count != g_publishedRows) || !RowStateEqual(staged, g_rowState, count);
+    g_publishedRows = count;
+    if (changed) {
+        for (int r = 0; r < count; r++) {
+            g_rowState.segmentCount[r] = staged.segmentCount[r];
+            g_rowState.ringCount[r] = staged.ringCount[r];
+            g_rowState.inlineRing[r] = staged.inlineRing[r];
+            wcscpy(g_rowState.text[r], staged.text[r]);
+            for (int i = 0; i < staged.segmentCount[r]; i++) {
+                g_rowState.segments[r][i] = staged.segments[r][i];
+            }
+            for (int i = 0; i < staged.ringCount[r]; i++) {
+                g_rowState.rings[r][i] = staged.rings[r][i];
+            }
+        }
     }
     g_values = v;
     LeaveCriticalSection(&g_valuesLock);
+    return changed;
 }
 
-static void SamplerIteration() {
+static bool SamplerIteration() {
     // Take a consistent snapshot of the settings, and notice row changes so the
     // collector set can be re-derived.
     ModSettings settings;
@@ -5895,27 +5998,90 @@ static void SamplerIteration() {
     }
     g_activeGroups = groups;
     g_sampleCount++;
-    PublishRows(v, settings);
+    return PublishRows(v, settings);
+}
+
+// The "a pushed value arrived" path: re-expand the rows against the values already
+// on hand and nothing else.
+//
+// This exists because waking the sampler used to mean re-reading every counter.
+// The sampler's wait is interrupted by g_extDirty so a pushed value does not wait a
+// whole refresh interval -- but running a full SamplerIteration for it made the
+// panel's *system* rows follow the publisher's rate instead of the configured one:
+// with a bridge pushing title, lyric and position a few times a second, CPU,
+// memory, network (and NVML, when a row asks for {gpu...}) were being sampled
+// several times a second, and every one of those samples repainted. The pushed
+// value only ever changes the text of the rows, so only the text is rebuilt.
+//
+// Returns true when the rows changed, i.e. when the change is worth a repaint.
+static bool RepublishRows() {
+    ModSettings settings;
+    EnterCriticalSection(&g_settingsLock);
+    settings = g_settings;
+    LeaveCriticalSection(&g_settingsLock);
+
+    Values v;
+    EnterCriticalSection(&g_valuesLock);
+    v = g_values;
+    LeaveCriticalSection(&g_valuesLock);
+
+    const bool changed = PublishRows(v, settings);
+    if (changed) {
+        // Bounded diagnostic: enough to see a chatty publisher in the log, without
+        // a line per pushed value. The [perf] line carries both totals as well.
+        if ((++g_republishCount % 64) == 0) {
+            Wh_Log(L"EXT republish n=%llu samples=%llu (a pushed value republishes, it does not re-sample)",
+                   g_republishCount, g_sampleCount);
+        }
+    }
+    return changed;
+}
+
+// The sampler's wake policy, kept pure so the rule can be asserted instead of being
+// implied by a thread loop: an external wake is cheap (republish the rows), unless
+// the refresh interval is due as well -- then the counters get re-read, or a
+// publisher pushing values continuously would starve the system rows of samples
+// entirely, which is the opposite failure of the one this whole path fixes.
+static bool SamplerWakeIsLight(bool extWake, DWORD now, DWORD lastSampleAt, LONG refreshMs) {
+    if (!extWake) return false;
+    return (LONG)(now - lastSampleAt) < refreshMs;
 }
 
 static DWORD WINAPI SamplerThread(LPVOID) {
     // Prime CPU/network deltas so the first published sample is meaningful.
     SamplerIteration();
+    DWORD lastSampleAt = GetTickCount();
+    LONG waited = 0;
     while (InterlockedCompareExchange(&g_stopSampler, 0, 0) == 0) {
-        for (LONG waited = 0; waited < g_refreshMs; waited += 50) {
+        // Two reasons to wake, and they must not cost the same:
+        //   * the refresh interval elapsed -> re-read the system counters;
+        //   * a pushed value arrived       -> only the rows' text can have changed.
+        // `waited` deliberately survives an external wake, so a publisher cannot push
+        // the scheduled sample further and further away; SamplerWakeIsLight is the belt
+        // for that braces (a burst can consume the whole interval).
+        bool extWake = false;
+        while (waited < g_refreshMs) {
             if (InterlockedCompareExchange(&g_stopSampler, 0, 0) != 0) break;
             // A pushed value must not wait a whole refresh interval to appear.
-            // Test-and-clear, so a burst of SETs costs exactly one extra sample
+            // Test-and-clear, so a burst of SETs costs exactly one extra pass
             // and one repaint rather than one per message.
             if ((g_activeGroups & G_EXT) &&
                 InterlockedCompareExchange(&g_extDirty, 0, 1) == 1) {
+                extWake = true;
                 break;
             }
             Sleep(50);
+            waited += 50;
         }
         if (InterlockedCompareExchange(&g_stopSampler, 0, 0) != 0) break;
-        SamplerIteration();
-        if (g_window) PostMessage(g_window, kMsgRatesReady, 0, 0);
+
+        if (SamplerWakeIsLight(extWake, GetTickCount(), lastSampleAt, g_refreshMs)) {
+            if (RepublishRows() && g_window) PostMessage(g_window, kMsgRatesReady, 0, 0);
+            continue;
+        }
+        if (SamplerIteration() && g_window) PostMessage(g_window, kMsgRatesReady, 0, 0);
+        lastSampleAt = GetTickCount();
+        waited = 0;
     }
     return 0;
 }
@@ -6622,6 +6788,9 @@ static void ExtSelfTest() {
 static HANDLE g_pubJob = nullptr;
 static HANDLE g_pubProc = nullptr;
 static DWORD g_pubRestarts = 0;
+// When the current attempt was started, so a run that stays up can earn the restart
+// budget back (see PublisherEarnedBackRestarts).
+static DWORD g_pubStartedAt = 0;
 static DWORD g_pubLastTry = 0;
 static DWORD g_pubLastRead = 0;
 static WCHAR g_pubCmd[512] = L"";
@@ -6630,6 +6799,13 @@ static bool g_pubGaveUp = false;
 static const DWORD kPubMaxRestarts = 5;
 static const DWORD kPubBackoffMs = 5000;
 static const DWORD kPubSettingRecheckMs = 10000;
+// A publisher that stays up this long has proved the failures were not systematic, so
+// its restart budget is restored. Without this the budget was a *lifetime* counter:
+// five starts ever -- including the harmless ones a user causes by restarting the
+// music client, or by killing the publisher by hand -- permanently disabled it, and
+// the only cure was reloading the mod. Symptom in the field: the song title and lyric
+// stop updating for good, and the log says "gave up after 5 restarts".
+static const DWORD kPubHealthyMs = 60000;
 // 看门狗：目标进程的扫描周期（**不每拍做** ✗ —— 建进程快照不便宜 ✓）
 static const DWORD kPubWatchScanMs = 5000;
 static WCHAR g_pubWatch[128] = L"";   // 要观察的进程名（空 = 不做看门狗，维持旧行为 ✓）
@@ -6818,6 +6994,14 @@ static bool ExtProcessRunning(const WCHAR *name) {
 
 // Called on every sampler pass; cheap. The settings are re-read every 10 s so an edit takes
 // effect, the restart policy is bounded, and nothing is ever started twice.
+// The restart budget is for crash loops, not for a lifetime tally. Pure, so the rule
+// is assertable: a dead process has earned nothing, a process we never started has
+// earned nothing, and only a run that has actually stayed up counts.
+static bool PublisherEarnedBackRestarts(bool alive, DWORD now, DWORD startedAt) {
+    if (!alive || startedAt == 0) return false;
+    return (DWORD)(now - startedAt) >= kPubHealthyMs;
+}
+
 static void ExtPublisherTick() {
     DWORD now = GetTickCount();
     if (g_pubLastRead == 0 || now - g_pubLastRead > kPubSettingRecheckMs) {
@@ -6870,13 +7054,26 @@ static void ExtPublisherTick() {
     }
 
     if (!g_pubCmd[0]) return;
+
+    // A healthy run gives the budget back before the "still alive" shortcut, so an
+    // exhausted budget does not stay exhausted for the rest of the session.
+    if (PublisherEarnedBackRestarts(ExtPublisherAlive(), now, g_pubStartedAt)) {
+        if (g_pubRestarts || g_pubGaveUp) {
+            Wh_Log(L"EXT publisher: up for %lus, restart budget restored (%lu spent)",
+                   (unsigned long)((now - g_pubStartedAt) / 1000), g_pubRestarts);
+        }
+        g_pubRestarts = 0;
+        g_pubGaveUp = false;
+    }
+
     if (ExtPublisherAlive()) return;
 
     if (g_pubRestarts >= kPubMaxRestarts) {
         if (!g_pubGaveUp) {
             g_pubGaveUp = true;
-            Wh_Log(L"EXT publisher: gave up after %lu restarts; {ext.*} values will go stale",
-                   g_pubRestarts);
+            Wh_Log(L"EXT publisher: gave up after %lu restarts in a row; {ext.*} values "
+                   L"will go stale (a run that survives %lus restores the budget)",
+                   g_pubRestarts, kPubHealthyMs / 1000);
         }
         return;
     }
@@ -6893,6 +7090,7 @@ static void ExtPublisherTick() {
         return;
     }
     g_pubRestarts++;
+    g_pubStartedAt = now ? now : 1;
     ExtPublisherStart(exe, args);
 }
 

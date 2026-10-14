@@ -1817,7 +1817,7 @@ int main() {
                 escView.state = IS_CARD;
                 escView.showing = ES_WARN;
                 escView.cardDeadline = 9999;
-                Check(StepIsland(&escView, esc, m, 2000, false, nullptr) == IS_COLLAPSING,
+                Check(StepIsland(&escView, esc, m, 2000, false, 6000, nullptr) == IS_COLLAPSING,
                       "so a card already on screen stands down for it");
 
                 // A repeat at a lower level must not lower the queued one either.
@@ -1857,31 +1857,89 @@ int main() {
 
             IslandView v = {};
             int pop = -1;
-            Check(StepIsland(&v, q, 1, 1000, false, &pop) == IS_POPPING && pop == 0,
+            Check(StepIsland(&v, q, 1, 1000, false, 6000, &pop) == IS_POPPING && pop == 0,
                   "a queued event starts the pop");
             Check(v.cardDeadline == 1500, "the card inherits the event's ttl");
-            Check(StepIsland(&v, q, 1, 1100, false, nullptr) == IS_POPPING,
+            Check(StepIsland(&v, q, 1, 1100, false, 6000, nullptr) == IS_POPPING,
                   "the pop keeps playing until the animation reports it finished");
-            Check(StepIsland(&v, q, 1, 1200, true, nullptr) == IS_CARD,
+            Check(StepIsland(&v, q, 1, 1200, true, 6000, nullptr) == IS_CARD,
                   "the pop settles into a card");
-            Check(StepIsland(&v, q, 1, 1499, false, nullptr) == IS_CARD,
+            Check(StepIsland(&v, q, 1, 1499, false, 6000, nullptr) == IS_CARD,
                   "the card lives until its ttl");
-            Check(StepIsland(&v, q, 1, 1500, false, nullptr) == IS_COLLAPSING,
+            Check(StepIsland(&v, q, 1, 1500, false, 6000, nullptr) == IS_COLLAPSING,
                   "then it collapses -- nothing stays on screen forever");
-            Check(StepIsland(&v, q, 0, 1600, true, nullptr) == IS_IDLE,
+            Check(StepIsland(&v, q, 0, 1600, true, 6000, nullptr) == IS_IDLE,
                   "with nothing queued, collapsing settles back to idle");
             v.state = IS_CARD; v.showing = ES_INFO; v.cardDeadline = 2000;
-            Check(StepIsland(&v, q, 1, 2000, false, nullptr) == IS_COLLAPSING,
+            Check(StepIsland(&v, q, 1, 2000, false, 6000, nullptr) == IS_COLLAPSING,
                   "an expired card starts collapsing");
-            Check(StepIsland(&v, q, 1, 2100, true, &pop) == IS_POPPING && pop == 0,
+            Check(StepIsland(&v, q, 1, 2100, true, 6000, &pop) == IS_POPPING && pop == 0,
                   "a queue that is not empty goes straight into the next pop");
 
             v.state = IS_CARD; v.showing = ES_INFO; v.cardDeadline = 99000;
-            Check(StepIsland(&v, q, 2, 3000, false, nullptr) == IS_COLLAPSING,
+            Check(StepIsland(&v, q, 2, 3000, false, 6000, nullptr) == IS_COLLAPSING,
                   "a waiting critical preempts an info card");
-            Check(StepIsland(&v, q, 2, 3100, true, &pop) == IS_POPPING && pop == 1,
+            Check(StepIsland(&v, q, 2, 3100, true, 6000, &pop) == IS_POPPING && pop == 1,
                   "and the critical is what pops next");
             Check(v.showing == ES_CRITICAL, "the view now shows the critical");
+        }
+
+        // A publisher's *value* ttl is not a display duration. The bridge sends its
+        // 600000 ms value ttl along with every event, and the mod used to take it
+        // verbatim: one card held the island for ten minutes, a queue of eight held
+        // hours, and the card on screen was minutes behind the music -- which is what
+        // "the island looks broken with dense lyrics" actually was.
+        printf("  card duration: value ttl 600000, no ttl, a deliberate 500ms flash, exactly 60000\n");
+        Check(IslandCardDuration(600000, 6000) == 60000,
+              "a ten-minute value ttl is capped to the longest card");
+        Check(IslandCardDuration(0, 6000) == 6000,
+              "an event that sends no ttl uses the configured default");
+        Check(IslandCardDuration(500, 6000) == 500,
+              "a publisher that deliberately asks for a short flash keeps it");
+        Check(IslandCardDuration(60000, 6000) == 60000, "the cap itself is not shortened");
+        {
+            IslandView cv = {};
+            IslandEvent cq[1] = {};
+            cq[0].severity = ES_INFO;
+            cq[0].ttlMs = 600000;
+            cq[0].queuedAt = 1000;
+            int cpop = -1;
+            Check(StepIsland(&cv, cq, 1, 1000, false, 6000, &cpop) == IS_POPPING && cpop == 0,
+                  "a card carrying a ten-minute ttl still starts like any other");
+            Check(StepIsland(&cv, cq, 1, 1200, true, 6000, nullptr) == IS_CARD,
+                  "and settles into a card");
+            Check(StepIsland(&cv, cq, 1, 60000, false, 6000, nullptr) == IS_CARD,
+                  "it is still up at the cap's boundary");
+            Check(StepIsland(&cv, cq, 1, 61001, false, 6000, nullptr) == IS_COLLAPSING,
+                  "and it goes away just past the cap, not ten minutes later");
+        }
+
+        // Staleness bounds the lag. Depth alone was not enough: with a lyric line per
+        // second the queue held eight *stale* lines, so the island narrated the song
+        // from a minute ago. A critical event gets a longer window -- an alarm is worth
+        // more than a lyric line, and dropping one silently is the worst of both.
+        printf("  stale: 9s info kept, 11s info dropped, 11s critical kept, 41s critical dropped\n");
+        {
+            IslandEvent sq[4] = {};
+            sq[0].queuedAt = 3000;  sq[0].severity = ES_INFO;      // 9 s old
+            sq[1].queuedAt = 5000;  sq[1].severity = ES_WARN;      // 7 s old
+            sq[2].queuedAt = 1000;  sq[2].severity = ES_INFO;      // 11 s old -> stale
+            sq[3].queuedAt = 1000;  sq[3].severity = ES_CRITICAL;  // 11 s old -> kept
+            unsigned sdrops = 0;
+            const int kept = IslandDropStale(sq, 4, 12000, &sdrops);
+            Check(kept == 3, "info and warn events past the staleness bound are dropped");
+            Check(sdrops == 1, "and every drop is counted, so the log can report it");
+            Check(sq[0].queuedAt == 3000 && sq[1].queuedAt == 5000 && sq[3].queuedAt == 1000,
+                  "the survivors keep their order");
+            Check(IslandStaleBoundMs(ES_CRITICAL) > IslandStaleBoundMs(ES_INFO),
+                  "a critical event is allowed to wait longer than an info one");
+            IslandEvent cq2[1] = {};
+            cq2[0].queuedAt = 1000;
+            cq2[0].severity = ES_CRITICAL;
+            unsigned cdrops = 0;
+            Check(IslandDropStale(cq2, 1, 1000 + IslandStaleBoundMs(ES_CRITICAL) + 1, &cdrops) == 0 &&
+                      cdrops == 1,
+                  "but a critical event is not immortal either");
         }
 
         // What the card shows, and how severity maps to colour (design 7.4 / 14 Q4).
@@ -2264,8 +2322,101 @@ int main() {
             }
         }
 
+        // A pushed value has to republish the rows, not re-run the collectors. Waking
+        // the sampler for g_extDirty used to run a whole SamplerIteration, so an active
+        // publisher set the panel's sampling rate: with a bridge pushing a title, a
+        // lyric and a position a few times a second, CPU, memory, network (and NVML,
+        // whenever a row asks for {gpu...}) were re-read at the publisher's rate, and
+        // every one of those samples repainted. RepublishRows is the light path; these
+        // checks are what keep it light, and what keep it from being repainted when
+        // nothing changed.
+        printf("\n  --- a pushed value republishes, it does not re-sample ---\n");
+        InitializeCriticalSection(&g_settingsLock);
+        InitializeCriticalSection(&g_valuesLock);   // the host never ran WhTool_ModInit
+        {
+            ModSettings s;
+            s.rowCount = 1;
+            wcscpy(s.rows[0], L"{ext.music.title}  [[ring:{ext.music.progress}]]");
+            const Values v;
+            EnterCriticalSection(&g_settingsLock);
+            g_settings = s;
+            LeaveCriticalSection(&g_settingsLock);
+            InterlockedIncrement(&g_settingsVersion);   // as the loader thread does
+            g_values = v;
+            // The provider name is what the row's provider is matched against; the
+            // earlier part of this section connected as "music", and spelling it out
+            // here keeps this block readable on its own.
+            wcscpy(g_ext[0].name, L"music");
+
+            ExtStoreValue(0, L"title", L"Blue Hour", 60000, 512);
+            Check(PublishRows(v, s), "the first publish is a change");
+            Check(!PublishRows(v, s),
+                  "publishing the same values again is not (so it is not repainted)");
+
+            ExtStoreValue(0, L"title", L"Blue Hour II", 60000, 512);
+            Check(PublishRows(v, s), "a changed pushed value is a change");
+
+            // A row that is nothing but a gauge: its text never moves while the value
+            // does, so a text-only comparison would miss the move entirely.
+            ExtStoreValue(0, L"progress", L"42", 60000, 512);
+            Check(PublishRows(v, s), "a gauge that moved is a change even when no text did");
+            Check(!PublishRows(v, s), "and it settles again once the gauge stops moving");
+
+            const unsigned long long samplesBefore = g_sampleCount;
+            ExtStoreValue(0, L"title", L"Blue Hour III", 60000, 512);
+            Check(RepublishRows(), "the light path finds the pushed change by itself");
+            Check(g_sampleCount == samplesBefore, "a pushed value costs no system sample");
+            Check(!RepublishRows(), "and a second pass finds nothing new to draw");
+            Check(g_sampleCount == samplesBefore, "so it still costs none");
+            SamplerIteration();
+            Check(g_sampleCount == samplesBefore + 1,
+                  "while a scheduled sample does re-read the counters");
+            printf("  light republishes=%llu, samples=%llu\n", g_republishCount, g_sampleCount);
+        }
+        DeleteCriticalSection(&g_valuesLock);
+        DeleteCriticalSection(&g_settingsLock);
+
         DeleteCriticalSection(&g_extLock);
         g_extLockReady = false;
+    }
+
+    printf("\n=== sampler wake policy ===\n");
+    {
+        // A pushed value is cheap; the refresh interval is not optional. If a chatty
+        // publisher could make every wake "light", the system rows would never be
+        // re-read at all -- the opposite failure of the one this rule fixes.
+        printf("  push just after a sample, push mid-interval, push past the interval, "
+               "interval alone\n");
+        Check(SamplerWakeIsLight(true, 1000, 1000, 1000),
+              "a push arriving right after a sample is the cheap path");
+        Check(SamplerWakeIsLight(true, 1500, 1000, 1000),
+              "and so is a push that lands mid-interval");
+        Check(!SamplerWakeIsLight(true, 2000, 1000, 1000),
+              "but a push that lands once the interval is due re-reads the counters");
+        Check(!SamplerWakeIsLight(true, 9000, 1000, 1000),
+              "and a badly overdue interval cannot be talked out of it by a push");
+        Check(!SamplerWakeIsLight(false, 1500, 1000, 1000),
+              "an interval wake re-reads the counters, push or no push");
+    }
+
+    printf("\n=== publisher restart budget ===\n");
+    {
+        // The budget is for crash loops, not a lifetime tally. Five starts *ever* --
+        // including the harmless ones a user causes by restarting the music client, or
+        // by killing the publisher by hand -- used to disable it for the rest of the
+        // session, and the only cure was reloading the mod: the song title and lyric
+        // simply stopped updating while the log said "gave up after 5 restarts".
+        printf("  up 61s / exactly 60s / 59s / dead-but-long-lived / never started\n");
+        Check(PublisherEarnedBackRestarts(true, 62000, 1000),
+              "a publisher that has been up for over a minute earns its budget back");
+        Check(PublisherEarnedBackRestarts(true, 61000, 1000),
+              "exactly a minute counts too (the boundary is inclusive)");
+        Check(!PublisherEarnedBackRestarts(true, 60000, 1000),
+              "just under a minute of uptime is not enough to prove anything");
+        Check(!PublisherEarnedBackRestarts(false, 900000, 1000),
+              "a process that has died has earned nothing, however long it lived");
+        Check(!PublisherEarnedBackRestarts(true, 900000, 0),
+              "nor has a process the mod itself never started");
     }
 
     // The settings strings are the one place the product has to pair an allocation with

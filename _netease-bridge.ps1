@@ -46,6 +46,12 @@ param(
     [string]$ProcessName = 'cloudmusic',
     # 换歌时发一条 EVENT，让灵动岛弹一次
     [switch]$Event,
+    # 卡片在屏时长（毫秒）。**这不是值的寿命**：值用 -TtlMs（默认 10 分钟），事件用它。
+    # 早先两处都发 $TtlMs，于是每张卡片在屏幕上待 10 分钟：队列只有 8 格，两张卡就能把
+    # 岛堵住几十分钟，歌词密集的歌看起来就像坏了。
+    [int]$EventTtlMs = 6000,
+    # 两条岛事件之间的最小间隔（毫秒）：歌词很密的歌、或窗口标题抖动时不许刷屏。
+    [int]$EventMinIntervalMs = 4000,
     # 只打印要发的帧，不连管道
     [switch]$DryRun,
     # 打印拿到的 JSON 片段，方便接口形状变了时自己改
@@ -390,6 +396,29 @@ function Publish {
     if ($TtlMs -gt 0) { Write-Frame $Writer "SET $Provider $Key $TtlMs $Text" }
     else { Write-Frame $Writer "SET $Provider $Key - $Text" }
     $true
+}
+
+# 岛事件的节流。歌词密的时候（或窗口标题抖动被误判成"换歌"时），事件会来得比卡片能展示的
+# 快得多；mod 侧现在会丢弃过旧的事件，但更该做的是**根本不要发那么多**——每张卡片在屏几秒，
+# 事件也每几秒最多一条。纯函数，所以自检能直接钉住这条规则。
+function Test-EventAllowed {
+    param([datetime]$Now, [datetime]$LastAt, [int]$MinMs)
+    if ($MinMs -le 0) { return $true }
+    return (($Now - $LastAt).TotalMilliseconds -ge $MinMs)
+}
+
+# 发一条岛事件：受最小间隔约束，用的是卡片的在屏时长（$EventTtlMs）而不是值的寿命（$TtlMs）。
+function Write-IslandEvent {
+    param($Writer, [string]$Provider, [int]$CardMs, [string]$Title, [string]$Body)
+    if (-not $Writer) { return $false }
+    $now = Get-Date
+    if (-not (Test-EventAllowed -Now $now -LastAt $script:LastEventAt -MinMs $EventMinIntervalMs)) {
+        Write-Host ("跳过岛事件（距上一条不足 {0} ms）：{1}" -f $EventMinIntervalMs, $Title)
+        return $false
+    }
+    $script:LastEventAt = $now
+    Write-Frame $Writer ("EVENT {0} info {1} {2}  {3}" -f $Provider, $CardMs, $Title, $Body)
+    return $true
 }
 
 # ---------------------------------------------------------------------------
@@ -1314,6 +1343,8 @@ if ($SelfTest) {
 [01:05.001]第三句
 [99:99.99]
 "@
+    # 一个固定时刻，给"两拍之间过了多久"这类断言用（不依赖真实时钟）。
+    $stamp = [datetime]::new(2026, 10, 14, 12, 0, 0, [DateTimeKind]::Local)
     $lines = ConvertFrom-Lrc -Text $fixture
     $checks = @(
         @{ Name = '解析出 3 行（元信息与纯时间戳行被丢掉）'; Ok = ($lines.Count -eq 3) }
@@ -1339,6 +1370,12 @@ if ($SelfTest) {
         @{ Name = '切歌粗校验：回落或明显跳变 = 有效'; Ok = (Test-PosAfterTrackChange -Prev 60000 -Now 1200) -and (Test-PosAfterTrackChange -Prev 60000 -Now 20000) }
         @{ Name = '切歌粗校验：几乎原样 = 可疑'; Ok = (-not (Test-PosAfterTrackChange -Prev 60000 -Now 60200)) }
         @{ Name = '连不上管道时返回空值（不抛异常）'; Ok = ($null -eq (Connect-PipeClient -Pipe ("endfield-info-windhawk-selftest-{0}" -f [guid]::NewGuid().ToString('N')) -TimeoutMs 200 -WaitSeconds 0)) }
+        # 岛事件的节流。歌词密时事件会来得比卡片能展示的快得多，所以"不要发那么多"是桥的责任，
+        # mod 侧丢弃过旧事件只是兜底（两边都改了 ✓）。
+        @{ Name = '岛事件：首次（从未发过）总是允许'; Ok = (Test-EventAllowed -Now $stamp -LastAt ([datetime]::MinValue) -MinMs 4000) }
+        @{ Name = '岛事件：间隔不足时不发（密集歌词不刷屏）'; Ok = (-not (Test-EventAllowed -Now $stamp.AddMilliseconds(3999) -LastAt $stamp -MinMs 4000)) }
+        @{ Name = '岛事件：达到最小间隔才发'; Ok = (Test-EventAllowed -Now $stamp.AddMilliseconds(4000) -LastAt $stamp -MinMs 4000) }
+        @{ Name = '岛事件：间隔设为 0 表示不节流'; Ok = (Test-EventAllowed -Now $stamp -LastAt $stamp -MinMs 0) }
         # 曲目标题的判定。真机形状：同一进程里既有「桌面歌词」也有「歌名 - 歌手」，
         # 而后者不是 MainWindowTitle（2026-10-14 实测，见 Get-PlayingTrack 的注释）。
         @{ Name = '曲目标题：桌面歌词窗口不算曲目'; Ok = ($null -eq (Select-SongTitle @('桌面歌词', '网易云音乐'))) }
@@ -1449,6 +1486,8 @@ if (-not $DryRun) {
 $started = Get-Date
 $lastRaw = $track.Raw
 $announced = $false
+# 上一条岛事件的时间。初值取最小时间，于是"从未发过"永远允许第一条 ✓。
+$script:LastEventAt = [datetime]::MinValue
 $lyricAttemptAt = Get-Date
 $lyricMisses = 0
 
@@ -1468,9 +1507,10 @@ try {
             try { $lyricLines = @(Get-LyricLines -Title $track.Title -Artist $track.Artist) }
             catch { $lyricLines = @() }
             Write-Host ("换歌：{0} — {1}（{2} 行 LRC）" -f $track.Title, $track.Artist, $lyricLines.Count)
-            if ($Event -and $writer) {
+            if ($Event) {
                 $first = Select-LrcLine $lyricLines 0
-                Write-Frame $writer "EVENT $Provider info $TtlMs $($track.Title) - $($track.Artist)  $first"
+                [void](Write-IslandEvent -Writer $writer -Provider $Provider -CardMs $EventTtlMs `
+                        -Title ("{0} - {1}" -f $track.Title, $track.Artist) -Body $first)
             }
             $announced = $true
         }
@@ -1600,9 +1640,12 @@ try {
                 [void](Publish $writer 'pos' (Format-PositionSource -Source $posSrc `
                             -PositionMs ([int]$positionMs) -LeadMs $leadApply))
             }
-            if ($Event -and -not $announced -and $writer) {
-                Write-Frame $writer "EVENT $Provider info $TtlMs $($now.Title) - $($now.Artist)  $line"
-                $announced = $true
+            if ($Event -and -not $announced) {
+                # 只有真的发出去了才算"播报过"：被节流掉的话，下一拍还有机会。
+                if (Write-IslandEvent -Writer $writer -Provider $Provider -CardMs $EventTtlMs `
+                        -Title ("{0} - {1}" -f $now.Title, $now.Artist) -Body $line) {
+                    $announced = $true
+                }
             }
         }
 
