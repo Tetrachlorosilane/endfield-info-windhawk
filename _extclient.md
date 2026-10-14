@@ -5,28 +5,19 @@
 
 ## 怎么跑
 
-PowerShell（**真机验证过的是这一个**）：
+PowerShell（**真机验证过的是这一个**）与 Python 版（参数同义：`--provider` / `--key` / `--ttl`，
+`-` 用设置里的值、`0` 表示删除，另有 `--event` / `--raw` / `--quiet`）：
 
 ```powershell
 pwsh -ExecutionPolicy Bypass -File _extclient.ps1
 pwsh -ExecutionPolicy Bypass -File _extclient.ps1 -Key progress -Ttl 60000 -Text 0.42
 pwsh -ExecutionPolicy Bypass -File _extclient.ps1 -Raw 'GARBAGE'      # 看错误码
-```
-
-参数：`-Provider`（默认 `music`）、`-Key`（`title`）、`-Ttl`（`600000`）、`-Text`、`-Raw`、
-`-Event`、`-Severity`（`info` / `warn` / `critical`）。事件模式下 `-Text` 是卡片标题、`-Key` 不用；
-`-Ttl` 是 `[int]`，传非数字在参数绑定阶段就报错退出。
-
-Python：
-
-```powershell
 python _extclient.py "Now Playing: Blue Hour"
 python _extclient.py --key progress --ttl 60000 0.42
-python _extclient.py --raw "SET music title 5000 hello"
 ```
 
-参数：`--provider` / `--key` / `--ttl`（`-` 用设置里的值，`0` 表示删除）/ `--event` / `--raw` /
-`--quiet`，位置参数是要发布的文本。
+参数：`-Provider`（默认 `music`）、`-Key`（`title`）、`-Ttl`（`600000`，`[int]`）、`-Text`、`-Raw`、
+`-Event`、`-Severity`（`info` / `warn` / `critical`）；事件模式下 `-Text` 是卡片标题、`-Key` 不用。
 
 ## 需要什么
 
@@ -39,18 +30,16 @@ python _extclient.py --raw "SET music title 5000 hello"
 
 - **服务端的回答在 Windhawk 日志里**，不在终端：`EXT hello ...` / `EXT set ...` / `EXT err code=...`。
   PowerShell 版只写不读，末行提示 `sent N frame(s); check the Windhawk log for EXT hello / EXT set / EXT err`。
-- Python 版每行打印**实际写出的字节数**（`-> <内容>  (N/M bytes)`）、读到的回包 `<- ...` 与总耗时 `(N ms)`。
-- 退出码：Python —— 0 正常，1 是管道不存在或打开被拒；PowerShell —— 0 正常，连不上时打印原因并 `exit 1`。
-- `--raw` / `-Raw` 是唯一能看错误码的路子（例如发 `GARBAGE`）。
+- Python 版每行打印**实际写出的字节数**（`-> <内容>  (N/M bytes)`）、回包 `<- ...` 与总耗时 `(N ms)`。
+- 退出码：Python —— 0 正常，1 是管道不存在或打开被拒；PowerShell —— 0 正常，连不上时打印原因并
+  `exit 1`（`Connect(2000)` 带超时）。`--raw` / `-Raw` 是唯一能看错误码的路子（例如发 `GARBAGE`）。
 
 ## 坑
 
-- **"打不开管道"和"DACL 不让这个用户连"从客户端看是同一个现象。** Python 版在 `PermissionError`
-  时把两句都写出来：可能是沙箱禁止任何管道客户端（DSH 受限模式连"完全不给安全描述符"的对照管道都拒），
-  也可能真是 DACL。**判别要用 mod 的日志**：里面有一行
-  `EXT: pipe DACL grants SYSTEM, Administrators and <sid>`，拿那个 SID 和 `whoami /user` 比对；
-  沙箱场景换普通终端再跑。
-- Python 版把回复放在**线程里**读、写用 `os.write` 直接写原始 fd：服务端容忍一个从不读的客户端，
-  所以它不会因为"只写不读"卡住；而那个字节数正是区分"客户端没写"和"传输丢了"的证据。
-- PowerShell 版每行一次 `WriteLine`（协议是 message 模式），写完 `Start-Sleep -Milliseconds 300`
-  再关闭——这点等待是留给服务端把收到的内容写进日志的；脚本自己也是 `Connect(2000)` 带超时的。
+- **"打不开管道"和"DACL 不让这个用户连"从客户端看是同一个现象。** Python 版在 `PermissionError` 时把
+  两句都写出来：可能是沙箱禁止任何管道客户端（受限模式连没有安全描述符的对照管道都拒），也可能真是
+  DACL。**判别要用 mod 的日志**：`EXT: pipe DACL grants SYSTEM, Administrators and <sid>`，拿那个
+  SID 和 `whoami /user` 比对；沙箱场景换普通终端再跑。
+- PowerShell 版每行一次 `WriteLine`（协议是 message 模式），写完 `Start-Sleep -Milliseconds 300` 再
+  关闭——这点等待留给服务端把收到的内容写进日志；Python 版把回复放在线程里读、用 `os.write` 直接写
+  原始 fd，所以不读也不会卡住，而那个字节数正是区分"客户端没写"和"传输丢了"的证据。

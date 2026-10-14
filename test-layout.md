@@ -14,12 +14,10 @@ $wc = 'D:\Program Files\Windhawk\Compiler'
 & "$env:TEMP\layouttest.exe"
 ```
 
-产物名由调用方决定（头注释里写的是 `_layouttest.exe`）。
-
 ## 需要什么
 
-Windhawk 的 clang++ 与 Windows；不需要管理员权限。最后一段会真启动 GDI+
-（`g_gdiplus.Load()` + `GdiplusStartup`）用真字体量文本排版；GDI+ 起不来时那一段降级成 `SKIP`。
+Windhawk 的 clang++ 与 Windows，不需要管理员权限。最后一段会真启动 GDI+
+（`g_gdiplus.Load()` + `GdiplusStartup`）用真字体量文本排版，起不来时那一段降级成 `SKIP`。
 
 ## 输出与判读
 
@@ -41,7 +39,6 @@ Windhawk 的 clang++ 与 Windows；不需要管理员权限。最后一段会真
 - **当心旧 exe。** 编译失败却仍执行上一次的产物，会得出"改了没效果"的错误结论（本仓库踩过两次）；
   任何"探针说没问题"的结论，先确认 exe 的时间戳比源码新，命令行里加个
   `if (-not (Test-Path $out)) { exit 1 }` 守卫。
-- 宿主**测不了**管道读写（客户端要写，沙箱/宿主都做不到），那条靠真机日志；
-  断言覆盖不到的地方，日志就是防线。
-- 这里的 `Wh_Log` 桩**不检查格式串**：clang 只对带 format 属性的函数做检查，而这个工具链上
-  宽字符 format 属性是硬错误、`ms_printf` / `wprintf` 又不受支持。宽格式要用 `python _logfmt.py` 查。
+- 宿主**测不了**管道读写（客户端要写，沙箱/宿主都做不到）。这里的 `Wh_Log` 桩也**不检查格式串**：
+  clang 只查带 format 属性的函数，而这个工具链上宽字符 format 属性是硬错误、`ms_printf` / `wprintf`
+  又不受支持——宽格式要用 `python _logfmt.py` 查。

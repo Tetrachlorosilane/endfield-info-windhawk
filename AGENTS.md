@@ -55,7 +55,8 @@ endfield-info-windhawk/
 不变量与踩过的坑**。同一个事实不要在三处各写一遍——写在你改代码时需要看到的那一处。
 
 `test-layout.cpp` 与 `test-gdiplus-scale.cpp` 是**开发工具**，不随 mod 交付。
-`_settings.py` 需要 Pillow 与 Python；`_logfmt.py` 只需要 Python。
+`_settings.py` / `_logfmt.py` / `_deadcode.py` 只要 Python 标准库；**需要 Pillow 的是 `_preview.py`**
+（它自己重画一遍版面）。
 
 > 本机 `python` 解析到的是 Windows Store 的占位程序，不一定真的能执行。
 > 如果 `python` 打开的是应用商店，用 DSH 运行时自带的解释器：
