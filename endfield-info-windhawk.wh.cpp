@@ -246,6 +246,9 @@ through WMI.
 - ExtProviders: ""
   $name: 'Allowed external providers'
   $description: 'Semicolon separated provider names, for example music;discord. Empty allows any name, which is still logged and rate limited. Matched case-insensitively.'
+- ExternalPublisherWatchProcess: ""
+  $name: 'External publisher watch process'
+  $description: 'Optional. A process name such as cloudmusic. When set, the publisher command above is started only while that process is running, and stopped when it exits -- a watchdog. The mod only observes the process; it never starts or restarts it, and never touches any other application. Leave empty to start the command whenever {ext.*} values are in use.'
 - ExternalPublisherCommand: ""
   $name: 'External publisher command'
   $description: 'Optional. A command line the mod starts for you while {ext.*} values are in use, e.g. pwsh -NoProfile -File C:\path\_netease-bridge.ps1. The process is stopped when the mod unloads, and restarted at most 5 times if it dies. The mod never starts or restarts your other applications.'
