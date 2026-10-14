@@ -12,11 +12,11 @@
   （头顺序 + `ApplyPanelTransform` 未使用）。
 - 7 个导出入口齐全。
 - 依赖仅系统 DLL：`USER32 / GDI32 / PDH / IPHLPAPI / PSAPI / ADVAPI32 / msvcrt / KERNEL32`。
-- 回归测试全绿（460 条断言，含一段**真启动 GDI+** 的排版断言：
+- 回归测试全绿（478 条断言，含一段**真启动 GDI+** 的排版断言：
   文字不折行、且在预算内）。
 - GDI+ 缩放管线用**已知内容**的图验证过（含透明底、纯 RGB、索引色、灰度+alpha、
   16 位、隔行 PNG）。
-- 外部数据（M1）：编译只剩上面那两条已知警告；回归 **460 条断言**全绿（M1、M2、M3 与 CPU 频率共新增 300 条）；
+- 外部数据（M1）：编译只剩上面那两条已知警告；回归 **478 条断言**全绿（M1、M2、M3 与 CPU 频率共新增 318 条）；
   并做了**负对照**——把展开改成递归后，注入断言确实变红（不是"看着像在守"）。
 - 设置块 46 项 / 10 个选项组，`_settings.py` 报 `no structural problems found`。
 - **mod 的日志格式串**：`-Wformat` **从来没有检查过它们**（2026-10-14 更正）✗。
@@ -285,7 +285,7 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 | 桩的 `Wh_FreeStringSetting` 是空实现（漏 free / double free 都测不出） | 桩按真实 API **每次发放新内存**并记账：每笔发放可查、重复释放/释放非发放指针会打印并置错、末段 `=== settings string ownership ===` 报出未释放数（实测 351 次发放 / 0 未释放） | 删掉 mod 里一处 `Wh_FreeStringSetting(theme)` → `every settings string the run asked for was released` FAIL，并报 13 个未释放 |
 | token 覆盖是**手抄**的 32 个字面量，与 `kVariables[]` 无对应 | 直接遍历 `kVariables[]`，并加"每个注册项都要有采集组"（`group != G_NONE`） | 往 `kVariables[]` 加一个未实现的 `{L"disk", G_SYS}` → `every registered variable resolves` FAIL |
 
-断言数 380 → **434**（第五批，+54：列表改遍历后按注册项计，加上新增的行级几何与下限检查）→ **460**（第六批，+26：灵动岛三条）。
+断言数 380 → **434**（第五批，+54：列表改遍历后按注册项计，加上新增的行级几何与下限检查）→ **460**（第六批，+26：灵动岛三条）→ **478**（第七批，+18：剩余五项）。
 **测试装置现在仍有的信任边界**（诚实记录）：`PaintPanel` 的**调用点**依旧不可断言（需要真窗口），
 所以内联预算只测到 `ComputeInlineTextLimit`／`LayoutWidthFloor` 本身，绘制分支里怎么用它们靠读代码；
 `StartIntro` 的关键帧接线没被驱动（收回时长由测试自己乘 `kCollapseDurationRatio` 算出，这是 §7.6 的
@@ -299,15 +299,22 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 | **关闭按钮比卡片高**：按钮按卡片尺寸收缩（`min(kIslandCloseSize, card.w, card.h)`）。此前固定 22 px 对单行 18 px 卡片时，上钳位先抬到卡片上沿、下钳位再把它推出卡片（y = card.y − 4） | `the close button fits inside a card of any height`（h = 1/8/18/21/22/30/90/168）、`and it shrinks to the card when the card is smaller`；恢复固定尺寸 → 红 8 条 |
 | **淡出期点击落到面板**：抽出纯函数 `IslandClickActionFor(hit, dismissable)`——按钮命中时**能淡出就淡出、正在淡出也吃掉**；卡片命中一律吃掉；只有卡片之外归面板 | `and during the fade it is still swallowed, not handed to the panel`、`a click on the card is swallowed, never the panel's`、`so the button's two questions agree on both states`；改回"失败就落到面板" → 红 3 条 |
 
-**其余已确认、尚未修**（按建议顺序）：
+**第七批已修（2026-10-14；剩余五项一次清完，负对照共红 7 条 + 桥自检对照）**：
 
-| 类别 | 问题（位置见当次复查报告） |
+| 修复 | 断言 / 负对照 |
 | :-- | :-- |
-| 绘制 | `FitTextToWidth` 的省略号宽度缓存在函数 static，注释称"字体终生固定"，实际字体每次绘制按设置重建 → 改字号后预留宽度失效 |
-| 外部数据 | `WaitForSingleObject(sampler, 2000)` 超时被忽略，随后仍 `DeleteCriticalSection` |
-| 图标 | 自定义图片不参与入场 `iconScale`（`dw > 2*plateRadius*1.01` 对缓存图恒假） |
-| GPU | PDH 数组读只认 `CStatus == ERROR_SUCCESS`，而 CPU 路径接受 `PDH_CSTATUS_NEW_DATA` |
-| 脚本 | bridge 的 `$client.Connect(3000)` 无 try/catch → 瞬态管道失败即退出，烧掉 mod 的重启预算 |
+| **`FitTextToWidth` 不再按进程缓存省略号宽度**（理由写"字体终生固定"，而绘制每帧重建字体 → 改字号后预留宽度失效） | GDI+ 段扫 40..200 共 161 个预算：先用 15 px 字号"弄脏"旧缓存，再要求 24 px 下**每个**预算都不越界（实测陈旧缓存下预算 132 越界 6.1 px）→ 红 |
+| **sampler join 的等待结果不再丢弃**（超时后仍删 `g_valuesLock` = 在另一条线程可能还握着它时删锁） | `ValuesLockCanBeReleased` 只认 `WAIT_OBJECT_0`：`a sampler that did not stop leaves its lock alone`、`and so does a failed wait`；恒真 → 红 2 条 |
+| **自定义图片随入场缩放**：抽出 `ComputeIconImageDrawSize` = `min(自然尺寸, 盘径) × iconScale`（旧条件只在"比盘大"时乘缩放，而缓存图恰好等于盘径） | `and follows the intro as it scales the plate in`、`while the intro still scales it down`、`at zero scale it draws at zero size`；旧条件 → 红 3 条 |
+| **PDH 状态口径统一**：`PdhValueUsable()` 接受 `VALID_DATA` 与 `NEW_DATA`，三条路径共用（GPU 数组读取此前只认 `ERROR_SUCCESS` → 计数器刚建好的第一个采样被丢） | `and so is a counter's first sample (new data)` 等 5 条；只认 `ERROR_SUCCESS` → 红 1 条 |
+| **bridge 的管道连接加等待窗口**：`Connect-PipeClient` 失败重试、等不到返回 `$null`（此前裸 `Connect(3000)` 抛未处理异常、脚本当场死掉、烧掉 mod 的重启预算） | 自检新增 `连不上管道时返回空值（不抛异常）`（31 项）；对照：换回裸 Connect → **未捕获异常、exit 1**，自检根本跑不完 |
+
+**其余已确认、尚未修**：**本会话复查列出的项目已全部处理完**。剩下的都是真机项（见 §12.1）
+与 AGENTS §7.13 末尾记的测试装置信任边界（`PaintPanel` 调用点、`StartIntro` 接线）。
+
+**观察记录（不是缺陷，留给真机）**：`FitTextToWidth` 每次多量一次省略号宽度；这发生在
+"某段超预算"的帧里，与旁边的二分测量同量级。若真机上发现滚动文本的帧时间有变化，
+第一个可回退的点是把它改成**按字号键控**的缓存——**不要**改回"按进程"。
 
 ---
 
@@ -317,13 +324,13 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 
 **已验证（有证据）**：
 
-- mod 编译：**恰好 2 条已知警告**，DLL **180736** 字节；回归 **460 断言**全绿（2026-10-14 六批修复后为 460，含 1 条环境性 SKIP）。
+- mod 编译：**恰好 2 条已知警告**，DLL **180736** 字节；回归 **478 断言**全绿（2026-10-14 七批修复后为 478，含 1 条环境性 SKIP）。
 - 设置块：`_settings.py` → `no structural problems found`；独立结构检查 49 条目、顶层 dash 缩进唯一为 0、每条目恰好一个 `$name`/`$description`。
 - 真实管道链：mod 开机自检两帧被服务端完整收到；`_extclient.ps1` 的值**显示在面板上**。
 - `{cpu.ghz}`：用户确认显示**正确**，标称取电源 API 的 **2.20 GHz**（注册表 2.42 被正确忽略）。⚠️ 但**保存过任何设置之后**它曾回退到注册表值（2026-10-14 修，见 §10.y 头条 1）。
 - 看门狗：日志出现 `EXT publisher: started pid=…`，命令行按 `CreateProcessW` 约定正确拆分。
 - 歌词来源（部分打通）：`async:lyric.lyricLines`（实测 **64 / 67** 行）与 `tlyricLines`；**真 currentTime** 来自 `#page_pc_mini_bar` 的 `mm:ss / mm:ss`。
-- bridge 自检 **30 项**（含 8 项 Select-StoreLineIndex，不假设长度）全绿。
+- bridge 自检 **31 项**（含 8 项 Select-StoreLineIndex，不假设长度）全绿。
 - 图标全局覆盖（Custom icon file）与 None 语义：2026-10-14 实现并断言（第四批，见 §10.y）。
 
 **未验证 / 待办（按优先级）**：

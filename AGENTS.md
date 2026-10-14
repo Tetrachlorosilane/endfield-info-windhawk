@@ -298,7 +298,12 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   `FitCharsWithEllipsis` / `ComputeInlineTextLimit` 是纯函数或注入测量的函数，都有断言。
 - **`DrawString` 的框宽下限是 `kMinLayoutWidth`（1.0）**，不能是 0：
   0 宽会让 GDI+ 把整段裁掉，这与第一条是同一个坑的另一面。
-  截断与框用的是同一个下限，两者不能各写一个数字。
+  截断与框用的是同一个下限（`LayoutWidthFloor`），两者不能各写一个数字。
+- **`FitTextToWidth` 不缓存省略号宽度。** 它曾经"按进程缓存一次"，理由写着"字体终生固定"——
+  **不成立**：绘制每帧按设置重建字体。于是改字号后缓存还是旧字号的宽度，被截断的行可以
+  比预算宽出这个差值（实测 24 px 字体下某个预算超 6.1 px）。现在每次量一次（旁边本来就有
+  一次二分测量，多这一次可以忽略）。断言是**扫一遍预算**（40..200）而不是试一个：
+  预留被低估时只有"刚好填满预留"的那些预算会越界。
 
 ### 5.2 配色
 
@@ -312,6 +317,10 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   （`gpuTempValid` / `gpuFanValid` / `gpuPowerValid` / `vramUsedValid` / `vramTotalValid`）：
   少一个标志，"这台机器读不到"就会被画成一个看着很像真读数的 `0`——温度、风扇、功耗、
   显存总量各栽过一次。
+- **PDH 的"这个值能不能用"只有一个判据**：`PdhValueUsable()` 接受 `PDH_CSTATUS_VALID_DATA`
+  **和** `PDH_CSTATUS_NEW_DATA`。CPU 时钟路径一直接受两者，而 GPU 的数组读取只接受
+  `ERROR_SUCCESS`（即 VALID_DATA）——于是**计数器刚建好时的第一个采样被丢掉**，
+  表现为 GPU 读数晚一拍才出现。三条路径现在问同一个函数。
 
 ### 5.3 图标
 
@@ -345,6 +354,10 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   且每帧重采样很贵。**逐级折半对"短边已经小于目标箱"的横幅同样成立**：
   `PlanDownscale` 只按比例折半，不把短边钳回目标（那个钳位有不动点，会让宽扁图做十几次
   1:1 空转、然后一次性压 173 倍）；短边在中间步骤允许降到 1px，末级仍由长边定尺。
+- **图片的绘制尺寸 = min(自然尺寸, 盘径) × 入场缩放**（`ComputeIconImageDrawSize`）。
+  "不放大超过自然尺寸"是给**基准**尺寸的天花板，不是第二次钳位。它曾经被写成
+  "只有比盘还大的图才乘缩放"，而缓存图恰好**等于**盘径，于是自定义图片只会淡入、
+  不随盘子长大（内置字形那条路径一直是乘缩放的）。
 
 ### 5.4 动画
 
@@ -403,6 +416,9 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   替换出来的文本不会被重新扫描——并且有断言钉住：把展开改成递归，
   `test-layout.cpp` 里 "a pushed value that looks like a token stays literal" 必须变红（已实测）。
 - **停机顺序：IPC 先于 sampler**（写者先于读者），最后才 `DeleteCriticalSection(&g_extLock)`。
+  同理，**删 `g_valuesLock` 之前必须确认 sampler 真的停了**：等待结果不能丢
+  （`ValuesLockCanBeReleased` 只认 `WAIT_OBJECT_0`）。超时就把锁留给进程退出——
+  在"另一条线程可能还握着它"的时候删锁是未定义行为，而超时正是这个等待要防的情形。
 - **`CreateNamedPipe` 的 `nMaxInstances` 必须等于实例线程数**（每线程建一个实例）。
   传 1 会让第一个线程占满额度、其余线程以 `ERROR_PIPE_BUSY (231)` 退出——表面上"serving 4
   instances"，实际只有一个客户端能连。**231 是瞬态**（实例都被占着），要等一会儿重试，
@@ -508,6 +524,11 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 | 合并窗口吞掉同一标题的升级 | 同标题从 warn 变 critical 时卡片仍停在 warn，升级永远看不见 | `an escalation inside the merge window raises the queued level`、`so a card already on screen stands down for it` |
 | 关闭按钮比卡片还高 | 单行卡片（18 px）下按钮被下钳位顶出卡片上沿（y = card.y − 4）→ 卡片外多出一个可点区域 | `the close button fits inside a card of any height`、`and it shrinks to the card when the card is smaller` |
 | 淡出期间点击 × 落到面板行为上 | 卡片正在淡出时再点 × → 面板被切换（看着像"× 关掉了面板"）；点卡片本身同样如此 | `and during the fade it is still swallowed, not handed to the panel`、`a click on the card is swallowed, never the panel's` |
+| `FitTextToWidth` 按进程缓存省略号宽度 | 改字号后被截断的行比预算宽出省略号的差值（实测 24 px 下某个预算超 6.1 px），文字压到后面的环上 | `a trimmed run fits its budget under any second font size`（扫 40..200 全部预算） |
+| sampler 的 join 超时被忽略 | 超时后仍 `DeleteCriticalSection(&g_valuesLock)`：另一条线程可能还握着它，未定义行为 | `a sampler that did not stop leaves its lock alone`、`and so does a failed wait` |
+| 自定义图片不参与入场缩放 | 图片只淡入、不随盘子长大（内置字形那条路径一直会） | `and follows the intro as it scales the plate in`、`while the intro still scales it down` |
+| PDH 的 GPU 数组读只认 `ERROR_SUCCESS` | 计数器刚建好时的第一个采样（`NEW_DATA`）被丢掉 → GPU 读数晚一拍 | `and so is a counter's first sample (new data)` |
+| bridge 的 `$client.Connect(3000)` 无保护 | 瞬时连不上变成未处理异常、脚本当场死掉，mod 看门狗再拉起它——重启预算烧在"再等一秒就能连上"上 | 自检 `连不上管道时返回空值（不抛异常）`；对照（裸 Connect）实测未捕获异常 + exit 1 |
 
 ### 排查心法：先分类，再定位
 
