@@ -804,3 +804,20 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 - 本仓库的设计文档（**M1 与 M2 已实现；M3 进行中——几何/区域/命中/关闭按钮/悬停/帧率决策均已落地，
   剩下 `ComputeIslandRect` 接管窗口定位；M4 仍是提案**，不要当成现有行为）：
   [docs/external-data-island-design.md](docs/external-data-island-design.md)
+
+### 10.x 真机更正与新增教训（2026-10-13，用户实测）
+
+- **`playingLyricLineNumber` 不可用（真机更正）**：播放中、歌词页开着、两次采样相隔 20 秒，
+  它**稳定停在 10**（行文本与 `time` 一字不差）。它是 **UI 状态**：随换歌重建、随播放**不推进**。
+  → 当前行改为**用位置在 `async:lyric.lyricLines[].time`（秒）上选**（`Select-StoreLineIndex`）。
+- **`playingState = 2` 是"播放中"**（用户确认当时在播）→ 此前"1=播放、2=暂停"的猜测作废；
+  暂停时的取值仍未知，所以不拿它当暂停依据。
+- **真 currentTime 在 DOM 里**：`#page_pc_mini_bar` 内 `span` 文本形如 `02:58 / 03:06`（用户从 DevTools 找到）。
+  `Get-CdpDomTime` 读它并读进度柄 `left: xx%` 交叉校验。**早先的 DOM 探测只找 `audio/video`、`m:ss` 与
+  `style.width`，漏掉了这一个** —— 教训：DOM 探测要**枚举可见文本形状**，而不是只找"我以为该有的标签"。
+- **断言第一次跑就抓到真 bug**：`times` 若用 `[double[]]` 收，JSON 的 `null` 会被**静默变成 0**，
+  那一行于是匹配任何位置 → 必须 `[object[]]` + 显式跳过 `null`。
+- **不要把整文件行尾改掉**：`ReadAllText` 读、却 `split`+`join CRLF` 写回，使 20 行补丁在 diff 里
+  变成 **1400 增 / 1295 删**；"修"时又整file翻成 LF → 1400/1400。写回前先确认原行尾。
+- **辅助函数名先用 `Select-String` 确认**：自检里我写了 `Check ...`，而那份自检的失败计数是 `$bad`，
+  于是整段自检中断、连 `SELFTEST PASSED` 都打不出来；而"移除"时只删掉一半，残留 20 行留了数轮。

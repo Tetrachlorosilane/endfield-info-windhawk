@@ -432,6 +432,7 @@ pwsh -File _netease-bridge.ps1 -Event -Ttl 600000
 | `-SongId` | 手工指定歌曲 id，跳过搜索（接口查不到时的兜底） |
 | `-LyricSource` | 歌词来源：`auto`（默认，先用 CDP store，失败退回 LRC）/ `store`（只读客户端页面里的状态，**精确到客户端自己的当前行**，拖动进度条与暂停天然正确 ✓）/ `lrc`（只读歌词接口 + 位置选行）。`store` 需要你自己给快捷方式加调试端口（见 `-ProbeCdp`） |
 | `-PositionSource` | 位置来源：`auto`（默认，顺序为 **store 的行时间 → cdp → memory → media → 推算时钟**）/ `memory` / `media` / `clock`。⚠️ store 给的是**当前行的起始时间**（按行跳变）；要**连续毫秒**（进度条那种）才需要 `memory` —— 只读客户端内存、拖动/暂停都跟得上、每个客户端进程只发现一次 |
+| 位置来源（实际顺序） | (1) 迷你条 DOM 的 "已播 / 总长"（客户端自己显示的时钟，`#page_pc_mini_bar`，不锚哈希类名）(2) store 的行时间 (3) cdp (4) 内存 (5) SMTC (6) 推算时钟 |
 | `-ProbePosition` | 探测位置来源（媒体会话那条）；`-ProbeCdp` 探测 CDP 调试端口（需要你手动给快捷方式加 `--remote-debugging-port=9229`，脚本会打印步骤） |
 | `-DryRun` / `-SelfTest` / `-DumpJson` | 不发送 / 离线自检 / 打印接口返回的 JSON |
 
