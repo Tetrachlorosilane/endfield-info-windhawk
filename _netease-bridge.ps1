@@ -134,14 +134,83 @@ function Select-LrcLine {
 
 # ---------------------------------------------------------------------------
 # 曲目：从窗口标题拿「歌名 - 歌手」
+#
+# **不能用 Process.MainWindowTitle**。2026-10-14 真机实测：网易云开着「桌面歌词」时，
+# cloudmusic.exe 的 MainWindowTitle 是**「桌面歌词」**，带歌名的那个顶层窗口反而不是
+# 主窗口（`Get-Process -Id 15824` → `MainWindowTitle: 桌面歌词`，而同一个 pid 的另一个
+# 顶层窗口标题是「下等马 - 洛天依Official/ChiliChill乐团」）。于是按 MainWindowTitle
+# 取标题永远拿不到「 - 」，`Get-PlayingTrack` 判为"没有可用窗口"，桥**一直停在等待
+# 循环里、从不连接管道**——面板上 title 与 lyric 两行就永远是 `--`。
+#
+# 所以自己枚举该进程的顶层窗口，挑标题里有「 - 」的那个。
 # ---------------------------------------------------------------------------
-function Get-PlayingTrack {
-    $procs = @(Get-Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.ProcessName -like "*$ProcessName*" -and $_.MainWindowTitle })
-    if ($procs.Count -eq 0) { return $null }
+if (-not ('Endfield.Win32' -as [type])) {
+    Add-Type -Namespace Endfield -Name Win32 -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, System.IntPtr lParam);
+public delegate bool EnumWindowsProc(System.IntPtr hWnd, System.IntPtr lParam);
+[DllImport("user32.dll")] public static extern int GetWindowTextLength(System.IntPtr hWnd);
+[DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)] public static extern int GetWindowText(System.IntPtr hWnd, System.Text.StringBuilder s, int n);
+[DllImport("user32.dll")] public static extern bool IsWindowVisible(System.IntPtr hWnd);
+[DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(System.IntPtr hWnd, out int pid);
+'@
+}
 
-    $title = $procs[0].MainWindowTitle.Trim()
-    # 没在播时标题就是产品名，没有「 - 」
+# 纯函数：从一组窗口标题里挑出曲目标题。没有「 - 」就没有曲目（没在播时标题是产品名，
+# 桌面歌词窗口的标题也是产品名之外的东西）。多个候选取**最长**的——完整标题比截断的长。
+function Select-SongTitle {
+    param([string[]]$Titles)
+    $best = $null
+    foreach ($t in $Titles) {
+        if (-not $t) { continue }
+        $t = $t.Trim()
+        if ($t.IndexOf(' - ') -lt 1) { continue }
+        if (-not $best -or $t.Length -gt $best.Length) { $best = $t }
+    }
+    return $best
+}
+
+# 该进程（名字匹配 `*$ProcessName*`）所有**可见且有标题**的顶层窗口标题。
+#
+# 按**窗口所属进程名**判定，而不是"先列出所有进程、再筛 pid"：进程**列表**在受限环境里
+# 可能只给一部分（实测：沙箱里 `Get-Process` 只返回 13 个进程，而按 pid 单查是可靠的）。
+# 所以这里枚举窗口、取每个窗口的 pid、再按 pid 查进程名；每次调用只为**去重后的几个
+# pid** 各查一次（有标题的顶层窗口通常不到 20 个）。
+function Get-NeteaseWindowTitles {
+    $titles = New-Object System.Collections.ArrayList
+    $ownerNames = @{}
+    $cb = [Endfield.Win32+EnumWindowsProc] {
+        param($hWnd, $lParam)
+        if (-not [Endfield.Win32]::IsWindowVisible($hWnd)) { return $true }
+        $len = [Endfield.Win32]::GetWindowTextLength($hWnd)
+        if ($len -le 0) { return $true }
+        $owner = 0
+        [void][Endfield.Win32]::GetWindowThreadProcessId($hWnd, [ref]$owner)
+        if (-not $ownerNames.ContainsKey($owner)) {
+            $name = ''
+            try { $name = (Get-Process -Id $owner -ErrorAction Stop).ProcessName } catch { $name = '' }
+            $ownerNames[$owner] = $name
+        }
+        if ($ownerNames[$owner] -like "*$ProcessName*") {
+            $sb = New-Object System.Text.StringBuilder ($len + 2)
+            [void][Endfield.Win32]::GetWindowText($hWnd, $sb, $sb.Capacity)
+            [void]$titles.Add($sb.ToString())
+        }
+        return $true
+    }
+    [void][Endfield.Win32]::EnumWindows($cb, [System.IntPtr]::Zero)
+    return $titles.ToArray()
+}
+
+function Get-PlayingTrack {
+    $title = Select-SongTitle (Get-NeteaseWindowTitles)
+    if (-not $title) {
+        # 兜底：枚举拿不到东西时退回主窗口标题（有的客户端/版本里主窗口就是曲目标题）
+        $procs = @(Get-Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProcessName -like "*$ProcessName*" -and $_.MainWindowTitle })
+        if ($procs.Count -gt 0) { $title = Select-SongTitle @($procs[0].MainWindowTitle) }
+    }
+    if (-not $title) { return $null }
+
     $sep = $title.LastIndexOf(' - ')
     if ($sep -lt 1) { return $null }
 
@@ -1229,8 +1298,19 @@ if ($SelfTest) {
         @{ Name = '切歌粗校验：回落或明显跳变 = 有效'; Ok = (Test-PosAfterTrackChange -Prev 60000 -Now 1200) -and (Test-PosAfterTrackChange -Prev 60000 -Now 20000) }
         @{ Name = '切歌粗校验：几乎原样 = 可疑'; Ok = (-not (Test-PosAfterTrackChange -Prev 60000 -Now 60200)) }
         @{ Name = '连不上管道时返回空值（不抛异常）'; Ok = ($null -eq (Connect-PipeClient -Pipe ("endfield-info-windhawk-selftest-{0}" -f [guid]::NewGuid().ToString('N')) -TimeoutMs 200 -WaitSeconds 0)) }
+        # 曲目标题的判定。真机形状：同一进程里既有「桌面歌词」也有「歌名 - 歌手」，
+        # 而后者不是 MainWindowTitle（2026-10-14 实测，见 Get-PlayingTrack 的注释）。
+        @{ Name = '曲目标题：桌面歌词窗口不算曲目'; Ok = ($null -eq (Select-SongTitle @('桌面歌词', '网易云音乐'))) }
+        @{ Name = '曲目标题：从多窗口里挑出带「 - 」的那个'; Ok = ((Select-SongTitle @('桌面歌词', '下等马 - 洛天依Official/ChiliChill乐团', '网易云音乐')) -eq '下等马 - 洛天依Official/ChiliChill乐团') }
+        @{ Name = '曲目标题：多个候选取最长的'; Ok = ((Select-SongTitle @('A - B', '下等马 - 洛天依Official/ChiliChill乐团')) -eq '下等马 - 洛天依Official/ChiliChill乐团') }
+        @{ Name = '曲目标题：空标题与空数组都不算'; Ok = ($null -eq (Select-SongTitle @('', '   ')) -and $null -eq (Select-SongTitle @())) }
+        # 活的枚举：网易云在跑就必须至少看到一个顶层窗口（不在跑则这条无意义，视为通过）
+        @{ Name = '窗口枚举：网易云在跑时能看到它的顶层窗口'; Ok = ((@(Get-NeteaseWindowTitles).Count -gt 0) -or (-not (Get-NeteasePid))) }
     )
     $bad = 0
+    # 活体证据：判定用的是这一份窗口列表，打出来省得下一个人再猜一次
+    $liveWindows = @(Get-NeteaseWindowTitles)
+    Write-Host ("网易云顶层窗口（{0} 个）：{1}" -f $liveWindows.Count, (($liveWindows | ForEach-Object { "[$_]" }) -join ' '))
     foreach ($c in $checks) {
         if ($c.Ok) { Write-Host ("  OK   {0}" -f $c.Name) } else { Write-Host ("  FAIL {0}" -f $c.Name); $bad++ }
     }
@@ -1245,11 +1325,15 @@ $track = Get-PlayingTrack
 if (-not $track) {
     # 发布器是被 mod 长期托管的（看门狗 / 作业对象负责收尾），所以"暂时没有窗口"不是退出理由：
     # 早先这里直接 exit 2，于是 mod 在 18 秒里把它启动了 5 次然后判定失败（真机日志 2026-10-13）。
-    Write-Host ("暂时没有可用的网易云窗口（进程名匹配 '*{0}*'，主窗口标题里要有「 - 」）。" -f $ProcessName)
-    Write-Host "每 5 秒重试；窗口出现就继续。若一直不出现，用 -ProcessName 指定真实进程名。当前有标题的进程："
-    Get-Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.MainWindowTitle } |
-        ForEach-Object { Write-Host ("  {0,-28} {1}" -f $_.ProcessName, $_.MainWindowTitle) }
+    Write-Host ("暂时没有可用的网易云窗口（进程名匹配 '*{0}*'，某个顶层窗口标题里要有「 - 」）。" -f $ProcessName)
+    Write-Host "每 5 秒重试；窗口出现就继续。若一直不出现，用 -ProcessName 指定真实进程名。"
+    Write-Host "网易云进程的顶层窗口（这就是判定用的那一份；主窗口标题不算数）："
+    $winTitles = @(Get-NeteaseWindowTitles)
+    if ($winTitles.Count -eq 0) {
+        Write-Host "  （一个都没看到——进程名不对，或者窗口还没建出来）"
+    } else {
+        $winTitles | ForEach-Object { Write-Host ("  [{0}]" -f $_) }
+    }
     while (-not $track) {
         Start-Sleep -Seconds 5
         $track = Get-PlayingTrack
