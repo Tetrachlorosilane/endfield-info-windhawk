@@ -1583,6 +1583,14 @@ try {
             $lastRaw = $now.Raw
             $started = Get-Date
             $script:Sent.Clear()
+            # 换歌时 store 的缓存一起作废。不清的话，新歌第一拍若拿不到行时间表，
+            # 选行就会用**上一首**的时间表、而 `$idx -ne $StoreLineIndex` 的判断还可能
+            # 正好命中，于是上一首的最后一句被当成新歌的当前行发出去。
+            $script:StoreTimes = $null
+            $script:StoreTimesTrack = ''
+            $script:StoreLineIndex = -1
+            $script:StoreLineText = ''
+            $script:StoreLineTrans = ''
             $lyricAttemptAt = Get-Date
             $lyricMisses = 0
             try { $lyricLines = @(Get-LyricLines -Title $track.Title -Artist $track.Artist) }
