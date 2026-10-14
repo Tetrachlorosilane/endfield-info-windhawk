@@ -6334,6 +6334,12 @@ static bool g_pubGaveUp = false;
 static const DWORD kPubMaxRestarts = 5;
 static const DWORD kPubBackoffMs = 5000;
 static const DWORD kPubSettingRecheckMs = 10000;
+// 看门狗：目标进程的扫描周期（**不每拍做** ✗ —— 建进程快照不便宜 ✓）
+static const DWORD kPubWatchScanMs = 5000;
+static WCHAR g_pubWatch[128] = L"";   // 要观察的进程名（空 = 不做看门狗，维持旧行为 ✓）
+static bool g_pubWatchFound = false;
+static DWORD g_pubLastScan = 0;
+static bool g_pubWatchLogged = false;
 
 // Pure: split a command line the way CreateProcessW does when lpApplicationName is null.
 // A leading quoted token may contain spaces; an unquoted one ends at the first space.
@@ -6441,7 +6447,80 @@ static void ExtPublisherStart(const WCHAR *exe, const WCHAR *args) {
     Wh_Log(L"EXT publisher: started pid=%lu '%s'", pi.dwProcessId, cmdline);
 }
 
-// Called on every sampler pass; cheap. The setting is re-read every 10 s so an edit takes
+// 看门狗（用户设计 2026-10-13）：把"触发"与"信息收集"分开 —— mod 只**观察**某个进程在不在跑，
+// 在跑才启动用户配置的发布器，退出就把它收掉。**绝不启动/重启那个程序本身** ✓。
+// 名字比较是纯函数（有断言 ✓）：大小写不敏感 ✓、带不带 .exe 都认 ✓、空名字一律不匹配 ✓。
+static bool ExtProcessNameMatches(const WCHAR *imageName, const WCHAR *want) {
+    if (!imageName || !want || !*imageName || !*want) return false;
+    const WCHAR *a = imageName;
+    const WCHAR *b = want;
+    for (;;) {
+        WCHAR ca = *a;
+        WCHAR cb = *b;
+        if (ca >= L'A' && ca <= L'Z') ca = (WCHAR)(ca - L'A' + L'a');
+        if (cb >= L'A' && cb <= L'Z') cb = (WCHAR)(cb - L'A' + L'a');
+        if (cb == 0) {
+            if (ca == 0) return true;
+            // 用户写 cloudmusic、实际映像名是 cloudmusic.exe → 认 ✓
+            if (ca == L'.' && (a[1] == L'e' || a[1] == L'E') && (a[2] == L'x' || a[2] == L'X') &&
+                (a[3] == L'e' || a[3] == L'E') && a[4] == 0)
+                return true;
+            return false;
+        }
+        if (ca == 0) {
+            // 反向：用户写 cloudmusic.exe、而映像名恰好没有后缀 → 也认 ✓
+            // （断言第一次跑就把这一条抓出来了 ✗ —— 只做单向匹配是不够的 ✓）
+            if (cb == L'.' && (b[1] == L'e' || b[1] == L'E') && (b[2] == L'x' || b[2] == L'X') &&
+                (b[3] == L'e' || b[3] == L'E') && b[4] == 0)
+                return true;
+            return false;
+        }
+        if (ca != cb) return false;
+        a++;
+        b++;
+    }
+}
+
+// 目标进程在不在跑。用 kernel32 的 toolhelp（**不加新库依赖** ✓）；调用方按 kPubWatchScanMs 限频 ✓。
+// 这几项**自己声明**而不是引 <tlhelp32.h> ✓ —— 与 GDI+ / pdh 常量同一种做法：不动包含顺序、
+// 不新增依赖 ✓（符号都在 kernel32 里 ✓）。
+#define TH32CS_SNAPPROCESS 0x00000002
+struct ExtProcessEntry32W {
+    DWORD dwSize;
+    DWORD cntUsage;
+    DWORD th32ProcessID;
+    ULONG_PTR th32DefaultHeapID;
+    DWORD th32ModuleID;
+    DWORD cntThreads;
+    DWORD th32ParentProcessID;
+    LONG pcPriClassBase;
+    DWORD dwFlags;
+    WCHAR szExeFile[MAX_PATH];
+};
+extern "C" __declspec(dllimport) HANDLE WINAPI CreateToolhelp32Snapshot(DWORD, DWORD);
+extern "C" __declspec(dllimport) BOOL WINAPI Process32FirstW(HANDLE, ExtProcessEntry32W *);
+extern "C" __declspec(dllimport) BOOL WINAPI Process32NextW(HANDLE, ExtProcessEntry32W *);
+
+static bool ExtProcessRunning(const WCHAR *name) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    ExtProcessEntry32W pe;
+    ZeroMemory(&pe, sizeof(pe));
+    pe.dwSize = sizeof(pe);
+    bool found = false;
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (ExtProcessNameMatches(pe.szExeFile, name)) {
+                found = true;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return found;
+}
+
+// Called on every sampler pass; cheap. The settings are re-read every 10 s so an edit takes
 // effect, the restart policy is bounded, and nothing is ever started twice.
 static void ExtPublisherTick() {
     DWORD now = GetTickCount();
@@ -6461,6 +6540,37 @@ static void ExtPublisherTick() {
             g_pubCmd[0] = 0;
             ExtPublisherStop();
         }
+        PCWSTR watch = Wh_GetStringSetting(L"ExternalPublisherWatchProcess");
+        g_pubWatch[0] = 0;
+        if (watch) {
+            wcsncpy(g_pubWatch, watch, 127);
+            g_pubWatch[127] = 0;
+            Wh_FreeStringSetting(watch);
+        }
+        g_pubWatchFound = false;
+        g_pubLastScan = 0;                   // 改完立刻重新判定一次 ✓
+    }
+
+    // 看门狗：只在目标进程运行时才让发布器活着 ✓（目标没了就收掉并重置计数 ✓，不重扫不刷屏 ✓）
+    if (g_pubWatch[0]) {
+        if (g_pubLastScan == 0 || now - g_pubLastScan > kPubWatchScanMs) {
+            g_pubLastScan = now ? now : 1;
+            g_pubWatchFound = ExtProcessRunning(g_pubWatch);
+        }
+        if (!g_pubWatchFound) {
+            if (ExtPublisherAlive()) {
+                if (!g_pubWatchLogged) {
+                    g_pubWatchLogged = true;
+                    Wh_Log(L"EXT publisher: watched process '%s' is not running; stopping",
+                           g_pubWatch);
+                }
+                ExtPublisherStop();
+                g_pubRestarts = 0;
+                g_pubGaveUp = false;
+            }
+            return;
+        }
+        g_pubWatchLogged = false;
     }
 
     if (!g_pubCmd[0]) return;
