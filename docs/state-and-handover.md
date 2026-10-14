@@ -12,11 +12,11 @@
   （头顺序 + `ApplyPanelTransform` 未使用）。
 - 7 个导出入口齐全。
 - 依赖仅系统 DLL：`USER32 / GDI32 / PDH / IPHLPAPI / PSAPI / ADVAPI32 / msvcrt / KERNEL32`。
-- 回归测试全绿（434 条断言，含一段**真启动 GDI+** 的排版断言：
+- 回归测试全绿（460 条断言，含一段**真启动 GDI+** 的排版断言：
   文字不折行、且在预算内）。
 - GDI+ 缩放管线用**已知内容**的图验证过（含透明底、纯 RGB、索引色、灰度+alpha、
   16 位、隔行 PNG）。
-- 外部数据（M1）：编译只剩上面那两条已知警告；回归 **434 条断言**全绿（M1、M2、M3 与 CPU 频率共新增 274 条）；
+- 外部数据（M1）：编译只剩上面那两条已知警告；回归 **460 条断言**全绿（M1、M2、M3 与 CPU 频率共新增 300 条）；
   并做了**负对照**——把展开改成递归后，注入断言确实变红（不是"看着像在守"）。
 - 设置块 46 项 / 10 个选项组，`_settings.py` 报 `no structural problems found`。
 - **mod 的日志格式串**：`-Wformat` **从来没有检查过它们**（2026-10-14 更正）✗。
@@ -285,11 +285,19 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 | 桩的 `Wh_FreeStringSetting` 是空实现（漏 free / double free 都测不出） | 桩按真实 API **每次发放新内存**并记账：每笔发放可查、重复释放/释放非发放指针会打印并置错、末段 `=== settings string ownership ===` 报出未释放数（实测 351 次发放 / 0 未释放） | 删掉 mod 里一处 `Wh_FreeStringSetting(theme)` → `every settings string the run asked for was released` FAIL，并报 13 个未释放 |
 | token 覆盖是**手抄**的 32 个字面量，与 `kVariables[]` 无对应 | 直接遍历 `kVariables[]`，并加"每个注册项都要有采集组"（`group != G_NONE`） | 往 `kVariables[]` 加一个未实现的 `{L"disk", G_SYS}` → `every registered variable resolves` FAIL |
 
-断言数 380 → **434**（+54：列表改遍历后按注册项计，加上新增的行级几何与下限检查）。
+断言数 380 → **434**（第五批，+54：列表改遍历后按注册项计，加上新增的行级几何与下限检查）→ **460**（第六批，+26：灵动岛三条）。
 **测试装置现在仍有的信任边界**（诚实记录）：`PaintPanel` 的**调用点**依旧不可断言（需要真窗口），
 所以内联预算只测到 `ComputeInlineTextLimit`／`LayoutWidthFloor` 本身，绘制分支里怎么用它们靠读代码；
 `StartIntro` 的关键帧接线没被驱动（收回时长由测试自己乘 `kCollapseDurationRatio` 算出，这是 §7.6 的
 "断言关系"，但也意味着接线错误测不到）；GDI+ 段的像素阈值全是关系式，换字体会让具体数值变但关系不变。
+
+**第六批已修（2026-10-14；灵动岛三条，五处负对照共红 15 条）**：
+
+| 修复 | 断言 / 负对照 |
+| :-- | :-- |
+| **合并窗口吞掉升级**：同 `(provider,title)` 在窗口内重复时**取更高的 severity**（并刷新为最新文本）；此前保留首次的级别 → 状态机看不到 `criticalWaiting`，卡片一直停在 warn | `an escalation inside the merge window raises the queued level`、`so a card already on screen stands down for it`（直接驱动 `StepIsland`）、`a repeat never lowers the level the queue already holds`、`the same title after the merge window is a new card, not a repeat`；去掉取高 → 红 4 条 |
+| **关闭按钮比卡片高**：按钮按卡片尺寸收缩（`min(kIslandCloseSize, card.w, card.h)`）。此前固定 22 px 对单行 18 px 卡片时，上钳位先抬到卡片上沿、下钳位再把它推出卡片（y = card.y − 4） | `the close button fits inside a card of any height`（h = 1/8/18/21/22/30/90/168）、`and it shrinks to the card when the card is smaller`；恢复固定尺寸 → 红 8 条 |
+| **淡出期点击落到面板**：抽出纯函数 `IslandClickActionFor(hit, dismissable)`——按钮命中时**能淡出就淡出、正在淡出也吃掉**；卡片命中一律吃掉；只有卡片之外归面板 | `and during the fade it is still swallowed, not handed to the panel`、`a click on the card is swallowed, never the panel's`、`so the button's two questions agree on both states`；改回"失败就落到面板" → 红 3 条 |
 
 **其余已确认、尚未修**（按建议顺序）：
 
@@ -297,9 +305,6 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 | :-- | :-- |
 | 绘制 | `FitTextToWidth` 的省略号宽度缓存在函数 static，注释称"字体终生固定"，实际字体每次绘制按设置重建 → 改字号后预留宽度失效 |
 | 外部数据 | `WaitForSingleObject(sampler, 2000)` 超时被忽略，随后仍 `DeleteCriticalSection` |
-| 灵动岛 | 合并窗口只看 `(provider,title)` → 同标题的 `warn → critical` 升档被吞 |
-| 灵动岛 | `ComputeIslandCloseRect` 在 `card.h < 22`（`rowHeight` 下限 18）时 y = −4，跑出卡片 |
-| 灵动岛 | 淡出期间再点 × → `IslandDismiss` 幂等返回 false → 落到面板自己的点击行为 |
 | 图标 | 自定义图片不参与入场 `iconScale`（`dw > 2*plateRadius*1.01` 对缓存图恒假） |
 | GPU | PDH 数组读只认 `CStatus == ERROR_SUCCESS`，而 CPU 路径接受 `PDH_CSTATUS_NEW_DATA` |
 | 脚本 | bridge 的 `$client.Connect(3000)` 无 try/catch → 瞬态管道失败即退出，烧掉 mod 的重启预算 |
@@ -312,7 +317,7 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 
 **已验证（有证据）**：
 
-- mod 编译：**恰好 2 条已知警告**，DLL **180736** 字节；回归 **434 断言**全绿（2026-10-14 五批修复后为 434，含 1 条环境性 SKIP）。
+- mod 编译：**恰好 2 条已知警告**，DLL **180736** 字节；回归 **460 断言**全绿（2026-10-14 六批修复后为 460，含 1 条环境性 SKIP）。
 - 设置块：`_settings.py` → `no structural problems found`；独立结构检查 49 条目、顶层 dash 缩进唯一为 0、每条目恰好一个 `$name`/`$description`。
 - 真实管道链：mod 开机自检两帧被服务端完整收到；`_extclient.ps1` 的值**显示在面板上**。
 - `{cpu.ghz}`：用户确认显示**正确**，标称取电源 API 的 **2.20 GHz**（注册表 2.42 被正确忽略）。⚠️ 但**保存过任何设置之后**它曾回退到注册表值（2026-10-14 修，见 §10.y 头条 1）。

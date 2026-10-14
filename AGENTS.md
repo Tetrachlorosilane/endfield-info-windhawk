@@ -450,6 +450,18 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   16 ms），所以淡出只有两三帧；现在相位与高度动画共用同一个决策点。
 - **关闭卡片与 ttl 到期走同一条路**（`IslandDismiss` → `COLLAPSING`），所以淡出与状态机不会分叉；
   它**幂等**，第二次点击不会重启淡出。
+- **合并窗口内"同一件事又来了"只加计数，但 `severity` 必须取两者中更高的那个。** 否则
+  "同一个标题，现在变成 critical"这条**升级会被窗口整个吞掉**：条目留在原级别 → 状态机看不到
+  `criticalWaiting` → 卡片一直停在 warn。文本取最新的一条（同标题的最新读数是更准的），
+  而**窗口从最后一次出现算起**（每次重复都刷新它，断了两倍窗口才算新事件）。
+  断言不只查队列字段，还直接驱动 `StepIsland`：屏幕上正显示的 warn 卡必须为它让位。
+- **关闭按钮不得比卡片大。** 卡片可以只有一行（`rowHeight` 下限 18）而按钮默认 22 px，
+  这时**没有任何位置能同时满足上下两个钳位**：旧代码先把 y 抬到卡片上沿、再被下钳位推出卡片
+  （实测 y = card.y − 4），于是卡片之外多出一个可点区域。按钮按卡片尺寸收缩是唯一解。
+- **卡片在时，点击要么关卡片、要么被卡片吃掉，绝不落到面板行为上。** 规则抽成纯函数
+  `IslandClickActionFor(hit, dismissable)`：按钮命中 → 可淡出就淡出，**正在淡出也要吃掉**
+  （旧代码要求 `IslandDismiss()` 返回 true 才算处理，于是淡出期间再点 × 会切换面板——
+  看起来像"× 把面板关掉了"）；卡片命中 → 吃掉（点卡片读它不该切换面板）；只有卡片之外才归面板。
 - **"动画期间取两态并集"这条规则仍然不在代码里**：它服务于已移除的宽度动画。现在没有动画窗口期，
   区域表本身就是完整的可点范围；等 M3 的悬停态落地时再回来看是否需要它。
 
@@ -493,6 +505,9 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 | `Row N icon = None` 与"没设置"无法区分 | 设了 `None` 的行**照样得到继承来的字形**（实测 `Icon1=Memory`+`Icon3=None` → 第 3 行是 Memory），README 的"设成 None 就不要图标"不成立 | `an explicit None leaves that row without a glyph`、`an unconfigured row inherits the first real glyph, not a None` |
 | 全局 `IconPath` 从未被读取（死设置项） | 界面上有"Custom icon file"，填了没有任何效果 | `the global icon applies to a row that has no file of its own`、`a global icon on its own still means plates are drawn` |
 | 多行用同一张图时逐行解码 | 全局图片在大图上会被解码 N 次（峰值内存按行数翻倍） | `every row shares one cache slot, so the file is decoded once`、`a row that names the global file shares row 1's slot` |
+| 合并窗口吞掉同一标题的升级 | 同标题从 warn 变 critical 时卡片仍停在 warn，升级永远看不见 | `an escalation inside the merge window raises the queued level`、`so a card already on screen stands down for it` |
+| 关闭按钮比卡片还高 | 单行卡片（18 px）下按钮被下钳位顶出卡片上沿（y = card.y − 4）→ 卡片外多出一个可点区域 | `the close button fits inside a card of any height`、`and it shrinks to the card when the card is smaller` |
+| 淡出期间点击 × 落到面板行为上 | 卡片正在淡出时再点 × → 面板被切换（看着像"× 关掉了面板"）；点卡片本身同样如此 | `and during the fade it is still swallowed, not handed to the panel`、`a click on the card is swallowed, never the panel's` |
 
 ### 排查心法：先分类，再定位
 
