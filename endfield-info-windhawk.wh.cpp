@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              endfield-info-windhawk
 // @name            Endfield Info Windhawk
-// @description     A configurable always-on-top status capsule: user-defined rows, on-demand collectors (CPU / memory / network / GPU), top-of-the-topmost-monitor anchoring, and proximity-or-always display with click-to-toggle.
-// @version         0.2.0
+// @description     A configurable always-on-top status capsule: user-defined rows with {variable} tokens, on-demand collectors (CPU / memory / network / GPU), ring gauges, per-row icons, an optional notification island fed by other programs over a named pipe, and proximity-or-always display with click-to-toggle.
+// @version         0.3.0
 // @author          Silicon Dioxide
 // @github          https://github.com/Tetrachlorosilane/endfield-info-windhawk
 // @include         windhawk.exe
@@ -15,7 +15,7 @@
 
 A lightweight always-on-top status capsule, built as a Windhawk **tool mod**: it
 runs in its own dedicated `windhawk.exe` process and never injects into, or hooks
-anything in, another process.
+anything in, another process. Nothing is collected until a row asks for it.
 
 ## Rows and variables
 
@@ -26,7 +26,7 @@ collectors for the groups you reference are the only ones that start.
 | :-- | :-- |
 | `{cpu}` | CPU total usage % |
 | `{cpu.user}` `{cpu.kernel}` | CPU split |
-| `{cpu.ghz}` `{cpu.ghz.max}` | Effective / base clock (GHz) |
+| `{cpu.ghz}` `{cpu.ghz.max}` | Effective / nominal clock (GHz) |
 | `{cpu.name}` `{cpu.cores}` `{cpu.threads}` | CPU identity |
 | `{mem}` | Memory usage % |
 | `{mem.used}` `{mem.total}` `{mem.free}` | Memory in GB |
@@ -40,9 +40,60 @@ collectors for the groups you reference are the only ones that start.
 | `{gpu.name}` `{gpu.fan}` `{gpu.power}` | GPU identity / fan % / watts |
 | `{time}` `{date}` `{uptime}` | Clock and uptime |
 | `{mod.ws}` `{mod.cpu}` | This mod's own footprint |
+| `{ext.provider.key}` | A value pushed by another program (see below) |
 
 A `{variable|spec}` suffix formats the value: `0` `1` `2` decimals, `gb`, `mb`,
-`pct`, `int`, `time`.
+`pct`, `int`, `time`. `[[ring:VALUE:MAX:THICK:COLOR]]` draws a gauge; one placed
+after text sits inline on that row. A variable that is known but unreadable on
+this machine (a GPU with no temperature sensor, say) renders as `--` rather than
+as a plausible-looking zero.
+
+## Rings, icons and themes
+
+* Ring gauges are drawn where you write them: right-docked by default, or inline
+  after text.
+* Every row can carry a disc icon: a built-in glyph (`CPU`, `Memory`, `Disk`,
+  `Network`, `GPU`), your own image file, or nothing. One image can be set for
+  all rows at once.
+* Three colour presets plus a `Custom` theme that unlocks the colour fields.
+* An intro animation (slide / fade / none) with a ripple, and a speed you set per
+  the machine.
+
+## Display
+
+* Anchored to the **top-centre of the topmost monitor** (the one highest in the
+  virtual desktop, not necessarily the primary one).
+* Always topmost, and it never takes focus.
+* **Mouse proximity** - hidden until the pointer reaches the top edge, then it
+  slides in and hides again shortly after the pointer leaves.
+* **Always shown** - stays up; clicking the capsule toggles it, and the collapsed
+  state is visible at a glance.
+* The panel is never hidden completely: collapsed it is an 8 px tab that can
+  always be clicked back.
+
+## The island (optional notifications)
+
+Set `Island` to on and a card can appear under the capsule for an event pushed by
+another program: a title, a body line, a severity (`info` / `warn` / `critical`,
+which picks the colour) and a lifetime. It fades out on its own, and the card's
+close button dismisses it early. Nothing shows a card unless a program pushes one.
+
+## External data (`{ext.provider.key}`)
+
+Turn on `External data` and the mod serves a **named pipe**; another program can
+`HELLO`, then `SET provider key ttl text`, and rows that reference
+`{ext.provider.key}` show that text (values expire on their own, and the row falls
+back to `--`). The optional `External publisher command` setting lets the mod
+start your publisher for you *while a row actually references `{ext.*}`*, and it
+is stopped again when nothing consumes it; the mod never starts or restarts your
+other software by itself.
+
+**This is a trust boundary, not a security channel.** The pipe is local-only and
+its DACL admits the user running the mod (plus SYSTEM and Administrators), so any
+program running as you can push text. The mod prints that text and nothing else:
+it executes nothing and accepts no image bytes - icons are built-in glyphs or
+files you chose yourself. Treat the values as untrusted input if you display them
+next to anything you trust.
 
 ## Collectors start on demand
 
@@ -58,23 +109,8 @@ because those two are by far the most expensive things this mod can do:
 
 Measured on the development machine. `PdhCloseQuery` does not give the memory
 back, so a collector that has started stays started until the mod is reloaded.
-
-## Display
-
-* Anchored to the **top-centre of the topmost monitor** (the one highest in the
-  virtual desktop, not necessarily the primary one).
-* Always topmost.
-* **Mouse proximity** - hidden until the pointer reaches the top edge, then it
-  slides in and hides again shortly after the pointer leaves.
-* **Always shown** - stays up; clicking the capsule toggles it, and the border
-  colour dims when collapsed so the current state is visible at a glance.
-
-## A note on the cost of GPU collectors
-
-`{gpu.temp}` and `{gpu}` read a real sensor, and reading one is not free: on the
-development machine NVML costs ~1.9 ms per sample and ~22 MB resident. That is a
-deliberate trade - it is still far cheaper, and far more accurate, than going
-through WMI.
+Reading a real GPU sensor is not free (~1.9 ms per sample with NVML); that is a
+deliberate trade for accuracy, and it only happens when you asked for it.
 */
 // ==/WindhawkModReadme==
 
@@ -782,7 +818,8 @@ static const double kIconContentGap = 8.0;
 // and the host's downward offset are the original's numbers.
 static const double kRippleScaleEnd[3] = {1.5, 2.0, 2.5};
 static const double kRipplePeakOpacity[3] = {0.50, 0.50, 0.60};
-static const double kRippleOffsetY = 16.0;    // RippleRise start
+// (The original's RippleRise offset lived here. It is not applied -- see PaintRipples --
+// so the constant and the frame field it fed are gone rather than kept unused.)
 
 // The icon plate: a light disc with a dark glyph, from HudTheme.axaml
 // (Hud.IconPlate #E9E7E4 / Hud.BoltDark #141313).
@@ -897,19 +934,6 @@ static const double kPanelBounceStrength = 0.04;
 
 static double Lerp(double a, double b, double t) { return a + (b - a) * t; }
 
-// Evaluates a two-keyframe segment: holds `from` until cue1, eases to `to` by
-// cue2 using the given spline, then keeps `to`. This mirrors how the Avalonia
-// KeyFrames behave with FillMode.Forward, so the original cues map over directly.
-static double Segment(double cue, double cue1, double cue2,
-                      double from, double to,
-                      double (*ease)(double)) {
-    if (cue <= cue1) return from;
-    if (cue2 <= cue1) return to;
-    double t = (cue - cue1) / (cue2 - cue1);
-    if (t > 1.0) t = 1.0;
-    return Lerp(from, to, ease(t));
-}
-
 // One edge in a keyframe chain: reach `value` at `cue`, easing into it.
 struct IntroKey { double cue; double value; double (*ease)(double); };
 
@@ -928,7 +952,9 @@ static double EvaluateKeys(double cue, const IntroKey *keys, int count) {
     return keys[count - 1].value;
 }
 
-// The four KeySplines, plus the curves the panel needs that are plain names.
+// The KeySplines this panel actually uses. The original also had KS_Smooth, which only
+// drove RippleRise -- the rise this port deliberately does not apply -- so it is gone
+// with it rather than kept as an unused helper.
 static double Clamp01(double x) { return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x); }
 
 static double CubicBezierY(double x, double x1, double y1, double x2, double y2) {
@@ -951,7 +977,6 @@ static double CubicBezierY(double x, double x1, double y1, double x2, double y2)
 static double EaseIn(double t) { return CubicBezierY(t, 0.42, 0.0, 1.0, 1.0); }
 static double EaseOut(double t) { return CubicBezierY(t, 0.0, 0.0, 0.58, 1.0); }
 static double EaseInOut(double t) { return CubicBezierY(t, 0.42, 0.0, 0.58, 1.0); }
-static double EaseSmooth(double t) { return CubicBezierY(t, 0.65, 0.0, 0.35, 1.0); }
 static double EaseBackOut(double t) {
     return CubicBezierY(t, 0.175, 0.885, 0.32, 1.0 + kPanelBounceStrength);
 }
@@ -980,7 +1005,6 @@ struct IntroFrame {
     double iconAlpha;
     bool expanding;       // true = arriving, false = collapsing
     double rippleProgress;  // 0 until the ripples start, then 0..1
-    double rippleRise;      // host vertical offset
 };
 
 // Note: this deliberately does not consult g_displayHeight. That variable holds
@@ -1126,11 +1150,11 @@ static IntroFrame EvaluateIntro() {
         f.contentAlpha = 1.0 - EaseIn(Clamp01(cue / kCueSettle));
     }
 
-    // Ripples run from the grow cue to the settle cue, rising meanwhile. The
-    // rise uses KS_Smooth, matching RippleRise in the original.
+    // Ripples run from the grow cue to the settle cue. The original's RippleRise
+    // (lifting the host by 16 px while they expand) is deliberately not applied -- see
+    // PaintRipples -- so there is no rise term to compute here.
     if (expanding && g_intro.rippleCount > 0 && cue > kCueGrow) {
         f.rippleProgress = EaseOut(Clamp01((cue - kCueGrow) / (kCueSettle - kCueGrow)));
-        f.rippleRise = Segment(cue, kCueGrow, kCueSettle, kRippleOffsetY, 0.0, EaseSmooth);
     }
     return f;
 }
@@ -1600,7 +1624,6 @@ struct Values {
     WCHAR uptimeText[24] = L"";
 
     double modWsMb = 0, modCpuMs = 0;
-    bool valid = false;
 };
 
 static CRITICAL_SECTION g_valuesLock;       // guards g_rowState and g_publishedRows
@@ -1637,7 +1660,6 @@ struct ExtProvider {
     WCHAR    name[kExtProviderChars + 1];
     ExtEntry entries[kMaxExtKeys];
     int      count;
-    DWORD    lastSeenAt;
     unsigned drops;                       // bounded counter for the log
 };
 
@@ -1821,8 +1843,7 @@ static int ExtFindProvider(const WCHAR *name, int len, bool create, int maxProvi
             g_ext[i].name[copy] = L'\0';
             g_ext[i].count = 0;
             g_ext[i].drops = 0;
-            g_ext[i].lastSeenAt = GetTickCount();
-            return i;
+                    return i;
         }
     }
     return -1;
@@ -2216,7 +2237,6 @@ static void ExtStoreValue(int slot, const WCHAR *key, const WCHAR *text, DWORD t
     ExtSanitize(text, e.text, cap);
     e.updatedAt = GetTickCount();
     e.ttlMs = ttlMs;
-    p.lastSeenAt = e.updatedAt;
     LeaveCriticalSection(&g_extLock);
 }
 
@@ -3129,13 +3149,6 @@ static PanelTransform ComputePanelTransform(float width, float height, double in
     t.dx = (1.0f - t.scale) * width / 2.0f;
     t.dy = (1.0f - t.scale) * height / 2.0f;
     return t;
-}
-
-// Maps a point from local (untransformed) panel space to rendered space.
-static void ApplyPanelTransform(const PanelTransform &t, float x, float y,
-                                float *outX, float *outY) {
-    *outX = t.scale * x + t.dx;
-    *outY = t.scale * y + t.dy;
 }
 
 // Right edge available to text on one row, and the width the text should occupy.
@@ -4297,8 +4310,7 @@ struct IconGeometry {
     bool present = false;
     float centerX = 0.0f;
     float centerY = 0.0f;
-    float plateRadius = 0.0f;   // the icon disc
-    float ringInner = 0.0f;     // radius a ring has at the start of its expansion
+    float plateRadius = 0.0f;   // the icon disc; the rings start from this radius
 };
 
 // rowTop is the row's own offset, so one call describes exactly one plate and its
@@ -4313,9 +4325,8 @@ static IconGeometry ComputeIconGeometry(const ModSettings &settings, int slot,
     IconPlateCenterForRow(settings, slot, rowTop, (float)settings.rowHeight,
                           &g.centerX, &g.centerY);
     g.plateRadius = diameter / 2.0f;
-    // Rings are larger than the plate and measured from its radius, so the
-    // innermost ring starts at the plate's edge rather than on top of the glyph.
-    g.ringInner = diameter / 2.0f;
+    // Rings are larger than the plate and measured from this radius (RingRadiusAt), so
+    // the innermost ring starts at the plate's edge rather than on top of the glyph.
     return g;
 }
 
@@ -5882,7 +5893,6 @@ static void SamplerIteration() {
         }
         g_gpu.Sample(v);
     }
-    v.valid = true;
     g_activeGroups = groups;
     g_sampleCount++;
     PublishRows(v, settings);

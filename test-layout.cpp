@@ -21,7 +21,6 @@
 #include <wchar.h>
 
 #define WH_MOD_ID L"test"
-#define WH_EDITING 1
 
 // ---- Windhawk API stubs ---------------------------------------------------
 // These honour the name they are asked for, so ReadSettings can be driven from
@@ -135,7 +134,7 @@ int main() {
         ModSettings s;
         ReadSettings(s);
         printf("  Theme=Midnight with custom colours set:\n");
-        printf("    themeIndex=%d bg=%08X border=%08X text=%08X accent=%08X\n",
+        printf("    themeIndex=%d bg=%08lX border=%08lX text=%08lX accent=%08lX\n",
                s.themeIndex, s.background, s.border, s.text, s.accent);
         Check(s.themeIndex == 1, "named theme resolved");
         Check(s.background == kThemes[1].background, "named theme wins for background");
@@ -155,7 +154,7 @@ int main() {
         g_stubStringCount = (int)(sizeof(custom) / sizeof(custom[0]));
         ReadSettings(s);
         printf("  Theme=Custom with the same colours:\n");
-        printf("    themeIndex=%d bg=%08X border=%08X text=%08X accent=%08X\n",
+        printf("    themeIndex=%d bg=%08lX border=%08lX text=%08lX accent=%08lX\n",
                s.themeIndex, s.background, s.border, s.text, s.accent);
         Check(s.themeIndex == -1, "Custom theme resolved");
         Check(s.background == 0xAA111111, "custom background takes effect");
@@ -170,7 +169,7 @@ int main() {
         g_stubStringCount = (int)(sizeof(blank) / sizeof(blank[0]));
         ReadSettings(s);
         printf("  Theme=Custom, all colour fields empty:\n");
-        printf("    bg=%08X border=%08X text=%08X\n", s.background, s.border, s.text);
+        printf("    bg=%08lX border=%08lX text=%08lX\n", s.background, s.border, s.text);
         Check(s.background == kThemes[0].background, "empty custom falls back to Endfield bg");
         Check(s.text == kThemes[0].text, "empty custom falls back to Endfield text");
 
@@ -195,19 +194,19 @@ int main() {
         explicitColor.hasColor = true;
         explicitColor.color = 0xFF00FF00;
 
-        printf("  per-ring colour wins:      %08X (expect FF00FF00)\n",
+        printf("  per-ring colour wins:      %08lX (expect FF00FF00)\n",
                ResolveRingColor(explicitColor, preset));
         Check(ResolveRingColor(explicitColor, preset) == 0xFF00FF00,
               "per-ring :COLOR beats the theme");
         Check(ResolveRingColor(explicitColor, custom) == 0xFF00FF00,
               "per-ring :COLOR beats the Custom ring colour");
 
-        printf("  RingColor under Custom:    %08X (expect FFAB12CD)\n",
+        printf("  RingColor under Custom:    %08lX (expect FFAB12CD)\n",
                ResolveRingColor(plain, custom));
         Check(ResolveRingColor(plain, custom) == 0xFFAB12CD,
               "RingColor applies when Theme is Custom");
 
-        printf("  no RingColor -> border:    %08X (expect %08X)\n",
+        printf("  no RingColor -> border:    %08lX (expect %08lX)\n",
                ResolveRingColor(plain, preset), preset.border);
         Check(ResolveRingColor(plain, preset) == preset.border,
               "falls back to the border colour");
@@ -333,7 +332,7 @@ int main() {
         // of the struct twice ("ring centre == plate centre") is algebraically true and
         // cannot fail -- there was one here, and it proved nothing. What is worth
         // asserting is that the value itself is sane: the plate has to fit the panel.
-        printf("\n  row  plate centre      ring r    plate r  ring r(0)  r(0.5)  r(1)\n");
+        printf("\n  row  plate centre      plate r  ring r(0)  r(0.5)  r(1)\n");
         for (int r = 0; r < 4; r++) {
             IconGeometry g = ComputeIconGeometry(s, r, (float)(r * s.rowHeight));
             if (!g.present) continue;
@@ -341,7 +340,7 @@ int main() {
             float r0 = RingRadiusAt(g, 0, 0.0);
             float rMid = RingRadiusAt(g, 0, 0.5);
             float rEnd = RingRadiusAt(g, 0, 1.0);
-            printf("  %3d  (%6.1f,%6.1f)  %7.1f  %7.1f  %7.1f  %6.1f  %5.1f\n",
+            printf("  %3d  (%6.1f,%6.1f)  %7.1f  %7.1f  %6.1f  %5.1f\n",
                    r + 1, g.centerX, g.centerY, g.plateRadius, r0, rMid, rEnd);
             Check(g.centerX - g.plateRadius >= 0.0f,
                   "the plate stays inside the panel's left edge");
@@ -367,14 +366,29 @@ int main() {
             Check(anchorY != panelCentreY, "first origin is not the panel centre");
             Check(anchorY < panelCentreY, "first origin is on the first row");
 
+            // The intro scales the capsule **about its centre**, and the painter hands
+            // these three fields straight to the GDI+ matrix, so the fields are what is
+            // asserted here. (An ApplyPanelTransform() used to live in the mod for this
+            // arithmetic; nothing but this test called it, so it is gone and the
+            // properties are stated the way GDI+ maps a point: x*scale + dx.)
             PanelTransform t = ComputePanelTransform(W, H, 0.94, true);
-            float mappedX = 0.0f, mappedY = 0.0f;
-            ApplyPanelTransform(t, anchorX, anchorY, &mappedX, &mappedY);
-            printf("  transformed origin = (%.1f, %.1f), panel centre = %.1f\n",
-                   mappedX, mappedY, panelCentreY);
-            Check(mappedY != anchorY, "the transform displaces the origin");
-            Check(mappedY > anchorY, "a 0.94 scale pushes the first row toward the top");
-            printf("  origin shifts by %.1f px during the intro scale\n", mappedY - anchorY);
+            Check(t.active && t.scale > 0.93f && t.scale < 0.95f,
+                  "a mid-intro frame is an active 0.94 transform");
+            Check(t.dx == (1.0f - t.scale) * W / 2.0f && t.dy == (1.0f - t.scale) * H / 2.0f,
+                  "and its offset is built from the panel centre");
+            Check(t.scale * (W / 2.0f) + t.dx == W / 2.0f &&
+                      t.scale * (H / 2.0f) + t.dy == H / 2.0f,
+                  "so the panel centre is the fixed point of the mapping");
+            // Two frames that must not be transformed at all: a finished intro, and the
+            // very first frame (scale 0, where GDI+ would collapse everything to a point).
+            Check(!ComputePanelTransform(W, H, 1.0, true).active,
+                  "a finished intro is not a transform");
+            Check(!ComputePanelTransform(W, H, 0.0, true).active,
+                  "and neither is the first frame");
+            Check(!ComputePanelTransform(W, H, 0.94, false).active,
+                  "nor is any frame once the intro is inactive");
+            printf("  mid-intro transform: scale=%.3f dx=%.1f dy=%.1f (centre %.1f,%.1f)\n",
+                   t.scale, t.dx, t.dy, W / 2.0f, H / 2.0f);
         }
 
         // With no icon anywhere there is no plate, so there must be no ripple.
@@ -876,7 +890,6 @@ int main() {
             if (count > l->length) count = l->length;
             return (float)count * l->perChar;
         };
-        Layout layout = {40, 10.0f};          // 400 px of text in total
         const float ellipsis = 10.0f;         // one character wide
 
         printf("  400 px of text (10 px/char) into these budgets, ellipsis = %.0f px\n",
