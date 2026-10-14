@@ -380,7 +380,7 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 - `{cpu.ghz}`：用户确认显示**正确**，标称取电源 API 的 **2.20 GHz**（注册表 2.42 被正确忽略）。⚠️ 但**保存过任何设置之后**它曾回退到注册表值（2026-10-14 修，见 §10.y 头条 1）。
 - 看门狗：日志出现 `EXT publisher: started pid=…`，命令行按 `CreateProcessW` 约定正确拆分。
 - 歌词来源（部分打通）：`async:lyric.lyricLines`（实测 **64 / 67** 行）与 `tlyricLines`；**真 currentTime** 来自 `#page_pc_mini_bar` 的 `mm:ss / mm:ss`。
-- bridge 自检 **46 项**（含 8 项 Select-StoreLineIndex 与 5 项窗口/曲名判定，都不假设长度或环境）全绿。
+- bridge 自检 **66 项**（含 8 项 Select-StoreLineIndex、6 项行时间表缓存、4 项 store 行时间当位置的判定，与 5 项窗口/曲名判定，都不假设长度或环境）全绿。
 - 图标全局覆盖（Custom icon file）与 None 语义：2026-10-14 实现并断言（第四批，见 §10.y）。
 - **曲名来源（真机定论，2026-10-14）**：网易云开着「桌面歌词」时 `cloudmusic` 的 `MainWindowTitle`
   **就是「桌面歌词」**，带歌名的窗口是同一 pid 的**另一个顶层窗口**
@@ -391,8 +391,18 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 
 **未验证 / 待办（按优先级）**：
 
-1. **面板上的歌词是否真的随播放换行**（用户尚未回报）。排查顺序：bridge 手跑输出 → `Get-CdpDomTime` 是否拿到 `curS` → `times` 是否拉到 → 选行索引是否变化。
-   ⚠️ 2026-10-14：`$positionMs = $null` 被写了两遍、第二遍把 DOM 的真 currentTime 清掉（已修，见 §10.y 头条 3）——**先确认修后是否换行**，再按这个顺序排查。
+1. **手动切歌之后歌词是否真的继续走**（2026-10-15 用户报"切歌后歌词不动"；本机没有网易云在跑、
+   也没有 CDP 端口，**没能真机复现**）。已经做掉的：把位置降级链里"会冻结的 store 行时间"这条
+   来源加上前进判据（`Test-StoreLineUsable`），并让行时间表缓存多一把"行数"的尺子
+   （`Test-StoreTimesStale`）；`-ProbeStore` 每轮新增 `origin=` / `lineMs=` / `table=` 三列。
+   **还缺的证据**（一次运行就能定性）：手播一次歌，同时看
+   `pwsh -ExecutionPolicy Bypass -File _netease-bridge.ps1 -ProbeStore -ProbeRounds 30`
+   的 `pos` / `lineMs` / `table` 三列，以及面板上 `{ext.netease.pos}` 的**来源名**：
+   · `pos=n/a` 且 `lineMs` 一直不变 → 迷你条 DOM 读不到、位置会退到 store 行时间（已修的那条）；
+   · `table=stale`（或 `times` 与 store 的 `lines` 不一致）→ 表是上一份数组的（第二把尺子那条）；
+   · `pos` 与 `byPosition` 都在走、而面板歌词不动 → 问题在取行文本那一环（`Get-CdpStoreLyricLine`），
+     目前**没有**任何证据指向这一条。
+   ⚠️ 2026-10-14：`$positionMs = $null` 被写了两遍、第二遍把 DOM 的真 currentTime 清掉（已修，见 §10.y 头条 3）。
 2. **发布器重启风暴是否消失**（已改成"等待窗口"而非 `exit 2`）；建议同时设 `External publisher watch process = cloudmusic`。
 3. 作业对象是否收掉**孙进程**、`CREATE_NO_WINDOW` 是否不闪窗、重载无孤儿 —— 三条只能真机看进程列表。
 4. 客户端**升级后** store 自寻址是否仍可用（跑一次 `-ProbeCdp`，它会自寻址并列出可见字段）。
@@ -480,6 +490,9 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 | 桥对同一个 key 有两个发布者 | 标题在"歌名"（store 的 `resourceName`，**没有作者**）与"歌名 - 歌手"之间闪；歌词隔一拍跳回 store 那个**会冻结**的 `playingLyricLineNumber` 行（真机 DryRun 实测：两条 `SET title` 一轮） | `Get-PublishPlan` 的 6 条自检（有序字典 = 重复 key 不可能）+ `Publish` 的运行期点名 |
 | 不读回复的客户端让服务端每帧白等 500 ms | out 缓冲约 1300 条回复，按每秒 4 帧算**五六分钟**后写回复开始超时；管道线程跟不上，积压的值一拍一拍地应用——**上面那条缺陷因此才看得见**（"播放一段时间后作者开始闪、歌词对不准位置"） | `ExtReplyTimeoutsAfter` 的 7 条断言（2 次连续超时才放弃、成功即清零、硬失败不算） |
 | 对齐组被**它前面的文字**截掉内容 | 行里在组之前先有一段长读数时，`[[center]]ABC[[/center]]` 只画出 `AB`（再长一个字母整组消失），而组明明落在面板正中、位置完全正确：相位 A 拿**行流游标**当组的预算，而组是相位 B 才整体定位的；相位 B/C 只会**缩短** run，于是这次截断永久生效（2026-10-15 用户报"位置标签把中间内容的最后一个字吞了"，宿主复现：26 个 `W` + `[[center]]ABC[[/center]]` → `"AB"`） | `a group's content survives a long flow run before it (all three alignments)`、`and the group's width counts the characters the flow run was stealing`（前缀 0..40 个 `W` × 三种对齐；负对照：预算换回 `regionCursor` → 6 条红；组宽少算最后一段 → 同名断言红） |
+| bridge：**冻结的 store 行时间被当成播放位置** | `storeline` 这一级取的是 `playingLyricLineNumber` 那一行的起始时间（实测冻结在第 10 行 → 常数 29.5 s），却排在 memory/media/推算时钟**之前**——它是唯一不随时间前进的位置来源，于是迷你条 DOM 那一拍读不到时位置被钉死、歌词永远停在同一行（2026-10-15 用户报"手动切歌后歌词不动"）。**静态可证**：用"第 k 行的起始时间"去选行，选回来的必然是第 k 行（同义反复，一步也推不动）；memory 那条来源早有同性质守卫（`Test-PosAfterTrackChange`），storeline 没有 | 自检 4 条：`store 行时间：冻结不动 = 不可用（歌词不会被它钉住）`（负对照：改成恒 true → 红 2 条）等；判据函数 `Test-StoreLineUsable` |
+| bridge：**行时间表只用曲目 id 校验** | id 来自 `playing` 切片、时间表来自 `async:lyric` 切片，同一个 state 里各自更新；换歌那一拍（`135c069` 让"换歌当拍就重读"）可能读到"新 id + 旧表"，缓存之后永不重读 → 选行按旧表走到头被钳位 → 歌词停住。**这一条是"洞"而不是已复现的活缺陷**：它的触发依赖"客户端先更新 playing、后更新歌词数组"这个未在本机证实的时序 | 自检 6 条：`时间表缓存：曲目 id 相同但行数变了 = 过期（表不是现在这份数组的）`（负对照：去掉行数判据 → 红）、`时间表缓存：清空后立刻判为过期（换歌当拍就重读）`（否掉"清了却没人读"那条猜想）、空表/未知行数两条边界 |
+| bridge：`-ProbeStore` 看不出"歌词为什么不动" | 探针只打迷你条 DOM 的位置与 `byPosition`，不打**主循环这一拍会用的位置来源**、也不打**表还配不配得上现在这份数组** → 三种成因（DOM 读不到 / 表过期 / 取行失败）在输出上长得一样 | 探针每轮新增 `origin=`（主循环会用的来源，判据与主循环同一对纯函数）、`lineMs=`（store 行时间）、`table=fresh/stale`；三列的读法写进 `_netease-bridge.md` |
 
 ---
 

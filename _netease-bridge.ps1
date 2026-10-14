@@ -978,6 +978,47 @@ function Select-StoreLineIndex {
     if ($idx -lt 0) { return 0 }
     return $idx
 }
+
+# 纯函数：这一拍要不要**重新读** store 的行时间表（缓存判定，-SelfTest 覆盖）。
+#
+# 换歌时主循环显式清空缓存（$script:StoreTimes = $null），这里确认那确实会触发重读：
+# `-not $null` 为真 → stale ✓，所以"清了以后没人再读"这条猜想不成立（清空后**下一拍**就读）。
+# 另一条同源的语言事实：PowerShell 里**空数组是假的**，所以"表读回来了但只有零行"
+# （换歌瞬间 async:lyric 还没填）也会走同一个分支、每拍重读一次，直到表真的有行 ✓。
+#
+# 第二把尺子是**行数**，不是曲目 id。id 来自 store 的 playing 切片，而 times 来自
+# async:lyric 切片——两者是同一个 state 里**各自更新**的两块，切歌那一拍 playing 已经是新歌、
+# lyric 还是旧的（这正是 135c069 让"换歌就重读"发生的那一拍）。于是缓存里可能存着一张
+# **上一首歌的时间表**、却被新歌的 id 打了标 → 之后永远不会重读，选行索引按旧表走到头就被钳位，
+# 歌词停在那里。判据：表里的行数必须等于 store 现在这份数组的行数。
+function Test-StoreTimesStale {
+    param([object[]]$Cached, [string]$CachedTrack, [int]$CachedLines,
+          [string]$StoreTrack, [int]$StoreLines)
+    if (-not $Cached) { return $true }                 # 没表（或空表）→ 必须读
+    if ($CachedTrack -ne $StoreTrack) { return $true }  # 别的曲目 → 必须读
+    # 行数只在两边都是**正数**时才算数：读取失败/旧客户端给 0 时不能让这里变成每拍重读。
+    if ($CachedLines -gt 0 -and $StoreLines -gt 0 -and $CachedLines -ne $StoreLines) { return $true }
+    return $false
+}
+
+# 纯函数：store 的"当前行起始时间"能不能当**位置**用（-SelfTest 覆盖）。
+#
+# 这个数是 `playingLyricLineNumber` 那一行的起始时间，而**那个行号实测会冻结**
+# （2026-10-14 两次实测：82 行的歌一直报第 10 行；26 行的歌位置从 167 s 走到 177 s，它一直报第 10 行
+#  → 行时间恒为 29.5 s）。把它当位置用是**同义反复**：用"第 k 行的起始时间"去选行，选回来的
+# 必然还是第 k 行——它一步也推不动选行。所以它只能当**一次**引导值（它确实是位置的下界：
+# 这一行已经开始了），之后只有在**往前走**的时候才允许再用（那时它真的带回了新信息）。
+#
+# 为什么必须有这条：位置降级链里 storeline 排在 memory / media / 推算时钟**之前**，而它是
+# 唯一一个不随真实时间前进的来源。它一旦冻结，就等于把下面那些会前进的来源全部遮住
+# （`$positionMs` 不再是 $null，链就停了）→ 换歌后的某一个瞬间只要迷你条 DOM 读失败一次，
+# 位置就永远停在 29.5 s、歌词永远停在同一行 = 用户报的"切歌后歌词不动"。memory 那条来源
+# 早就有同性质的守卫（Test-PosAfterTrackChange：切歌后没跳变就判它失效），storeline 没有。
+function Test-StoreLineUsable {
+    param([int]$PrevMs, [int]$NowMs)
+    if ($PrevMs -lt 0) { return $true }        # 第一次见到它：当一次引导值
+    return ($NowMs -gt $PrevMs)                # 没往前走（或往回走）= 这一行不会推着歌词走
+}
 function Get-CdpStoreState {
     if (-not (Get-CdpTab)) { return $null }
     $expr = @'
@@ -1441,6 +1482,20 @@ if ($SelfTest) {
         # 组合起来的效果：同一个行边界（10 s），不加提早量时 9.9 s 仍是第 0 行，
         # 加 1 s 后（=10.9 s）已经是第 1 行 —— 换行确实提前了 1 秒。
         @{ Name = '负延迟确实把换行提早（9.9s 仍是 0 行，+1s 后是 1 行）'; Ok = (((Select-StoreLineIndex -TimesSec @(0, 10, 20, 30) -PositionMs 9900) -eq 0) -and ((Select-StoreLineIndex -TimesSec @(0, 10, 20, 30) -PositionMs (9900 + 1000)) -eq 1)) }
+        # 行时间表的缓存判定。"换歌时清空缓存"之后必须**当拍就重读**——清了却没人读，正是
+        # "手动切歌后歌词不动"最容易被怀疑的成因，这条断言就是用来否掉它的。
+        @{ Name = '时间表缓存：清空后立刻判为过期（换歌当拍就重读）'; Ok = (Test-StoreTimesStale -Cached $null -CachedTrack '' -CachedLines 0 -StoreTrack 'x' -StoreLines 26) }
+        @{ Name = '时间表缓存：空表也算过期（PowerShell 空数组为假，所以会一直重读到有行为止）'; Ok = (Test-StoreTimesStale -Cached ([object[]]@()) -CachedTrack 'x' -CachedLines 0 -StoreTrack 'x' -StoreLines 26) }
+        @{ Name = '时间表缓存：同曲目同长度 = 可用（不会每拍白读一次）'; Ok = (-not (Test-StoreTimesStale -Cached @(0, 1, 2) -CachedTrack 'x' -CachedLines 3 -StoreTrack 'x' -StoreLines 3)) }
+        @{ Name = '时间表缓存：曲目变了 = 过期'; Ok = (Test-StoreTimesStale -Cached @(0, 1, 2) -CachedTrack 'x' -CachedLines 3 -StoreTrack 'y' -StoreLines 3) }
+        @{ Name = '时间表缓存：曲目 id 相同但行数变了 = 过期（表不是现在这份数组的）'; Ok = (Test-StoreTimesStale -Cached @(0, 1, 2) -CachedTrack 'x' -CachedLines 3 -StoreTrack 'x' -StoreLines 26) }
+        @{ Name = '时间表缓存：行数未知（0）时不重读，免得变成每拍一次 CDP'; Ok = (-not (Test-StoreTimesStale -Cached @(0, 1, 2) -CachedTrack 'x' -CachedLines 3 -StoreTrack 'x' -StoreLines 0)) }
+        # store 行时间当位置的判定。实测：那个行号会冻结（行时间恒为 29.5 s），而它排在
+        # memory/media/推算时钟之前——不判它，换歌后歌词就永远停在同一行。
+        @{ Name = 'store 行时间：第一次见到它时可用（当一次引导值）'; Ok = (Test-StoreLineUsable -PrevMs -1 -NowMs 29500) }
+        @{ Name = 'store 行时间：冻结不动 = 不可用（歌词不会被它钉住）'; Ok = (-not (Test-StoreLineUsable -PrevMs 29500 -NowMs 29500)) }
+        @{ Name = 'store 行时间：往前走了 = 可用（行号没冻结时这条来源照常工作）'; Ok = (Test-StoreLineUsable -PrevMs 29500 -NowMs 42000) }
+        @{ Name = 'store 行时间：往回走 = 不可用（换歌/回退，别用它当位置）'; Ok = (-not (Test-StoreLineUsable -PrevMs 29500 -NowMs 0)) }
     )
     $bad = 0
     # 活体证据：判定用的是这一份窗口列表，打出来省得下一个人再猜一次
@@ -1462,21 +1517,45 @@ if ($ProbeStore) {
     # "歌词对不准真实位置"的直接证据——所以**值绝不能用后者发布**（真机 2026-10-14）。
     Write-Host ("store 探针：{0} 轮，每 {1} ms 一轮" -f $ProbeRounds, $IntervalMs)
     $stx = Get-CdpStoreLyricTimes
+    $tableLines = if ($stx -and $stx.ok -and $null -ne $stx.lineCount) { [int]$stx.lineCount } else { 0 }
     Write-Host ("行时间表：ok={0} 行数={1} trackId={2}" -f `
         $(if ($stx) { $stx.ok } else { 'n/a' }), `
         $(if ($stx -and $stx.times) { @($stx.times).Count } else { 0 }), `
         $(if ($stx) { $stx.trackId } else { '' }))
+    # 每轮要能回答"歌词为什么不动"，所以除了客户端自己报的行号，还要打出**主循环这一拍会用的
+    # 位置**与**缓存表还配不配得上现在这份歌词数组**（判据与主循环是同一对纯函数）：
+    #   pos=n/a + lineMs 不变 + table=fresh → 迷你条 DOM 读不到，位置会退到会冻结的 store 行时间；
+    #   table=stale                        → 表是上一份数组的（选行会按旧表走到头然后钳位）；
+    #   pos 在走 + byPosition 在走          → 位置与选行都没问题，问题在取行文本那一环。
+    $prevLineMs = -1
     for ($i = 1; $i -le $ProbeRounds; $i++) {
         $dom = Get-CdpDomTime
         $ss = Get-CdpStoreState
-        $posMs = if ($dom -and $dom.ok) { [int]$dom.curS * 1000 } else { $null }
+        $domMs = if ($dom -and $dom.ok) { [int]$dom.curS * 1000 } else { $null }
+        $lineMs = if ($ss -and $ss.ok -and $null -ne $ss.lineTimeSec) { [int]([double]$ss.lineTimeSec * 1000) } else { $null }
+        $origin = 'n/a'
+        $posMs = $null
+        if ($null -ne $domMs) { $posMs = $domMs; $origin = 'dom' }
+        elseif ($null -ne $lineMs) {
+            if (Test-StoreLineUsable -PrevMs $prevLineMs -NowMs $lineMs) {
+                $posMs = $lineMs; $origin = 'storeline'
+            } else { $origin = 'storeline冻结→下一级(mem/media/clock)' }
+        }
+        if ($null -ne $lineMs) { $prevLineMs = $lineMs }
+        $linesNow = if ($ss -and $ss.ok -and $null -ne $ss.lines) { [int]$ss.lines } else { 0 }
+        # 这一拍的表（= 探针开头读回来的那份）还配不配得上 store 现在这份数组？判据与主循环同一个函数。
+        $table = if (Test-StoreTimesStale -Cached $(if ($stx -and $stx.times) { [object[]]$stx.times } else { $null }) `
+                -CachedTrack $(if ($stx) { '' + $stx.trackId } else { '' }) -CachedLines $tableLines `
+                -StoreTrack $(if ($ss -and $ss.ok) { '' + $ss.trackId } else { '' }) `
+                -StoreLines $linesNow) { 'stale' } else { 'fresh' }
         $sel = -2
         if ($stx -and $stx.ok -and $null -ne $posMs) {
             $sel = Select-StoreLineIndex -TimesSec ([object[]]$stx.times) -PositionMs $posMs
         }
         $storeIdx = if ($ss -and $ss.ok -and $null -ne $ss.index) { [int]$ss.index } else { -2 }
-        Write-Host ("  {0,2}. pos={1,-8} storeIndex={2,-4} byPosition={3,-4} times={4,-5} offset={5,-6} used={6,-14} storeLine='{7}'" -f `
-            $i, $(if ($null -eq $posMs) { 'n/a' } else { "$($posMs)ms" }), $storeIdx, $sel, `
+        Write-Host ("  {0,2}. pos={1,-8} origin={2,-34} lineMs={3,-8} table={4,-6} storeIndex={5,-4} byPosition={6,-4} times={7,-5} offset={8,-6} used={9,-14} storeLine='{10}'" -f `
+            $i, $(if ($null -eq $domMs) { 'n/a' } else { "$($domMs)ms" }), $origin, `
+            $(if ($null -eq $lineMs) { 'n/a' } else { "$($lineMs)ms" }), $table, $storeIdx, $sel, `
             $(if ($stx -and $stx.times) { @($stx.times).Count } else { 0 }), `
             $(if ($ss) { $ss.offset } else { '' }), $(if ($ss) { $ss.usedLyric } else { '' }), `
             $(if ($ss) { $ss.line } else { '' }))
@@ -1564,9 +1643,15 @@ $script:LastEventAt = [datetime]::MinValue
 # 免得"读到没赋值过的变量"看起来像有默认值。
 $script:StoreTimes = $null
 $script:StoreTimesTrack = ''
+# 读回 times 时 store 那份数组的行数。缓存表"还配不配得上现在这份数组"就是靠它判的
+# （Test-StoreTimesStale）：只看曲目 id 会漏掉"id 已经换了、歌词数组还没换"的那一拍。
+$script:StoreTimesLines = 0
 $script:StoreLineIndex = -1
 $script:StoreLineText = ''
 $script:StoreLineTrans = ''
+# 上一次见到的 store 当前行起始时间（毫秒），-1 = 还没见过。**换歌时不清**：store 那个行号
+# 会冻结，所以这个来源整条生命周期只允许当一次引导值（见 Test-StoreLineUsable）。
+$script:StoreLineMs = -1
 $lyricAttemptAt = Get-Date
 $lyricMisses = 0
 
@@ -1588,6 +1673,7 @@ try {
             # 正好命中，于是上一首的最后一句被当成新歌的当前行发出去。
             $script:StoreTimes = $null
             $script:StoreTimesTrack = ''
+            $script:StoreTimesLines = 0
             $script:StoreLineIndex = -1
             $script:StoreLineText = ''
             $script:StoreLineTrans = ''
@@ -1657,9 +1743,16 @@ try {
                     # 只在按位置选行的通路不可用时当兜底（见下面 $line 的拼装）；
                     # 绝不在这里发布，也不把 store 的翻译当值——它属于 store 自己那一行。
                     if ($ss.line) { $storeLine = '' + $ss.line }
+                    # store 自己那一行的起始时间能不能当**位置**用，归 Test-StoreLineUsable 判：
+                    # 它来自会冻结的 playingLyricLineNumber，而这一级排在 memory/media/时钟**之前**，
+                    # 不判就会把会前进的来源全遮住（2026-10-15 用户报"手动切歌后歌词不动"）。
                     if ($null -eq $positionMs -and $null -ne $ss.lineTimeSec) {
-                        $positionMs = [int]([double]$ss.lineTimeSec * 1000)
-                        $posSrc = 'storeline'
+                        $lineMs = [int]([double]$ss.lineTimeSec * 1000)
+                        if (Test-StoreLineUsable -PrevMs $script:StoreLineMs -NowMs $lineMs) {
+                            $positionMs = $lineMs
+                            $posSrc = 'storeline'
+                        }
+                        $script:StoreLineMs = $lineMs
                     }
                 }
             }
@@ -1695,11 +1788,16 @@ try {
             # times 只在换歌时取一次（纯数字）；文本/翻译只在行号变化时按需取。
             if ($LyricSource -in 'auto', 'store') {
                 $trackNow = if ($ss -and $ss.ok) { '' + $ss.trackId } else { '' }
-                if (-not $script:StoreTimes -or $script:StoreTimesTrack -ne $trackNow) {
+                # store 现在这份歌词数组有多少行（判定缓存表还配不配得上它，见 Test-StoreTimesStale）
+                $linesNow = if ($ss -and $ss.ok -and $null -ne $ss.lines) { [int]$ss.lines } else { 0 }
+                if (Test-StoreTimesStale -Cached $script:StoreTimes `
+                        -CachedTrack $script:StoreTimesTrack -CachedLines $script:StoreTimesLines `
+                        -StoreTrack $trackNow -StoreLines $linesNow) {
                     $stx = Get-CdpStoreLyricTimes
                     if ($stx -and $stx.ok) {
                         $script:StoreTimes = [object[]]$stx.times
                         $script:StoreTimesTrack = '' + $stx.trackId
+                        $script:StoreTimesLines = if ($null -ne $stx.lineCount) { [int]$stx.lineCount } else { 0 }
                         $script:StoreLineIndex = -1
                         $script:StoreLineText = ''
                         $script:StoreLineTrans = ''
