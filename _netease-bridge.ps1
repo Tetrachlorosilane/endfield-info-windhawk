@@ -833,7 +833,60 @@ $script:CdpProbeExpression = @'
       } catch (x2) { o.store.probeError = '' + x2; }
     }
   } catch (x) { o.store.error = '' + x; }
-  return JSON.stringify(o);
+  // ---- fiber 路（照 netease-desktop-mcp/src/playlist-bridge.mjs:5-13 的做法）----
+  // 从任意 React 节点取 __reactFiber / __reactInternalInstance，向上走 fiber.return（<=100 层），
+  // 找 Provider 的 memoizedProps.value.store —— **不猜 webpack 模块 id**。
+  // 真机教训：模块 11 的 getStore() 结果**没有 getState**，而它们找到的 store 有 getState + dispatch
+  // → 先前很可能读的是**次级/陈旧的 state-like 对象**（这能解释"行号冻结"）。
+  // 同时收集各层 props 的标量：**两次采样对比"谁变了"**，就能定论页面里有没有活位置。
+  o.fiber = {};
+  try {
+    var host = document.querySelector('[class*=bar], .m-playbar, #root *') || document.body;
+    var rk = Object.keys(host).filter(function (k) {
+      return k.indexOf('__reactFiber') === 0 || k.indexOf('__reactInternalInstance') === 0;
+    })[0];
+    o.fiber.found = !!rk;
+    var f = rk ? host[rk] : null;
+    var props = {}, store2 = null;
+    for (var d = 0; f && d < 100; d++, f = f.return) {
+      try {
+        var mp = f.memoizedProps;
+        if (mp && typeof mp === 'object') {
+          for (var k2 in mp) {
+            var v2 = mp[k2];
+            if (typeof v2 === 'number') props['d' + d + '.' + k2] = v2;
+            else if (typeof v2 === 'string' && v2.length <= 40) props['d' + d + '.' + k2] = v2;
+          }
+          if (!store2 && mp.value && typeof mp.value.getState === 'function' &&
+              typeof mp.value.dispatch === 'function') store2 = mp.value;
+        }
+        var mst = f.memoizedState;
+        if (!store2 && mst && typeof mst.getState === 'function' && typeof mst.dispatch === 'function') store2 = mst;
+      } catch (e3) { }
+    }
+    o.fiber.propCount = Object.keys(props).length;
+    o.fiber.props = props;
+    o.fiber.storeFound = !!store2;
+    if (store2) {
+      var stt = store2.getState();
+      o.fiber.storeSlices = Object.keys(stt).slice(0, 40);
+      var pl = stt.playing || {}, ps = {};
+      for (var pk2 in pl) {
+        var pv2 = pl[pk2];
+        if (typeof pv2 === 'number') ps[pk2] = pv2;
+        else if (typeof pv2 === 'string' && pv2.length <= 40) ps[pk2] = pv2;
+      }
+      o.fiber.playingScalars = ps;
+      var dl = stt['async:decorationDesktop'] || {};
+      o.fiber.decoKeys = Object.keys(dl).slice(0, 30);
+      var cd = dl.currentData;
+      o.fiber.decoCurrentDataType = (cd === null) ? 'null' : (typeof cd);
+      if (cd && typeof cd === 'object') {
+        o.fiber.decoCurrentDataKeys = Object.keys(cd).slice(0, 30);
+        try { o.fiber.decoCurrentDataJson = ('' + JSON.stringify(cd)).slice(0, 400); } catch (e4) { }
+      }
+    }
+  } catch (xF) { o.fiber.error = '' + xF; }  return JSON.stringify(o);
 })()
 '@
 
