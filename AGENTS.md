@@ -385,6 +385,14 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
     （`IconSlotForRow`；手工构造的 `ModSettings` 没有映射表时按同一行处理）。
     **把空行的图标槽丢掉过一次**：于是 `Icon1 = Memory` 单独设置时连继承源一起消失，
     整块面板一个图标都不画，真机上看起来就是"Row icon 选项失效"（2026-10-14）。
+- **每帧的重活是"测量"，而它被缓存掉了**（`RowLayoutPlan` + `EnsureRowPlan`）：选族（覆盖查询）与
+  拟合（`FitTextToWidth` 的二分、哨兵、省略号）只在**文本或几何变化时**跑一次，中间那些帧只
+  `DrawString`。**注意前提**：标记解析（`ExpandTokensAndRings` / `BuildRowLayout`）本来就只在
+  `PublishRows` 里跑，不在每帧——所以"每帧解析文本"从来不是本项目的成本，别按那个去优化。
+  新鲜度键的**每个字段都要有断言**（`RowPlanIsFresh` 的纪元/宽度/内缩/行高/字号/行数/段数）；
+  纪元由 `ReleaseFontResources` 与 `PublishRows`（只在内容真的变了时）自增，**新增任何
+  "改了就该重排"的状态都要加进这两处之一**，否则屏幕会留着上一份文本。证据链：
+  `g_measureCalls`（产品计数器，`[perf]` 里的 `meas=`）——宿主断言"复用计划时测量次数为 0"。
 - **岛上的卡片不受行高影响**：它有自己的行距，取的是全局 `Row height`。卡片不是"一行"，
   它盖在行上面；如果它的行距跟着下面的行变，一个正在淡出的卡片会在中途改尺寸。
 

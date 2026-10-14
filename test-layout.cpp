@@ -2196,6 +2196,191 @@ int main() {
                     Check(allInsideBudget, "every fitted run stays inside its budget");
                     Check(allFitted, "a run wider than its budget is actually trimmed");
 
+                    // --- the per-row layout plan: what a frame does *not* have to redo ---
+                    //
+                    // Placing and fitting a row's runs used to happen on every frame: each run
+                    // re-chose its family and re-fitted itself with a binary search over
+                    // MeasureString, 25 times a second, for text that had not changed since the
+                    // last sample. The plan is built once per publish and read verbatim after
+                    // that, so the assertion that matters is "the second call measures nothing".
+                    // It is measured through the product's own counter (g_measureCalls, which
+                    // every text measurement goes through) rather than by timing anything.
+                    {
+                        const ModSettings savedSettings = g_settings;
+                        const RowState savedState = g_rowState;
+                        const int savedRows = g_publishedRows;
+                        const unsigned savedEpoch = g_layoutEpoch;
+
+                        ModSettings s = {};
+                        s.fontSize = 15;
+                        s.rowHeight = 30;
+                        s.panelWidth = 380;
+                        s.ringSize = 22;
+                        s.ringRightOffset = 6;
+                        wcscpy(s.fontFamily, L"Segoe UI");
+                        s.rowCount = 1;
+                        // One inline gauge, so the plan also exercises the inline-flow branch
+                        // (per-run budget against the gauges that still follow it).
+                        wcscpy(s.rows[0], L"CPU 12%  RAM 73%  [[ring:50]]  done");
+                        g_settings = s;
+
+                        WCHAR marked[640];
+                        RingSpec rings[kMaxRingsPerRow];
+                        int ringCount = 0;
+                        ExpandTokensAndRings(s.rows[0], Values(), s, marked, 640, rings, &ringCount,
+                                             kMaxRingsPerRow);
+                        RowState staged = {};
+                        BuildRowLayout(marked, ringCount, staged, 0);
+                        for (int i = 0; i < ringCount; i++) staged.rings[0][i] = rings[i];
+                        g_rowState = staged;
+                        g_publishedRows = 1;
+                        g_layoutEpoch++;   // a publish happened, so any plan is stale
+
+                        const float planWidth = 380.0f;
+                        const float planInset = 12.0f;
+                        const int planFontSize = 15;
+                        const float planRowHeight = 30.0f;
+
+                        const unsigned before = g_measureCalls;
+                        const RowLayoutPlan *built = EnsureRowPlan(
+                            graphics, font, format, 0, 1, planWidth, planInset, planFontSize,
+                            planRowHeight, false);
+                        const unsigned afterBuild = g_measureCalls;
+                        const RowLayoutPlan *reused = EnsureRowPlan(
+                            graphics, font, format, 0, 1, planWidth, planInset, planFontSize,
+                            planRowHeight, false);
+                        const unsigned afterReuse = g_measureCalls;
+                        printf("    layout plan: %d segments, measure build=%lu reuse=%lu\n",
+                               built->segmentCount, (unsigned long)(afterBuild - before),
+                               (unsigned long)(afterReuse - afterBuild));
+
+                        Check(built == reused, "a plan that still matches is handed back, not rebuilt");
+                        Check(afterBuild > before, "building a row's layout measures its runs");
+                        Check(afterReuse == afterBuild,
+                              "reusing it measures nothing: that is the whole point of the cache");
+
+                        // Every field of the key has to be able to invalidate the plan, or a
+                        // changed row would keep drawing the run it was measured with. Each of
+                        // these is a change that arrives *without* the text changing.
+                        struct PlanChange {
+                            const char *what;
+                            float width, inset, rowHeight;
+                            int fontSize;
+                        };
+                        const PlanChange changes[] = {
+                            {"width", planWidth + 20.0f, planInset, planRowHeight, planFontSize},
+                            {"inset", planWidth, planInset + 5.0f, planRowHeight, planFontSize},
+                            {"row height", planWidth, planInset, planRowHeight + 8.0f, planFontSize},
+                            {"font size", planWidth, planInset, planRowHeight, planFontSize + 3},
+                        };
+                        for (const PlanChange &c : changes) {
+                            const unsigned was = g_measureCalls;
+                            const RowLayoutPlan *again = EnsureRowPlan(
+                                graphics, font, format, 0, 1, c.width, c.inset, c.fontSize,
+                                c.rowHeight, false);
+                            printf("      %-11s -> remeasured %lu\n", c.what,
+                                   (unsigned long)(g_measureCalls - was));
+                            Check(g_measureCalls > was, "a changed key remeasures the row");
+                            // And the rebuilt plan records the key it was built with. Comparing
+                            // pointers would prove nothing here: a plan is a fixed slot per row,
+                            // so the address is the same whether it was rebuilt or not.
+                            Check(again->width == c.width && again->leftInset == c.inset &&
+                                      again->rowHeight == c.rowHeight &&
+                                      again->rowFontSize == c.fontSize,
+                                  "and remembers the geometry it was built from");
+                            // Put the original key back for the next change in the table.
+                            EnsureRowPlan(graphics, font, format, 0, 1, planWidth, planInset,
+                                          planFontSize, planRowHeight, false);
+                        }
+
+                        // The bump that a new sample performs: same geometry, same fonts, same
+                        // number of segments -- *only* the text differs. That isolation is the
+                        // point: with the segment count changed as well, the plan would be
+                        // rebuilt for that reason and this would pass even if the epoch were
+                        // ignored (it did, until this was fixed).
+                        {
+                            // The old plan is a fixed slot, so its content is captured before the
+                            // rebuild overwrites it -- otherwise "carries the new text" would be
+                            // comparing the new plan with itself.
+                            WCHAR firstSliceBefore[640];
+                            wcsncpy(firstSliceBefore, built->segments[0].slice, 639);
+                            firstSliceBefore[639] = L'\0';
+
+                            WCHAR marked2[640];
+                            RingSpec rings2[kMaxRingsPerRow];
+                            int ringCount2 = 0;
+                            ExpandTokensAndRings(L"CPU 99%  RAM 12%  [[ring:80]]  ok", Values(), s,
+                                                 marked2, 640, rings2, &ringCount2,
+                                                 kMaxRingsPerRow);
+                            RowState staged2 = {};
+                            BuildRowLayout(marked2, ringCount2, staged2, 0);
+                            for (int i = 0; i < ringCount2; i++) staged2.rings[0][i] = rings2[i];
+                            Check(staged2.segmentCount[0] == built->segmentCount,
+                                  "the two samples really do have the same shape");
+                            g_rowState = staged2;
+                            g_layoutEpoch++;
+                            const unsigned was = g_measureCalls;
+                            const RowLayoutPlan *afterPublish = EnsureRowPlan(
+                                graphics, font, format, 0, 1, planWidth, planInset, planFontSize,
+                                planRowHeight, false);
+                            printf("      new sample  -> remeasured %lu, first run \"%ls\" -> \"%ls\"\n",
+                                   (unsigned long)(g_measureCalls - was), firstSliceBefore,
+                                   afterPublish->segments[0].slice);
+                            Check(g_measureCalls > was, "a new sample rebuilds the row's layout");
+                            Check(wcscmp(afterPublish->segments[0].slice, firstSliceBefore) != 0,
+                                  "and the plan carries the new text, not the old one");
+                            Check(wcsncmp(afterPublish->segments[0].slice, g_rowState.text[0],
+                                          wcslen(afterPublish->segments[0].slice)) == 0,
+                                  "which is the text that was just published");
+                        }
+
+                        // Two more fields of the key. Neither can differ without the epoch in
+                        // the product (a structure change always comes from new text, and new
+                        // text bumps the epoch), so these force the situation directly: they are
+                        // defence in depth, and defence in depth that nothing exercises is
+                        // exactly the kind of check that silently stops working.
+                        {
+                            const int savedCount = g_rowState.segmentCount[0];
+                            const unsigned wasSegments = g_measureCalls;
+                            g_rowState.segmentCount[0] = savedCount > 1 ? savedCount - 1 : 1;
+                            EnsureRowPlan(graphics, font, format, 0, 1, planWidth, planInset,
+                                          planFontSize, planRowHeight, false);
+                            printf("      segment count -> remeasured %lu\n",
+                                   (unsigned long)(g_measureCalls - wasSegments));
+                            Check(g_measureCalls > wasSegments,
+                                  "a row that changed shape is remeasured even without a new sample");
+                            g_rowState.segmentCount[0] = savedCount;
+
+                            // Rebuild under the original key (the plan left behind is the
+                            // shrunken one, so this call is *supposed* to measure), then prove
+                            // the rebuilt plan is fresh. Without that proof the row-count case
+                            // below would rebuild because of leftover staleness and pass for the
+                            // wrong reason -- which it did, until this was added.
+                            EnsureRowPlan(graphics, font, format, 0, 1, planWidth, planInset,
+                                          planFontSize, planRowHeight, false);
+                            const unsigned wasRestore = g_measureCalls;
+                            EnsureRowPlan(graphics, font, format, 0, 1, planWidth, planInset,
+                                          planFontSize, planRowHeight, false);
+                            Check(g_measureCalls == wasRestore,
+                                  "the plan is fresh again under the original key");
+
+                            const unsigned wasRows = g_measureCalls;
+                            EnsureRowPlan(graphics, font, format, 0, 2, planWidth, planInset,
+                                          planFontSize, planRowHeight, false);
+                            printf("      row count     -> remeasured %lu\n",
+                                   (unsigned long)(g_measureCalls - wasRows));
+                            Check(g_measureCalls > wasRows,
+                                  "and so is a row when the panel gains or loses one");
+                            EnsureRowPlan(graphics, font, format, 0, 1, planWidth, planInset,
+                                          planFontSize, planRowHeight, false);
+                        }
+
+                        g_settings = savedSettings;
+                        g_rowState = savedState;
+                        g_publishedRows = savedRows;
+                        g_layoutEpoch = savedEpoch + 1;   // leave nothing stale behind
+                    }
+
                     // The trailing-space sentinel: GDI+ MeasureString deliberately ignores
                     // trailing spaces, so "9%  " would advance no further than "9%" and an
                     // inline gauge would land on top of the '%'. Measured here with the

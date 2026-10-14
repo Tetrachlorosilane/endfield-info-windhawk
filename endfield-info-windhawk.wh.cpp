@@ -3840,10 +3840,17 @@ static DWORD ResolveRingColor(const RingSpec &ring, const ModSettings &settings)
 // would let the sentinel absorb the following whitespace, so "ab" and "ab      "
 // would report the same width and a width-ordered search would have no order to
 // rely on.
+// Every text measurement the drawing path makes goes through MeasureAdvance, so this counts
+// them all -- including the ones inside FitTextToWidth's binary search. It exists because the
+// per-row layout plans are supposed to make a frame that draws unchanged text measure
+// *nothing*: the host asserts that, and the [perf] line reports it on a real machine, where
+// "is the layout cache actually being reused" is otherwise invisible.
+static DWORD g_measureCalls = 0;
+
 static float MeasureAdvance(GpGraphics *graphics, GpFont *font, GpStringFormat *format,
                             const WCHAR *text, float boxHeight, int exactLength = -1) {
     static const WCHAR kSentinel = 0x2502;
-
+    g_measureCalls++;
     WCHAR probe[644];
     int length = exactLength >= 0 ? exactLength : (int)wcslen(text);
     if (length > 640) length = 640;
@@ -5613,9 +5620,19 @@ static GpFont *AcquireRowFont(GpGraphics *graphics, const WCHAR *family, int siz
     return font;
 }
 
+// Bumped by everything a laid-out row was measured from: the published text (PublishRows),
+// the fonts and sizes (ReleaseFontResources) and the settings as a whole. The per-row layout
+// plans (see EnsureRowPlan) are keyed on it, so a plan can never outlive the text or the font
+// it was fitted with.
+static unsigned g_layoutEpoch = 1;
+
 // Drops every font object and the GDI coverage DC. Called on a settings change (the sizes and
 // families may all be different) and on unload, in both cases *before* GDI+ shuts down.
 static void ReleaseFontResources() {
+    // Any row plan was fitted with these fonts and these sizes, so it dies with them. This is
+    // the one place the layouts could be left holding a stale measurement, so the bump lives
+    // here rather than at the call sites.
+    g_layoutEpoch++;
     for (int i = 0; i < kFontCacheSlots; i++) {
         if (g_fontCache[i].font) g_gdiplus.DeleteFont(g_fontCache[i].font);
         if (g_fontCache[i].fontFamily) g_gdiplus.DeleteFontFamily(g_fontCache[i].fontFamily);
@@ -5632,6 +5649,196 @@ static void ReleaseFontResources() {
         DeleteDC(g_coverDc);
         g_coverDc = nullptr;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Laid-out rows: the per-frame cost point
+//
+// Placing and fitting a row's runs is the most expensive thing a frame used to do, and it was
+// done *every* frame: each run re-chose its family (glyph-coverage queries) and re-fitted itself
+// with a binary search over MeasureString -- per row, per segment, 25 times a second, for rows
+// whose text had not changed since the last sample. (The markup parsing itself was already out
+// of the frame path: ExpandTokensAndRings/BuildRowLayout only run in PublishRows.)
+//
+// So each row's geometry is computed here once, cached, and read verbatim by the frames in
+// between. What the frame still does per frame is everything that genuinely varies: the ring
+// values and colours, the intro alpha, the ripples, the world transform.
+// ---------------------------------------------------------------------------
+struct RowSegmentPlan {
+    bool isRing = false;    // a gauge: `x` is its centre, the rest is unused
+    bool skip = false;      // nothing to draw (empty run)
+    WCHAR slice[640] = {};  // the text as it will be drawn (already fitted)
+    // The family this run resolved to, "" for the panel's main one. The *name* is stored, not
+    // the GpFont: a font object lives in an 8-slot cache that later rows can evict, so a plan
+    // holding the pointer could outlive it. Re-acquiring per frame is a cache hit.
+    WCHAR family[kMaxFontFamilyChars] = {};
+    int fontSize = 0;
+    bool fitted = false;
+    float x = 0.0f;         // left edge (text) / centre (ring)
+    float boxWidth = 0.0f;  // the layout box the text is drawn in
+    float advance = 0.0f;   // how far an inline cursor moves on
+};
+
+struct RowLayoutPlan {
+    bool valid = false;
+    // The key. Anything not listed here is either derived from the text (covered by the
+    // epoch) or is the same for every row of a frame (width, inset).
+    unsigned epoch = 0;
+    int rows = 0;
+    float width = 0.0f;
+    float leftInset = 0.0f;
+    float rowHeight = 0.0f;
+    int rowFontSize = 0;
+    int segmentCount = 0;
+    RowSegmentPlan segments[kMaxSegments];
+};
+static RowLayoutPlan g_rowPlans[kMaxRows];
+
+// True when `plan` still describes this row. Every field in the key has a test: dropping one
+// means a changed row silently keeps drawing its old text, which is the failure this whole
+// cache could introduce.
+static bool RowPlanIsFresh(const RowLayoutPlan &plan, unsigned epoch, int rows, float width,
+                           float leftInset, float rowHeight, int rowFontSize, int segmentCount) {
+    return plan.valid && plan.epoch == epoch && plan.rows == rows && plan.width == width &&
+           plan.leftInset == leftInset && plan.rowHeight == rowHeight &&
+           plan.rowFontSize == rowFontSize && plan.segmentCount == segmentCount;
+}
+
+// Fills one row's plan. This is the code the frame used to run: choose each run's family from
+// the run itself, fit it to its own budget, remember where it goes.
+static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringFormat *format,
+                         int row, int rows, float width, float leftInset, int rowFontSizePx,
+                         float rowHeight, bool globalFontPath, RowLayoutPlan &plan) {
+    plan.segmentCount = g_rowState.segmentCount[row];
+    if (plan.segmentCount > kMaxSegments) plan.segmentCount = kMaxSegments;
+
+    const int ringCount = g_rowState.ringCount[row];
+    const bool inlineFlow = g_rowState.inlineRing[row];
+    // Every text run of an inline-flow row is fitted against the gauges that still follow it,
+    // so the row's text box is the whole inner width there (ComputeInlineTextLimit narrows it
+    // per run).
+    RowTextMetrics metrics = ComputeRowTextMetrics(width, ringCount, g_settings.ringSize,
+                                                  g_settings.ringRightOffset, inlineFlow,
+                                                  leftInset);
+    float parkX = 0.0f;
+    if (!inlineFlow && ringCount > 0) {
+        parkX = metrics.textRight + (float)g_settings.ringSize / 2.0f;
+    }
+
+    float cursor = leftInset;
+    for (int s = 0; s < plan.segmentCount; s++) {
+        const TextSeg &seg = g_rowState.segments[row][s];
+        RowSegmentPlan &entry = plan.segments[s];
+        entry = RowSegmentPlan();
+
+        if (seg.offset < 0) {
+            // A gauge: the frame needs its centre and nothing else from here.
+            entry.isRing = true;
+            const float outer = (float)g_settings.ringSize;
+            if (inlineFlow) {
+                entry.x = cursor + outer / 2.0f;
+                cursor = entry.x + outer / 2.0f + 4.0f;
+            } else {
+                entry.x = parkX;
+                parkX += outer + 4.0f;
+            }
+            continue;
+        }
+
+        if (seg.length <= 0) {
+            entry.skip = true;
+            continue;
+        }
+        int length = MinInt(seg.length, 639);
+        wcsncpy(entry.slice, g_rowState.text[row] + seg.offset, length);
+        entry.slice[length] = L'\0';
+
+        // This run's size: its own [[size:NN]], or the row's size. The font is chosen from it
+        // before anything is measured, or the fit would be computed for a font the run is not
+        // drawn in.
+        entry.fontSize = seg.runFontSize > 0 ? seg.runFontSize : rowFontSizePx;
+        GpFont *segMainFont = rowMainFont;
+        if (entry.fontSize != rowFontSizePx) {
+            GpFont *sized = AcquireRowFont(graphics, g_settings.fontFamily, entry.fontSize);
+            if (sized) segMainFont = sized;
+        }
+
+        // The family is chosen from the whole run, not from whatever survives the trim: the
+        // row says which family it wants, not how much of it fits.
+        GpFont *runFont = segMainFont;
+        // The same cost gate the frame used: with no global chain and no tag on this row there
+        // is nothing to pick between, and asking would spend coverage queries per run.
+        if (RowNeedsFontPath(row < kMaxRows && g_settings.rowFontTag[row], globalFontPath)) {
+            const FontChain &tagChain = seg.tagChain > 0
+                                            ? g_settings.tagFonts[seg.tagChain - 1].chain
+                                            : kNoFontChain;
+            const WCHAR *picked = PickFontFamily(entry.slice, length, g_settings.fontFamily,
+                                                 tagChain, g_settings.fallbackFonts,
+                                                 FontFamilyCovers);
+            if (picked && _wcsicmp(picked, g_settings.fontFamily) != 0) {
+                GpFont *fallbackFont = AcquireRowFont(graphics, picked, entry.fontSize);
+                if (fallbackFont) {
+                    runFont = fallbackFont;
+                    wcsncpy(entry.family, picked, kMaxFontFamilyChars - 1);
+                    entry.family[kMaxFontFamilyChars - 1] = L'\0';
+                }
+            }
+        }
+        if (!runFont) {
+            entry.skip = true;
+            continue;
+        }
+
+        float limit = metrics.textWidth;
+        if (inlineFlow) {
+            int ringsAfter = 0;
+            for (int k = s + 1; k < plan.segmentCount; k++) {
+                if (g_rowState.segments[row][k].offset < 0) ringsAfter++;
+            }
+            limit = ComputeInlineTextLimit(metrics.textRight, cursor, ringsAfter,
+                                           g_settings.ringSize);
+        }
+        const float budget = LayoutWidthFloor(limit);
+
+        // The run's own width is what an inline gauge is placed after (including the spaces
+        // written before it); a parked run is drawn in its whole budget instead.
+        float advance = inlineFlow ? MeasureAdvance(graphics, runFont, format, entry.slice,
+                                                    rowHeight)
+                                   : budget;
+        entry.fitted = FitTextToWidth(graphics, runFont, format, entry.slice,
+                                      (int)(sizeof(entry.slice) / sizeof(entry.slice[0])), budget,
+                                      rowHeight);
+        if (entry.fitted) {
+            advance = MeasureAdvance(graphics, runFont, format, entry.slice, rowHeight);
+        }
+        entry.x = cursor;
+        entry.advance = advance;
+        entry.boxWidth = LayoutWidthFloor(advance);
+        if (inlineFlow) cursor += advance;
+    }
+}
+
+// The plan for one row, rebuilt only when it no longer matches what it was built from.
+static const RowLayoutPlan *EnsureRowPlan(GpGraphics *graphics, GpFont *rowMainFont,
+                                          GpStringFormat *format, int row, int rows, float width,
+                                          float leftInset, int rowFontSizePx, float rowHeight,
+                                          bool globalFontPath) {
+    RowLayoutPlan &plan = g_rowPlans[row];
+    const int segmentCount = g_rowState.segmentCount[row];
+    if (RowPlanIsFresh(plan, g_layoutEpoch, rows, width, leftInset, rowHeight, rowFontSizePx,
+                       segmentCount)) {
+        return &plan;
+    }
+    plan.epoch = g_layoutEpoch;
+    plan.rows = rows;
+    plan.width = width;
+    plan.leftInset = leftInset;
+    plan.rowHeight = rowHeight;
+    plan.rowFontSize = rowFontSizePx;
+    BuildRowPlan(graphics, rowMainFont, format, row, rows, width, leftInset, rowFontSizePx,
+                 rowHeight, globalFontPath, plan);
+    plan.valid = true;
+    return &plan;
 }
 
 static void PaintPanel(HWND hwnd) {
@@ -5866,8 +6073,6 @@ static void PaintPanel(HWND hwnd) {
                 const bool globalFontPath = g_settings.fallbackFonts.count > 0;
 
                 for (int r = 0; r < rows; r++) {
-                    const bool rowFontPath =
-                        RowNeedsFontPath(r < kMaxRows && g_settings.rowFontTag[r], globalFontPath);
                     // This row's own box: rows are not interchangeable any more, so the top
                     // edge is the sum of the rows above it and everything inside the row --
                     // the plate, the gauges, the text -- is placed against this height.
@@ -5879,7 +6084,6 @@ static void PaintPanel(HWND hwnd) {
                     const float rowHeight = rowMetrics.lineHeight;
                     const float top = (float)RowTopPx(g_settings, r);
                     const float centerY = top + rowHeight / 2.0f;
-                    float cursor = leftInset;
 
                     // The main font for this row. A row that inherits the global size keeps
                     // using the one font built above, so the default configuration allocates
@@ -5909,22 +6113,16 @@ static void PaintPanel(HWND hwnd) {
                     int ringCount = g_rowState.ringCount[r];
                     bool inlineFlow = g_rowState.inlineRing[r];
 
-                    // Ahead of an inline gauge the text is drawn normally, and the
-                    // gauge is laid down wherever the text ended. In the other
-                    // layout the gauges are parked at the right edge and the text
-                    // is confined to whatever space is left.
-                    RowTextMetrics metrics = ComputeRowTextMetrics(
-                        (float)width, ringCount, g_settings.ringSize,
-                        g_settings.ringRightOffset, inlineFlow, leftInset);
-
-                    float parkX = 0.0f;
-                    if (!inlineFlow && ringCount > 0) {
-                        // Centre of the first parked gauge.
-                        parkX = metrics.textRight + (float)g_settings.ringSize / 2.0f;
-                    }
+                    // Everything about this row that depends on measurement was worked out
+                    // once, when the text or the geometry last changed; this frame only draws
+                    // it (see the plan comment above EnsureRowPlan).
+                    const RowLayoutPlan *plan = EnsureRowPlan(
+                        graphics, rowMainFont, format, r, rows, (float)width, leftInset,
+                        rowFontSizePx, rowHeight, globalFontPath);
 
                     for (int s = 0; s < g_rowState.segmentCount[r]; s++) {
                         const TextSeg &seg = g_rowState.segments[r][s];
+                        const RowSegmentPlan &planned = plan->segments[s];
                         if (seg.offset < 0) {
                             // A gauge.
                             int ringIndex = seg.length;
@@ -5935,14 +6133,7 @@ static void PaintPanel(HWND hwnd) {
                             float ringRadius = (outer - thickness) / 2.0f;
                             if (ringRadius < 3.0f) ringRadius = 3.0f;
 
-                            float centerX;
-                            if (inlineFlow) {
-                                centerX = cursor + outer / 2.0f;
-                                cursor = centerX + outer / 2.0f + 4.0f;
-                            } else {
-                                centerX = parkX;
-                                parkX += outer + 4.0f;
-                            }
+                            float centerX = planned.x;
 
                             double fraction = ring.max > 0 ? ring.value / ring.max : 0.0;
                             if (fraction < 0) fraction = 0;
@@ -5963,87 +6154,24 @@ static void PaintPanel(HWND hwnd) {
                             continue;
                         }
 
-                        if (!font || !textBrush || seg.length <= 0) continue;
-                        WCHAR slice[640];
-                        int length = MinInt(seg.length, 639);
-                        wcsncpy(slice, g_rowState.text[r] + seg.offset, length);
-                        slice[length] = L'\0';
-
-                        // This run's size: its own [[size:NN]], or the row's size. The font is
-                        // chosen from it before anything is measured, so the fit is computed
-                        // with the font the run will actually be drawn in.
-                        const int segFontSize = seg.runFontSize > 0 ? seg.runFontSize : rowFontSizePx;
-                        GpFont *segMainFont = rowMainFont;
-                        if (segFontSize != rowFontSizePx) {
-                            GpFont *sized = AcquireRowFont(graphics, g_settings.fontFamily, segFontSize);
-                            if (sized) segMainFont = sized;
+                        if (!font || !textBrush || planned.skip || planned.fontSize <= 0) continue;
+                        GpFont *runFont = nullptr;
+                        if (planned.family[0]) {
+                            runFont = AcquireRowFont(graphics, planned.family, planned.fontSize);
+                        } else if (planned.fontSize == rowFontSizePx) {
+                            runFont = rowMainFont;
+                        } else {
+                            runFont =
+                                AcquireRowFont(graphics, g_settings.fontFamily, planned.fontSize);
                         }
+                        if (!runFont) continue;
 
-                        // Fallback fonts: choose this run's family *before* measuring it, so the
-                        // fit is computed with the font it will actually be drawn in. The choice
-                        // is made from the whole run, not from whatever survives the trim: the row
-                        // says which family it wants, not how much of it fits.
-                        GpFont *runFont = segMainFont;
-                        if (rowFontPath) {
-                            const FontChain &tagChain =
-                                seg.tagChain > 0 ? g_settings.tagFonts[seg.tagChain - 1].chain
-                                                 : kNoFontChain;
-                            const WCHAR *picked =
-                                PickFontFamily(slice, length, g_settings.fontFamily, tagChain,
-                                               g_settings.fallbackFonts, FontFamilyCovers);
-                            if (picked && _wcsicmp(picked, g_settings.fontFamily) != 0) {
-                                GpFont *fallbackFont =
-                                    AcquireRowFont(graphics, picked, segFontSize);
-                                if (fallbackFont) runFont = fallbackFont;
-                            }
-                        }
-
-                        // How much room this run may use. Right-parked gauges leave the
-                        // text whatever they do not need; an inline run has to count the
-                        // gauges that still follow it, or a long run pushes them off the
-                        // panel (and FitTextToWidth gets a budget it can never exceed,
-                        // so the run was never trimmed at all -- see
-                        // ComputeInlineTextLimit).
-                        float limit = metrics.textWidth;
-                        if (inlineFlow) {
-                            int ringsAfter = 0;
-                            for (int k = s + 1; k < g_rowState.segmentCount[r]; k++) {
-                                if (g_rowState.segments[r][k].offset < 0) ringsAfter++;
-                            }
-                            limit = ComputeInlineTextLimit(metrics.textRight, cursor, ringsAfter,
-                                                           g_settings.ringSize);
-                        }
-                        float budget = LayoutWidthFloor(limit);
-
-                        // The run's own width is what an inline gauge is placed after
-                        // (including the spaces written before it); a parked run is
-                        // drawn in its whole budget instead.
-                        float advance = inlineFlow
-                                            ? MeasureAdvance(graphics, runFont, format, slice,
-                                                             rowHeight)
-                                            : budget;
-
-                        // Trim to the space this segment is actually allowed to
-                        // occupy. GDI+ does not clip text to the layout box, so
-                        // without this a long run would be drawn straight across the
-                        // gauge that follows it. The fit is measured through the same
-                        // helper used for the advance, so a fitted run costs exactly
-                        // what it reports.
-                        bool fitted = FitTextToWidth(graphics, runFont, format, slice,
-                                                     sizeof(slice) / sizeof(slice[0]),
-                                                     budget, rowHeight);
-                        if (fitted) {
-                            advance = MeasureAdvance(graphics, runFont, format, slice, rowHeight);
-                        }
-
-                        float drawWidth = LayoutWidthFloor(advance);
-                        RectF layout(cursor, top, drawWidth, rowHeight);
+                        RectF layout(planned.x, top, planned.boxWidth, rowHeight);
                         if (logDraws) {
                             DBG(L"    draw row=%d seg=%d x=%.1f y=%.1f w=%.1f "
                                    L"adv=%.1f inline=%d fitted=%d \"%ls\"",
-                                   r, s, layout.X, layout.Y,
-                                   layout.Width, advance, inlineFlow ? 1 : 0,
-                                   fitted ? 1 : 0, slice);
+                                   r, s, layout.X, layout.Y, layout.Width, planned.advance,
+                                   inlineFlow ? 1 : 0, planned.fitted ? 1 : 0, planned.slice);
                         }
                         // Text alpha tracks the intro so the numbers fade in with
                         // the rings rather than appearing before them.
@@ -6053,9 +6181,8 @@ static void PaintPanel(HWND hwnd) {
                                     ? WithOpacity(g_settings.text, contentAlpha)
                                     : g_settings.text);
                         }
-                        g_gdiplus.DrawString(graphics, slice, -1, runFont, &layout, format,
+                        g_gdiplus.DrawString(graphics, planned.slice, -1, runFont, &layout, format,
                                              (GpBrush *)textBrush);
-                        if (inlineFlow) cursor += advance;
                     }
                 }
                 LeaveCriticalSection(&g_valuesLock);
@@ -6569,10 +6696,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&mem, sizeof(mem));
             unsigned long long elapsed = GetTickCount64() - g_perfBaseTick;
             DBG(L"[perf] up=%llus rows=%d groups=0x%X samples=%llu republish=%llu paints=%llu "
-                   L"glyphq=%lu cpu=%llums cpu/sample=%.3fms ws=%.1fMB private=%.1fMB "
+                   L"glyphq=%lu meas=%lu cpu=%llums cpu/sample=%.3fms ws=%.1fMB private=%.1fMB "
                    L"visible=%d expanded=%d prox=%d",
                    elapsed / 1000ULL, g_visibleRows, g_activeGroups, g_sampleCount, g_republishCount,
-                   g_paintCount, (unsigned long)g_coverQueryCount,
+                   g_paintCount, (unsigned long)g_coverQueryCount, (unsigned long)g_measureCalls,
                    cpuMs, g_sampleCount ? (double)cpuMs / (double)g_sampleCount : 0.0,
                    mem.WorkingSetSize / 1048576.0, mem.PrivateUsage / 1048576.0,
                    g_visible ? 1 : 0, g_expanded ? 1 : 0, g_modeProximity ? 1 : 0);
@@ -6918,6 +7045,9 @@ static bool PublishRows(const Values &v, const ModSettings &settings) {
     const bool changed = (count != g_publishedRows) || !RowStateEqual(staged, g_rowState, count);
     g_publishedRows = count;
     if (changed) {
+        // New text means every laid-out row was measured from a different string; the plans
+        // have to be rebuilt or a frame would keep drawing the previous sample's run.
+        g_layoutEpoch++;
         for (int r = 0; r < count; r++) {
             g_rowState.segmentCount[r] = staged.segmentCount[r];
             g_rowState.ringCount[r] = staged.ringCount[r];
