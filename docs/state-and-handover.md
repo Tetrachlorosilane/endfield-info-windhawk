@@ -325,6 +325,15 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 > （两个端点都失败），但歌词仍从播放器自己的 store 取到了（`-> SET netease lyric … 练就这套拳叫`），
 > 所以搜索只是"store 里没有时的兜底"。要不要修这条另说。
 
+**第九批（2026-10-14，回答"当前歌词是直接获取还是按时间点算的"）**：
+
+| 结论 / 改动 | 真机证据 |
+| :-- | :-- |
+| **当前歌词是"算"的**：取播放**位置**，再在歌词行时间戳上选行（`Select-StoreLineIndex`，纯函数） | 播放器自己的 `playingLyricLineNumber` **冻结在 10**（82 行歌词、那句 `それを珍品として崇めて` = 29.5 s），而真实位置 **90.0 s**、算出来的行是 `つまらない生活の中`——直接读的行只作为过渡一帧，随即被算出来的覆盖 |
+| **位置来源链**（每一步失败静默降级）：迷你条 DOM 的真 currentTime → store 当前行起始时间 → CDP 其它位置 → 内存差分 → SMTC 媒体会话 → 推算时钟 | 本机 SMTC **不可用**（`_netease-position.ps1 -Probe` → `PROBE none (no active media session)`）；CDP **可用**（9229，`playingState=2`）；实际生效 **DOM**：`-> SET netease pos 600000 dom 90.0s` |
+| **新增 `pos` key**（`{ext.netease.pos}`）：把"位置是哪来的"发到面板上，不再只打在 mod 收走的 stdout | 自检新增 4 项 `位置来源标签：…`（36 → **40** 项）；实测 `pos` 帧内容为 `dom 90.0s` |
+| 顺手澄清两处易误读：① 启动那句 `位置：媒体会话不可用，退回推算时钟` **只说明 SMTC 不可用**，不代表整条链退到时钟；② `-PositionSource auto` 的注释原写"memory → media → clock"，与实际顺序不符（已按主循环改写） | README 的发布器一节写明了顺序与 `clock` 的含义 |
+
 **其余已确认、尚未修**：**本会话复查列出的项目已全部处理完**。剩下的都是真机项（见 §12.1）
 与 AGENTS §7.13 末尾记的测试装置信任边界（`PaintPanel` 调用点、`StartIntro` 接线）。
 
@@ -346,7 +355,7 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 - `{cpu.ghz}`：用户确认显示**正确**，标称取电源 API 的 **2.20 GHz**（注册表 2.42 被正确忽略）。⚠️ 但**保存过任何设置之后**它曾回退到注册表值（2026-10-14 修，见 §10.y 头条 1）。
 - 看门狗：日志出现 `EXT publisher: started pid=…`，命令行按 `CreateProcessW` 约定正确拆分。
 - 歌词来源（部分打通）：`async:lyric.lyricLines`（实测 **64 / 67** 行）与 `tlyricLines`；**真 currentTime** 来自 `#page_pc_mini_bar` 的 `mm:ss / mm:ss`。
-- bridge 自检 **36 项**（含 8 项 Select-StoreLineIndex 与 5 项窗口/曲名判定，都不假设长度或环境）全绿。
+- bridge 自检 **40 项**（含 8 项 Select-StoreLineIndex 与 5 项窗口/曲名判定，都不假设长度或环境）全绿。
 - 图标全局覆盖（Custom icon file）与 None 语义：2026-10-14 实现并断言（第四批，见 §10.y）。
 - **曲名来源（真机定论，2026-10-14）**：网易云开着「桌面歌词」时 `cloudmusic` 的 `MainWindowTitle`
   **就是「桌面歌词」**，带歌名的窗口是同一 pid 的**另一个顶层窗口**

@@ -433,6 +433,17 @@ pwsh -File _netease-bridge.ps1 -Ttl 600000
 pwsh -File _netease-bridge.ps1 -Event -Ttl 600000
 ```
 
+> **当前歌词是"算"出来的，不是直接读的**：播发器取播放**位置**，再在歌词行的时间戳上
+> 选行（播放器自己那个"当前行号"在真机上会**冻结**，所以只作为过渡的一帧）。
+> 位置按这个顺序找：**迷你条 DOM 的"已播/总长"（客户端自己显示的真 currentTime）** →
+> store 当前行的起始时间 → CDP 其它位置 → 内存差分 → 媒体会话（SMTC）→ 推算时钟。
+> 前几条都是真实时间，所以**拖动进度条、暂停都能跟上**；只有退到最后那条"推算时钟"
+> 才会漂（从"第一次看到这首歌"起算）。
+> **想知道当前用的是哪一条**：在任意一行里写 `{ext.netease.pos}`，它会显示成
+> `dom 90.0s` / `storeline 29.5s` / `mem …` / `cdp …` / `media …` / `clock …`
+> —— 看到 `clock` 就说明位置已经在漂。启动时那句
+> `位置：媒体会话不可用，退回推算时钟` **只说明 SMTC 不可用**，不代表整条链退到了时钟。
+
 > **也可以让 mod 替你启动它**：设置里把 `External publisher command` 填成
 > `pwsh -NoProfile -File <本仓库路径>\_netease-bridge.ps1` 即可 —— 只有**某一行真的引用了
 > `{ext.*}`** 且 `External data` 打开时才会启动 ✓；卸载 mod 时它会被一起收掉（作业对象，
@@ -455,7 +466,8 @@ pwsh -File _netease-bridge.ps1 -Event -Ttl 600000
 **它只在内容变化时才发**：一秒一次地重复同一句歌词没有意义，管道限速会丢，但更好的做法是根本不发。
 
 > 面板侧要做的只有两件事：设置里 `External data` 打开，然后**在一行里引用** `{ext.netease.title}`
-> 或 `{ext.netease.lyric}`（没有引用就不会建管道，这是刻意的）。
+> 或 `{ext.netease.lyric}`（没有引用就不会建管道，这是刻意的）。排错时可以再加一个
+> `{ext.netease.pos}`：它显示当前歌词用的位置来自哪条来源（见上面那一段）。
 
 ---
 
