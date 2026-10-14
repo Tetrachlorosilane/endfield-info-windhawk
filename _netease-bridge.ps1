@@ -658,6 +658,71 @@ function Get-CdpPositionMs {
 #   #page_pc_mini_bar … div.curtime-thumb … span.cmd-button-content  ->  "02:58 / 03:06"
 # **不锚带哈希的类名**（TimeWarpper_t1eityq1 / SpaceContainer_s8o78dm 会随构建变），
 # 只锚 "#page_pc_mini_bar + 文本形状 m:ss / m:ss"；并顺带读进度柄比例做交叉校验。
+# 取**整条时间数组**（秒）—— 只在换歌时调一次。**只搬数字**（2000 行也才约 8 KB），
+# 因此不需要假设长度；超出安全上限时**如实上报** truncated，而不是悄悄截断。
+function Get-CdpStoreLyricTimes {
+    if (-not (Get-CdpTab)) { return $null }
+    $expr = @"
+(function(){
+  try{
+    if(!window.__ei_probe_require__){
+      webpackJsonp.push([[987661],{987661:function(m,e,require){window.__ei_probe_require__=require;}},[[987661]]]);
+    }
+    var req=window.__ei_probe_require__, cache=req.c||{}, id=window.__ei_store_id__;
+    if(!id){
+      for(var k in cache){ try{ var ex=cache[k]&&cache[k].exports; if(!ex) continue;
+        var cd=[ex,ex.a,ex.default];
+        for(var i=0;i<cd.length;i++){ if(cd[i]&&typeof cd[i].getStore==='function'){ id=k; window.__ei_store_id__=k; break; } }
+      }catch(e){} if(id) break; }
+    }
+    if(!id) return JSON.stringify({ok:false, why:'no store module'});
+    var h=[cache[id].exports,cache[id].exports.a,cache[id].exports.default]
+            .filter(function(x){return x&&typeof x.getStore==='function';})[0];
+    var g=h.getStore(), st=(g&&typeof g.getState==='function')?g.getState():g;
+    var p=(st&&st.playing)||{}, a=(st&&st['async:lyric'])||{}, L=a.lyricLines||[];
+    var CAP=2000, times=[];
+    for(var i=0;i<L.length && i<CAP;i++){
+      times.push((L[i]&&typeof L[i].time==='number')?L[i].time:null);   // 允许 null（元信息行）
+    }
+    return JSON.stringify({ok:true, moduleId:id, trackId:p.resourceTrackId||'',
+      name:p.resourceName||'', state:p.playingState, offset:a.offset,
+      lineCount:L.length, usedLyric:a.currentUsedLyric, truncated:(L.length>CAP), times:times});
+  }catch(x){ return JSON.stringify({ok:false, why:''+x}); }
+})()
+"@
+    $raw = Invoke-CdpExpression -Expression $expr
+    if (-not $raw) { return $null }
+    $m = [regex]::Match($raw, '"value"\s*:\s*"((?:[^"\\]|\\.)*)"', 'Singleline')
+    if (-not $m.Success) { return $null }
+    try { return (('"' + $m.Groups[1].Value + '"') | ConvertFrom-Json) | ConvertFrom-Json } catch { return $null }
+}
+
+# 按需取**某一行的文本与翻译**（行号变化时才调，很小）。越界返回空，不报错。
+function Get-CdpStoreLyricLine {
+    param([int]$Index)
+    if ($Index -lt 0 -or -not (Get-CdpTab)) { return $null }
+    $expr = @"
+(function(){
+  try{
+    var req=window.__ei_probe_require__, cache=(req&&req.c)||{}, id=window.__ei_store_id__;
+    if(!id) return JSON.stringify({ok:false, why:'store id not cached yet'});
+    var ex=cache[id]&&cache[id].exports;
+    var h=[ex,ex&&ex.a,ex&&ex.default].filter(function(x){return x&&typeof x.getStore==='function';})[0];
+    var g=h.getStore(), st=(g&&typeof g.getState==='function')?g.getState():g;
+    var a=(st&&st['async:lyric'])||{}, L=a.lyricLines||[], T=a.tlyricLines||[], i=$Index;
+    var t=(i<L.length)?L[i]:null, q=(i<T.length)?T[i]:null;
+    return JSON.stringify({ok:true, index:i, lines:L.length, trans:T.length,
+      text:(t?(''+(t.lyric||t.text||'')).slice(0,200):''),
+      trans:(q?(''+(q.lyric||q.text||'')).slice(0,200):'')});
+  }catch(x){ return JSON.stringify({ok:false, why:''+x}); }
+})()
+"@
+    $raw = Invoke-CdpExpression -Expression $expr
+    if (-not $raw) { return $null }
+    $m = [regex]::Match($raw, '"value"\s*:\s*"((?:[^"\\]|\\.)*)"', 'Singleline')
+    if (-not $m.Success) { return $null }
+    try { return (('"' + $m.Groups[1].Value + '"') | ConvertFrom-Json) | ConvertFrom-Json } catch { return $null }
+}
 function Get-CdpDomTime {
     if (-not (Get-CdpTab)) { return $null }
     $expr = @"
@@ -692,8 +757,9 @@ function Get-CdpDomTime {
 
 # 纯函数：在 times（**秒**，注意单位）上按位置（**毫秒**）选行；返回索引，-1 = 无法判定。
 # **不假设长度**（同一客户端上实测见过 64 行与 67 行）；跳过 null 时间戳；越界钳位到末行。
+# ⚠ 参数必须是 object[]：若写成 double[]，JSON 里的 null 会被静默转成 0，于是那一行会匹配任何位置（断言抓到过）。
 function Select-StoreLineIndex {
-    param([double[]]$TimesSec, [int]$PositionMs)
+    param([object[]]$TimesSec, [int]$PositionMs)   # object[] 而非 double[]：JSON 的 null 不能被转成 0
     if (-not $TimesSec -or $TimesSec.Count -eq 0) { return -1 }
     $idx = -1
     for ($i = 0; $i -lt $TimesSec.Count; $i++) {
@@ -1076,6 +1142,45 @@ function Get-MemoryPosition {
 
 
 if ($SelfTest) {
+    # --- Select-StoreLineIndex（选行纯函数）：**不假设长度**（实测同一客户端见过 64 行与 67 行）---
+    $irr = [object[]]@(0..79 | ForEach-Object { [double]($_ * 2.5) })   # object[]：才能真正放 null
+    $irr[3] = $null                      # 元信息行没有时间戳 → 必须跳过
+    $idxCases = @(
+        @{ m = 0;       want = 0;    d = 'position 0 -> line 0 (intro)' },
+        @{ m = 2500;    want = 1;    d = 'exact line start -> that line (closed interval)' },
+        @{ m = 2501;    want = 1;    d = 'between lines -> previous line' },
+        @{ m = 5000;    want = 2;    d = 'a null timestamp is skipped, no crash' },
+        @{ m = 999999;  want = 79;   d = 'past the last line -> clamped to last' },
+        @{ m = 1000;    want = -1;   d = 'empty array -> -1 (caller falls back to LRC)'; empty = $true },
+        @{ m = 100;     want = 0;    d = 'single line array -> 0'; one = $true },
+        @{ m = 1500500; want = 1499; d = '2000-line array -> the 1500th second = index 1499'; big = $true }
+    )
+    foreach ($c in $idxCases) {
+        $ts = if ($c.empty) { [double[]]@() } elseif ($c.one) { [double[]]@(5) } elseif ($c.big) { [double[]](1..2000 | ForEach-Object { [double]$_ }) } else { $irr }
+        $got = Select-StoreLineIndex -TimesSec $ts -PositionMs $c.m
+        if ($got -ne $c.want) { $bad++; Write-Host ("  FAIL Select-StoreLineIndex: {0} (got {1}, want {2})" -f $c.d, $got, $c.want) }
+        else { Write-Host ("  OK   Select-StoreLineIndex: {0}" -f $c.d) }
+    }
+        # --- Select-StoreLineIndex（选行纯函数）---------------------------------
+        # 不假设长度：~80 行、间距不规则的数组也必须正确（用户点名要求）
+        $irr = [object[]]@(0..79 | ForEach-Object { [double]($_ * 2.5) })   # object[]：才能真正放 null
+        $irr[3] = $null                       # 元信息行没有时间戳 → 跳过
+        $okA = (Select-StoreLineIndex -TimesSec $irr -PositionMs 0) -eq 0
+        $okB = (Select-StoreLineIndex -TimesSec $irr -PositionMs 2500) -eq 1
+        $okC = (Select-StoreLineIndex -TimesSec $irr -PositionMs 2501) -eq 1
+        $okD = (Select-StoreLineIndex -TimesSec $irr -PositionMs 5000) -eq 2
+        $okE = (Select-StoreLineIndex -TimesSec $irr -PositionMs 999999) -eq 79
+        $okF = (Select-StoreLineIndex -TimesSec ([double[]]@()) -PositionMs 1000) -eq -1
+        $okG = (Select-StoreLineIndex -TimesSec ([double[]]@(5)) -PositionMs 100) -eq 0
+        $okH = (Select-StoreLineIndex -TimesSec ([double[]](1..2000 | ForEach-Object { [double]$_ })) -PositionMs 1500500) -eq 1500
+        Check ($okA) "Select-StoreLineIndex：位置 0 → 第 0 行（前奏）"
+        Check ($okB) "Select-StoreLineIndex：恰好落在某行起点 → 取该行（闭区间）"
+        Check ($okC) "Select-StoreLineIndex：行间 → 仍取上一行"
+        Check ($okD) "Select-StoreLineIndex：跨过 null 行不崩、仍取最近一行"
+        Check ($okE) "Select-StoreLineIndex：晚于末行 → 钳到末行（不越界）"
+        Check ($okF) "Select-StoreLineIndex：空数组 → -1（调用方据此退回 LRC）"
+        Check ($okG) "Select-StoreLineIndex：单行数组 → 0"
+        Check ($okH) "Select-StoreLineIndex：2000 行数组 → 命中第 1500 行（无固定长度假设）"
     $fixture = @"
 [ti:示例]
 [00:00.00]第一句
