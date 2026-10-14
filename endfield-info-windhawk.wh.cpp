@@ -1991,6 +1991,16 @@ static int IslandEnqueue(IslandEvent *queue, int count, int cap, const IslandEve
         if (_wcsicmp(queue[i].title, ev.title) == 0 &&
             (DWORD)(ev.queuedAt - queue[i].queuedAt) <= kIslandMergeWindowMs) {
             // The same thing again: bump the badge instead of queueing a twin.
+            //
+            // Severity is the one field that must not be inherited from the first
+            // sighting. "The same title, but now critical" is exactly the escalation this
+            // window would otherwise swallow: the entry kept its old level, so the state
+            // machine never saw a critical waiting and the card stayed at warn. Take the
+            // higher of the two -- a repeat can raise the level, never lower it.
+            if (ev.severity > queue[i].severity) queue[i].severity = ev.severity;
+            // The newest text describes the same thing most accurately.
+            wcsncpy(queue[i].body, ev.body, kIslandBodyChars - 1);
+            queue[i].body[kIslandBodyChars - 1] = L'\0';
             queue[i].repeat++;
             queue[i].queuedAt = ev.queuedAt;
             queue[i].ttlMs = ev.ttlMs;
@@ -4469,16 +4479,25 @@ static PanelRect ComputeIslandRect(const IslandMetrics &m, const ModSettings &cf
 }
 
 // The close affordance: a square at the card's right edge, centred on its first line.
-// The clamps win over the padding, so on a very narrow card it stays inside the card
-// rather than poking out of it -- which would be a click target outside the panel.
+//
+// The button may not be larger than the card it belongs to. The clamps below are what
+// keeps it inside, but when the button is *taller* than the card no position satisfies
+// both clamps at once: the old fixed 22 px square against a single 18 px row landed at
+// y = -2, the top clamp lifted it to the card's edge, and the bottom clamp then pushed it
+// straight back out of the card (measured: y = card.y - 4) -- a click target outside the
+// panel, over whatever is behind it. Shrinking is the only way both clamps can hold.
 static const int kIslandCloseSize = 22;
 
 static PanelRect ComputeIslandCloseRect(const PanelRect &card, int rowHeight) {
     PanelRect out = {};
-    out.w = kIslandCloseSize;
-    out.h = kIslandCloseSize;
-    out.x = card.x + card.w - kIslandCloseSize - 8;
-    out.y = card.y + (rowHeight - kIslandCloseSize) / 2;
+    int size = kIslandCloseSize;
+    if (size > card.w) size = card.w;
+    if (size > card.h) size = card.h;
+    if (size < 1) size = 1;
+    out.w = size;
+    out.h = size;
+    out.x = card.x + card.w - size - 8;
+    out.y = card.y + (rowHeight - size) / 2;
     if (out.x + out.w > card.x + card.w) out.x = card.x + card.w - out.w;
     if (out.x < card.x) out.x = card.x;
     if (out.y < card.y) out.y = card.y;
@@ -4521,11 +4540,32 @@ static IslandRegion IslandHitTest(const IslandHitRegion *regions, int count, int
 // Closing a card early takes the same road the ttl expiry takes, so the fade and the
 // state machine cannot diverge. Idempotent on purpose: a second click on the button must
 // not restart the fade.
+static bool IslandDismissable(const IslandView &v) {
+    return v.state == IS_POPPING || v.state == IS_CARD;
+}
+
 static bool IslandDismiss(IslandView *v, DWORD now) {
-    if (v->state != IS_POPPING && v->state != IS_CARD) return false;
+    if (!IslandDismissable(*v)) return false;
     v->state = IS_COLLAPSING;
     v->phaseStarted = now;
     return true;
+}
+
+// What a click does while a card is up. Pure, so the rule is assertable rather than
+// buried in WindowProc.
+//
+// The button consumes the click whether or not there is still a fade to start: the old
+// code demanded IslandDismiss() == true, so a *second* click on the × during the fade
+// fell straight through to the panel's own click behaviour and toggled the panel -- which
+// reads as "the × closed the panel". The card body consumes as well, for the same reason:
+// clicking the card to read it must not toggle the panel either. Only a click outside the
+// card belongs to the panel.
+enum IslandClickAction { ICA_PANEL = 0, ICA_CONSUMED, ICA_DISMISS };
+
+static IslandClickAction IslandClickActionFor(IslandRegion hit, bool dismissable) {
+    if (hit == IR_CLOSE) return dismissable ? ICA_DISMISS : ICA_CONSUMED;
+    if (hit == IR_CARD) return ICA_CONSUMED;
+    return ICA_PANEL;
 }
 
 // ---------------------------------------------------------------------------
@@ -5519,10 +5559,17 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 BuildIslandRegions(card, g_settings.rowHeight, regions, 2);
             const int screenX = wr.left + (int)(short)LOWORD(lParam);
             const int screenY = wr.top + (int)(short)HIWORD(lParam);
-            if (IslandHitTest(regions, regionCount, screenX, screenY) == IR_CLOSE &&
-                IslandDismiss(&g_islandView, GetTickCount())) {
+            const IslandRegion hit = IslandHitTest(regions, regionCount, screenX, screenY);
+            switch (IslandClickActionFor(hit, IslandDismissable(g_islandView))) {
+            case ICA_DISMISS:
+                IslandDismiss(&g_islandView, GetTickCount());
                 PaintPanel(hwnd);
                 return 0;
+            case ICA_CONSUMED:
+                // The card swallows the click; the panel's own behaviour must not run.
+                return 0;
+            default:
+                break;
             }
         }
         if (g_settings.clickToggle) {

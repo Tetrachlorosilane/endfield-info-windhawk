@@ -1670,6 +1670,63 @@ int main() {
             n = IslandEnqueue(q, n, 3, alarm, &drops);
             Check(n == 3 && q[IslandPick(q, n)].severity == ES_CRITICAL,
                   "a critical displaces an info rather than being dropped");
+
+            // A repeat that arrives at a *higher* level is an escalation, not a repeat:
+            // the merge window used to keep the first sighting's severity, so "same
+            // title, now critical" never reached the screen (the card stayed at warn).
+            {
+                IslandEvent esc[kIslandQueueMax] = {};
+                unsigned escDrops = 0;
+                IslandEvent warn = {};
+                wcsncpy(warn.provider, L"music", kExtProviderChars);
+                wcsncpy(warn.title, L"Now playing", kIslandTitleChars - 1);
+                wcsncpy(warn.body, L"battery 15%", kIslandBodyChars - 1);
+                warn.severity = ES_WARN; warn.ttlMs = 6000; warn.repeat = 1;
+                warn.queuedAt = 1000;
+
+                IslandEvent hot = warn;
+                wcsncpy(hot.body, L"battery 4%, plug in now", kIslandBodyChars - 1);
+                hot.severity = ES_CRITICAL; hot.queuedAt = 1500;   // inside the window
+
+                int m = IslandEnqueue(esc, 0, 4, warn, &escDrops);
+                m = IslandEnqueue(esc, m, 4, hot, &escDrops);
+                Check(m == 1 && esc[0].severity == ES_CRITICAL,
+                      "an escalation inside the merge window raises the queued level");
+                Check(esc[0].repeat == 2 && wcscmp(esc[0].body, hot.body) == 0,
+                      "and it still counts as the same thing, with the newest text");
+
+                // The symptom, driven through the real state machine: a warn card on
+                // screen must give way when the queue now holds a critical.
+                IslandView escView = {};
+                escView.state = IS_CARD;
+                escView.showing = ES_WARN;
+                escView.cardDeadline = 9999;
+                Check(StepIsland(&escView, esc, m, 2000, false, nullptr) == IS_COLLAPSING,
+                      "so a card already on screen stands down for it");
+
+                // A repeat at a lower level must not lower the queued one either.
+                IslandEvent cool = hot;
+                cool.severity = ES_INFO; cool.queuedAt = 2000;
+                m = IslandEnqueue(esc, m, 4, cool, &escDrops);
+                Check(m == 1 && esc[0].severity == ES_CRITICAL,
+                      "a repeat never lowers the level the queue already holds");
+
+                // Outside the window it is a new card rather than a repeat. It carries
+                // the same provider, so it *replaces* that provider's pending entry
+                // instead of queueing beside it (which is the documented rule), so what
+                // identifies it as new is the timestamp and a repeat count of 1.
+                // The window runs from the *last* sighting -- every repeat refreshes it.
+                IslandEvent later = warn;
+                later.queuedAt = esc[0].queuedAt + kIslandMergeWindowMs + 1;
+                m = IslandEnqueue(esc, m, 4, later, &escDrops);
+                Check(m == 1 && esc[0].queuedAt == later.queuedAt && esc[0].repeat == 1,
+                      "the same title after the merge window is a new card, not a repeat");
+                IslandEvent again = later;
+                again.queuedAt += 10;
+                m = IslandEnqueue(esc, m, 4, again, &escDrops);
+                Check(m == 1 && esc[0].repeat == 2,
+                      "and a repeat of that new card merges with it, not with the old one");
+            }
         }
 
         // The state machine's transitions (design 7.2), on an explicit clock.
@@ -1785,12 +1842,63 @@ int main() {
             Check(close.x >= card.x && close.x + close.w <= card.x + card.w &&
                       close.y >= card.y && close.y + close.h <= card.y + card.h,
                   "the close button never pokes outside the card");
+
+            // A card can be shorter than the button (a single 18 px row against the 22 px
+            // square). No fixed-size square fits there: the old code clamped the top and
+            // then the bottom clamp pushed it back out, top edge first (y = card.y - 4).
+            printf("  card h  close rect (w,h)  inside\n");
+            const int cardHeights[] = {1, 8, 18, 21, 22, 30, 90, 168};
+            for (int h : cardHeights) {
+                PanelRect shortCard = {10, 20, 360, h};
+                PanelRect btn = ComputeIslandCloseRect(shortCard, cfg.rowHeight);
+                const bool inside = btn.x >= shortCard.x && btn.y >= shortCard.y &&
+                                    btn.x + btn.w <= shortCard.x + shortCard.w &&
+                                    btn.y + btn.h <= shortCard.y + shortCard.h &&
+                                    btn.w >= 1 && btn.h >= 1;
+                printf("  %6d  %9dx%-4d  %s\n", h, btn.w, btn.h, inside ? "yes" : "NO");
+                Check(inside, "the close button fits inside a card of any height");
+                if (h < kIslandCloseSize) {
+                    Check(btn.h == h, "and it shrinks to the card when the card is smaller");
+                }
+            }
+            Check(ComputeIslandCloseRect(card, cfg.rowHeight).w == kIslandCloseSize,
+                  "on a card with room to spare the button keeps its full size");
+
             Check(IslandHitTest(regions, count, close.x + 2, close.y + 2) == IR_CLOSE,
                   "a click on the button is the button");
             Check(IslandHitTest(regions, count, card.x + 5, card.y + 5) == IR_CARD,
                   "a click on the card is the card");
             Check(IslandHitTest(regions, count, card.x - 1, card.y - 1) == IR_NONE,
                   "a click outside the card is nothing");
+            Check(IslandHitTest(regions, count, card.x + 5, card.y + 5) == IR_CARD &&
+                      IslandHitTest(regions, count, close.x + 2, close.y + 2) == IR_CLOSE,
+                  "the button wins over the card inside itself");
+
+            // What a click does with that hit. The rule used to live in WindowProc and
+            // read "if the button was hit *and* the dismiss took effect, else fall
+            // through": a second click on the × during the fade toggled the panel, and so
+            // did a click anywhere on the card.
+            Check(IslandClickActionFor(IR_NONE, true) == ICA_PANEL,
+                  "a click outside the card belongs to the panel");
+            Check(IslandClickActionFor(IR_CARD, true) == ICA_CONSUMED &&
+                      IslandClickActionFor(IR_CARD, false) == ICA_CONSUMED,
+                  "a click on the card is swallowed, never the panel's");
+            Check(IslandClickActionFor(IR_CLOSE, true) == ICA_DISMISS,
+                  "the button dismisses while there is a card to dismiss");
+            Check(IslandClickActionFor(IR_CLOSE, false) == ICA_CONSUMED,
+                  "and during the fade it is still swallowed, not handed to the panel");
+            {
+                IslandView live = {};
+                live.state = IS_CARD;
+                IslandView fading = {};
+                fading.state = IS_COLLAPSING;
+                Check(IslandDismissable(live) && !IslandDismissable(fading),
+                      "a live card can be dismissed and a fading one cannot");
+                Check(IslandClickActionFor(IR_CLOSE, IslandDismissable(live)) == ICA_DISMISS &&
+                          IslandClickActionFor(IR_CLOSE, IslandDismissable(fading)) ==
+                              ICA_CONSUMED,
+                      "so the button's two questions agree on both states");
+            }
 
             int unclickable = 0;
             for (int x = card.x; x < card.x + card.w; x++) {
