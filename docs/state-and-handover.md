@@ -263,6 +263,17 @@
 
 **第四批（用户要求实现 `IconPath`，2026-10-14；含一个附带缺陷，五处负对照共红 12 条）**：
 
+> **这一批已经作废（2026-10-14，同日稍后）**：图标设置项（`Row N icon` / `Row N icon file` /
+> `Custom icon file`）被整体删除，图标改为行内标签 `[[icon:…]]`
+> （见 [inline-markup-design.md](inline-markup-design.md) §7 第 4 步、CHANGELOG「删除的与不兼容的」）。
+> 下表里的断言**已经随功能一起删除**，`ModSettings` 里也不再有任何图标字段——
+> 不要照着它去找那些断言。行内图标的不变量与断言现在记在 AGENTS §5.3 与
+> `test-layout.cpp` 的 `=== inline icons: the tag, the glyph and the ripple switch ===` /
+> `=== inline icon images: one cache entry per file, bounded ===` 两节。
+> 下面这段留着是因为其中的**教训**仍然成立：一个"有设置项、却从来没被读取"的死设置项
+> （它当时的表现就是"填了没效果"），以及"空行的槽位被顺手丢掉"这类因继承规则而起的错位。
+> 内联图标从结构上消掉了继承（图标跟着写它的那一行走），所以那两类缺陷不会再出现。
+
 | 内容 | 断言 / 负对照 |
 | :-- | :-- |
 | **`Custom icon file` 真正生效**（此前是死设置项）：`ModSettings::iconPath`，一张图给所有行用；每行优先级 `Row N icon file` > 显式 `None` > 全局图片 > 内置字形 | `the global icon applies to a row that has no file of its own`、`a global icon on its own still means plates are drawn` |

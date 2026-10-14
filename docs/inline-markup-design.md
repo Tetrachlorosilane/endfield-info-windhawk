@@ -1,8 +1,8 @@
 # 行内标记语言：图标、对齐、占位符与一次性编译
 
 面向**实现者**。用户向说明写在 [README.md](../README.md)，不变量写进 [AGENTS.md](../AGENTS.md)。
-本文记录 2026-10-14 与用户确认后的设计决定（**§7 的第 3 步已完成：行内标记在读取设置时编译；
-图标/对齐/占位符仍未实现**），以及为什么这么定。
+本文记录 2026-10-14 与用户确认后的设计决定（**§7 的第 3、4 步已完成：行内标记在读取设置时编译，
+`[[icon:…]]` 与行首盘一起落地**；对齐/占位符仍未实现），以及为什么这么定。
 
 背景：`Row N icon` 系列设置被用户判定为"失效"（真机原因见
 [state-and-handover](state-and-handover.md) §13：为修错位把空行的图标槽丢了，继承源一起消失）。
@@ -27,7 +27,7 @@
 **保留**的底层设施（它们与"图标是什么"无关）：图片解码与重采样
 （`PlanDownscale` / `DownscaleToFit`）、`kIconPlateRatio` 与字形绘制。
 
-设置块从 58 项降到约 46 项。
+设置块从 58 项降到 **49 项**（实测：`python _settings.py` 报 `settings entries: 49`）。
 
 ---
 
@@ -46,6 +46,10 @@
 [[center]]…[[/center]]           居中
 [[right]]…[[/right]]             靠右
 ```
+
+字形名就是 `IconStyleFromName` 那张表的键（`CPU` / `Memory` / `Disk` / `Network` / `GPU`，
+大小写不敏感），另外接受两个同义写法 `RAM`（= Memory）与 `Net`（= Network）——
+它们没有进那张按字形序号索引的表，而是在同一个函数里折进去。
 
 规则：
 
@@ -234,6 +238,21 @@ struct RowMetrics {
    `[[`"与"字体标记"——也就是"环画不出来、回退扫描又认出了它里面的标签"这条最绕的路径。
    还没有做的：`RowLive` 与测量缓存合并（§4 的第 6 条），因为图标/对齐尚未落地。
 4. **加 `[[icon:…]]`（含涟漪开关）**，同时删掉图标设置与行首盘。
+   **已完成**（811 → 851 条断言）：九个图标设置项与它们专用的代码全部删除；
+   `[[icon:字形]]` / `[[icon:file=路径]]` / `:ripple` / `:noripple` 在 `CompileRowText` 里解析进
+   `RowPart`（字形与涟漪开关压在一个字节里，路径是行文本的一段切片——`RowPart` 仍然只有 12 字节，
+   所以 `ModSettings` 一次采样要复制的体积没有变大）；图标在 `BuildRowPlan` 里变成
+   自己的盒子（`x` + `diameter`，直径 = **该元素所在处**的字号 × `kIconPlateRatio`，
+   也就是 `ElementFontSizePx` + `IconDiameterForFontSize` 两处唯一实现），
+   `TextSeg` 用 `kIconSegOffset` 与环的 `kRingSegOffset` 区分；图片缓存改为按**路径**的定长表
+   （8 条目，条目级 LRU，每个条目再留 2 份重采样结果，因为同一个文件可能在两个字号下出现）。
+   与本文不同的两处实现选择，见下面的方括号。
+   > **实现时偏离本文的地方**（都写进了代码注释）：
+   > — 部件表里**没有** `WCHAR path[MAX_PATH]`（§4 的 `RowPart` 草图里有）：那会让
+   >   `kMaxRowParts`(514) 个元素每个都背 520 字节，`ModSettings` 从 ~35 KB 涨到 ~270 KB，
+   >   而它每采样一次就要复制一份。路径改存**行文本里的偏移+长度**，绘制前用 `CopyUserPath` 取用。
+   > — 图标标记的载荷不是"图标序号"而是**程序元素下标**：字形与路径本来就住在那条元素里，
+   >   于是 `BuildRowLayout` 不需要任何侧表。
 5. **加 `[[gap:…]]` 与 `[[left/center/right]]…[[/…]]`**。
 6. 文档、`_preview.py`、CHANGELOG、缺陷表。
 

@@ -1,7 +1,7 @@
 // ==WindhawkMod==
 // @id              endfield-info-windhawk
 // @name            Endfield Info Windhawk
-// @description     A configurable always-on-top status capsule: user-defined rows with {variable} tokens, on-demand collectors (CPU / memory / network / GPU), ring gauges, per-row icons, an optional notification island fed by other programs over a named pipe, and proximity-or-always display with click-to-toggle.
+// @description     A configurable always-on-top status capsule: user-defined rows with {variable} tokens, on-demand collectors (CPU / memory / network / GPU), ring gauges, inline [[icon:...]] elements, an optional notification island fed by other programs over a named pipe, and proximity-or-always display with click-to-toggle.
 // @version         0.3.0
 // @author          Silicon Dioxide
 // @github          https://github.com/Tetrachlorosilane/endfield-info-windhawk
@@ -77,17 +77,24 @@ anywhere but the very start it applies to the text it wraps, closed by
 `[[/size]]` (or running to the end of the line). So
 `CPU [[size:20]]{cpu.ghz}GHz[[/size]]` draws only those characters larger. Runs do
 not nest: `[[/size]]` returns to the row's own size. The row's height floor follows
-the largest text in it, and the icon plate follows the global `Font size` only, so
-a bigger row size changes the text and nothing else. A tag written anywhere but the
+the largest text in it. A tag written anywhere but the
 start is ordinary text and is drawn as such.
+
+## Icons
+
+An icon is an element you place with a tag, the same way a gauge is:
+`[[icon:Memory]]`, `[[icon:file=C:\pics\ssd.png]]`. It takes the font size in
+effect where it appears, so inside `[[size:24]]...[[/size]]` it is the 24 px
+icon, and text before and after it flows around it. By default the **first**
+icon in a row plays the intro ripples; `[[icon:Memory:ripple]]` and
+`[[icon:Memory:noripple]]` override that per icon.
 
 ## Rings, icons and themes
 
 * Ring gauges are drawn where you write them: right-docked by default, or inline
   after text.
-* Every row can carry a disc icon: a built-in glyph (`CPU`, `Memory`, `Disk`,
-  `Network`, `GPU`), your own image file, or nothing. One image can be set for
-  all rows at once.
+* Icons are inline elements: a built-in glyph (`CPU`, `Memory`, `Disk`,
+  `Network`, `GPU`) or your own image file, placed wherever you write the tag.
 * Three colour presets plus a `Custom` theme that unlocks the colour fields.
 * An intro animation (slide / fade / none) with a ripple, and a speed you set per
   the machine.
@@ -253,61 +260,6 @@ deliberate trade for accuracy, and it only happens when you asked for it.
 - RingColor: ""
   $name: 'Ring colour (Custom theme only)'
   $description: 'AARRGGBB. Colour of a ring gauge that has no :COLOR field of its own, for example [[ring:{cpu}]]. Leave empty to use the border colour. Used only when Theme is Custom.'
-- Icon1: Memory
-  $name: 'Row 1 icon'
-  $description: 'The plate drawn at the left of row 1. Rows with no icon of their own inherit the first configured one, so setting only this gives every row the same glyph. None leaves the space empty.'
-  $options:
-    - None: No icon
-    - CPU: Processor
-    - Memory: Memory module
-    - Disk: Storage drive
-    - Network: Network link
-    - GPU: Graphics adapter
-- Icon2: ""
-  $name: 'Row 2 icon'
-  $description: 'Icon for row 2. Empty inherits the first configured icon.'
-  $options:
-    - "": Inherit
-    - None: No icon
-    - CPU: Processor
-    - Memory: Memory module
-    - Disk: Storage drive
-    - Network: Network link
-    - GPU: Graphics adapter
-- Icon3: ""
-  $name: 'Row 3 icon'
-  $description: 'Icon for row 3. Empty inherits the first configured icon.'
-  $options:
-    - "": Inherit
-    - None: No icon
-    - CPU: Processor
-    - Memory: Memory module
-    - Disk: Storage drive
-    - Network: Network link
-    - GPU: Graphics adapter
-- Icon4: ""
-  $name: 'Row 4 icon'
-  $description: 'Icon for row 4. Empty inherits the first configured icon.'
-  $options:
-    - "": Inherit
-    - None: No icon
-    - CPU: Processor
-    - Memory: Memory module
-    - Disk: Storage drive
-    - Network: Network link
-    - GPU: Graphics adapter
-- Icon1Path: ""
-  $name: 'Row 1 icon file'
-  $description: 'Full path to a PNG, JPEG, BMP, GIF or TIFF for row 1, drawn centred on the plate. Overrides the built-in glyph. SVG is not supported because GDI+ has no SVG decoder.'
-- Icon2Path: ""
-  $name: 'Row 2 icon file'
-  $description: 'Image file for row 2. Empty inherits nothing; the built-in glyph is used.'
-- Icon3Path: ""
-  $name: 'Row 3 icon file'
-  $description: 'Image file for row 3. Empty inherits nothing; the built-in glyph is used.'
-- Icon4Path: ""
-  $name: 'Row 4 icon file'
-  $description: 'Image file for row 4. Empty inherits nothing; the built-in glyph is used.'
 - IntroStyle: Slide
   $name: 'Intro animation'
   $description: 'How the panel arrives. Slide uses the original overshoot-and-settle curve; Fade is a plain fade; None appears instantly.'
@@ -321,9 +273,6 @@ deliberate trade for accuracy, and it only happens when you asked for it.
 - RippleCount: 2
   $name: 'Intro ripples'
   $description: '0-3. Concentric rings expanding from the icon while the panel arrives, as in the original.'
-- IconPath: ""
-  $name: 'Custom icon file'
-  $description: 'Full path to a PNG, JPEG, BMP, GIF or TIFF. Used on every row that has no icon file of its own, and it takes precedence over the built-in glyphs. A row set to None still draws no icon at all. SVG is not supported because GDI+ has no SVG decoder.'
 - UpdateMs: 1000
   $name: 'Update interval (ms)'
   $description: '200-10000. Clocks refresh every second regardless.'
@@ -871,13 +820,23 @@ static const double kCueTextFade4 = 0.62;
 // long enough to look deliberate.
 static const double kCollapseDurationRatio = 0.5;
 
-// Icon geometry, matching the bolt's animated footprint. The original icon is
-// scaled by GlobalScale exactly like the text, so it is sized from FontSize.
+// Icon geometry. An icon is an *element* of a row now ([[icon:...]]), not a plate bolted to
+// the row's left edge, so it is sized from the font size in effect where it appears -- the
+// row's own, or the enclosing [[size:NN]] run's.
 static const double kIconScaleStart = 0.4;    // BoltIcon start scale
 static const double kIconScalePeak = 1.12;    // BoltIcon peak scale
-static const double kIconPlateRatio = 1.55;   // plate diameter / glyph size
-static const double kIconLeftMargin = 10.0;
+static const double kIconPlateRatio = 1.55;   // icon diameter / font size
+// The space an icon leaves behind it, so the glyphs that follow it do not touch the disc.
+// Fixed rather than font-relative because it is a *separation between elements*, like the
+// 4 px an inline gauge leaves after itself.
 static const double kIconContentGap = 8.0;
+// The row's own text padding: the text starts here, and the right edge of the text box is
+// this far from the panel's right edge. There used to be a per-panel "shared plate column"
+// inset here (kIconLeftMargin + the widest plate + the content gap), which is gone with the
+// left-edge plate: an icon is content now, so it moves the text it is written next to and
+// nothing else.
+static const float kRowTextLeftInset = 12.0f;
+static const float kRowTextRightInset = 12.0f;
 
 // Ripples: three concentric rings expanding from the icon. Radii, peak opacity
 // and the host's downward offset are the original's numbers.
@@ -886,29 +845,20 @@ static const double kRipplePeakOpacity[3] = {0.50, 0.50, 0.60};
 // (The original's RippleRise offset lived here. It is not applied -- see PaintRipples --
 // so the constant and the frame field it fed are gone rather than kept unused.)
 
-// The icon plate: a light disc with a dark glyph, from HudTheme.axaml
-// (Hud.IconPlate #E9E7E4 / Hud.BoltDark #141313).
+// The icon disc: a light circle with a dark glyph, from HudTheme.axaml
+// (Hud.IconPlate #E9E7E4 / Hud.BoltDark #141313). The names say "plate" because that is what
+// the original theme calls it; it is the disc under an inline icon here.
 static const DWORD kPlateLight = 0xFFE9E7E4;
 static const DWORD kGlyphDark = 0xFF141313;
 
 // ---------------------------------------------------------------------------
-// Icons are per-row: every row carries its own plate, its own built-in glyph
-// choice and its own optional image file, and each plate emits its own ripples.
+// Icons are placed by a tag: [[icon:Memory]] / [[icon:file=C:\a.png]] / [[icon:Memory:ripple]].
 //
-// The layout is row-aligned on purpose. Rows already form a fixed list (Row1..Row4)
-// with per-row text, so a matching Icon1..Icon4 list is the least surprising way to
-// configure them: the Nth icon belongs to the Nth row, and no separate capacity
-// setting is needed because kMaxRows already bounds it.
+// There used to be a row-aligned list of icon settings (Icon1..Icon4 + a file each, plus one
+// global file) drawn as a plate at the row's left edge. The user judged that whole list
+// broken, and the replacement is the same one the gauges already use: an inline element
+// whose position, glyph and ripple switch are written in the row's own text.
 // ---------------------------------------------------------------------------
-struct IconSpec {
-    int style = 0;                  // 0 none, 1 cpu, 2 memory, 3 disk, 4 network, 5 gpu
-    // True when the settings key held a value. Without it an explicit `None` cannot be
-    // told apart from "this row was never configured", so it fell through to the
-    // inherited glyph and README's "set it to None to leave a row without an icon" was
-    // simply untrue (measured: Icon1=Memory + Icon3=None gave row 3 the Memory glyph).
-    bool styleSet = false;
-    WCHAR path[MAX_PATH] = L"";     // empty = use the built-in glyph
-};
 
 // Copies a user-supplied path, stripping the quoting and padding people naturally
 // add. "C:\x\y.png", 'C:\x\y.png' and a trailing space all mean the same file, and
@@ -934,27 +884,30 @@ static void CopyUserPath(WCHAR *dest, size_t destCount, const WCHAR *source) {
     dest[written] = L'\0';
 }
 
-// Names accepted by the IconN settings, indexed by style.
+// The glyph names [[icon:...]] accepts, indexed by style: 1 cpu, 2 memory, 3 disk,
+// 4 network, 5 gpu. Index 0 is the "no icon" answer -- which is also what an unknown name
+// gets, and that is what makes a mis-spelt tag stay literal text instead of drawing a blank
+// disc (see ParseIconTag).
 static const WCHAR *const kIconStyleNames[] = {
     L"None", L"CPU", L"Memory", L"Disk", L"Network", L"GPU",
 };
 static const int kIconStyleCount = (int)(sizeof(kIconStyleNames) / sizeof(kIconStyleNames[0]));
 
-// Position of an icon by name. Returns 0 ("None") for anything unrecognised, which
-// is also what an empty setting resolves to.
+// Position of an icon by name. Returns 0 for anything unrecognised.
+//
+// The table is indexed *by glyph number* (index N is what PaintIconGlyph's `case N` draws), so
+// the two accepted synonyms are folded in here rather than appended to it: `RAM` is Memory and
+// `Net` is Network. They are the spellings the settings used to print in the README's name
+// list, and a tag that asked for one must not come out as ordinary text.
 static int IconStyleFromName(const WCHAR *name) {
     if (!name || !name[0]) return 0;
+    if (_wcsicmp(name, L"RAM") == 0) return 2;
+    if (_wcsicmp(name, L"Net") == 0) return 4;
     for (int i = 0; i < kIconStyleCount; i++) {
         if (_wcsicmp(name, kIconStyleNames[i]) == 0) return i;
     }
     return 0;
 }
-
-// Glyphs with no image file of their own fall back to the first configured glyph,
-// so setting only Icon1 still produces a plate on every row.
-static int ResolveIconStyle(const ModSettings &settings, int index);
-static const WCHAR *ResolveIconPath(const ModSettings &settings, int index);
-static int ResolveIconSlot(const ModSettings &settings, int index);
 
 
 // Colour presets. The alpha on the background matches the mod's 90% default.
@@ -1589,7 +1542,22 @@ enum RowPartKind : unsigned char {
     kPartFontClose,    // [[/font]]
     kPartSizeOpen,     // [[size:NN]]
     kPartSizeClose,    // [[/size]]
+    kPartIcon,         // [[icon:...]]: a built-in glyph or an image file
 };
+
+// An icon's own two attributes, packed into the single byte `RowPart::glyphFlags`. They are
+// packed rather than given a byte each because kMaxRowParts is 514 and a RowPart is copied with
+// every settings snapshot: a second byte per element costs 2 KB of every sample. The glyph names
+// run 0..5, so three bits are enough.
+static const unsigned char kIconGlyphMask = 0x07;
+static const unsigned char kIconRippleOn = 0x08;    // ":ripple"
+static const unsigned char kIconRippleOff = 0x10;   // ":noripple"
+
+// The glyph drawn for an image icon whose file cannot be decoded: `Memory`, which is what the
+// old settings resolved to when none of them named a glyph ("an image that cannot be loaded
+// falls back to the Memory glyph"). The reason is unchanged -- an empty disc reads as "the
+// icon turned white", which sends the reader off in the wrong direction.
+static const int kIconImageFallbackGlyph = 2;
 
 struct RowPart {
     RowPartKind kind;
@@ -1599,15 +1567,19 @@ struct RowPart {
     // kPartText: the [[size:NN]] run in force, 0 = the row's own size.
     // kPartSizeOpen: the run's size (kMinRowFontSize..kMaxRowFontSize, so two digits).
     unsigned char runFontSize;
+    // kPartIcon: the built-in glyph (kIconGlyphMask) plus the :ripple / :noripple override.
+    unsigned char glyphFlags;
     // kPartText: the template, as a slice of the row's own text. kPartRing: the tag's body
     // after "ring:", which is what ParseRing is handed (after token expansion).
+    // kPartIcon: the image path's slice of the row's text (quotes and padding included;
+    // CopyUserPath trims them), or an empty slice for a built-in glyph.
     short offset;
     short length;
     // The next element on the ordinary path, or -1 at the end of the program.
     short next;
-    // kPartRing / kPartSizeOpen: where to continue when this element cannot be emitted (a ring
-    // ParseRing rejects, or no room for a four-character size marker) and the markup therefore
-    // stays literal text starting with the '[' it was recognised at.
+    // kPartRing / kPartSizeOpen / kPartIcon: where to continue when this element cannot be
+    // emitted (a ring ParseRing rejects, no room for a marker, no room for the element) and the
+    // markup therefore stays literal text starting with the '[' it was recognised at.
     short failNext;
 };
 
@@ -1642,17 +1614,71 @@ static const int kRowNotCompiled = -2;
 struct RowTag {
     RowPartKind kind;
     int close;         // index of the "]]" that ends the tag
-    int payload;       // first character after the tag's own prefix ("ring:" / "size:")
+    int payload;       // first character after the tag's own prefix ("ring:" / "size:" / "icon:")
     int payloadLen;
     int chain;         // kPartFontOpen: the registered chain, 1-based
     int size;          // kPartSizeOpen: the run's size
+    int glyph;         // kPartIcon: the built-in glyph, 1..5
+    int ripple;        // kPartIcon: kIconRippleOn / kIconRippleOff, 0 = leave it to the row
 };
 
+// The icon tag's body, parsed while compiling: a built-in glyph name, or `file=<path>`, each
+// optionally followed by `:ripple` / `:noripple`. Returns false for anything else, which is
+// what keeps `[[icon:Bogus]]` and `[[icon:]]` as literal text.
+//
+// The ripple suffix is recognised as a *trailing* field, not by splitting on every ':' --
+// `C:\pics\a.png` always contains a colon (the drive letter), so the path is whatever is left
+// after `file=` and the suffix has to be taken off the end.
+static bool ParseIconTag(const WCHAR *body, int bodyLen, RowTag &tag) {
+    if (bodyLen <= 0) return false;
+    // A body is at most the row's own length (kRowTextCap), and this buffer is larger than
+    // that, so the copy is never truncated.
+    WCHAR buffer[MAX_PATH + 48];
+    const int len = MinInt(bodyLen, MAX_PATH + 46);
+    wcsncpy(buffer, body, len);
+    buffer[len] = L'\0';
+
+    // ":ripple" is 7 characters, ":noripple" is 9. `bodyLen` is what the *raw* slice is
+    // measured against, so the suffix length is kept: the path's payload is the characters
+    // between "file=" and the suffix, quotes and padding included.
+    int suffixLen = 0;
+    if (len >= 7 && _wcsicmp(buffer + len - 7, L":ripple") == 0) {
+        tag.ripple = kIconRippleOn;
+        suffixLen = 7;
+    } else if (len >= 9 && _wcsicmp(buffer + len - 9, L":noripple") == 0) {
+        tag.ripple = kIconRippleOff;
+        suffixLen = 9;
+    }
+    buffer[len - suffixLen] = L'\0';
+
+    if (_wcsnicmp(buffer, L"file=", 5) == 0) {
+        // The path is stored as the slice that follows "file=" in the *raw* row, so no
+        // MAX_PATH member has to live in a RowPart. An empty path (or one that is nothing but
+        // quotes and spaces) is not an icon: it stays literal, like every other bad tag.
+        WCHAR trimmed[MAX_PATH];
+        CopyUserPath(trimmed, MAX_PATH, buffer + 5);
+        if (trimmed[0] == L'\0') return false;
+        tag.kind = kPartIcon;
+        // The caller turns this length into the payload *offset*: it is the part of the body
+        // after "file=", with any :ripple / :noripple suffix already off the end.
+        tag.payloadLen = len - 5 - suffixLen;
+        if (tag.payloadLen <= 0) return false;
+        return true;
+    }
+
+    const int glyph = IconStyleFromName(buffer);
+    if (glyph <= 0) return false;   // an unknown name, or the "None" entry, is not an icon
+    tag.kind = kPartIcon;
+    tag.glyph = glyph;
+    tag.payloadLen = 0;
+    return true;
+}
+
 // Classifies the markup at `at`, in the expander's own order: a ring first (whether it draws
-// can only be decided with live values), then [[font:...]], then [[size:NN]], then the two
-// closing tags. A [[font:...]] whose chain was never registered -- mis-spelt, not installed,
-// past the chain limit -- comes back as ordinary text, exactly as it did when this decision
-// was made per publish.
+// can only be decided with live values), then [[font:...]], then [[size:NN]], then [[icon:...]],
+// then the two closing tags. A [[font:...]] whose chain was never registered -- mis-spelt, not
+// installed, past the chain limit -- comes back as ordinary text, exactly as it did when this
+// decision was made per publish. So does an icon tag this function cannot make sense of.
 static RowTag ClassifyRowTag(const WCHAR *raw, int at, const FontTag *tags, int tagCount) {
     RowTag tag = {};
     tag.kind = kPartText;
@@ -1687,6 +1713,14 @@ static RowTag ClassifyRowTag(const WCHAR *raw, int at, const FontTag *tags, int 
         if (ParseInlineSize(body + 5, close, &size)) {
             tag.kind = kPartSizeOpen;
             tag.size = size;
+        }
+        return tag;
+    }
+    if (bodyLen > 5 && _wcsnicmp(body, L"icon:", 5) == 0) {
+        // ParseIconTag is handed the body after "icon:", so its payload length is measured
+        // from there; the slice it describes starts after "icon:file=" in the row.
+        if (ParseIconTag(body + 5, bodyLen - 5, tag)) {
+            if (tag.payloadLen > 0) tag.payload = bodyAt + 5 + 5;
         }
         return tag;
     }
@@ -1782,6 +1816,15 @@ static int CompileRowSuffix(RowCompiler &c, int at, int chain, int size) {
             case kPartSizeClose:
                 part.next = (short)CompileRowSuffix(c, tag.close + 2, chain, 0);
                 break;
+            case kPartIcon:
+                // The glyph and the ripple override are known here; the path is a slice of the
+                // row, so nothing has to be copied into the part table.
+                part.glyphFlags = (unsigned char)(tag.glyph | tag.ripple);
+                part.offset = (short)tag.payload;
+                part.length = (short)tag.payloadLen;
+                part.next = (short)CompileRowSuffix(c, tag.close + 2, chain, size);
+                part.failNext = (short)CompileRowSuffix(c, textEnd + 1, chain, size);
+                break;
             default:
                 break;
         }
@@ -1861,24 +1904,7 @@ struct ModSettings {
     int extEventQueue = 4;
     int islandMinWidth = 260;        // floor for the card's width; text widens it
 
-    // Left icon plates and intro animation. One icon per row, row-aligned with the
-    // RowN settings.
-    IconSpec icons[kMaxRows] = {};
-    int iconCount = 0;             // slots that will draw a plate
-    // Drawn row -> the settings row whose icon slot belongs to it, stored as (settings row + 1),
-    // 0 meaning "no mapping: this row is its own slot". The two orders differ as soon as a row
-    // is left empty, and they must not be conflated: the *settings* are keyed by row number
-    // (`Icon3` belongs to `Row 3`, as the README says), while the painter only knows the drawn
-    // order. A slot that belongs to a row with no text is still a slot -- it is what every
-    // other row inherits from, so dropping it made `Icon1 = Memory` on its own leave the whole
-    // panel without icons.
-    int iconSlotOfRow[kMaxRows] = {};
-    // A custom icon file that applies to every row ("Custom icon file"). A row's own
-    // IconN path wins over it; a row that says None gets no icon at all.
-    WCHAR iconPath[MAX_PATH] = L"";
-    // The glyph an image falls back to when it cannot be decoded: the first glyph the
-    // user chose, or Memory when the icons are images only, or 0 when there are none.
-    int iconFallbackStyle = 0;
+    // Intro animation.
     int introStyle = 0;            // 0 slide, 1 fade, 2 none
     int introMs = 1200;
     int rippleCount = 2;
@@ -1948,33 +1974,69 @@ static int RowTopPx(const ModSettings &settings, int row) {
     return top;
 }
 
+// The font size an *element* of a row is drawn at: its own [[size:NN]] run, or the row's size.
+// Text segments and icon elements ask the same function, which is what makes an icon inside
+// [[size:24]] the 24 px icon -- the rule the user reported twice, in both directions ("the icon
+// does not follow its own size").
+static int ElementFontSizePx(const ModSettings &settings, int row, int runFontSize) {
+    return runFontSize > 0 ? runFontSize : RowFontSizePx(settings, row);
+}
+
+// Diameter of an inline icon at a given font size. The single place kIconPlateRatio is applied:
+// a second copy of this multiplication is exactly how the icon and its ripple would drift apart.
+static float IconDiameterForFontSize(int fontSizePx) {
+    return (float)fontSizePx * (float)kIconPlateRatio;
+}
+
+// Whether one icon element plays the intro ripples. Its own `:ripple` / `:noripple` wins;
+// otherwise the **first** icon of the row does, which is the look the old per-row plate had
+// (one disc per row, one set of ripples per row) -- and the reason a second icon on the same
+// row stays quiet unless it asks.
+static bool IconElementRipples(int rippleFlag, bool isFirstIconOfRow) {
+    if (rippleFlag == kIconRippleOn) return true;
+    if (rippleFlag == kIconRippleOff) return false;
+    return isFirstIconOfRow;
+}
+
+// Centre of one inline icon, in the panel's own (untransformed) coordinates. The layout plan
+// says where the element starts and how wide its box is; the row says how tall that box is,
+// and the icon is centred in it. The disc and its ripples are both drawn from this one point,
+// so they cannot end up concentric with each other but not with the icon.
+static void IconElementCenter(float planX, float diameter, float rowTop, float rowHeight,
+                              float *outX, float *outY) {
+    *outX = planX + diameter / 2.0f;
+    *outY = rowTop + rowHeight / 2.0f;
+}
+
 // ---------------------------------------------------------------------------
 // Row metrics: every pixel size the drawing code needs, derived in one place.
 //
-// These values used to be worked out at each use site, and they drifted: the plate started
-// following a row's font size while the shared text column kept using the global one, so
-// setting one row larger also redrew its icon and moved every other row's text. The rule now
-// is that a size has exactly one owner, and that owner is here. The inputs are the two
-// numbers a row already has -- the size its text is drawn at, and the height of its box.
+// These values used to be worked out at each use site, and they drifted: the row's icon and
+// the text column disagreed about which font size they followed, so setting one row larger
+// also redrew its icon and moved every other row's text. The rule now is that a size has
+// exactly one owner, and that owner is here. The inputs are the two numbers a row already
+// has -- the size its text is drawn at, and the height of its box.
 //
 // Deliberately *not* a field here: the row's minimum height. The floor follows the **largest**
 // text in the row (a [[size:30]] run inside a small row still has to fit), so it cannot be
 // derived from the row's base size; `MinimumRowHeightForFont` owns it and `RowHeightPx` calls
 // it with the largest size. A field that could not answer for the row would be worse than none.
+//
+// Also deliberately not here: an icon diameter. An icon is an element of the row, not a
+// property of it -- two icons in one row can be two different sizes when a [[size:NN]] run
+// wraps one of them -- so a single per-row diameter would be a lie. `IconDiameterForFontSize`
+// is the only place the ratio is applied, and it is asked with the size in effect at the
+// element (see `ElementFontSizePx`).
 // ---------------------------------------------------------------------------
 struct RowMetrics {
     float fontSize;       // the size this row's text is drawn at
     float lineHeight;     // the height of this row's box
-    float plateDiameter;  // this row's icon plate (0.0f = this row has no icon)
 };
 
 static RowMetrics MetricsForRow(const ModSettings &settings, int row) {
     RowMetrics metrics = {};
     metrics.fontSize = (float)RowFontSizePx(settings, row);
     metrics.lineHeight = (float)RowHeightPx(settings, row);
-    const bool hasIcon =
-        ResolveIconStyle(settings, row) > 0 || ResolveIconPath(settings, row)[0] != L'\0';
-    metrics.plateDiameter = hasIcon ? (float)settings.fontSize * (float)kIconPlateRatio : 0.0f;
     return metrics;
 }
 
@@ -2027,9 +2089,6 @@ static void ReadSettings(ModSettings &s) {
             // The prefix tags are gone from the stored text, so anything left in it that looks
             // like [[size:NN]] is an inline run -- and that run may be bigger than the row.
             s.rowMaxFontSize[slot] = MaxInt(s.rowFontSize[slot], MaxInlineRunSize(s.rows[slot]));
-            // Which settings row this drawn row came from, so the icon slots (which are keyed
-            // by settings row number) can be looked up from the drawn order.
-            s.iconSlotOfRow[slot] = i + 1;
             s.rowCount++;
         }
         Wh_FreeStringSetting(value);
@@ -2130,79 +2189,6 @@ static void ReadSettings(ModSettings &s) {
     }
     Wh_FreeStringSetting(introStyle);
 
-    // Icons are read as a row-aligned list: Icon1/Icon1Path .. Icon{kMaxRows}, plus
-    // one optional file that applies to every row (IconPath). An entry counts as
-    // configured when it names a glyph (including None, which is a choice) or
-    // supplies an image path.
-    //
-    // Every slot is read, including the ones whose row is empty: `Icon3` belongs to `Row 3`
-    // whether or not that row has text, and an empty row's slot is still what the other rows
-    // inherit from (see IconSlotForRow). Which drawn row each slot belongs to is recorded in
-    // the row loop above.
-    s.iconCount = 0;
-    for (int i = 0; i < kMaxRows; i++) {
-        IconSpec &slot = s.icons[i];
-        slot.style = 0;
-        slot.styleSet = false;
-        slot.path[0] = L'\0';
-
-        WCHAR key[32];
-        swprintf(key, 32, L"Icon%d", i + 1);
-        PCWSTR styleName = Wh_GetStringSetting(key);
-        if (styleName && styleName[0]) {
-            slot.styleSet = true;
-            slot.style = IconStyleFromName(styleName);
-        }
-        Wh_FreeStringSetting(styleName);
-
-        swprintf(key, 32, L"Icon%dPath", i + 1);
-        PCWSTR path = Wh_GetStringSetting(key);
-        if (path && path[0]) {
-            CopyUserPath(slot.path, MAX_PATH, path);
-            if (slot.path[0] == L'\0') {
-                // The field had content but nothing usable survived trimming.
-                Wh_Log(L"Icon%d: the icon path is empty after trimming "
-                       L"quotes and spaces; ignoring it", i + 1);
-            }
-        }
-        Wh_FreeStringSetting(path);
-
-        if (slot.style > 0 || slot.path[0]) s.iconCount++;
-    }
-
-    // The global icon file, if any. Read after the slots so the fallback below can tell
-    // whether there is a glyph anywhere to fall back on.
-    {
-        PCWSTR global = Wh_GetStringSetting(L"IconPath");
-        s.iconPath[0] = L'\0';
-        if (global && global[0]) {
-            CopyUserPath(s.iconPath, MAX_PATH, global);
-            if (s.iconPath[0] == L'\0') {
-                Wh_Log(L"Icons: the global icon path is empty after trimming quotes and "
-                       L"spaces; ignoring it");
-            }
-        }
-        Wh_FreeStringSetting(global);
-    }
-
-    // The glyph an image falls back on when it cannot be decoded, otherwise the row shows
-    // an empty plate -- which reads as "the icon turned white" and sends the reader off in
-    // the wrong direction. Resolved here, once, rather than by writing a style into the
-    // image-only slots: the global image does not belong to any slot, so the rule has to
-    // live where both cases can see it.
-    s.iconFallbackStyle = 0;
-    for (int i = 0; i < kMaxRows; i++) {
-        if (s.icons[i].style > 0) {
-            s.iconFallbackStyle = s.icons[i].style;
-            break;
-        }
-    }
-    if (!s.iconFallbackStyle && (s.iconCount > 0 || s.iconPath[0])) {
-        s.iconFallbackStyle = 2;   // Memory
-        Wh_Log(L"Icons: no built-in glyph was chosen, so an image that cannot be loaded "
-               L"falls back to the Memory glyph");
-    }
-
     // Palette resolution. The two sources are mutually exclusive on purpose:
     //
     //   Theme = Endfield / Midnight / Mono  ->  that preset is used, and the
@@ -2302,89 +2288,6 @@ static void ReadSettings(ModSettings &s) {
     s.extEventMs = ClampInt((int)Wh_GetIntSetting(L"ExtEventMs"), 1000, 60000);
     s.extEventQueue = ClampInt((int)Wh_GetIntSetting(L"ExtEventQueue"), 1, 8);
     s.islandMinWidth = ClampInt((int)Wh_GetIntSetting(L"IslandMinWidth"), 120, 640);
-}
-
-// Per-row icon resolution.
-//
-// A row with no icon of its own inherits the first configured one, which makes "set
-// Icon1 only" mean "this glyph on every row", while Icon2..Icon4 override individual
-// rows. On top of that there is one optional global image (`IconPath`) that applies to
-// every row. The rules for the two live in the three functions below, in one place,
-// because they interlock (see ResolveIconPath).
-//
-// "Configured" is deliberately not one predicate: a row can choose a glyph (including
-// `None`, which is a choice -- "this row has no icon" -- and not an absence) and/or name
-// a file, and the two are consulted separately. `IconSpec::styleSet` is what separates an
-// explicit `None` from "never set".
-
-// The settings slot whose icon belongs to a drawn row, or -1 when there is none.
-//
-// `ReadSettings` records the mapping; a `ModSettings` built by hand (the regression host does
-// that) has none, and then a drawn row is its own slot -- which is also the right answer for
-// every configuration that has no empty row at all.
-static int IconSlotForRow(const ModSettings &settings, int row) {
-    if (row < 0 || row >= kMaxRows) return -1;
-    const int mapped = settings.iconSlotOfRow[row];
-    return mapped > 0 ? mapped - 1 : row;
-}
-
-// The glyph a row falls back on when it has no (working) image. Highest first:
-//
-//   1. the glyph the row chose itself (`None` means none, and must not inherit)
-//   2. the shared fallback for an image-only row: the first glyph anywhere, else Memory
-//   3. otherwise the first glyph anywhere, for rows that said nothing at all
-//
-// Resolved rather than written into the slots, so the global image -- which belongs to
-// no slot -- gets the same fallback as a row's own file.
-static int ResolveIconStyle(const ModSettings &settings, int index) {
-    const int slot = IconSlotForRow(settings, index);
-    if (slot >= 0) {
-        const IconSpec &rowIcon = settings.icons[slot];
-        if (rowIcon.style > 0 || rowIcon.styleSet) return rowIcon.style;
-        if (rowIcon.path[0]) return settings.iconFallbackStyle;
-    }
-    for (int i = 0; i < kMaxRows; i++) {
-        if (settings.icons[i].style > 0) return settings.icons[i].style;
-    }
-    return settings.iconFallbackStyle;
-}
-
-// The image file a row shows, or "" when it shows a glyph. Highest first:
-//
-//   1. the row's own `Row N icon file`
-//   2. nothing, when the row says `None`: no icon at all, not even the global one
-//   3. the global `IconPath`, which is the panel-wide default for every row
-//   4. a file another row set -- the documented "set Icon1 only and every row uses it"
-//      inheritance, which only comes into play when there is no global image (with one,
-//      the per-row file is the exception, so it must not leak to the other rows)
-static const WCHAR *ResolveIconPath(const ModSettings &settings, int index) {
-    const int slot = IconSlotForRow(settings, index);
-    if (slot >= 0) {
-        const IconSpec &rowIcon = settings.icons[slot];
-        if (rowIcon.path[0]) return rowIcon.path;
-        if (rowIcon.styleSet && rowIcon.style <= 0) return L"";
-    }
-    if (settings.iconPath[0]) return settings.iconPath;
-    for (int i = 0; i < kMaxRows; i++) {
-        if (settings.icons[i].path[0]) return settings.icons[i].path;
-    }
-    return L"";
-}
-
-// Which cache slot holds the image for a row. Rows that resolve to the same file share
-// one slot -- the lowest row that wants it -- so a file is decoded and resampled once
-// however many rows show it, which is the normal case for the global icon. The sharing
-// is done at resolution time instead of by adding a slot or by reference counting, so
-// every file still has exactly one owner and the per-slot dispose path is unchanged.
-// Returns -1 when the row shows no image at all.
-static int ResolveIconSlot(const ModSettings &settings, int index) {
-    const WCHAR *path = ResolveIconPath(settings, index);
-    if (!path || !path[0]) return -1;
-    for (int i = 0; i < index && i < kMaxRows; i++) {
-        const WCHAR *earlier = ResolveIconPath(settings, i);
-        if (earlier && earlier[0] && _wcsicmp(earlier, path) == 0) return i;
-    }
-    return index;
 }
 
 // ---------------------------------------------------------------------------
@@ -4068,11 +3971,10 @@ struct RowTextMetrics {
 };
 
 static RowTextMetrics ComputeRowTextMetrics(float panelWidth, int ringCount, int ringSize,
-                                            int ringRightOffset, bool inlineFlow,
-                                            float leftInset = 12.0f) {
+                                            int ringRightOffset, bool inlineFlow) {
     RowTextMetrics m;
-    const float inset = leftInset;
-    m.textRight = panelWidth - 12.0f;
+    const float inset = kRowTextLeftInset;
+    m.textRight = panelWidth - kRowTextRightInset;
     if (!inlineFlow && ringCount > 0) {
         float ringsWidth = (float)ringCount * ((float)ringSize + 4.0f);
         m.textRight = panelWidth - (float)ringRightOffset - ringsWidth;
@@ -4418,6 +4320,17 @@ struct TextSeg {
     int runFontSize = 0;
 };
 
+// A segment is either text or an element. Text is a slice of RowState::text; the two elements
+// have their own encodings, both negative so that the old "offset < 0" test cannot silently
+// treat an icon as a gauge:
+//
+//   offset == kRingSegOffset  -> a gauge, `length` is the index into RowState::rings
+//   offset == kIconSegOffset  -> an icon,  `length` is the index of its element in the row's
+//                                compiled program (RowProgram::parts), which is where the
+//                                glyph, the ripple override and the image path slice live.
+static const int kRingSegOffset = -1;
+static const int kIconSegOffset = -2;
+
 struct RowState {
     WCHAR text[kMaxRows][640];
     RingSpec rings[kMaxRows][kMaxRingsPerRow];
@@ -4446,6 +4359,11 @@ static const WCHAR kFontMarkEnd = 0xE003;
 // no lookup -- the painter can read the number straight back out of the string.
 static const WCHAR kSizeMarkStart = 0xE004;
 static const WCHAR kSizeMarkEnd = 0xE005;
+// An [[icon:...]] element. Its payload is the *element index* in the row's compiled program --
+// the program element is where the glyph, the ripple override and the path slice live, so
+// nothing has to be copied through a side table to reach the painter. Three digits, because
+// kMaxRowParts is 514; the payload terminator is kRingMarkEnd, as for the other tags.
+static const WCHAR kIconMarkStart = 0xE006;
 
 // Instantiates a compiled row against the current values: expands the {tokens} left in each
 // TEXT template, turns a [[ring:...]] the values allow into a gauge, and writes the same marked
@@ -4588,6 +4506,26 @@ static void InstantiateRowProgram(const ModSettings &settings, int row, const Va
             node = part.next;
             continue;
         }
+        if (part.kind == kPartIcon) {
+            // An icon is known to be drawable -- an unknown glyph or an empty path never
+            // became a kPartIcon in the first place -- so the only thing that can go wrong
+            // here is the marker's own headroom, exactly as for [[size:NN]]. The payload is
+            // this element's index in the program, so BuildRowLayout (and through it the
+            // painter) can read the glyph and the path slice straight out of the element the
+            // marker came from.
+            if (node <= 999 && written + 5 < outCount) {
+                out[written++] = kIconMarkStart;
+                out[written++] = (WCHAR)(L'0' + (node / 100) % 10);
+                out[written++] = (WCHAR)(L'0' + (node / 10) % 10);
+                out[written++] = (WCHAR)(L'0' + node % 10);
+                out[written++] = kRingMarkEnd;
+                node = part.next;
+            } else {
+                out[written++] = L'[';
+                node = part.failNext;
+            }
+            continue;
+        }
 
         // An element kind this build does not know: nothing to write, and nothing sensible to
         // continue with.
@@ -4597,8 +4535,9 @@ static void InstantiateRowProgram(const ModSettings &settings, int row, const Va
     out[written] = L'\0';
 }
 
-// Splits the marked string into text / ring segments. A ring segment is encoded
-// as offset = -1 with length = ring index.
+// Splits the marked string into text / element segments. A ring segment is encoded
+// as offset = kRingSegOffset with length = ring index; an icon segment as
+// offset = kIconSegOffset with length = the index of its element in the row's program.
 static void BuildRowLayout(const WCHAR *marked, int ringCount, RowState &state, int row) {
     state.segmentCount[row] = 0;
     state.ringCount[row] = ringCount;
@@ -4634,12 +4573,38 @@ static void BuildRowLayout(const WCHAR *marked, int ringCount, RowState &state, 
             flushText();
             if (ringIndex < ringCount && state.segmentCount[row] < kMaxSegments) {
                 TextSeg &seg = state.segments[row][state.segmentCount[row]++];
-                seg.offset = -1;
+                seg.offset = kRingSegOffset;
                 seg.length = ringIndex;
                 if (sawText) state.inlineRing[row] = true;
             }
             ringIndex++;
             // Skip the digits and the end marker that follow.
+            while (p[1] && p[1] != kRingMarkEnd) p++;
+            if (p[1] == kRingMarkEnd) p++;
+            continue;
+        }
+        if (*p == kIconMarkStart) {
+            flushText();
+            // The payload is the index of the icon's element in the row's program. The
+            // element is not reachable from here (this function is handed a string), so the
+            // number is carried through to the layout plan, which does have the settings.
+            // A payload this code cannot read leaves the marker stripped and the element
+            // unsized, which is the same outcome as a marker that never arrived.
+            if (state.segmentCount[row] < kMaxSegments) {
+                int element = -1;
+                if (p[1] >= L'0' && p[1] <= L'9' && p[2] >= L'0' && p[2] <= L'9' &&
+                    p[3] >= L'0' && p[3] <= L'9') {
+                    element = ((int)(p[1] - L'0')) * 100 + ((int)(p[2] - L'0')) * 10 +
+                              (int)(p[3] - L'0');
+                }
+                if (element >= 0) {
+                    TextSeg &seg = state.segments[row][state.segmentCount[row]++];
+                    seg.offset = kIconSegOffset;
+                    seg.length = element;
+                    seg.tagChain = tagChain;
+                    seg.runFontSize = runFontSize;
+                }
+            }
             while (p[1] && p[1] != kRingMarkEnd) p++;
             if (p[1] == kRingMarkEnd) p++;
             continue;
@@ -4954,27 +4919,41 @@ static unsigned long long CpuTime100ns() {
 // The decoded image is cached because this is on the paint path: re-reading and
 // re-decoding a file every frame at 16 ms intervals would be visible.
 // ---------------------------------------------------------------------------
-// One decoded image per icon slot, so each row can carry its own file. The decoded
-// image is cached because this is on the paint path: re-reading and re-decoding a
-// file every frame at 16 ms intervals would be visible.
+// One decoded image per *file*, in a small fixed table keyed by the resolved path. The decoded
+// image is cached because this is on the paint path: re-reading and re-decoding a file every
+// frame at 16 ms intervals would be visible.
 //
-// The decoded source is cached, and a second, resampled copy at the exact plate
-// size is cached alongside it. Drawing the source every frame would make GDI+
-// resample the whole file once per frame, which for a large image is both slow and
-// aliased (a naive single-step shrink skips source pixels whenever the ratio drops
-// below 0.5).
-static GpImage *g_iconImage[kMaxRows] = {};
-static WCHAR g_iconImagePath[kMaxRows][MAX_PATH] = {};
+// Keyed by path rather than by row, because an icon is an inline element now: one row can show
+// the same file twice, and two rows can show it too, and they must share one decode.
+//
+// Per entry: the decoded source, plus up to kIconVariants resampled copies. The second axis is
+// needed because an icon's diameter follows the size in effect where it is written -- the same
+// file at row size and inside a [[size:24]] run is two *different* resample targets, and a
+// single target per path would rebuild the bitmap on every frame, alternating between the two.
+//
+// Eviction (the bounded rule): a new path takes an unused entry if there is one; otherwise it
+// takes the least recently used entry, whose images are disposed. Inside an entry, a new
+// resample target uses an unused variant, else the least recently used one.
+static const int kIconCacheSlots = 8;
+static const int kIconVariants = 2;
+
+struct IconCacheEntry {
+    bool used = false;
+    WCHAR path[MAX_PATH] = {};
+    GpImage *source = nullptr;                       // the decoded file
+    GpImage *scaled[kIconVariants] = {};             // resampled copies, may be null
+    int scaledFor[kIconVariants] = {};               // the diameter each was built for
+    unsigned variantUsed[kIconVariants] = {};        // variant LRU clock
+    unsigned lastUsed = 0;                           // entry LRU clock
+    // A path that already failed once. Without this, a typo'd path would be re-read from disk
+    // and re-logged on every painted frame.
+    bool failed = false;
+};
+static IconCacheEntry g_iconCache[kIconCacheSlots];
+static unsigned g_iconCacheClock = 0;
 // Bounded diagnostic counter: prints what the paint path decided for the first few
 // frames after a change, then stops.
 static int g_iconDrawLogs = 0;
-// The resampled copy actually drawn, and the size it was built for. The plate
-// diameter follows FontSize, so changing the font has to invalidate this.
-static GpImage *g_iconScaled[kMaxRows] = {};
-static int g_iconScaledFor[kMaxRows] = {};
-// A path that already failed once, per slot. Without this, a typo'd path would be
-// re-read from disk and re-logged on every painted frame.
-static WCHAR g_iconFailedPath[kMaxRows][MAX_PATH] = {};
 
 static bool PathEndsWith(const WCHAR *path, const WCHAR *suffix) {
     size_t pathLen = wcslen(path), suffixLen = wcslen(suffix);
@@ -4982,18 +4961,62 @@ static bool PathEndsWith(const WCHAR *path, const WCHAR *suffix) {
     return _wcsicmp(path + pathLen - suffixLen, suffix) == 0;
 }
 
-static void ReleaseSlotImage(int slot) {
-    if (slot < 0 || slot >= kMaxRows) return;
-    if (g_iconScaled[slot]) {
-        g_gdiplus.DisposeImage(g_iconScaled[slot]);
-        g_iconScaled[slot] = nullptr;
+// Drops everything one entry owns and marks it unused. The only release path for icon images;
+// it is called on eviction and from DisposeIconImage, so an entry can never outlive the GDI+
+// objects it holds.
+static void ReleaseIconEntry(int slot) {
+    if (slot < 0 || slot >= kIconCacheSlots) return;
+    IconCacheEntry &entry = g_iconCache[slot];
+    for (int v = 0; v < kIconVariants; v++) {
+        if (entry.scaled[v]) {
+            g_gdiplus.DisposeImage(entry.scaled[v]);
+            entry.scaled[v] = nullptr;
+        }
+        entry.scaledFor[v] = 0;
+        entry.variantUsed[v] = 0;
     }
-    g_iconScaledFor[slot] = 0;
-    if (g_iconImage[slot]) {
-        g_gdiplus.DisposeImage(g_iconImage[slot]);
-        g_iconImage[slot] = nullptr;
+    if (entry.source) {
+        g_gdiplus.DisposeImage(entry.source);
+        entry.source = nullptr;
     }
-    g_iconImagePath[slot][0] = L'\0';
+    entry.used = false;
+    entry.failed = false;
+    entry.lastUsed = 0;
+    entry.path[0] = L'\0';
+}
+
+// The entry holding `path`, or -1. Compared case-insensitively: Windows paths are, and two
+// spellings of one file must not decode it twice.
+static int IconCacheFind(const WCHAR *path) {
+    for (int i = 0; i < kIconCacheSlots; i++) {
+        if (g_iconCache[i].used && _wcsicmp(g_iconCache[i].path, path) == 0) return i;
+    }
+    return -1;
+}
+
+// The entry a path should use: its own, else an unused one, else the least recently used --
+// which is released first. Pure bookkeeping (no image is touched), so the policy is assertable.
+static int IconCachePick(const WCHAR *path) {
+    const int found = IconCacheFind(path);
+    if (found >= 0) {
+        g_iconCache[found].lastUsed = ++g_iconCacheClock;
+        return found;
+    }
+    int chosen = -1;
+    for (int i = 0; i < kIconCacheSlots; i++) {
+        if (!g_iconCache[i].used) {
+            chosen = i;
+            break;
+        }
+        if (chosen < 0 || g_iconCache[i].lastUsed < g_iconCache[chosen].lastUsed) chosen = i;
+    }
+    ReleaseIconEntry(chosen);
+    IconCacheEntry &entry = g_iconCache[chosen];
+    entry.used = true;
+    entry.lastUsed = ++g_iconCacheClock;
+    wcsncpy(entry.path, path, MAX_PATH - 1);
+    entry.path[MAX_PATH - 1] = L'\0';
+    return chosen;
 }
 
 // Plans the resampling chain for one image: a sequence of halving steps followed by
@@ -5058,7 +5081,7 @@ static DownscalePlan PlanDownscale(int srcW, int srcH, int target) {
 
 // Reports what a bitmap actually contains, by sampling a grid of pixels. Used to
 // tell "the file has no colour" apart from "the renderer lost the colour", which
-// look identical on screen when the plate behind the icon is light.
+// look identical on screen when the disc behind the icon is light.
 static void LogBitmapContent(const WCHAR *label, GpImage *image) {
     if (!image || !g_gdiplus.BitmapGetPixel) return;
     UINT w = 0, h = 0;
@@ -5143,65 +5166,83 @@ static GpImage *DownscaleToFit(GpImage *source, int target) {
     return current;
 }
 
-// Returns the image to draw for this slot: resampled to the plate size, or the
-// decoded source when no resampling was needed.
+// Returns the image to draw for one icon: resampled to `target` px, or the decoded
+// source when no resampling was needed.
 //
-// target is the plate diameter in pixels, which follows FontSize. The resampled
-// copy is rebuilt when that size changes, so a font-size change does not leave a
-// stale bitmap at the wrong resolution.
-static GpImage *IconImageFor(int slot, const WCHAR *path, int target, bool *failed) {
+// `target` is this element's icon diameter, which follows the font size in effect where
+// the tag sits. A resampled copy is kept per target (up to kIconVariants of them per path),
+// so the same file drawn at two sizes in one row does not rebuild its bitmap every frame.
+static GpImage *IconImageFor(const WCHAR *path, int target, bool *failed) {
     *failed = false;
-    if (slot < 0 || slot >= kMaxRows) return nullptr;
     if (!path || !path[0]) return nullptr;
 
-    if (g_iconImage[slot] && _wcsicmp(g_iconImagePath[slot], path) == 0) {
-        if (g_iconScaled[slot] && g_iconScaledFor[slot] == target) return g_iconScaled[slot];
-        if (!g_iconScaled[slot]) {
-            // Already decided this file needs no resampling.
-            UINT w = 0, h = 0;
-            if (g_gdiplus.GetImageWidth) g_gdiplus.GetImageWidth(g_iconImage[slot], &w);
-            if (g_gdiplus.GetImageHeight) g_gdiplus.GetImageHeight(g_iconImage[slot], &h);
-            if ((int)w <= target && (int)h <= target) return g_iconImage[slot];
+    const int slot = IconCacheFind(path);
+    if (slot >= 0) {
+        IconCacheEntry &entry = g_iconCache[slot];
+        entry.lastUsed = ++g_iconCacheClock;
+        if (!entry.source) {
+            // The file failed earlier; do not re-read and re-log it on every frame.
+            *failed = true;
+            return nullptr;
         }
-        // Target size changed: rebuild the resampled copy.
-        if (g_iconScaled[slot]) {
-            g_gdiplus.DisposeImage(g_iconScaled[slot]);
-            g_iconScaled[slot] = nullptr;
+
+        // A variant already built for this target.
+        for (int v = 0; v < kIconVariants; v++) {
+            if (entry.scaled[v] && entry.scaledFor[v] == target) {
+                entry.variantUsed[v] = ++g_iconCacheClock;
+                return entry.scaled[v];
+            }
         }
-        g_iconScaled[slot] = DownscaleToFit(g_iconImage[slot], target);
-        g_iconScaledFor[slot] = g_iconScaled[slot] ? target : 0;
-        if (g_iconScaled[slot]) return g_iconScaled[slot];
+        // A source that already fits the target needs no variant at all: drawing it directly
+        // never upsamples, and the caller scales it.
+        UINT w = 0, h = 0;
+        if (g_gdiplus.GetImageWidth) g_gdiplus.GetImageWidth(entry.source, &w);
+        if (g_gdiplus.GetImageHeight) g_gdiplus.GetImageHeight(entry.source, &h);
+        if ((int)w <= target && (int)h <= target) return entry.source;
+
+        // Build the variant, evicting an unused one first, else the least recently used.
+        int variant = -1;
+        for (int v = 0; v < kIconVariants; v++) {
+            if (!entry.scaled[v]) {
+                variant = v;
+                break;
+            }
+            if (variant < 0 || entry.variantUsed[v] < entry.variantUsed[variant]) variant = v;
+        }
+        if (entry.scaled[variant]) {
+            g_gdiplus.DisposeImage(entry.scaled[variant]);
+            entry.scaled[variant] = nullptr;
+        }
+        entry.scaledFor[variant] = 0;
+        entry.scaled[variant] = DownscaleToFit(entry.source, target);
+        if (entry.scaled[variant]) {
+            entry.scaledFor[variant] = target;
+            entry.variantUsed[variant] = ++g_iconCacheClock;
+            return entry.scaled[variant];
+        }
         // Resampling failed; fall back to the source rather than dropping the icon.
-        UINT w2 = 0, h2 = 0;
-        if (g_gdiplus.GetImageWidth) g_gdiplus.GetImageWidth(g_iconImage[slot], &w2);
-        if (g_gdiplus.GetImageHeight) g_gdiplus.GetImageHeight(g_iconImage[slot], &h2);
-        if ((int)w2 <= target && (int)h2 <= target) return g_iconImage[slot];
-        *failed = true;
-        return nullptr;
-    }
-    if (g_iconFailedPath[slot][0] && _wcsicmp(g_iconFailedPath[slot], path) == 0) {
+        if ((int)w <= target && (int)h <= target) return entry.source;
         *failed = true;
         return nullptr;
     }
 
-    // Settings changed (or first call): drop this slot's old images and load anew.
-    ReleaseSlotImage(slot);
-    g_iconFailedPath[slot][0] = L'\0';
+    const int chosen = IconCachePick(path);
+    IconCacheEntry &entry = g_iconCache[chosen];
 
     if (PathEndsWith(path, L".svg")) {
-        Wh_Log(L"Icon%d: SVG is not supported (GDI+ has no SVG decoder); "
-               L"using the built-in glyph. Export the icon as PNG instead.",
-               slot + 1);
+        Wh_Log(L"Icon \"%s\": SVG is not supported (GDI+ has no SVG decoder); "
+               L"drawing the built-in glyph instead. Export the icon as PNG.",
+               path);
+        entry.failed = true;
         *failed = true;
-        wcsncpy(g_iconFailedPath[slot], path, MAX_PATH - 1);
         return nullptr;
     }
 
     GpImage *image = nullptr;
     if (!g_gdiplus.LoadImageFromFile || g_gdiplus.LoadImageFromFile(path, &image) != 0 || !image) {
-        Wh_Log(L"Icon%d: could not load \"%s\"; using the built-in glyph", slot + 1, path);
+        Wh_Log(L"Icon \"%s\": could not load; drawing the built-in glyph", path);
+        entry.failed = true;
         *failed = true;
-        wcsncpy(g_iconFailedPath[slot], path, MAX_PATH - 1);
         return nullptr;
     }
 
@@ -5209,53 +5250,53 @@ static GpImage *IconImageFor(int slot, const WCHAR *path, int target, bool *fail
     if (g_gdiplus.GetImageWidth) g_gdiplus.GetImageWidth(image, &w);
     if (g_gdiplus.GetImageHeight) g_gdiplus.GetImageHeight(image, &h);
 
-    g_iconImage[slot] = image;
-    wcsncpy(g_iconImagePath[slot], path, MAX_PATH - 1);
-    g_iconImagePath[slot][MAX_PATH - 1] = L'\0';
+    entry.source = image;
 
     if ((int)w <= target && (int)h <= target) {
-        // Smaller than the plate: drawing it directly never upsamples, and the
+        // Smaller than the icon box: drawing it directly never upsamples, and the
         // caller scales it, so there is nothing to precompute.
         if (g_iconDrawLogs < 4) LogBitmapContent(L"Icon source (as-is)", image);
-        Wh_Log(L"Icon%d: loaded \"%s\" (%ux%u), used as-is (plate is %d px)",
-               slot + 1, path, w, h, target);
+        Wh_Log(L"Icon \"%s\": loaded (%ux%u), used as-is (the icon is %d px)",
+               path, w, h, target);
         return image;
     }
 
-    g_iconScaled[slot] = DownscaleToFit(image, target);
-    g_iconScaledFor[slot] = g_iconScaled[slot] ? target : 0;
-    if (g_iconScaled[slot]) {
+    entry.scaled[0] = DownscaleToFit(image, target);
+    if (entry.scaled[0]) {
+        entry.scaledFor[0] = target;
+        entry.variantUsed[0] = ++g_iconCacheClock;
         UINT sw = 0, sh = 0;
-        if (g_gdiplus.GetImageWidth) g_gdiplus.GetImageWidth(g_iconScaled[slot], &sw);
-        if (g_gdiplus.GetImageHeight) g_gdiplus.GetImageHeight(g_iconScaled[slot], &sh);
+        if (g_gdiplus.GetImageWidth) g_gdiplus.GetImageWidth(entry.scaled[0], &sw);
+        if (g_gdiplus.GetImageHeight) g_gdiplus.GetImageHeight(entry.scaled[0], &sh);
         // Sampling the resampled copy is what distinguishes "the file really is
         // white" from "resampling destroyed the colours".
-        LogBitmapContent(L"Icon resampled", g_iconScaled[slot]);
-        Wh_Log(L"Icon%d: loaded \"%s\" (%ux%u) -> resampled to %ux%u for a %d px plate",
-               slot + 1, path, w, h, sw, sh, target);
-        return g_iconScaled[slot];
+        LogBitmapContent(L"Icon resampled", entry.scaled[0]);
+        Wh_Log(L"Icon \"%s\": loaded (%ux%u) -> resampled to %ux%u for a %d px icon",
+               path, w, h, sw, sh, target);
+        return entry.scaled[0];
     }
 
-    Wh_Log(L"Icon%d: loaded \"%s\" (%ux%u); resampling failed, drawing the source",
-           slot + 1, path, w, h);
+    Wh_Log(L"Icon \"%s\": loaded (%ux%u); resampling failed, drawing the source",
+           path, w, h);
     return image;
 }
 
 static void DisposeIconImage() {
-    for (int i = 0; i < kMaxRows; i++) {
-        ReleaseSlotImage(i);
-        g_iconFailedPath[i][0] = L'\0';
-    }
+    for (int i = 0; i < kIconCacheSlots; i++) ReleaseIconEntry(i);
+    g_iconCacheClock = 0;
     g_iconDrawLogs = 0;   // report again after a settings change
 }
 
 // ---------------------------------------------------------------------------
-// Left icon plate
+// Inline icon elements
 //
 // The original capsule has a light disc at its left end with a dark glyph on it
 // (Hud.IconPlate #E9E7E4 over Hud.BoltDark #141313). It is the most recognisable
-// thing about the HUD, so the mod reproduces the plate and draws its own glyphs
+// thing about the HUD, so the mod reproduces the disc and draws its own glyphs
 // as plain primitives: a chip, a memory module, a platter, a link and a fan.
+//
+// Where it is drawn is not this code's business any more: [[icon:...]] makes it an
+// element of the row's flow, and the row's plan says where that element landed.
 // ---------------------------------------------------------------------------
 static void PaintIconGlyph(GpGraphics *graphics, int style, float cx, float cy,
                            float size, GpSolidFill *fill) {
@@ -5276,7 +5317,7 @@ static void PaintIconGlyph(GpGraphics *graphics, int style, float cx, float cy,
         break;
     }
     case 2: {   // Memory: a filled module with one notch, kept chunky so it stays
-                // legible at the plate's ~23 px size.
+                // legible at the default icon's ~23 px size.
         float body = size * 0.74f, thickness = size * 0.40f;
         g_gdiplus.FillRectangle(graphics, brush, cx - body / 2, cy - thickness / 2,
                                 body, thickness);
@@ -5340,109 +5381,25 @@ static void PaintIconGlyph(GpGraphics *graphics, int style, float cx, float cy,
     }
 }
 
-// Returns the plate diameter for the current settings, or 0 when no icon is on.
-// A custom image counts as an icon even when no built-in glyph was chosen, so
-// setting only a path is enough to get a plate.
-// Diameter of the plate for one row, or 0 when that row has no icon.
+// Ring radius for a given expansion progress, measured from the icon's own edge.
 //
-// The diameter follows the **global** Font size, never a row's own size (neither
-// `Row N font size` nor a `[[size:…]]` run). The plate is a panel element, not a piece of
-// the row's text: making it grow with the row's font meant that setting one row to a larger
-// size also redrew its icon larger, which is not what the row asked for, and it moved the
-// text column of every row around with it. `slot` therefore only decides *whether* there is
-// a plate.
-static float IconPlateDiameter(const ModSettings &settings, int slot) {
-    return MetricsForRow(settings, slot).plateDiameter;
-}
-
-// The plate diameter to reserve room for in the shared text column: the widest plate any row
-// will draw. Every plate is the same size, so this only has to cope with the rows that have
-// **no** plate at all -- the first row may well be one of those (`Row 1 icon = None`), and
-// reading the diameter off row 0 specifically would then inset the text by nothing while the
-// rows below it still draw a disc under it.
-static float MaxIconPlateDiameter(const ModSettings &settings) {
-    float widest = 0.0f;
-    for (int i = 0; i < kMaxRows; i++) {
-        const float diameter = IconPlateDiameter(settings, i);
-        if (diameter > widest) widest = diameter;
-    }
-    return widest;
-}
-
-// True when at least one row will have a plate. Asked through the same function the
-// painter uses for each row, so "is the plate margin needed" and "does this row get a
-// plate" cannot answer differently -- and an explicit `None` on every row is not a
-// configuration that wants a margin.
-static bool AnyIconConfigured(const ModSettings &settings) {
-    for (int i = 0; i < kMaxRows; i++) {
-        if (IconPlateDiameter(settings, i) > 0.0f) return true;
-    }
-    return false;
-}
-
-// Centre of the icon plate for one row, in the panel's own (untransformed)
-// coordinates. All plates share a size, so the X offset is the same for every row;
-// only the vertical position varies.
-static void IconPlateCenterForRow(const ModSettings &settings, int slot, float rowTop,
-                                  float rowHeight, float *outX, float *outY) {
-    float diameter = IconPlateDiameter(settings, slot);
-    *outX = kIconLeftMargin + diameter / 2.0f;
-    *outY = rowTop + rowHeight / 2.0f;
-}
-
-// ---------------------------------------------------------------------------
-// Plate and ring geometry.
-//
-// The plate and the rings around it are one object as far as the eye is concerned,
-// so they are derived here together rather than by two code paths that each work
-// out "where is the icon" for themselves. They differ in size on purpose -- the
-// plate is the disc, the rings are larger and expand outward from it -- but they
-// share exactly one centre, and that centre is what the rings are built around.
-// ---------------------------------------------------------------------------
-struct IconGeometry {
-    bool present = false;
-    float centerX = 0.0f;
-    float centerY = 0.0f;
-    float plateRadius = 0.0f;   // the icon disc; the rings start from this radius
-};
-
-// rowTop is the row's own offset, so one call describes exactly one plate and its
-// rings. Passing the row offset matters: a fixed offset would put every row's rings
-// on row 1.
-static IconGeometry ComputeIconGeometry(const ModSettings &settings, int slot,
-                                        float rowTop) {
-    IconGeometry g = {};
-    float diameter = IconPlateDiameter(settings, slot);
-    if (diameter <= 0.0f) return g;
-    g.present = true;
-    // The row's own height: a row with a taller font is a taller box, and the plate belongs
-    // in the middle of the box it is drawn in, not in the middle of the default one.
-    IconPlateCenterForRow(settings, slot, rowTop, (float)RowHeightPx(settings, slot),
-                          &g.centerX, &g.centerY);
-    g.plateRadius = diameter / 2.0f;
-    // Rings are larger than the plate and measured from this radius (RingRadiusAt), so
-    // the innermost ring starts at the plate's edge rather than on top of the glyph.
-    return g;
-}
-
-// Ring radius for a given expansion progress, measured from the shared centre.
-//
-// The ring starts AT the plate's edge and grows outward from there, so its
-// innermost state is a ring grazing the plate rather than a smaller circle sitting
-// on top of the glyph. Starting below the plate radius is what made the rings look
-// concentric with the glyph instead of with the plate.
-static float RingRadiusAt(const IconGeometry &geometry, int ringIndex, double progress) {
+// The ring starts AT the disc's edge and grows outward from there, so its
+// innermost state is a ring grazing the disc rather than a smaller circle sitting
+// on top of the glyph. Starting below the disc radius is what made the rings look
+// concentric with the glyph instead of with the disc. `plateRadius` is the radius of
+// the icon the rings belong to -- one icon, one set of rings, one centre.
+static float RingRadiusAt(float plateRadius, int ringIndex, double progress) {
     double endScale = kRippleScaleEnd[ringIndex < 3 ? ringIndex : 2];
-    double outer = geometry.plateRadius * endScale;
-    return (float)Lerp(geometry.plateRadius, outer, progress);
+    double outer = plateRadius * endScale;
+    return (float)Lerp(plateRadius, outer, progress);
 }
 
 // The size a cached icon image is drawn at.
 //
-// The intro scales the whole plate in, so the image has to follow it. It did not: the
-// scale was applied only inside the branch for images *larger* than the plate, and a
-// cached image is already exactly plate-sized, so a custom icon merely faded in while its
-// plate grew. The "never upsample past the natural size" rule caps the base size; the
+// The intro scales the whole icon in, so the image has to follow it. It did not: the
+// scale was applied only inside the branch for images *larger* than the disc, and a
+// cached image is already exactly disc-sized, so a custom icon merely faded in while its
+// disc grew. The "never upsample past the natural size" rule caps the base size; the
 // animation multiplies that cap, it is not a second cap.
 static void ComputeIconImageDrawSize(int imageW, int imageH, float plateRadius,
                                      float iconScale, float *outW, float *outH) {
@@ -5459,17 +5416,21 @@ static void ComputeIconImageDrawSize(int imageW, int imageH, float plateRadius,
     if (outH) *outH = h * scale;
 }
 
-// Draws one plate, at the centre and radius the shared geometry reports.
-static void PaintIconPlate(GpGraphics *graphics, const ModSettings &settings,
-                           const IntroFrame &frame, int slot, const IconGeometry &geometry) {
-    if (!geometry.present) return;
+// Draws one inline icon: the disc, then either the image or the built-in glyph centred on
+// it. `centerX`/`centerY`/`diameter` come from the row's layout plan, so there is one owner
+// for "where is this element" (the plan) and one for "what is drawn inside it" (here).
+//
+// `glyph` is the built-in style; when `path` is non-empty it is the image that is tried
+// first and the glyph is the fallback, which is the same rule the old settings had: an
+// image that cannot be decoded must not leave an empty disc.
+static void PaintIconElement(GpGraphics *graphics, const ModSettings &settings,
+                             const IntroFrame &frame, int glyph, const WCHAR *path,
+                             float centerX, float centerY, float diameter) {
     float scale = (float)(frame.iconScale > 0.0 ? frame.iconScale : 0.0);
     if (scale <= 0.001f) return;
-    float radius = geometry.plateRadius * scale;
-    float centerX = geometry.centerX;
-    float centerY = geometry.centerY;
+    const float radius = diameter / 2.0f * scale;
 
-    // Circular plate. GDI+ has no arc primitive, so the disc is filled from a
+    // Circular disc. GDI+ has no arc primitive, so the disc is filled from a
     // closed two-arc path and the glyph is drawn inside the same transform.
     BYTE alpha = (BYTE)(Clamp01(frame.iconAlpha) * 255.0 + 0.5);
     GpPath *disc = nullptr;
@@ -5486,62 +5447,53 @@ static void PaintIconPlate(GpGraphics *graphics, const ModSettings &settings,
     }
     g_gdiplus.DeletePath(disc);
 
-    GpSolidFill *glyph = nullptr;
-    g_gdiplus.CreateSolidFill((kGlyphDark & 0x00FFFFFF) | ((DWORD)alpha << 24), &glyph);
+    GpSolidFill *glyphFill = nullptr;
+    g_gdiplus.CreateSolidFill((kGlyphDark & 0x00FFFFFF) | ((DWORD)alpha << 24), &glyphFill);
 
-    // A custom image replaces the drawn glyph but keeps the plate, so the icon
+    // A custom image replaces the drawn glyph but keeps the disc, so the icon
     // stays visually anchored.
     //
-    // The image arrives already resampled to the plate's pixel size, so this only
+    // The image arrives already resampled to the icon's pixel size, so this only
     // has to place it: the drawn size is the cached size times the intro's icon
-    // scale, and nothing is resampled per frame. When the plate is large enough to
+    // scale, and nothing is resampled per frame. When the disc is large enough to
     // hold the source unchanged, the source is used and this never upsamples it
     // past its natural size.
     bool imageFailed = false;
-    // The image may belong to a different cache slot than this row: rows that resolve to
-    // the same file share one slot, so it is decoded once (see ResolveIconSlot). The
-    // glyph fallback is still this row's own, so a row that said `None` draws nothing.
-    const int imageSlot = ResolveIconSlot(settings, slot);
-    const WCHAR *iconPath = imageSlot >= 0 ? ResolveIconPath(settings, slot) : L"";
-    int target = (int)(geometry.plateRadius * 2.0f + 0.5f);
-    GpImage *image = imageSlot >= 0 ? IconImageFor(imageSlot, iconPath, target, &imageFailed)
-                                    : nullptr;
+    int target = (int)(diameter + 0.5f);
+    GpImage *image = (path && path[0]) ? IconImageFor(path, target, &imageFailed) : nullptr;
     if (g_iconDrawLogs < 8) {
         g_iconDrawLogs++;
-        DBG(L"Icon%d draw: plate diameter target=%d  image=%s  cache slot=%d  built-in glyph=%d",
-               slot + 1, target, image ? L"custom" : L"none", imageSlot,
-               ResolveIconStyle(settings, slot));
+        DBG(L"icon draw: diameter=%d glyph=%d image=%s path=\"%s\"", target, glyph,
+            image ? L"custom" : L"none", path ? path : L"");
     }
     if (image) {
         UINT iw = 0, ih = 0;
         if (g_gdiplus.GetImageWidth) g_gdiplus.GetImageWidth(image, &iw);
         if (g_gdiplus.GetImageHeight) g_gdiplus.GetImageHeight(image, &ih);
         if (iw > 0 && ih > 0) {
-            // Same size rule as the glyph path below: base size capped at the plate, then
+            // Same size rule as the glyph path below: base size capped at the disc, then
             // the intro's scale on top of it (see ComputeIconImageDrawSize).
             float dw = 0.0f, dh = 0.0f;
-            ComputeIconImageDrawSize((int)iw, (int)ih, geometry.plateRadius, scale, &dw, &dh);
+            ComputeIconImageDrawSize((int)iw, (int)ih, diameter / 2.0f, scale, &dw, &dh);
             g_gdiplus.DrawImageRect(graphics, image, centerX - dw / 2.0f,
                                     centerY - dh / 2.0f, dw, dh);
         }
-    } else if (glyph) {
-        PaintIconGlyph(graphics, ResolveIconStyle(settings, slot), centerX, centerY,
-                       geometry.plateRadius * 2.0f * scale, glyph);
+    } else if (glyphFill && glyph > 0) {
+        PaintIconGlyph(graphics, glyph, centerX, centerY, diameter * scale, glyphFill);
     }
-    if (glyph) g_gdiplus.DeleteBrush((GpBrush *)glyph);
+    if (glyphFill) g_gdiplus.DeleteBrush((GpBrush *)glyphFill);
 }
 
-// Concentric rings expanding outward from the plate, from the original's Ripple
+// Concentric rings expanding outward from one icon, from the original's Ripple
 // animation: radii 1.5x / 2.0x / 2.5x, peak opacity 0.50 / 0.50 / 0.60.
 //
-// The rings are centred on the very same point as the plate, taken from the shared
-// geometry rather than recomputed. The original also lifted its ripple host by
-// 16 px (RippleRise), which made sense for a full-screen HUD whose icon travels
-// while the layout settles; here it would push the rings off the plate they are
-// supposed to be coming out of, so it is intentionally not applied.
+// The rings are centred on the very same point as the icon they belong to. The original
+// also lifted its ripple host by 16 px (RippleRise), which made sense for a full-screen HUD
+// whose icon travels while the layout settles; here it would push the rings off the disc
+// they are supposed to be coming out of, so it is intentionally not applied.
 static void PaintRipples(GpGraphics *graphics, const ModSettings &settings,
-                         const IntroFrame &frame, int slot, const IconGeometry &geometry) {
-    if (!geometry.present) return;   // rings come out of a plate, so no plate means none
+                         const IntroFrame &frame, float centerX, float centerY,
+                         float plateRadius) {
     if (settings.rippleCount <= 0 || frame.rippleProgress <= 0.0) return;
 
     int count = MinInt(settings.rippleCount, 3);
@@ -5556,7 +5508,7 @@ static void PaintRipples(GpGraphics *graphics, const ModSettings &settings,
 
         double opacity = progress < 0.5 ? Lerp(0.0, kRipplePeakOpacity[i], progress / 0.5)
                                         : Lerp(kRipplePeakOpacity[i], 0.0, (progress - 0.5) / 0.5);
-        float radius = RingRadiusAt(geometry, i, progress);
+        float radius = RingRadiusAt(plateRadius, i, progress);
         if (radius < 1.0f) continue;
 
         BYTE alpha = (BYTE)(Clamp01(opacity) * 255.0 + 0.5);
@@ -5565,9 +5517,8 @@ static void PaintRipples(GpGraphics *graphics, const ModSettings &settings,
         GpPen *pen = nullptr;
         g_gdiplus.CreatePen1(color, 2.0f, 0, &pen);
         if (pen) {
-            // Centred on the plate's centre exactly: same X and same Y, no offset.
-            g_gdiplus.DrawEllipse(graphics, pen, geometry.centerX - radius,
-                                  geometry.centerY - radius,
+            // Centred on the icon's centre exactly: same X and same Y, no offset.
+            g_gdiplus.DrawEllipse(graphics, pen, centerX - radius, centerY - radius,
                                   radius * 2.0f, radius * 2.0f);
             g_gdiplus.DeletePen(pen);
         }
@@ -5993,6 +5944,7 @@ static void ReleaseFontResources() {
 // ---------------------------------------------------------------------------
 struct RowSegmentPlan {
     bool isRing = false;    // a gauge: `x` is its centre, the rest is unused
+    bool isIcon = false;    // an inline icon: `x` is its left edge, `diameter` its box
     bool skip = false;      // nothing to draw (empty run)
     WCHAR slice[640] = {};  // the text as it will be drawn (already fitted)
     // The family this run resolved to, "" for the panel's main one. The *name* is stored, not
@@ -6001,19 +5953,25 @@ struct RowSegmentPlan {
     WCHAR family[kMaxFontFamilyChars] = {};
     int fontSize = 0;
     bool fitted = false;
-    float x = 0.0f;         // left edge (text) / centre (ring)
+    float x = 0.0f;         // left edge (text, icon) / centre (ring)
     float boxWidth = 0.0f;  // the layout box the text is drawn in
     float advance = 0.0f;   // how far an inline cursor moves on
+    // An inline icon. The image path is resolved here, once per publish, for the same reason
+    // the text is fitted here: the frame must not trim a user path or reach into a compiled
+    // program. `diameter` is this element's own size (see IconDiameterForFontSize).
+    WCHAR path[MAX_PATH] = {};
+    int glyph = 0;
+    bool ripple = false;    // does this icon play the intro ripples
+    float diameter = 0.0f;
 };
 
 struct RowLayoutPlan {
     bool valid = false;
     // The key. Anything not listed here is either derived from the text (covered by the
-    // epoch) or is the same for every row of a frame (width, inset).
+    // epoch) or is the same for every row of a frame (width).
     unsigned epoch = 0;
     int rows = 0;
     float width = 0.0f;
-    float leftInset = 0.0f;
     float rowHeight = 0.0f;
     int rowFontSize = 0;
     int segmentCount = 0;
@@ -6025,17 +5983,18 @@ static RowLayoutPlan g_rowPlans[kMaxRows];
 // means a changed row silently keeps drawing its old text, which is the failure this whole
 // cache could introduce.
 static bool RowPlanIsFresh(const RowLayoutPlan &plan, unsigned epoch, int rows, float width,
-                           float leftInset, float rowHeight, int rowFontSize, int segmentCount) {
+                           float rowHeight, int rowFontSize, int segmentCount) {
     return plan.valid && plan.epoch == epoch && plan.rows == rows && plan.width == width &&
-           plan.leftInset == leftInset && plan.rowHeight == rowHeight &&
-           plan.rowFontSize == rowFontSize && plan.segmentCount == segmentCount;
+           plan.rowHeight == rowHeight && plan.rowFontSize == rowFontSize &&
+           plan.segmentCount == segmentCount;
 }
 
 // Fills one row's plan. This is the code the frame used to run: choose each run's family from
-// the run itself, fit it to its own budget, remember where it goes.
+// the run itself, fit it to its own budget, remember where it goes -- and now also place the
+// icon elements, which occupy a box of their own and push what follows them along.
 static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringFormat *format,
-                         int row, int rows, float width, float leftInset, int rowFontSizePx,
-                         float rowHeight, bool globalFontPath, RowLayoutPlan &plan) {
+                         int row, int rows, float width, int rowFontSizePx, float rowHeight,
+                         bool globalFontPath, RowLayoutPlan &plan) {
     plan.segmentCount = g_rowState.segmentCount[row];
     if (plan.segmentCount > kMaxSegments) plan.segmentCount = kMaxSegments;
 
@@ -6045,20 +6004,32 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
     // so the row's text box is the whole inner width there (ComputeInlineTextLimit narrows it
     // per run).
     RowTextMetrics metrics = ComputeRowTextMetrics(width, ringCount, g_settings.ringSize,
-                                                  g_settings.ringRightOffset, inlineFlow,
-                                                  leftInset);
+                                                  g_settings.ringRightOffset, inlineFlow);
     float parkX = 0.0f;
     if (!inlineFlow && ringCount > 0) {
         parkX = metrics.textRight + (float)g_settings.ringSize / 2.0f;
     }
 
-    float cursor = leftInset;
+    // Which icon is the row's first. The default ripple rule is positional -- the first icon
+    // of the row plays the intro ripples, the rest stay quiet -- and it is decided here rather
+    // than while compiling because only the layout knows which icon elements actually made it
+    // into the row.
+    int firstIconSegment = -1;
+    for (int s = 0; s < plan.segmentCount; s++) {
+        if (g_rowState.segments[row][s].offset == kIconSegOffset) {
+            firstIconSegment = s;
+            break;
+        }
+    }
+
+    const RowProgram &program = g_settings.rowProgram[row];
+    float cursor = kRowTextLeftInset;
     for (int s = 0; s < plan.segmentCount; s++) {
         const TextSeg &seg = g_rowState.segments[row][s];
         RowSegmentPlan &entry = plan.segments[s];
         entry = RowSegmentPlan();
 
-        if (seg.offset < 0) {
+        if (seg.offset == kRingSegOffset) {
             // A gauge: the frame needs its centre and nothing else from here.
             entry.isRing = true;
             const float outer = (float)g_settings.ringSize;
@@ -6069,6 +6040,42 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
                 entry.x = parkX;
                 parkX += outer + 4.0f;
             }
+            continue;
+        }
+
+        if (seg.offset == kIconSegOffset) {
+            // An inline icon. The element index the marker carried is the program element
+            // that describes it: the glyph, the ripple override and the path slice.
+            const int element = seg.length;
+            if (element < 0 || element >= program.partCount ||
+                program.parts[element].kind != kPartIcon) {
+                entry.skip = true;
+                continue;
+            }
+            const RowPart &icon = program.parts[element];
+            entry.isIcon = true;
+            // The element's own glyph, or Memory when it is an image: the disc must never be
+            // left empty (see kIconImageFallbackGlyph). The painter prefers the image and only
+            // falls back to this.
+            entry.glyph = icon.glyphFlags & kIconGlyphMask;
+            if (entry.glyph == 0) entry.glyph = kIconImageFallbackGlyph;
+            entry.fontSize = ElementFontSizePx(g_settings, row, seg.runFontSize);
+            entry.diameter = IconDiameterForFontSize(entry.fontSize);
+            entry.x = cursor;
+            entry.ripple = IconElementRipples(icon.glyphFlags & (kIconRippleOn | kIconRippleOff),
+                                              s == firstIconSegment);
+            if (icon.length > 0) {
+                // The path is a slice of the row's own text, with the quotes and padding the
+                // user wrote; CopyUserPath is the same trimmer the settings path always used.
+                WCHAR rawPath[MAX_PATH + 2];
+                const int pathLen = MinInt(icon.length, MAX_PATH + 1);
+                wcsncpy(rawPath, g_settings.rows[row] + icon.offset, pathLen);
+                rawPath[pathLen] = L'\0';
+                CopyUserPath(entry.path, MAX_PATH, rawPath);
+            }
+            // The element occupies its own box, and the glyphs that follow it keep their
+            // distance from the disc.
+            cursor += entry.diameter + (float)kIconContentGap;
             continue;
         }
 
@@ -6083,7 +6090,7 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
         // This run's size: its own [[size:NN]], or the row's size. The font is chosen from it
         // before anything is measured, or the fit would be computed for a font the run is not
         // drawn in.
-        entry.fontSize = seg.runFontSize > 0 ? seg.runFontSize : rowFontSizePx;
+        entry.fontSize = ElementFontSizePx(g_settings, row, seg.runFontSize);
         GpFont *segMainFont = rowMainFont;
         if (entry.fontSize != rowFontSizePx) {
             GpFont *sized = AcquireRowFont(graphics, g_settings.fontFamily, entry.fontSize);
@@ -6116,11 +6123,14 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
             continue;
         }
 
-        float limit = metrics.textWidth;
+        // The run's budget. A parked run gets the row's text width minus whatever the
+        // elements before it already took (an icon written first pushes the text right, and
+        // the text must not be allowed to run under the parked gauges because of it).
+        float limit = metrics.textWidth - (cursor - kRowTextLeftInset);
         if (inlineFlow) {
             int ringsAfter = 0;
             for (int k = s + 1; k < plan.segmentCount; k++) {
-                if (g_rowState.segments[row][k].offset < 0) ringsAfter++;
+                if (g_rowState.segments[row][k].offset == kRingSegOffset) ringsAfter++;
             }
             limit = ComputeInlineTextLimit(metrics.textRight, cursor, ringsAfter,
                                            g_settings.ringSize);
@@ -6141,28 +6151,29 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
         entry.x = cursor;
         entry.advance = advance;
         entry.boxWidth = LayoutWidthFloor(advance);
-        if (inlineFlow) cursor += advance;
+        // Every run leaves the cursor where it ended, parked or not: a row is a flow, and
+        // the runs that follow it -- including an icon -- start where this one stopped.
+        cursor += advance;
     }
 }
 
 // The plan for one row, rebuilt only when it no longer matches what it was built from.
 static const RowLayoutPlan *EnsureRowPlan(GpGraphics *graphics, GpFont *rowMainFont,
                                           GpStringFormat *format, int row, int rows, float width,
-                                          float leftInset, int rowFontSizePx, float rowHeight,
+                                          int rowFontSizePx, float rowHeight,
                                           bool globalFontPath) {
     RowLayoutPlan &plan = g_rowPlans[row];
     const int segmentCount = g_rowState.segmentCount[row];
-    if (RowPlanIsFresh(plan, g_layoutEpoch, rows, width, leftInset, rowHeight, rowFontSizePx,
+    if (RowPlanIsFresh(plan, g_layoutEpoch, rows, width, rowHeight, rowFontSizePx,
                        segmentCount)) {
         return &plan;
     }
     plan.epoch = g_layoutEpoch;
     plan.rows = rows;
     plan.width = width;
-    plan.leftInset = leftInset;
     plan.rowHeight = rowHeight;
     plan.rowFontSize = rowFontSizePx;
-    BuildRowPlan(graphics, rowMainFont, format, row, rows, width, leftInset, rowFontSizePx,
+    BuildRowPlan(graphics, rowMainFont, format, row, rows, width, rowFontSizePx,
                  rowHeight, globalFontPath, plan);
     plan.valid = true;
     return &plan;
@@ -6311,11 +6322,6 @@ static void PaintPanel(HWND hwnd) {
             g_gdiplus.CreateSolidFill(g_settings.background, &background);
             if (background && panelPath) g_gdiplus.FillPath(graphics, (GpBrush *)background, panelPath);
 
-            // One inset for every row, sized by the widest plate in the panel (they are all
-            // the same size now, but the first row may have no plate at all).
-            float iconDiameter = MaxIconPlateDiameter(g_settings);
-            bool iconsPresent = AnyIconConfigured(g_settings);
-
             // The border doubles as the state indicator: it dims while collapsed,
             // so the current state is readable without any tooltip.
             DWORD borderColor = collapsed ? g_settings.borderCollapsed : g_settings.border;
@@ -6387,11 +6393,6 @@ static void PaintPanel(HWND hwnd) {
                 // fade out first when collapsing. The intro reports both.
                 float contentAlpha = (float)intro.contentAlpha;
                 if (contentAlpha < 0.01f) contentAlpha = 0.0f;
-                // The icon plate claims the left margin; text starts after it.
-                float leftInset = 12.0f;
-                if (iconsPresent) {
-                    leftInset = kIconLeftMargin + iconDiameter + (float)kIconContentGap;
-                }
 
                 // The cost gate, read from the settings rather than decided per frame: the
                 // global list is one flag, the per-row half is one bool per row (see
@@ -6402,7 +6403,7 @@ static void PaintPanel(HWND hwnd) {
                 for (int r = 0; r < rows; r++) {
                     // This row's own box: rows are not interchangeable any more, so the top
                     // edge is the sum of the rows above it and everything inside the row --
-                    // the plate, the gauges, the text -- is placed against this height.
+                    // the gauges, the icons, the text -- is placed against this height.
                     // Asked once, from the one place that derives sizes (RowMetrics). The
                     // name is distinct from RowTextMetrics (which measures one line's text)
                     // on purpose: these are the row's box sizes, not a measurement.
@@ -6421,22 +6422,6 @@ static void PaintPanel(HWND hwnd) {
                         if (sized) rowMainFont = sized;
                     }
 
-                    // One plate per row, at that row's vertical centre, drawn before
-                    // the row's text so the text never sits under it. Each row uses
-                    // its own IconN / IconNPath.
-                    //
-                    // The plate and its rings are built from one geometry value, so
-                    // there is no way for the rings to end up beside the plate.
-                    if (iconsPresent) {
-                        IconGeometry geometry = ComputeIconGeometry(g_settings, r, top);
-                        if (geometry.present) {
-                            if (introActive && intro.rippleProgress > 0.0f) {
-                                PaintRipples(graphics, g_settings, intro, r, geometry);
-                            }
-                            PaintIconPlate(graphics, g_settings, intro, r, geometry);
-                        }
-                    }
-
                     int ringCount = g_rowState.ringCount[r];
                     bool inlineFlow = g_rowState.inlineRing[r];
 
@@ -6444,13 +6429,13 @@ static void PaintPanel(HWND hwnd) {
                     // once, when the text or the geometry last changed; this frame only draws
                     // it (see the plan comment above EnsureRowPlan).
                     const RowLayoutPlan *plan = EnsureRowPlan(
-                        graphics, rowMainFont, format, r, rows, (float)width, leftInset,
+                        graphics, rowMainFont, format, r, rows, (float)width,
                         rowFontSizePx, rowHeight, globalFontPath);
 
                     for (int s = 0; s < g_rowState.segmentCount[r]; s++) {
                         const TextSeg &seg = g_rowState.segments[r][s];
                         const RowSegmentPlan &planned = plan->segments[s];
-                        if (seg.offset < 0) {
+                        if (seg.offset == kRingSegOffset) {
                             // A gauge.
                             int ringIndex = seg.length;
                             if (ringIndex < 0 || ringIndex >= ringCount) continue;
@@ -6478,6 +6463,24 @@ static void PaintPanel(HWND hwnd) {
 
                             DrawRing(graphics, centerX, centerY, ringRadius, thickness,
                                      fraction, trackColor, valueColor);
+                            continue;
+                        }
+
+                        if (seg.offset == kIconSegOffset) {
+                            // An inline icon, drawn where the plan put it and no wider than
+                            // its own size asked for. Its ripples come out of its own centre
+                            // and only if this icon is one of the row's ripple origins.
+                            if (planned.skip || planned.diameter <= 0.0f) continue;
+                            float iconCenterX = 0.0f, iconCenterY = 0.0f;
+                            IconElementCenter(planned.x, planned.diameter, top, rowHeight,
+                                              &iconCenterX, &iconCenterY);
+                            if (introActive && planned.ripple && intro.rippleProgress > 0.0f) {
+                                PaintRipples(graphics, g_settings, intro, iconCenterX,
+                                             iconCenterY, planned.diameter / 2.0f);
+                            }
+                            PaintIconElement(graphics, g_settings, intro, planned.glyph,
+                                             planned.path, iconCenterX, iconCenterY,
+                                             planned.diameter);
                             continue;
                         }
 

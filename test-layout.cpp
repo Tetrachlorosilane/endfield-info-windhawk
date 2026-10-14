@@ -129,12 +129,12 @@ static void Skip(const char *label) {
 // `x = ModSettings()` would materialise a 33 KB temporary in the frame -- the very cost this
 // arrangement exists to avoid.
 static const ModSettings kDefaultSettings = ModSettings();
-static ModSettings g_markRow, g_theme, g_ringPreset, g_ringCustom, g_ringThemed, g_icons,
-    g_iconOnlyFirst, g_iconNone, g_iconPath, g_fontChain, g_fontTagged, g_metricDefault,
-    g_metricHuge, g_metricRow, g_metricIcons, g_metricNoneFirst, g_sizeRun, g_sizeTagged,
-    g_runCase, g_prefixRows, g_geometrySaved, g_geometry, g_planSaved, g_plan, g_extAllow,
-    g_extRows, g_extBad, g_extCfg, g_extSettings, g_islandCfgA, g_islandCfgB, g_publish,
-    g_programCompile, g_programRead;
+static ModSettings g_markRow, g_theme, g_ringPreset, g_ringCustom, g_ringThemed, g_iconTag,
+    g_iconRow, g_iconPlan, g_iconPlanSame, g_iconPlanRipple, g_iconRing, g_iconSize,
+    g_fontChain, g_fontTagged, g_metricDefault, g_metricHuge, g_metricRow, g_sizeRun,
+    g_sizeTagged, g_runCase, g_prefixRows, g_geometrySaved, g_geometry, g_planSaved, g_plan,
+    g_extAllow, g_extRows, g_extBad, g_extCfg, g_extSettings, g_islandCfgA, g_islandCfgB,
+    g_publish, g_programCompile, g_programRead;
 
 #define LOCAL_SETTINGS(name, slot) ModSettings &name = slot; slot = kDefaultSettings
 
@@ -362,145 +362,243 @@ int main() {
         g_stubStringCount = 0;
     }
 
-    printf("\n=== per-row icons and their ripples ===\n");
+    printf("\n=== inline icons: the tag, the glyph and the ripple switch ===\n");
     {
-        // The reported bug: with several rows the ripple did not come out of the
-        // plate. Two causes were found and both are asserted here:
-        //
-        //   1. the plate was drawn once at the panel's vertical centre instead of
-        //      once per row, so on a multi-row panel it sat on a middle row (or
-        //      between rows) and the ripple anchored there too
-        //   2. the ripple was painted before the intro's world transform, so it was
-        //      in a different coordinate space from the plate
-        //
-        // The requested behaviour is then checked as well: every row carries its own
-        // configurable icon and emits its own ripples.
-        LOCAL_SETTINGS(s, g_icons);
+        // An icon used to be a per-row *setting* drawn as a plate at the row's left edge
+        // (Icon1..Icon4 / Icon1Path..Icon4Path / Custom icon file). Those settings are gone:
+        // an icon is an element placed by a tag, exactly like [[ring:...]], and this section
+        // is about the tag itself -- what it compiles to, and what it refuses to become.
+        LOCAL_SETTINGS(s, g_iconTag);
         s.fontSize = 15;
         s.rowHeight = 30;
 
-        // Per-row configuration. Each slot is independent, and a slot that is not
-        // configured inherits the first configured one.
-        s.icons[0].style = 2;   // Memory on row 1
-        s.icons[1].style = 1;   // CPU on row 2
-        // rows 3 and 4 left unconfigured
-        s.iconCount = 2;
+        // The tag is classified while compiling, so the glyph is already resolved here and
+        // never re-validated per publish.
+        const WCHAR iconRow[] = L"[[icon:Memory]]A";
+        RowProgram iconProgram;
+        CompileRowText(s, iconRow, iconProgram);
+        const RowPart *i0 = ProgramElement(iconProgram, 0);
+        const RowPart *i1 = ProgramElement(iconProgram, 1);
+        printf("    \"%ls\" -> %d element(s)\n", iconRow, iconProgram.partCount);
+        Check(i0 && i0->kind == kPartIcon, "[[icon:Memory]] compiles to an icon element");
+        Check(i0 && (i0->glyphFlags & kIconGlyphMask) == 2, "and records the Memory glyph");
+        Check(i0 && i0->length == 0, "a built-in glyph carries no path slice");
+        Check(i1 && i1->kind == kPartText && i1->offset == (int)wcslen(L"[[icon:Memory]]"),
+              "the text after the tag starts right after its ]]");
 
-        printf("  slot  style  path            diameter  origin x\n");
-        for (int i = 0; i < kMaxRows; i++) {
-            float px = 0.0f, py = 0.0f;
-            IconPlateCenterForRow(s, i, 0.0f, (float)s.rowHeight, &px, &py);
-            wprintf(L"  %4d  %5d  %-14s  %8.1f  %8.1f\n", i + 1,
-                    ResolveIconStyle(s, i), ResolveIconPath(s, i), IconPlateDiameter(s, i), px);
+        // Every tag is one element, and the index the marker carries *is* that element, which
+        // is what makes the glyph and the path reachable from a stripped row without any side
+        // table to keep in sync.
+        const WCHAR fileRow[] = L"[[icon:file=C:\\pics\\ssd.png]]B";
+        RowProgram fileProgram;
+        CompileRowText(s, fileRow, fileProgram);
+        const RowPart *p0 = ProgramElement(fileProgram, 0);
+        printf("    \"%ls\" -> %d element(s)\n", fileRow, fileProgram.partCount);
+        Check(p0 && p0->kind == kPartIcon, "[[icon:file=...]] compiles to an icon element");
+        Check(p0 && p0->length == (int)wcslen(L"C:\\pics\\ssd.png"),
+              "and its path is a slice of the row's own text");
+        Check(p0 && p0->offset > 0, "the slice points into the row, not at its start");
+
+        // The ripple switch is per icon, and it shares its byte with the glyph.
+        const WCHAR rippleRow[] = L"[[icon:Memory:ripple]]x[[icon:Disk:noripple]]y";
+        RowProgram rippleProgram;
+        CompileRowText(s, rippleRow, rippleProgram);
+        const RowPart *r0 = ProgramElement(rippleProgram, 0);
+        const RowPart *r1 = ProgramElement(rippleProgram, 1);
+        const RowPart *r2 = ProgramElement(rippleProgram, 2);
+        const RowPart *r3 = ProgramElement(rippleProgram, 3);
+        Check(r0 && r0->kind == kPartIcon && (r0->glyphFlags & kIconGlyphMask) == 2,
+              ":ripple keeps the glyph");
+        Check(r0 && (r0->glyphFlags & kIconRippleOn) != 0, "and asks for the ripples");
+        Check(r2 && r2->kind == kPartIcon && (r2->glyphFlags & kIconGlyphMask) == 3,
+              "the second tag is its own icon (Disk)");
+        Check(r2 && (r2->glyphFlags & kIconRippleOff) != 0, "with the ripples explicitly off");
+        Check(r0 && r2 && (r0->glyphFlags & kIconRippleOff) == 0 &&
+                  (r2->glyphFlags & kIconRippleOn) == 0,
+              "neither override leaks into the other icon");
+        Check(r1 && r1->kind == kPartText && r3 && r3->kind == kPartText,
+              "and the text between them survives");
+
+        // The glyph names, including the two synonyms the settings' own list used to print
+        // (RAM / Net): a name the mapping function does not know is not an icon at all, and
+        // the synonyms must not become that case.
+        Check(IconStyleFromName(L"CPU") == 1, "CPU names the first glyph");
+        Check(IconStyleFromName(L"Memory") == 2, "and Memory the second");
+        Check(IconStyleFromName(L"RAM") == 2, "RAM is the same glyph as Memory");
+        Check(IconStyleFromName(L"Network") == 4 && IconStyleFromName(L"Net") == 4,
+              "Net is the same glyph as Network");
+        Check(IconStyleFromName(L"GPU") == 5, "GPU the last one");
+        Check(IconStyleFromName(L"Memory") == IconStyleFromName(L"memory"),
+              "names are matched case-insensitively");
+        Check(IconStyleFromName(L"ram") == 2, "including the synonyms");
+        Check(IconStyleFromName(L"None") == 0 && IconStyleFromName(L"Bogus") == 0,
+              "None and an unknown name both mean no glyph");
+
+        // The tolerance rule, seen from this side: anything the compiler cannot make sense of
+        // stays literal text, whole. A blank disc would be a silent lie; the visible
+        // [[icon:...]] is the only clue about what the row asked for.
+        struct BadTag {
+            const WCHAR *row;
+            const char *label;
+        };
+        const BadTag badTags[] = {
+            {L"[[icon:Bogus]]x", "an unknown glyph stays literal text"},
+            {L"[[icon:None]]x", "so does None: the no-icon name is not an icon"},
+            {L"[[icon:]]x", "an empty body stays literal text"},
+            {L"[[icon:file=]]x", "a file= with no path stays literal text"},
+            {L"[[icon:file=\"\"]]x", "a path of nothing but quotes stays literal text"},
+            {L"[[icon:Memory]x", "a missing ]] stays literal text"},
+            {L"[[icon:Memory:sideways]]x", "an unknown modifier stays literal text"},
+        };
+        for (const BadTag &b : badTags) {
+            RowProgram program;
+            CompileRowText(s, b.row, program);
+            WCHAR templateText[256];
+            LinearTemplate(program, b.row, templateText, 256);
+            wprintf(L"    \"%ls\" -> template \"%ls\"\n", b.row, templateText);
+            Check(wcscmp(templateText, b.row) == 0 && program.partCount == 1 &&
+                      program.parts[0].kind == kPartText,
+                  b.label);
         }
-        Check(ResolveIconStyle(s, 0) == 2, "row 1 uses its own glyph");
-        Check(ResolveIconStyle(s, 1) == 1, "row 2 can differ from row 1");
-        Check(ResolveIconStyle(s, 2) == 2, "an unset row inherits the first configured glyph");
-        Check(ResolveIconStyle(s, 3) == 2, "every unset row inherits the same glyph");
-        Check(IconPlateDiameter(s, 0) == IconPlateDiameter(s, 1),
-              "all plates share one size so geometry stays in sync");
 
-        // Setting only row 1 must give every row a plate, or the default config
-        // would look broken on rows 2..4.
-        LOCAL_SETTINGS(onlyFirst, g_iconOnlyFirst);
-        onlyFirst.fontSize = 15;
-        onlyFirst.rowHeight = 30;
-        onlyFirst.icons[0].style = 5;
-        for (int i = 0; i < kMaxRows; i++) {
-            Check(IconPlateDiameter(onlyFirst, i) > 0.0f, "one configured icon covers all rows");
-        }
+        // A row with no tag pays nothing: one text element, and no icon element anywhere in
+        // the program (including the tails only a failing ring could reach).
+        const WCHAR plainProgramRow[] = L"CPU 12%  RAM 73%";
+        RowProgram plainProgram;
+        CompileRowText(s, plainProgramRow, plainProgram);
+        Check(plainProgram.partCount == 1, "a row with no icon tag compiles to one element");
+        Check(!ProgramHasKind(plainProgram, kPartIcon),
+              "and contains no icon element at all: unconfigured costs nothing");
 
-        // 1. One plate per row: the plate centres must be one row apart and must
-        //    start at the first row's centre, not at the panel's centre.
-        printf("  rows  panel h  plate ys (local)\n");
+        // The size an icon is drawn at is the size *in effect where it appears*: its own
+        // [[size:NN]] run, else the row's size. The diameter is that size times one ratio,
+        // applied in one place.
+        LOCAL_SETTINGS(sized, g_iconRow);
+        sized.fontSize = 15;
+        sized.rowHeight = 30;
+        printf("    icon diameters: row size %d -> %.2f, run size 24 -> %.2f\n",
+               RowFontSizePx(sized, 0), (double)IconDiameterForFontSize(15),
+               (double)IconDiameterForFontSize(24));
+        Check(ElementFontSizePx(sized, 0, 0) == 15, "an untagged icon takes the row's size");
+        Check(ElementFontSizePx(sized, 0, 24) == 24, "an icon in a [[size:24]] run takes 24");
+        Check(IconDiameterForFontSize(15) == 15.0f * (float)kIconPlateRatio,
+              "the diameter is the size times one ratio (no second formula)");
+        Check(IconDiameterForFontSize(24) > IconDiameterForFontSize(15),
+              "so two sizes are two diameters: the icon follows its own size");
+        Check(IconDiameterForFontSize(24) == IconDiameterForFontSize(24),
+              "and the same size twice is the same diameter");
+        Check(IconDiameterForFontSize(0) == 0.0f, "a zero size is a zero icon");
+
+        // The ripple default is positional: the first icon of a row plays the intro ripples,
+        // every later one stays quiet, and either can be overridden. That is the look the
+        // per-row plate had, kept as the default.
+        Check(IconElementRipples(0, true), "by default the first icon of a row ripples");
+        Check(!IconElementRipples(0, false), "and a later icon does not");
+        Check(IconElementRipples(kIconRippleOn, false), ":ripple overrides the default off");
+        Check(!IconElementRipples(kIconRippleOff, true), ":noripple overrides the default on");
+
+        // A tag with no text around it is still an icon element -- there is no "the icon needs
+        // a text run" rule, and the tag written first is how the default layout looks.
+        const WCHAR onlyIcon[] = L"x[[icon:Memory]]";
+        RowProgram onlyIconProgram;
+        CompileRowText(s, onlyIcon, onlyIconProgram);
+        WCHAR onlyTemplate[256];
+        LinearTemplate(onlyIconProgram, onlyIcon, onlyTemplate, 256);
+        wprintf(L"    \"%ls\" -> template \"%ls\"\n", onlyIcon, onlyTemplate);
+        Check(ProgramHasKind(onlyIconProgram, kPartIcon),
+              "a tag at the very end of a row is still an icon");
+        Check(wcscmp(onlyTemplate, L"x") == 0, "and it is not left in the text template");
+
+        // An icon is an element of a row, so its box is the row's own box: the plan says where
+        // the element starts and how wide it is, and the icon is centred in that row. The old
+        // reported bug was a plate drawn once at the panel's centre, so its ripple came out of
+        // a middle row; the equivalent statement now is that row r's icon centre is row r's
+        // centre, and never the panel's.
+        LOCAL_SETTINGS(boxed, g_iconPlanSame);
+        boxed.fontSize = 15;
+        boxed.rowHeight = 30;
+        boxed.rowCount = 4;
+        const float iconD = IconDiameterForFontSize(15);
+        printf("  rows  panel h  icon centre y (local)  diameter\n");
         for (int rowCount = 1; rowCount <= kMaxRows; rowCount++) {
-            float panelH = (float)(rowCount * s.rowHeight);
+            const float panelH = (float)PanelRowsHeight(boxed, rowCount);
             printf("  %4d  %7.0f  ", rowCount, panelH);
             for (int r = 0; r < rowCount; r++) {
-                float px = 0.0f, py = 0.0f;
-                const float rowTop = (float)(r * s.rowHeight);
-                IconPlateCenterForRow(s, r, rowTop, (float)s.rowHeight, &px, &py);
-                printf("%.0f ", py);
-                // The centre has to be the middle of *that* row, and the plate has to
-                // fit inside it. A "panel centre only coincides with a plate on one row"
-                // check used to sit here whose condition was algebraically identical to
-                // its conclusion -- it could not fail, and so proved nothing.
-                Check(py == rowTop + s.rowHeight / 2.0f,
-                      "each plate is centred in its own row");
-                Check(py - IconPlateDiameter(s, r) / 2.0f >= rowTop - 0.01f &&
-                          py + IconPlateDiameter(s, r) / 2.0f <= rowTop + s.rowHeight + 0.01f,
-                      "and the whole plate fits inside that row");
+                const float rowTop = (float)RowTopPx(boxed, r);
+                const float rowH = (float)RowHeightPx(boxed, r);
+                float cx = 0.0f, cy = 0.0f;
+                IconElementCenter(kRowTextLeftInset, iconD, rowTop, rowH, &cx, &cy);
+                printf("%.0f ", cy);
+                // The centre has to be the middle of *that* row, and the element has to fit
+                // inside it. A "panel centre only coincides with an icon on one row" check
+                // used to sit here whose condition was algebraically identical to its
+                // conclusion -- it could not fail, and so proved nothing.
+                Check(cy == rowTop + rowH / 2.0f, "each icon is centred in its own row");
+                Check(cy - iconD / 2.0f >= rowTop - 0.01f &&
+                          cy + iconD / 2.0f <= rowTop + rowH + 0.01f,
+                      "and the whole icon fits inside that row");
+                Check(cx - iconD / 2.0f == kRowTextLeftInset,
+                      "the icon's left edge is where the row's flow put it");
             }
             printf("\n");
         }
 
-        // Ripples must be emitted per plate, each from its own centre. Two icons
-        // therefore means two ripple origins.
+        // Ripples are emitted per icon, from that icon's own centre. Counting the origins of
+        // a 4-row panel is how "the ripples come from the wrong row" stays caught.
         {
+            const float H = (float)PanelRowsHeight(boxed, kMaxRows);
             int rippleOrigins = 0;
             float ys[kMaxRows] = {};
-            for (int r = 0; r < 4; r++) {
-                float px = 0.0f, py = 0.0f;
-                IconPlateCenterForRow(s, r, (float)(r * s.rowHeight), (float)s.rowHeight,
-                                      &px, &py);
-                if (IconPlateDiameter(s, r) > 0.0f) {
-                    ys[rippleOrigins++] = py;
-                }
+            for (int r = 0; r < kMaxRows; r++) {
+                const float rowTop = (float)RowTopPx(boxed, r);
+                float cx = 0.0f, cy = 0.0f;
+                IconElementCenter(kRowTextLeftInset, iconD, rowTop, (float)RowHeightPx(boxed, r),
+                                  &cx, &cy);
+                ys[rippleOrigins++] = cy;
             }
-            printf("  4 rows, 2 icons -> %d ripple origins at y = ", rippleOrigins);
+            printf("  4 rows -> %d ripple origins at y = ", rippleOrigins);
             for (int i = 0; i < rippleOrigins; i++) printf("%.0f ", ys[i]);
             printf("\n");
-            Check(rippleOrigins == 4, "every row with a plate is a ripple origin");
-            Check(ys[0] != ys[1], "the two origins are at different heights");
+            Check(rippleOrigins == kMaxRows, "every row with an icon is a ripple origin");
+            Check(ys[0] != ys[1], "two icons are at two different heights");
+            const float panelCentreY = H / 2.0f;
+            Check(ys[0] != panelCentreY, "the first origin is not the panel centre");
+            Check(ys[0] < panelCentreY, "the first origin is on the first row");
         }
 
-        // The plate and its rings are different sizes but must share one centre.
-        // This is the assertion that pins the reported symptom: the rings have to
-        // come out of the plate, not from somewhere near it.
-        // The plate and its rings are different sizes but share one centre. Both painters
-        // take that centre from this geometry value, so a check that reads the centre out
-        // of the struct twice ("ring centre == plate centre") is algebraically true and
-        // cannot fail -- there was one here, and it proved nothing. What is worth
-        // asserting is that the value itself is sane: the plate has to fit the panel.
-        printf("\n  row  plate centre      plate r  ring r(0)  r(0.5)  r(1)\n");
-        for (int r = 0; r < 4; r++) {
-            IconGeometry g = ComputeIconGeometry(s, r, (float)(r * s.rowHeight));
-            if (!g.present) continue;
-
-            float r0 = RingRadiusAt(g, 0, 0.0);
-            float rMid = RingRadiusAt(g, 0, 0.5);
-            float rEnd = RingRadiusAt(g, 0, 1.0);
-            printf("  %3d  (%6.1f,%6.1f)  %7.1f  %7.1f  %6.1f  %5.1f\n",
-                   r + 1, g.centerX, g.centerY, g.plateRadius, r0, rMid, rEnd);
-            Check(g.centerX - g.plateRadius >= 0.0f,
-                  "the plate stays inside the panel's left edge");
-
-            // Sizes differ on purpose, and the rings must always be the larger of
-            // the two: a ring smaller than the plate would sit on the glyph.
-            Check(g.plateRadius != rEnd, "rings and plate have different sizes");
-            Check(r0 >= g.plateRadius - 0.01f, "the innermost ring starts at the plate edge");
-            Check(rEnd > g.plateRadius, "rings expand outward past the plate");
+        // The icon and its rings differ in size on purpose and share exactly one centre, which
+        // is what pins the reported symptom ("the ripple did not come out of the icon"): the
+        // rings have to come out of the disc, not from somewhere near it.
+        printf("\n  icon r  ring r(0)  r(0.5)  r(1)\n");
+        {
+            const float iconRadius = iconD / 2.0f;
+            const float r0 = RingRadiusAt(iconRadius, 0, 0.0);
+            const float rMid = RingRadiusAt(iconRadius, 0, 0.5);
+            const float rEnd = RingRadiusAt(iconRadius, 0, 1.0);
+            printf("  %6.1f  %8.1f  %6.1f  %5.1f\n", (double)iconRadius, (double)r0,
+                   (double)rMid, (double)rEnd);
+            // Sizes differ on purpose, and the rings must always be the larger of the two: a
+            // ring smaller than the disc would sit on the glyph.
+            Check(r0 != rEnd, "rings and the icon have different sizes");
+            Check(r0 >= iconRadius - 0.01f, "the innermost ring starts at the icon's edge");
+            Check(rEnd > iconRadius, "rings expand outward past the icon");
             Check(rMid > r0 && rEnd > rMid, "ring radius grows with progress");
+            Check(rEnd == iconRadius * (float)kRippleScaleEnd[0],
+                  "the outermost radius is the icon radius times the ripple scale");
+            // The scale table is what the ring radii are built from, so a shorter one must not
+            // be read past its end.
+            Check(RingRadiusAt(iconRadius, 2, 1.0) == RingRadiusAt(iconRadius, 5, 1.0),
+                  "a ring index past the table reads the last entry, not past the array");
         }
 
-        // 2. The ripple's anchor must be the first row's plate, and the plate must
-        //    be drawn under the same transform as the ripple.
+        // The intro scales the capsule **about its centre**, and the painter hands
+        // these three fields straight to the GDI+ matrix, so the fields are what is
+        // asserted here. (An ApplyPanelTransform() used to live in the mod for this
+        // arithmetic; nothing but this test called it, so it is gone and the
+        // properties are stated the way GDI+ maps a point: x*scale + dx.)
         {
             const float W = 440.0f;
-            const float H = 4.0f * s.rowHeight;   // 4 rows, 120 px
-            float anchorX = 0.0f, anchorY = 0.0f;
-            IconPlateCenterForRow(s, 0, 0.0f, (float)s.rowHeight, &anchorX, &anchorY);
-            float panelCentreY = H / 2.0f;
-            printf("  4-row panel: first origin y=%.1f, panel centre y=%.1f, "
-                   "error=%.1f px\n", anchorY, panelCentreY, panelCentreY - anchorY);
-            Check(anchorY != panelCentreY, "first origin is not the panel centre");
-            Check(anchorY < panelCentreY, "first origin is on the first row");
-
-            // The intro scales the capsule **about its centre**, and the painter hands
-            // these three fields straight to the GDI+ matrix, so the fields are what is
-            // asserted here. (An ApplyPanelTransform() used to live in the mod for this
-            // arithmetic; nothing but this test called it, so it is gone and the
-            // properties are stated the way GDI+ maps a point: x*scale + dx.)
+            const float H = (float)PanelRowsHeight(boxed, kMaxRows);
             PanelTransform t = ComputePanelTransform(W, H, 0.94, true);
             Check(t.active && t.scale > 0.93f && t.scale < 0.95f,
                   "a mid-intro frame is an active 0.94 transform");
@@ -521,11 +619,41 @@ int main() {
                    t.scale, t.dx, t.dy, W / 2.0f, H / 2.0f);
         }
 
-        // With no icon anywhere there is no plate, so there must be no ripple.
-        LOCAL_SETTINGS(noIcon, g_iconNone);
-        Check(IconPlateDiameter(noIcon, 0) == 0.0f, "no icon means no ripple origin");
-        Check(!AnyIconConfigured(noIcon), "a default config has no icons at all");
-        Check(IconPlateDiameter(s, 0) > 0.0f, "an icon provides a ripple origin");
+        // No icon tag means no icon element, and therefore no ripple origin anywhere. Asked
+        // through the same pipeline the painter reads (instantiate -> strip), not through a
+        // second implementation of the tag rules.
+        {
+            struct RowCase {
+                const WCHAR *row;
+                int expectIcons;
+            };
+            const RowCase cases[] = {
+                {L"CPU 12%  RAM 73%", 0},
+                {L"[[icon:Memory]]CPU", 1},
+                {L"CPU [[icon:CPU]] RAM [[icon:Disk]]", 2},
+                {L"[[icon:Bogus]]CPU", 0},
+            };
+            for (const RowCase &c : cases) {
+                WCHAR marked[640];
+                RingSpec rings[kMaxRingsPerRow];
+                int ringCount = 0;
+                MarkRow(c.row, Values(), boxed, marked, 640, rings, &ringCount, kMaxRingsPerRow);
+                RowState state = {};
+                BuildRowLayout(marked, ringCount, state, 0);
+                int icons = 0;
+                for (int s = 0; s < state.segmentCount[0]; s++) {
+                    if (state.segments[0][s].offset == kIconSegOffset) icons++;
+                }
+                wprintf(L"    \"%ls\" -> %d icon segment(s) (expect %d)\n", c.row, icons,
+                        c.expectIcons);
+                Check(icons == c.expectIcons, "the row's icon elements are the tags it wrote");
+                if (c.expectIcons == 0) {
+                    Check(state.segmentCount[0] == 1 &&
+                              state.segments[0][0].offset == 0,
+                          "and a row with no icon is one plain text segment");
+                }
+            }
+        }
     }
 
     printf("\n=== intro curve shape ===\n");
@@ -753,201 +881,90 @@ int main() {
         Check(wcslen(tiny) < 8, "a short destination is still terminated");
     }
 
-    printf("\n=== icon resolution: glyph fallback, explicit None, global image ===\n");
+    printf("\n=== inline icon images: one cache entry per file, bounded ===\n");
     {
-        // The failure mode behind the fallback: the image cannot be decoded, the painter
-        // asks for that row's glyph and gets 0, and the row shows an empty plate -- which
-        // reads as "the icon turned white", not as "that path did not load".
-        const StubSetting *savedStrings = g_stubStrings;
-        const int savedStringCount = g_stubStringCount;
-        LOCAL_SETTINGS(s, g_iconPath);
-        const WCHAR *global = L"C:\\pics\\global.png";
-        const WCHAR *row2File = L"C:\\pics\\row2.png";
+        // The image cache used to be one slot per settings row (Icon1..Icon4), which cannot
+        // express an inline icon: one row can show a file twice, and two rows can show it too,
+        // and both must share one decode. It is a small fixed table keyed by the resolved path
+        // now, with a stated eviction rule -- an unused entry first, else the least recently
+        // used one, whose images are disposed before it is reused.
+        //
+        // Only the bookkeeping is exercised here: IconCachePick allocates nothing and
+        // ReleaseIconEntry disposes nothing while the entry is empty, so this runs without
+        // GDI+ -- which is also why the eviction rule can be asserted at all.
+        DisposeIconImage();
+        Check(kIconCacheSlots >= 2, "the icon image cache holds more than one file");
 
-        const StubSetting mixed[] = {
-            // Rows first: a per-row setting only reaches a row that is actually drawn, so these
-            // tables have to declare the rows they talk about. That is also the shape of the
-            // real configuration -- the icon of a row that does not exist is not read.
-            {L"Row1", L"CPU"},
-            {L"Row2", L"GPU"},
-            {L"Icon1", L""},
-            {L"Icon1Path", L"C:\\pics\\does-not-exist.png"},
-            {L"Icon2", L"Network"},
-        };
-        g_stubStrings = mixed;
-        g_stubStringCount = (int)(sizeof(mixed) / sizeof(mixed[0]));
-        ReadSettings(s);
-        Check(ResolveIconStyle(s, 0) == 4, "an image-only row falls back to the configured glyph");
-        Check(s.icons[0].style == 0,
-              "and that fallback is resolved, not written into the slot");
-        Check(ResolveIconStyle(s, 1) == 4, "the row that chose it keeps its own");
-
-        const StubSetting imageOnly[] = {
-            {L"Row1", L"CPU"},
-            {L"Icon1", L""},
-            {L"Icon1Path", L"C:\\pics\\does-not-exist.png"},
-        };
-        g_stubStrings = imageOnly;
-        g_stubStringCount = (int)(sizeof(imageOnly) / sizeof(imageOnly[0]));
-        ReadSettings(s);
-        Check(ResolveIconStyle(s, 0) == 2,
-              "with no glyph anywhere an image-only row falls back to Memory");
-
-        // An explicit None means "this row has no icon". Measured before the fix:
-        // Icon1=Memory + Icon3=None handed row 3 the Memory glyph, because None was
-        // indistinguishable from "never configured" and fell through to the inherit
-        // branch -- so README's "set it to None to leave a row without an icon" was
-        // simply untrue.
-        const StubSetting noneRow[] = {
-            {L"Row1", L"CPU"},
-            {L"Row2", L"GPU"},
-            {L"Row3", L"DISK"},
-            {L"Row4", L"MEM"},
-            {L"IconPath", global},
-            {L"Icon1", L"Memory"},
-            {L"Icon3", L"None"},
-        };
-        g_stubStrings = noneRow;
-        g_stubStringCount = (int)(sizeof(noneRow) / sizeof(noneRow[0]));
-        ReadSettings(s);
-        Check(ResolveIconStyle(s, 2) == 0, "an explicit None leaves that row without a glyph");
-        Check(ResolveIconPath(s, 2)[0] == 0, "and without the global image either");
-        Check(ResolveIconSlot(s, 2) == -1, "so it takes no image cache slot");
-        Check(ResolveIconStyle(s, 1) == 2 && ResolveIconStyle(s, 3) == 2,
-              "while the rows around it still inherit the chosen glyph");
-
-        // ... and None must not become the glyph every other row inherits.
-        const StubSetting noneFirst[] = {{L"Row1", L"CPU"},
-                                         {L"Row2", L"GPU"},
-                                         {L"Row3", L"DISK"},
-                                         {L"Icon1", L"None"},
-                                         {L"Icon2", L"Network"}};
-        g_stubStrings = noneFirst;
-        g_stubStringCount = (int)(sizeof(noneFirst) / sizeof(noneFirst[0]));
-        ReadSettings(s);
-        Check(ResolveIconStyle(s, 2) == 4,
-              "an unconfigured row inherits the first real glyph, not a None");
-        Check(ResolveIconStyle(s, 0) == 0, "and the row that said None has none");
-
-        // The global image: every row without a file of its own shows it, including the
-        // default configuration where Icon1 chose a glyph, and all of them share one
-        // cache slot so the file is decoded and resampled once.
-        const StubSetting globalOnly[] = {{L"Row1", L"CPU"},
-                                          {L"Row2", L"GPU"},
-                                          {L"Row3", L"DISK"},
-                                          {L"Row4", L"MEM"},
-                                          {L"IconPath", global}};
-        g_stubStrings = globalOnly;
-        g_stubStringCount = (int)(sizeof(globalOnly) / sizeof(globalOnly[0]));
-        ReadSettings(s);
-        printf("  global image only -> row1 path=%ls slot=%d, row4 slot=%d\n",
-               ResolveIconPath(s, 0), ResolveIconSlot(s, 0), ResolveIconSlot(s, 3));
-        Check(wcscmp(ResolveIconPath(s, 0), global) == 0,
-              "the global icon applies to a row that has no file of its own");
-        Check(ResolveIconSlot(s, 0) == 0 && ResolveIconSlot(s, 3) == 0,
-              "every row shares one cache slot, so the file is decoded once");
-        Check(AnyIconConfigured(s), "a global icon on its own still means plates are drawn");
-
-        // A row's own file wins over the global one, and a second row that names the same
-        // file as the global shares the global's slot rather than loading it again.
-        const StubSetting mixedPaths[] = {
-            {L"Row1", L"CPU"},
-            {L"Row2", L"GPU"},
-            {L"Row3", L"DISK"},
-            {L"Row4", L"MEM"},
-            {L"IconPath", global},
-            {L"Icon2Path", row2File},
-            {L"Icon3Path", global},
-        };
-        g_stubStrings = mixedPaths;
-        g_stubStringCount = (int)(sizeof(mixedPaths) / sizeof(mixedPaths[0]));
-        ReadSettings(s);
-        printf("  global + row2 file + row3 repeats global -> slots: %d %d %d %d\n",
-               ResolveIconSlot(s, 0), ResolveIconSlot(s, 1), ResolveIconSlot(s, 2),
-               ResolveIconSlot(s, 3));
-        Check(ResolveIconSlot(s, 1) == 1, "a row's own file gets its own cache slot");
-        Check(ResolveIconSlot(s, 2) == 0, "a row that names the global file shares row 1's slot");
-        Check(ResolveIconSlot(s, 3) == 0,
-              "and so does a row that inherits the global image");
-        Check(wcscmp(ResolveIconPath(s, 0), global) == 0,
-              "the per-row file does not leak to the rows the global covers");
-
-        // Without a global image, the documented per-row inheritance still holds: setting
-        // only row 1's file means every row uses it, and they all share its slot.
-        const StubSetting inheritFile[] = {{L"Row1", L"CPU"},
-                                           {L"Row2", L"GPU"},
-                                           {L"Row3", L"DISK"},
-                                           {L"Row4", L"MEM"},
-                                           {L"Icon1Path", row2File},
-                                           {L"Icon2", L"Network"}};
-        g_stubStrings = inheritFile;
-        g_stubStringCount = (int)(sizeof(inheritFile) / sizeof(inheritFile[0]));
-        ReadSettings(s);
-        Check(wcscmp(ResolveIconPath(s, 3), row2File) == 0 &&
-                  ResolveIconSlot(s, 3) == 0,
-              "one row's file still covers the rows after it when there is no global image");
-
-        const StubSetting noIcons[] = {{L"Row1", L"CPU"}, {L"Icon1", L"None"}};
-        g_stubStrings = noIcons;
-        g_stubStringCount = (int)(sizeof(noIcons) / sizeof(noIcons[0]));
-        ReadSettings(s);
-        Check(s.iconCount == 0 && ResolveIconStyle(s, 0) == 0 && !AnyIconConfigured(s),
-              "with nothing configured at all no row gets a plate");
-
-        // A gap in the rows must not shift the icons: IconN belongs to RowN, and the row that
-        // is drawn second is Row3 here. Pairing icons with the Nth *drawn* row instead (which
-        // is what the code did before this was asserted) hands Icon2 -- an unconfigured slot
-        // -- to Row3 and shifts every icon below the gap by one.
-        {
-            const StubSetting gap[] = {
-                {L"Row1", L"CPU"},
-                {L"Row2", L""},          // left empty: skipped in the published order
-                {L"Row3", L"GPU"},
-                {L"Icon1", L"Memory"},
-                {L"Icon3", L"Disk"},
-            };
-            g_stubStrings = gap;
-            g_stubStringCount = (int)(sizeof(gap) / sizeof(gap[0]));
-            ReadSettings(s);
-            printf("  Row2 empty: rows=%d, published icons = %d, %d\n", s.rowCount,
-                   ResolveIconStyle(s, 0), ResolveIconStyle(s, 1));
-            Check(s.rowCount == 2, "the empty row is skipped");
-            Check(ResolveIconStyle(s, 0) == 2, "the first drawn row keeps Icon1");
-            Check(ResolveIconStyle(s, 1) == 3,
-                  "and the second drawn row (settings Row3) gets Icon3, not Icon2");
+        WCHAR names[kIconCacheSlots + 1][64];
+        for (int i = 0; i <= kIconCacheSlots; i++) {
+            swprintf(names[i], 64, L"C:\\pics\\icon%d.png", i);
         }
 
-        // An icon configured on a row that is left empty is still a configuration. Dropping it
-        // because the row has no text is how `Icon1 = Memory` alone stopped giving any row a
-        // plate -- the option looked dead on a real machine (2026-10-14), because the
-        // inheritance source ("a row with no icon of its own inherits the first configured
-        // one") had been removed from the table.
-        {
-            const StubSetting emptyFirst[] = {
-                {L"Row1", L""},          // the row that carries the only *configured* icon
-                {L"Row2", L"GPU"},
-                {L"Row3", L"DISK"},
-                {L"Icon1", L"Memory"},
-            };
-            g_stubStrings = emptyFirst;
-            g_stubStringCount = (int)(sizeof(emptyFirst) / sizeof(emptyFirst[0]));
-            ReadSettings(s);
-            printf("  Row1 empty + Icon1 only: rows=%d, styles = %d, %d\n", s.rowCount,
-                   ResolveIconStyle(s, 0), ResolveIconStyle(s, 1));
-            Check(s.rowCount == 2, "the empty first row is skipped");
-            Check(ResolveIconStyle(s, 0) == 2,
-                  "an icon set on an empty row still covers the rows that are drawn");
-            Check(AnyIconConfigured(s), "so the text column still leaves room for a plate");
-        }
+        const int first = IconCachePick(names[0]);
+        printf("    %d slot(s); \"%ls\" -> %d\n", kIconCacheSlots, names[0], first);
+        Check(first >= 0 && first < kIconCacheSlots, "a new file takes a slot inside the table");
+        Check(IconCacheFind(names[0]) == first, "and the entry records the path it belongs to");
+        Check(IconCachePick(names[0]) == first, "asking for the same path again is the same slot");
 
-        g_stubStrings = savedStrings;
-        g_stubStringCount = savedStringCount;
+        // Windows paths are case-insensitive, so two spellings of one file must not decode it
+        // twice: the lookup folds case.
+        WCHAR shouted[64];
+        wcscpy(shouted, names[0]);
+        for (WCHAR *c = shouted; *c; c++) {
+            if (*c >= L'a' && *c <= L'z') *c = (WCHAR)(*c - L'a' + L'A');
+        }
+        Check(IconCacheFind(shouted) == first, "the path lookup folds case, like the filesystem");
+
+        // Fill the table. Every distinct path gets its own entry until the table is full.
+        int used = 1;
+        bool distinct = true;
+        for (int i = 1; i < kIconCacheSlots; i++) {
+            const int slot = IconCachePick(names[i]);
+            if (IconCacheFind(names[i]) != slot) distinct = false;
+            if (slot == first) distinct = false;
+            used++;
+        }
+        Check(distinct, "every distinct file gets its own entry while there is room");
+        Check(used == kIconCacheSlots, "and the table is now full");
+        Check(IconCacheFind(names[0]) == first && IconCacheFind(names[1]) == 1,
+              "every file is still findable once the table is full");
+        Check(IconCacheFind(names[kIconCacheSlots]) < 0, "a file that was never asked for is not");
+
+        // The eviction rule, isolated: touching entry 0 makes entry 1 the least recently used
+        // one, so the next new file has to take entry 1's slot and not entry 0's.
+        printf("    touching \"%ls\", then asking for \"%ls\"\n", names[0],
+               names[kIconCacheSlots]);
+        IconCachePick(names[0]);
+        const int evicted = IconCachePick(names[kIconCacheSlots]);
+        printf("    evicted slot %d (entry 1 was the least recently used)\n", evicted);
+        Check(evicted != first, "the most recently used entry is the one that survives");
+        Check(IconCacheFind(names[1]) < 0, "the least recently used entry is the one evicted");
+        Check(IconCacheFind(names[0]) == first, "and the entry that was touched is still there");
+        Check(IconCacheFind(names[kIconCacheSlots]) == evicted,
+              "the new file took the evicted entry's slot");
+
+        // The bound is the point of the table: however many files a panel names, the number of
+        // live entries never grows past the table.
+        int live = 0;
+        for (int i = 0; i < kIconCacheSlots; i++) {
+            if (g_iconCache[i].used) live++;
+        }
+        Check(live <= kIconCacheSlots, "the cache never holds more files than it has slots");
+
+        // Release everything, so a later section cannot see this state.
+        DisposeIconImage();
+        int afterRelease = 0;
+        for (int i = 0; i < kIconCacheSlots; i++) {
+            if (g_iconCache[i].used) afterRelease++;
+        }
+        Check(afterRelease == 0, "disposing the icon images empties every entry");
+        Check(IconCacheFind(names[0]) < 0, "so nothing is remembered after a settings change");
     }
 
     printf("\n=== custom icon resampling plan ===\n");
     {
-        // The plate diameter follows FontSize, so a loaded file has to be brought
-        // down to whatever that currently is. Two things must hold:
+        // A loaded file has to be brought down to the icon's own pixel size. Two things must
+        // hold:
         //
         //   * a large source is reduced in several steps, not one. A single big
         //     reduction makes GDI+ sample only a few source pixels (aliasing).
@@ -2054,49 +2071,41 @@ int main() {
             Check(PanelRowsHeight(s, 4) == RowTopPx(s, 4),
                   "the panel height is the top of the row just past the last one");
 
-            // The plate follows the **global** Font size, never a row's own size. Making it
-            // follow the row was a bug the user reported: setting one row larger also redrew
-            // its icon larger, which is not what the row asked for, and it dragged the shared
-            // text column around with it.
-            LOCAL_SETTINGS(icons, g_metricIcons);
+            // The icon diameter follows the size *in effect where the icon is written*, which
+            // is the rule the user reported twice (once per direction): a plate that follows a
+            // global size redraws every icon when one row's size changes, and a plate that
+            // follows the row ignores "make just these characters bigger". The two sizes below
+            // are the two elements of one row, and they must differ.
+            LOCAL_SETTINGS(icons, g_iconSize);
             icons.fontSize = 15;
             icons.rowHeight = 30;
-            icons.icons[0].style = 2;
             icons.rowFontSize[1] = 24;
             icons.rowMaxFontSize[1] = 24;
-            printf("    plate diameters: %f %f (row 2 draws at %d px)\n", IconPlateDiameter(icons, 0),
-                   IconPlateDiameter(icons, 1), RowFontSizePx(icons, 1));
-            Check(IconPlateDiameter(icons, 1) == IconPlateDiameter(icons, 0),
-                  "a row with a bigger font keeps the same plate: icons follow Font size");
-            Check(MaxIconPlateDiameter(icons) == IconPlateDiameter(icons, 0),
-                  "and the shared text inset is that one plate size");
-
-            // A row with no plate must not collapse the inset for the rows that have one.
-            LOCAL_SETTINGS(noneFirst, g_metricNoneFirst);
-            noneFirst.fontSize = 15;
-            noneFirst.rowHeight = 30;
-            noneFirst.icons[0].styleSet = true;   // explicit None on row 1
-            noneFirst.icons[0].style = 0;
-            noneFirst.icons[1].style = 2;         // Memory on row 2
-            Check(IconPlateDiameter(noneFirst, 0) == 0.0f, "the first row can have no plate");
-            Check(MaxIconPlateDiameter(noneFirst) > 0.0f,
-                  "while the inset still reserves room for the plate below it");
+            const float rowIcon = IconDiameterForFontSize(ElementFontSizePx(icons, 0, 0));
+            const float rowIcon32 = IconDiameterForFontSize(ElementFontSizePx(icons, 0, 32));
+            printf("    icon diameters: %.2f at the row's size, %.2f inside [[size:32]]\n",
+                   (double)rowIcon, (double)rowIcon32);
+            Check(rowIcon == (float)15 * (float)kIconPlateRatio,
+                  "an icon at the row's size uses the row's font size");
+            Check(rowIcon32 == (float)32 * (float)kIconPlateRatio,
+                  "an icon inside a run uses the run's size");
+            Check(rowIcon32 != rowIcon,
+                  "so two icons in one row at two sizes are two diameters");
+            Check(RowHeightPx(icons, 1) >= MinimumRowHeightForFont(24),
+                  "a row with its own larger size keeps a box that holds it");
         }
 
         // --- RowMetrics: one owner for every derived pixel size ---
         //
-        // The sizes used to be worked out at each use site and drifted apart (the plate
-        // followed a row's font while the shared text column did not). These assertions pin
-        // the single derivation the drawing code now reads: given the two numbers a row has,
-        // what size is its text, how tall is its box, how big is its plate.
+        // The sizes used to be worked out at each use site and drifted apart. These assertions
+        // pin the single derivation the drawing code now reads: given the two numbers a row
+        // has, what size is its text and how tall is its box. An icon's diameter is
+        // deliberately *not* here -- it belongs to the element, not to the row (see the
+        // [[size:NN]] run assertions below).
         {
             LOCAL_SETTINGS(s, g_sizeRun);
             s.fontSize = 15;
             s.rowHeight = 30;
-            s.icons[0].style = 2;                          // row 1: Memory
-            s.icons[1].styleSet = true;                    // row 2: explicit None
-            s.icons[1].style = 0;
-            s.icons[2].style = 2;                          // row 3: Memory, with its own metrics
             s.rowFontSize[1] = 24;
             s.rowHeightPx[1] = 40;
             s.rowFontSize[2] = 32;
@@ -2105,10 +2114,8 @@ int main() {
             const RowMetrics r0 = MetricsForRow(s, 0);
             const RowMetrics r1 = MetricsForRow(s, 1);
             const RowMetrics r2 = MetricsForRow(s, 2);
-            printf("    RowMetrics: r0 f=%g h=%g plate=%g | r1 f=%g h=%g plate=%g | "
-                   "r2 f=%g h=%g plate=%g\n", r0.fontSize, r0.lineHeight, r0.plateDiameter,
-                   r1.fontSize, r1.lineHeight, r1.plateDiameter, r2.fontSize, r2.lineHeight,
-                   r2.plateDiameter);
+            printf("    RowMetrics: r0 f=%g h=%g | r1 f=%g h=%g | r2 f=%g h=%g\n", r0.fontSize,
+                   r0.lineHeight, r1.fontSize, r1.lineHeight, r2.fontSize, r2.lineHeight);
 
             Check(r0.fontSize == 15.0f && r0.lineHeight == 30.0f,
                   "a row that inherits the global metrics reports them");
@@ -2117,15 +2124,12 @@ int main() {
             Check(r2.fontSize == 32.0f &&
                       r2.lineHeight == (float)MinimumRowHeightForFont(32),
                   "and a row whose font raises its floor reports the floored height");
-            Check(r0.plateDiameter == (float)15 * (float)kIconPlateRatio,
-                  "the plate diameter comes from the global Font size");
-            Check(r1.plateDiameter == 0.0f, "an explicit None means no plate at all");
-            Check(r2.plateDiameter == r0.plateDiameter,
-                  "a row drawn at 32 px still has the 15 px plate: the two are independent");
             // The relationship, not the number: whatever the table says, a row's box has to
             // hold the text that row draws at its largest.
             Check(r2.lineHeight >= (float)MinimumRowHeightForFont((int)r2.fontSize),
                   "every row's box holds at least its own font");
+            Check(sizeof(RowMetrics) == 2 * sizeof(float),
+                  "RowMetrics is two numbers: an icon size that pretended to be per-row is gone");
         }
 
         // --- ReadSettings wiring ---
@@ -2562,17 +2566,16 @@ int main() {
                         g_layoutEpoch++;   // a publish happened, so any plan is stale
 
                         const float planWidth = 380.0f;
-                        const float planInset = 12.0f;
                         const int planFontSize = 15;
                         const float planRowHeight = 30.0f;
 
                         const unsigned before = g_measureCalls;
                         const RowLayoutPlan *built = EnsureRowPlan(
-                            graphics, font, format, 0, 1, planWidth, planInset, planFontSize,
+                            graphics, font, format, 0, 1, planWidth, planFontSize,
                             planRowHeight, false);
                         const unsigned afterBuild = g_measureCalls;
                         const RowLayoutPlan *reused = EnsureRowPlan(
-                            graphics, font, format, 0, 1, planWidth, planInset, planFontSize,
+                            graphics, font, format, 0, 1, planWidth, planFontSize,
                             planRowHeight, false);
                         const unsigned afterReuse = g_measureCalls;
                         printf("    layout plan: %d segments, measure build=%lu reuse=%lu\n",
@@ -2589,19 +2592,22 @@ int main() {
                         // these is a change that arrives *without* the text changing.
                         struct PlanChange {
                             const char *what;
-                            float width, inset, rowHeight;
+                            float width, rowHeight;
                             int fontSize;
                         };
+                        // The row's left inset used to be a key field of its own (the shared
+                        // icon plate column sized it). It is a constant now -- an inline icon
+                        // moves the text it is written next to, and nothing else -- so there is
+                        // nothing left for a test to vary.
                         const PlanChange changes[] = {
-                            {"width", planWidth + 20.0f, planInset, planRowHeight, planFontSize},
-                            {"inset", planWidth, planInset + 5.0f, planRowHeight, planFontSize},
-                            {"row height", planWidth, planInset, planRowHeight + 8.0f, planFontSize},
-                            {"font size", planWidth, planInset, planRowHeight, planFontSize + 3},
+                            {"width", planWidth + 20.0f, planRowHeight, planFontSize},
+                            {"row height", planWidth, planRowHeight + 8.0f, planFontSize},
+                            {"font size", planWidth, planRowHeight, planFontSize + 3},
                         };
                         for (const PlanChange &c : changes) {
                             const unsigned was = g_measureCalls;
                             const RowLayoutPlan *again = EnsureRowPlan(
-                                graphics, font, format, 0, 1, c.width, c.inset, c.fontSize,
+                                graphics, font, format, 0, 1, c.width, c.fontSize,
                                 c.rowHeight, false);
                             printf("      %-11s -> remeasured %lu\n", c.what,
                                    (unsigned long)(g_measureCalls - was));
@@ -2609,12 +2615,12 @@ int main() {
                             // And the rebuilt plan records the key it was built with. Comparing
                             // pointers would prove nothing here: a plan is a fixed slot per row,
                             // so the address is the same whether it was rebuilt or not.
-                            Check(again->width == c.width && again->leftInset == c.inset &&
+                            Check(again->width == c.width &&
                                       again->rowHeight == c.rowHeight &&
                                       again->rowFontSize == c.fontSize,
                                   "and remembers the geometry it was built from");
                             // Put the original key back for the next change in the table.
-                            EnsureRowPlan(graphics, font, format, 0, 1, planWidth, planInset,
+                            EnsureRowPlan(graphics, font, format, 0, 1, planWidth,
                                           planFontSize, planRowHeight, false);
                         }
 
@@ -2645,7 +2651,7 @@ int main() {
                             g_layoutEpoch++;
                             const unsigned was = g_measureCalls;
                             const RowLayoutPlan *afterPublish = EnsureRowPlan(
-                                graphics, font, format, 0, 1, planWidth, planInset, planFontSize,
+                                graphics, font, format, 0, 1, planWidth, planFontSize,
                                 planRowHeight, false);
                             printf("      new sample  -> remeasured %lu, first run \"%ls\" -> \"%ls\"\n",
                                    (unsigned long)(g_measureCalls - was), firstSliceBefore,
@@ -2667,7 +2673,7 @@ int main() {
                             const int savedCount = g_rowState.segmentCount[0];
                             const unsigned wasSegments = g_measureCalls;
                             g_rowState.segmentCount[0] = savedCount > 1 ? savedCount - 1 : 1;
-                            EnsureRowPlan(graphics, font, format, 0, 1, planWidth, planInset,
+                            EnsureRowPlan(graphics, font, format, 0, 1, planWidth,
                                           planFontSize, planRowHeight, false);
                             printf("      segment count -> remeasured %lu\n",
                                    (unsigned long)(g_measureCalls - wasSegments));
@@ -2680,22 +2686,22 @@ int main() {
                             // the rebuilt plan is fresh. Without that proof the row-count case
                             // below would rebuild because of leftover staleness and pass for the
                             // wrong reason -- which it did, until this was added.
-                            EnsureRowPlan(graphics, font, format, 0, 1, planWidth, planInset,
+                            EnsureRowPlan(graphics, font, format, 0, 1, planWidth,
                                           planFontSize, planRowHeight, false);
                             const unsigned wasRestore = g_measureCalls;
-                            EnsureRowPlan(graphics, font, format, 0, 1, planWidth, planInset,
+                            EnsureRowPlan(graphics, font, format, 0, 1, planWidth,
                                           planFontSize, planRowHeight, false);
                             Check(g_measureCalls == wasRestore,
                                   "the plan is fresh again under the original key");
 
                             const unsigned wasRows = g_measureCalls;
-                            EnsureRowPlan(graphics, font, format, 0, 2, planWidth, planInset,
+                            EnsureRowPlan(graphics, font, format, 0, 2, planWidth,
                                           planFontSize, planRowHeight, false);
                             printf("      row count     -> remeasured %lu\n",
                                    (unsigned long)(g_measureCalls - wasRows));
                             Check(g_measureCalls > wasRows,
                                   "and so is a row when the panel gains or loses one");
-                            EnsureRowPlan(graphics, font, format, 0, 1, planWidth, planInset,
+                            EnsureRowPlan(graphics, font, format, 0, 1, planWidth,
                                           planFontSize, planRowHeight, false);
                         }
 
@@ -2703,6 +2709,198 @@ int main() {
                         g_rowState = savedState;
                         g_publishedRows = savedRows;
                         g_layoutEpoch = savedEpoch + 1;   // leave nothing stale behind
+                    }
+
+                    // --- inline icons in a plan: their own size, their own box, their own
+                    // ripples ---
+                    //
+                    // This is where "does the icon follow the size where it appears" is decided
+                    // in the product: BuildRowPlan turns each icon element into a box of its
+                    // own, and the frame just reads it. The assertions below are on the plan the
+                    // painter consumes, not on a second derivation the test could keep in sync
+                    // with the bug.
+                    {
+                        LOCAL_SETTINGS(savedSettings, g_planSaved);
+                        savedSettings = g_settings;
+                        const RowState savedState = g_rowState;
+                        const int savedRows = g_publishedRows;
+                        const unsigned savedEpoch = g_layoutEpoch;
+
+                        const float planWidth2 = 420.0f;
+                        const int planFont = 15;
+
+                        // Builds one row's plan and hands it back. The plan is a fixed slot per
+                        // row, so the caller reads it before the next call.
+                        auto ensureIconPlan = [&](const WCHAR *rowText,
+                                                  int rowMaxFont) -> const RowLayoutPlan * {
+                            LOCAL_SETTINGS(s, g_iconPlan);
+                            s.fontSize = planFont;
+                            s.rowHeight = 30;
+                            s.panelWidth = 420;
+                            s.ringSize = 26;
+                            s.ringRightOffset = 12;
+                            s.rowCount = 1;
+                            s.rowMaxFontSize[0] = rowMaxFont;
+                            wcsncpy(s.rows[0], rowText, kRowTextCap - 1);
+                            s.rows[0][kRowTextCap - 1] = L'\0';
+                            // Compiled into the *same* settings object that is published, which
+                            // is what ReadSettings does and what the icon marker's payload
+                            // (an element index) depends on.
+                            CompileRowText(s, s.rows[0], s.rowProgram[0]);
+                            g_settings = s;
+
+                            WCHAR marked[640];
+                            RingSpec rings[kMaxRingsPerRow];
+                            int ringCount = 0;
+                            InstantiateRowProgram(s, 0, Values(), marked, 640, rings, &ringCount,
+                                                  kMaxRingsPerRow);
+                            RowState staged = {};
+                            BuildRowLayout(marked, ringCount, staged, 0);
+                            for (int i = 0; i < ringCount; i++) staged.rings[0][i] = rings[i];
+                            g_rowState = staged;
+                            g_publishedRows = 1;
+                            g_layoutEpoch++;
+                            return EnsureRowPlan(graphics, font, format, 0, 1, planWidth2,
+                                                 planFont, (float)RowHeightPx(s, 0), false);
+                        };
+
+                        // Two icons, two sizes, one row. This is the reported bug in both
+                        // directions: an icon that ignores its own size, and an icon that
+                        // follows a global size instead of the one where it is written.
+                        {
+                            const RowLayoutPlan *plan = ensureIconPlan(
+                                L"[[icon:CPU]][[size:24]][[icon:Memory]][[/size]]tail", 24);
+                            printf("    two icons: segs=%d  d0=%.2f d1=%.2f  x0=%.1f x1=%.1f "
+                                   "x2=%.1f\n",
+                                   plan->segmentCount, (double)plan->segments[0].diameter,
+                                   (double)plan->segments[1].diameter, (double)plan->segments[0].x,
+                                   (double)plan->segments[1].x, (double)plan->segments[2].x);
+                            Check(plan->segmentCount == 3, "the row is two icons and one text run");
+                            Check(plan->segments[0].isIcon && plan->segments[1].isIcon,
+                                  "both icon tags became icon elements");
+                            Check(!plan->segments[2].isIcon, "and the text after them did not");
+                            Check(plan->segments[0].glyph == 1 && plan->segments[1].glyph == 2,
+                                  "each element keeps its own glyph");
+                            Check(plan->segments[0].fontSize == 15 &&
+                                      plan->segments[1].fontSize == 24,
+                                  "the element's size is the run it sits in");
+                            Check(plan->segments[0].diameter == IconDiameterForFontSize(15),
+                                  "so the first icon is the row's size");
+                            Check(plan->segments[1].diameter == IconDiameterForFontSize(24),
+                                  "and the second is the run's size");
+                            Check(plan->segments[0].diameter != plan->segments[1].diameter,
+                                  "two icons in one row at two sizes have two diameters");
+                            Check(plan->segments[1].diameter > plan->segments[0].diameter,
+                                  "and the bigger run is the bigger icon");
+                            // The flow: an element occupies its box, and the next element starts
+                            // after it (plus the one content gap).
+                            Check(plan->segments[1].x ==
+                                      plan->segments[0].x + plan->segments[0].diameter +
+                                          (float)kIconContentGap,
+                                  "the second icon starts after the first one's box");
+                            Check(plan->segments[2].x ==
+                                      plan->segments[1].x + plan->segments[1].diameter +
+                                          (float)kIconContentGap,
+                                  "and the text starts after the last icon");
+                            Check(plan->segments[0].x == kRowTextLeftInset,
+                                  "the first element starts at the row's own padding");
+                            Check(plan->segmentCount == g_rowState.segmentCount[0],
+                                  "the plan has one entry per segment the row produced");
+                            // The ripple default, read from the plan the painter reads.
+                            Check(plan->segments[0].ripple && !plan->segments[1].ripple,
+                                  "by default only the row's first icon ripples");
+                        }
+
+                        // The same size twice must be the same diameter -- the other half of
+                        // "the icon follows its own size": a per-element rule that ignored the
+                        // run would also pass the two-size check above.
+                        {
+                            const RowLayoutPlan *plan =
+                                ensureIconPlan(L"[[icon:CPU]][[icon:Memory]]tail", 0);
+                            printf("    same size twice: d0=%.2f d1=%.2f\n",
+                                   (double)plan->segments[0].diameter,
+                                   (double)plan->segments[1].diameter);
+                            Check(plan->segments[0].diameter == plan->segments[1].diameter,
+                                  "the same size twice is the same diameter");
+                            Check(plan->segments[1].fontSize == plan->segments[0].fontSize,
+                                  "and the same font size twice");
+                        }
+
+                        // The overrides, again through the plan.
+                        {
+                            const RowLayoutPlan *plan = ensureIconPlan(
+                                L"[[icon:CPU:noripple]][[icon:Memory:ripple]]tail", 0);
+                            Check(!plan->segments[0].ripple,
+                                  ":noripple keeps even the row's first icon quiet");
+                            Check(plan->segments[1].ripple,
+                                  "and :ripple makes a later icon ripple");
+                        }
+
+                        // A file icon: the path is a slice of the row, trimmed by CopyUserPath
+                        // (quotes and padding are the user's, not the loader's), and the disc
+                        // falls back to a real glyph if the file cannot be decoded.
+                        {
+                            const RowLayoutPlan *plan = ensureIconPlan(
+                                L"[[icon:file=\"C:\\my pics\\ssd.png\":ripple]]x", 0);
+                            wprintf(L"    file icon path=\"%ls\" glyph=%d ripple=%d\n",
+                                    plan->segments[0].path, plan->segments[0].glyph,
+                                    plan->segments[0].ripple ? 1 : 0);
+                            Check(wcscmp(plan->segments[0].path, L"C:\\my pics\\ssd.png") == 0,
+                                  "the image path keeps its spaces and loses its quotes");
+                            Check(plan->segments[0].path[0] != L'"',
+                                  "no quote reaches the image loader");
+                            Check(plan->segments[0].ripple,
+                                  "a :ripple after the path is the ripple switch, not the path");
+                            Check(plan->segments[0].glyph == kIconImageFallbackGlyph,
+                                  "an image icon still has a glyph to fall back on");
+                            Check(wcsstr(plan->segments[0].path, L":ripple") == nullptr,
+                                  "and the switch is not part of the path");
+                        }
+
+                        // An icon is an element of the flow, so a gauge written after one still
+                        // lands after it -- the property that used to hold because every ring
+                        // was placed relative to the text column.
+                        {
+                            const RowLayoutPlan *plan =
+                                ensureIconPlan(L"[[icon:CPU]]CPU [[ring:50]] done", 0);
+                            const RowSegmentPlan &icon = plan->segments[0];
+                            const RowSegmentPlan &text = plan->segments[1];
+                            const RowSegmentPlan &ring = plan->segments[2];
+                            printf("    icon x=%.1f w=%.1f  text x=%.1f  ring centre=%.1f\n",
+                                   (double)icon.x, (double)icon.diameter, (double)text.x,
+                                   (double)ring.x);
+                            Check(icon.isIcon && !text.isIcon && ring.isRing,
+                                  "icon, then text, then the gauge it was written after");
+                            Check(text.x >= icon.x + icon.diameter,
+                                  "the text follows the icon's box");
+                            const float ringLeftEdge = ring.x - (float)g_settings.ringSize / 2.0f;
+                            Check(ringLeftEdge >= icon.x + icon.diameter,
+                                  "and the inline gauge still lands after the icon");
+                            Check(ringLeftEdge >= text.x,
+                                  "which is after the text it was written after");
+                        }
+
+                        // A row with no icon tag: the plan is text and gauges only, and the
+                        // text starts at the row's own padding -- there is no plate column left
+                        // to inset it by.
+                        {
+                            const RowLayoutPlan *plan = ensureIconPlan(L"CPU 12%  RAM 73%", 0);
+                            bool anyIcon = false;
+                            for (int i = 0; i < plan->segmentCount; i++) {
+                                if (plan->segments[i].isIcon) anyIcon = true;
+                            }
+                            printf("    no tag: segs=%d first x=%.1f (inset %.1f)\n",
+                                   plan->segmentCount, (double)plan->segments[0].x,
+                                   (double)kRowTextLeftInset);
+                            Check(!anyIcon, "a row with no tag has no icon element in its plan");
+                            Check(plan->segments[0].x == kRowTextLeftInset,
+                                  "and its text starts at the row's padding, not after a plate");
+                        }
+
+                        g_settings = savedSettings;
+                        g_rowState = savedState;
+                        g_publishedRows = savedRows;
+                        g_layoutEpoch = savedEpoch + 1;
                     }
 
                     // The trailing-space sentinel: GDI+ MeasureString deliberately ignores

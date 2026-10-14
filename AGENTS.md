@@ -34,7 +34,7 @@ endfield-info-windhawk/
 │   ├── external-data-island-design.md 设计：外部数据（M1 数据面、M2 事件面均已实现）
 │   ├── font-and-row-metrics-design.md 设计：多字体回退 + 按行字号/高度（含"未配置零成本"闸门）
 │   ├── platform-notes.md              GDI+ 导出名/常量、NVML 加载缺陷（原 AGENTS §8）
-│   ├── inline-markup-design.md        设计：行内图标/对齐/占位符（未实现）+ 一次性编译（**已实现**）
+│   ├── inline-markup-design.md        设计：行内图标（**已实现**）+ 对齐/占位符（未实现）+ 一次性编译（**已实现**）
 │   └── state-and-handover.md          验证状态、真机更正、犯错档案、待办
 │
 ├── 开发工具（不随 mod 交付）——**每个都有自己的 .md，讲怎么跑/要什么/输出什么/坑在哪**
@@ -261,9 +261,9 @@ python _preview.py
 | 设置块 → `ReadSettings` | 读 Windhawk 设置，解析主题/颜色/图标/动画 |
 | 设计令牌常量 | 取自原项目 Avalonia 主题的调色板与不透明度层级 |
 | `LookupRaw` / `LookupNumber` / `ResolveToken` / `ExpandTokens` | 变量与格式说明符求值 |
-| `CompileRowText` → `InstantiateRowProgram` / `BuildRowLayout` | 把一行文本切分成「文字段 + 环段」 |
+| `CompileRowText` → `InstantiateRowProgram` / `BuildRowLayout` | 把一行文本切分成「文字段 + 环段 + 图标段」 |
 | `ComputeRowTextMetrics` | 一行文字可用的宽度 |
-| `ComputeIconGeometry` / `RingRadiusAt` | 图标盘与其波纹的几何（**单一来源**） |
+| `IconElementCenter` / `RingRadiusAt` | 行内图标的中心与其波纹半径（**单一来源**） |
 | `PlanDownscale` / `DownscaleToFit` | 自定义图片的缩放计划与执行 |
 | `PaintPanel` | 唯一的绘制入口 |
 | `ForceTopmost` / `PlaceWindow` / `WindowProc` | 窗口生命周期、热区、命中测试 |
@@ -277,15 +277,15 @@ python _preview.py
 都抽成一个不依赖 GDI+ 状态的纯函数，然后由回归测试直接调用。已有：
 
 `ComputeRowTextMetrics` · `ComputeRowVariables` · `ResolveRingColor` ·
-`ComputePanelTransform` · `IconPlateDiameter` ·
-`IconPlateCenterForRow` · `ComputeIconGeometry` · `RingRadiusAt` ·
-`PlanDownscale` · `CopyUserPath` · `ResolveIconStyle` / `ResolveIconPath` ·
+`ComputePanelTransform` · `RingRadiusAt` · `IconElementCenter` ·
+`IconDiameterForFontSize` / `ElementFontSizePx` / `IconElementRipples` / `IconStyleFromName` ·
+`PlanDownscale` · `CopyUserPath` · `IconCacheFind` / `IconCachePick` ·
 `ComputeIconImageDrawSize` · `LayoutWidthFloor` · `PdhValueUsable` ·
 `EvaluateIntro` · `FitCharacterCount` / `FitCharsWithEllipsis`（测量以函数指针注入） ·
 `ParseFontChainList` / `FontChainKey` / `RowNeedsFontPath` / `CollectRowFontTags` ·
 `PickFontFamily`（覆盖判定以函数指针注入） ·
 `ParseRowMetricTags` / `RowFontSizePx` / `RowHeightPx` / `RowTopPx` / `PanelRowsHeight` /
-`MinimumRowHeightForFont` / `MaxIconPlateDiameter` / `ParseInlineSize` / `MaxInlineRunSize` ·
+`MinimumRowHeightForFont` / `ParseInlineSize` / `MaxInlineRunSize` ·
 `ExtParseLine` · `ExtSanitize` · `ExtParseNumber` · `ExtLookup` · `ExtNextDeadline` ·
 `ExtEvictIndex` · `ExtProviderAllowed` · `ExtReplyTimeoutsAfter` · `IslandEnqueue` / `StepIsland` / `IslandHitTest` /
 `IslandClickActionFor` · `Select-StoreLineIndex` / `Select-SongTitle` / `Get-LeadMs`（脚本侧）
@@ -361,27 +361,29 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   与 `[[/font]]` 回到主字体是同一条规矩。
 - **行高下限用"这一行里最大的字"**（`ModSettings::rowMaxFontSize` = 本行字号与
   `MaxInlineRunSize` 的较大者），不是本行字号：否则 `[[size:30]]` 出现在小字行里会溢出到下一行。
-- **图标盘只跟随全局 `Font size`，不跟随任何行字号或段字号。** 用户明确报过这个是 bug
-  （"改变行 size 后图标也跟着变大，应该不对"）：盘是**面板元素**，不是行的一部分；
-  让它跟着行字号变，既改了那一行的图标，又会把**所有行**共用的文字列一起挪动。
-  `MaxIconPlateDiameter` 仍要留着——取"最宽的那个盘"是为了 `Row 1 icon = None` 这种情况
-  （第 0 行没有盘，但下面的行有）。
+- **图标跟随"它自己出现处的字号"，不跟随全局 `Font size`。** 图标是行里的**内容**
+  （`[[icon:…]]` 元素），和它旁边的文字同一层：`[[size:24]]…[[icon:Memory]]…[[/size]]` 里就是
+  24 px 那个图标，同一行里两个尺寸的图标是两个不同大小的盘子（`IconDiameterForFontSize` 是
+  唯一乘系数的地方，尺寸取 `ElementFontSizePx` = 段字号或该行字号）。
+  这条曾经**反过来**过：图标是行首的**盘**（面板元素，属于所有行共用的左侧一列），
+  所以它只跟随全局字号，`Row N icon` / `Custom icon file` 九个设置项就是这么用的。
+  那次用户报的是"改变行 size 后图标也跟着变大，应该不对"——在**行首盘**的模型下他是对的：
+  盘不是那一行的内容，让它跟着行字号变还会把**所有行**共用的文字列一起挪动。
+  改成行内元素后前提变了（盘不再存在、文字列也不再有共用的内缩），所以规则随之反转；
+  两条规则各自都对，错的是拿旧模型的那条去套新模型。
+  `RowMetrics` 里因此**没有**盘径字段：一个"每行一个盘径"的字段在新模型下必然是假的。
 - **行首标签只认行首**：前缀解析在 `ReadSettings` 里完成、标签已从 `rows[]` 剥掉，所以绘制侧只看得到
   段标签；`[[h:…]]` 写在文本中间是**普通文字**，写错的一律留下原文。
-- **两套"行号"必须分清**：设置按**设置里的行号**命名（`Icon3` 属于 `Row 3`），绘制只知道**显示顺序**。
-  留空的行会被跳过，两者因此会错位，而它们各自的正确做法**不一样**：
-  — `Row N font size` / `Row N height` 是**这一行自己的属性**，读取时按设置行号、存进被画出来的那一行
-    （`rowSlotOf[]`），所以 `Row3Height` 落在第二个显示行上。
-  — `Icon N` / `Icon N path` 除了"这一行的图标"之外**还是继承源**（"没设图标的行继承第一个已设的"），
-    所以槽位**始终按设置行号存**，由 `iconSlotOfRow[]` 把显示行序反查回设置行号
-    （`IconSlotForRow`；手工构造的 `ModSettings` 没有映射表时按同一行处理）。
-    **把空行的图标槽丢掉过一次**：于是 `Icon1 = Memory` 单独设置时连继承源一起消失，
-    整块面板一个图标都不画，真机上看起来就是"Row icon 选项失效"（2026-10-14）。
+- **两套"行号"必须分清**：设置按**设置里的行号**命名，绘制只知道**显示顺序**。
+  留空的行会被跳过，两者因此会错位：`Row N font size` / `Row N height` 是**这一行自己的属性**，
+  读取时按设置行号、存进被画出来的那一行（`rowSlotOf[]`），所以 `Row3Height` 落在第二个显示行上。
+  （图标不再有这个坑：它写在行里，跟着那一行走。）
 - **每帧的重活是"测量"，而它被缓存掉了**（`RowLayoutPlan` + `EnsureRowPlan`）：选族（覆盖查询）与
   拟合（`FitTextToWidth` 的二分、哨兵、省略号）只在**文本或几何变化时**跑一次，中间那些帧只
   `DrawString`。**注意前提**：标记解析（`InstantiateRowProgram` / `BuildRowLayout`）本来就只在
   `PublishRows` 里跑，不在每帧——所以"每帧解析文本"从来不是本项目的成本，别按那个去优化。
-  新鲜度键的**每个字段都要有断言**（`RowPlanIsFresh` 的纪元/宽度/内缩/行高/字号/行数/段数）；
+  新鲜度键的**每个字段都要有断言**（`RowPlanIsFresh` 的纪元/宽度/行高/字号/行数/段数；
+  行内缩曾经也是键里的一项，它随行首图标盘一起消失、成了常量，那一项断言也随之删除）；
   纪元由 `ReleaseFontResources` 与 `PublishRows`（只在内容真的变了时）自增，**新增任何
   "改了就该重排"的状态都要加进这两处之一**，否则屏幕会留着上一份文本。证据链：
   `g_measureCalls`（产品计数器，`[perf]` 里的 `meas=`）——宿主断言"复用计划时测量次数为 0"。
@@ -405,39 +407,49 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   `ERROR_SUCCESS`（即 VALID_DATA）——于是**计数器刚建好时的第一个采样被丢掉**，
   表现为 GPU 读数晚一拍才出现。三条路径现在问同一个函数。
 
-### 5.3 图标
+### 5.3 行内图标
 
-- **图标盘每行各画一个**，位置在该行垂直中心；**波纹从各自图标发出**。
-  曾只画一个盘在面板中心 → 多行时"涟漪从中间行弹出"。
-- **盘与环共享同一个圆心，尺寸不同。** 由 `ComputeIconGeometry()` 一并产出，
-  两个绘制函数都从它取值，不允许各自算一遍。
-- **环半径从盘半径起步**向外扩张（`RingRadiusAt`）。
+图标是**标签放进去的普通元素**（`[[icon:…]]`），不再是设置项，也不再是行首那个盘：
+
+- **`[[icon:字形]]` / `[[icon:file=路径]]`，`ParseIconTag` 在编译期解析**：字形名走
+  `IconStyleFromName`（`CPU` / `Memory`/`RAM` / `Disk` / `Network`/`Net` / `GPU`），
+  路径是**行文本里的一段切片**（`RowPart::offset/length`）——盘径与图片路径都不进 `RowPart`
+  的数组，否则每个 element 都要背一个 `MAX_PATH`。
+  **拼错的一律留下原文**（未知字形、空 body、`file=` 后面什么都没有、缺 `]]`），
+  与其它标签同一条容错规矩：一个空盘子会让人往完全错误的方向查。
+- **它占自己的盒子，行是"流"。** `BuildRowPlan` 把每个图标变成 `x` + `diameter`，
+  后面的元素从 `x + diameter + kIconContentGap` 开始；图标在**该行的垂直中心**
+  （`IconElementCenter`，盘和它的涟漪都用这一个点算）。
+  **没有行首盘，也没有"所有行共用的文字列内缩"**：文字从行自己的 `kRowTextLeftInset` 开始。
+  所以"图标画在哪个 x"只有 `BuildRowPlan` 一个来源，绘制侧只读计划。
+- **每个图标一个尺寸，没有全局图标尺寸。** 直径 = **该元素所在处**的字号 × `kIconPlateRatio`
+  （`IconDiameterForFontSize`，唯一乘系数的地方），字号取 `ElementFontSizePx`（段字号或该行字号）。
+  见 §5.1 那条：这条规则与旧的"盘只跟随全局字号"是同一个问题的两个前提。
+- **环半径从盘半径起步**向外扩张（`RingRadiusAt(plateRadius, …)`）。
   曾用 `盘半径 × 0.5` 起步，环比盘小、压在字形上，看起来像"不同心"。
 - **环必须画在入场世界变换之内**，否则与盘处于不同坐标系。
+- **涟漪默认只从一行的第一个图标发出**（那是"每行一个盘冒涟漪"的旧观感），
+  其余默认安静；`:ripple` / `:noripple` 逐图标覆盖（`IconElementRipples`，"第一个"按**布局里
+  第一个图标段**算，不是按编译顺序）。
 - **自定义图片：小而宽高不等的源图，两轴不能分别钳位。** 曾导致 2:1 的图被压成 1.35:1。
-- **用户路径必须裁剪引号与前后空白**（`CopyUserPath`）。
-  曾把 `"C:\...\img.png"` 的引号一起传给文件 API → "文件明明在却 could not load"。
-- **图片载入失败必须回退到内置字形。** 否则只剩空盘，看起来像"图标变纯白"，
-  会把人引向完全错误的排查方向。回退值在 `ReadSettings` 里解析一次
-  （`iconFallbackStyle`：第一个显式字形 → 没有任何字形但有图片时用 `Memory` → 否则 0），
-  由 `ResolveIconStyle` 统一取用——**不是**把字形写进槽位：全局图片不属于任何槽位，
-  规则必须放在两者都看得见的地方。
-- **`Row N icon = None` 是"这一行不要图标"，与"没设置"必须可区分。** `IconSpec::styleSet`
-  记录该键是否给了值；没有它，`None` 会落到继承分支，README 的"设成 None 就不要图标"
-  曾**不是真的**（实测：`Icon1=Memory` + `Icon3=None` → 第 3 行拿到 Memory 字形）。
-  `None` 连全局图片一起挡住。
-- **一张图给所有行**（`Custom icon file` → `ModSettings::iconPath`）。每行的优先级：
-  `Row N icon file` > 显式 `None`（不画）> 全局图片 > 内置字形（自己的 → 第一个显式字形）。
-  全局图片排在"继承别的行的文件"**之前**：有全局图时，单行的文件是例外，不该扩散到其余行；
-  没有全局图时，"只设 `Row 1 icon file` 就等于所有行都用它"这条继承照旧。
-- **相同路径的图片只解码/缩放一次**：`ResolveIconSlot` 让解析到同一文件的行**共用最低那个
-  槽位的缓存**（全局图片因此天然只解码一次）。**刻意不加第五个槽、也不做引用计数**——
-  每个文件仍然只有一个所有者，`ReleaseSlotImage` / `DisposeIconImage` 的按槽释放逻辑不变。
-- **自定义图片在载入时按盘径重采样一次**，不在每帧缩放。大图一步压到 23px 会有锯齿，
+- **用户路径必须裁剪引号与前后空白**（`CopyUserPath`，`[[icon:file="C:\a b.png"]]` 也走它）。
+  曾把引号一起传给文件 API → "文件明明在却 could not load"。
+- **图片载入失败必须回退到内置字形**。否则只剩空盘，看起来像"图标变纯白"，会把人引向
+  完全错误的排查方向。行内模型里这条由 `kIconImageFallbackGlyph`（`Memory`）实现：
+  图片图标的 `entry.glyph` 在 `BuildRowPlan` 里补成它，`PaintIconElement` 先试图片、
+  失败才画这个字形。
+- **图片按路径缓存，不再按行**（`g_iconCache`，`kIconCacheSlots` 个条目）：
+  一行里同一个文件出现两次、或四行都写它，都只解码一次。
+  **淘汰规则**：先占空条目，否则丢弃**最久未使用**的那个（条目级 LRU，`lastUsed` 时钟）；
+  换路径时 `ReleaseIconEntry` 是唯一的释放点。
+  每个条目里再留 `kIconVariants` 份重采样结果（变体级 LRU）：**同一个文件在两个字号下出现是
+  两个重采样目标**，只留一份会让它在同一帧里反复重建位图。
+  条目里**不放 GDI+ 句柄以外的东西**，`RowPart` / `RowProgram` 里则一个句柄都没有。
+- **自定义图片在载入时按该图标直径重采样一次**，不在每帧缩放。大图一步压到 23px 会有锯齿，
   且每帧重采样很贵。**逐级折半对"短边已经小于目标箱"的横幅同样成立**：
   `PlanDownscale` 只按比例折半，不把短边钳回目标（那个钳位有不动点，会让宽扁图做十几次
   1:1 空转、然后一次性压 173 倍）；短边在中间步骤允许降到 1px，末级仍由长边定尺。
-- **图片的绘制尺寸 = min(自然尺寸, 盘径) × 入场缩放**（`ComputeIconImageDrawSize`）。
+- **图片的绘制尺寸 = min(自然尺寸, 图标直径) × 入场缩放**（`ComputeIconImageDrawSize`）。
   "不放大超过自然尺寸"是给**基准**尺寸的天花板，不是第二次钳位。它曾经被写成
   "只有比盘还大的图才乘缩放"，而缓存图恰好**等于**盘径，于是自定义图片只会淡入、
   不随盘子长大（内置字形那条路径一直是乘缩放的）。
@@ -535,7 +547,8 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
    `published` 小 → 采样端问题，与绘制无关。
 2. **布局层**：`rowN segs= textLen= inline=` 与逐段 `draw row= seg= x= y= w= adv=`。
    **`w=1.0 adv=0.0` 就是"文本被裁没"**，这是 5.1 第一条的指纹。
-3. **几何层**：`ComputeIconGeometry` 的输出（盘心、盘半径、环半径）。
+3. **几何层**：`BuildRowPlan` 给每个元素算出的 `x` / 直径（行内图标是不是落在它该在的地方、
+   大小跟着谁），以及逐段 `draw row= seg= x= y= w= adv=`。
 4. **配色层**：`Theme=... bg=...` 那行确认谁赢了。
 5. **资源层**：`Icon...: loaded / could not load` 那几行。
 
