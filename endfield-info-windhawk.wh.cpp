@@ -1269,19 +1269,30 @@ static void ReadSettings(ModSettings &s) {
     }
 
     // A slot that supplies only an image needs a glyph to fall back on when that
-    // image cannot be decoded, otherwise the row shows an empty plate. Borrow the
-    // first configured glyph; if there is none, use Memory so a failed load is still
-    // visibly "an icon that did not load" rather than a blank disc.
-    bool anyGlyph = false;
+    // image cannot be decoded, otherwise the row shows an empty plate -- which reads
+    // as "the icon turned white" and sends the reader off in the wrong direction.
+    //
+    // Borrow the first configured glyph, and Memory when there is none at all. It has
+    // to be resolved to *every* image-only slot, not just to the ones on a config with
+    // no glyph anywhere: with Icon1 set to an image and Icon2 to, say, Network, the
+    // old rule did nothing and ResolveIconStyle() handed the painter style 0, i.e.
+    // nothing at all.
+    int borrowedGlyph = 0;
     for (int i = 0; i < kMaxRows; i++) {
-        if (s.icons[i].style > 0) { anyGlyph = true; break; }
-    }
-    if (!anyGlyph && s.iconCount > 0) {
-        for (int i = 0; i < kMaxRows; i++) {
-            if (s.icons[i].path[0]) s.icons[i].style = 2;   // Memory
+        if (s.icons[i].style > 0) {
+            borrowedGlyph = s.icons[i].style;
+            break;
         }
+    }
+    if (s.iconCount > 0 && !borrowedGlyph) {
+        borrowedGlyph = 2;   // Memory
         Wh_Log(L"Icons: no built-in glyph was chosen, so image-only slots fall back "
                L"to the Memory glyph if their file cannot be loaded");
+    }
+    if (borrowedGlyph) {
+        for (int i = 0; i < kMaxRows; i++) {
+            if (s.icons[i].path[0] && s.icons[i].style <= 0) s.icons[i].style = borrowedGlyph;
+        }
     }
 
     // Palette resolution. The two sources are mutually exclusive on purpose:
@@ -3820,26 +3831,21 @@ static DownscalePlan PlanDownscale(int srcW, int srcH, int target) {
     int guard = 0;
     while (guard++ < 12) {
         if (w <= target * 2 && h <= target * 2) break;
+        // Halve both axes. That alone keeps the aspect ratio -- what distorted a 2:1
+        // source into 23x17 was clamping the two axes *independently*, and the
+        // proportional repair that replaced it had a fixed point: whenever the short
+        // axis was already at or below the target, the repair scaled it back up to the
+        // target, the "never grow" clamp below put it straight back, and the step
+        // changed nothing. A 200x20 banner therefore did twelve 1:1 resamples and then
+        // one 173x reduction -- the aliasing this plan exists to prevent.
+        //
+        // The short axis is allowed to fall below the target here: it is an
+        // intermediate, and for a 200:1 source no chain of half-steps keeps both axes
+        // at or above 23. Only the long axis is what the final fit lands on the box.
         int nw = w / 2, nh = h / 2;
-        // Clamp proportionally. Clamping the two axes independently stretches the
-        // image: a 2:1 source reduced toward a 23 px box would land on 23x17
-        // (1.35:1) instead of keeping its shape.
-        if (nw < target) {
-            // Scale the other axis by the same factor so the aspect ratio survives.
-            double factor = (double)target / (double)nw;
-            nw = target;
-            nh = (int)((double)nh * factor + 0.5);
-        }
-        if (nh < target) {
-            double factor = (double)target / (double)nh;
-            nh = target;
-            nw = (int)((double)nw * factor + 0.5);
-        }
         if (nw < 1) nw = 1;
         if (nh < 1) nh = 1;
-        // Never allow a step to grow a dimension.
-        if (nw > w) nw = w;
-        if (nh > h) nh = h;
+        if (nw == w && nh == h) break;   // a 1 px axis: nothing left to halve
         w = nw;
         h = nh;
         if (plan.count < 15) {

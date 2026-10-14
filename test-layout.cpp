@@ -569,6 +569,52 @@ int main() {
         Check(wcslen(tiny) < 8, "a short destination is still terminated");
     }
 
+    printf("\n=== image-only icon slots borrow a glyph to fall back on ===\n");
+    {
+        // The failure mode: the image cannot be decoded, the painter asks for that
+        // slot's glyph and gets 0, and the row shows an empty plate -- which reads as
+        // "the icon turned white", not as "that path did not load". The borrow used to
+        // happen only when *no* slot anywhere had a glyph, so a mixed configuration
+        // (an image on row 1, a glyph on row 2) still produced the empty plate.
+        const StubSetting *savedStrings = g_stubStrings;
+        const int savedStringCount = g_stubStringCount;
+        ModSettings s;
+
+        const StubSetting mixed[] = {
+            {L"Icon1", L""},
+            {L"Icon1Path", L"C:\\pics\\does-not-exist.png"},
+            {L"Icon2", L"Network"},
+        };
+        g_stubStrings = mixed;
+        g_stubStringCount = (int)(sizeof(mixed) / sizeof(mixed[0]));
+        ReadSettings(s);
+        printf("  Icon1=image only, Icon2=Network -> icon1 style=%d, icon2 style=%d\n",
+               s.icons[0].style, s.icons[1].style);
+        Check(s.icons[0].style == 4, "an image-only slot borrows the configured glyph");
+        Check(ResolveIconStyle(s, 0) == 4, "and the painter is handed that glyph");
+        Check(ResolveIconStyle(s, 1) == 4, "the slot that chose it keeps its own");
+
+        const StubSetting imageOnly[] = {
+            {L"Icon1", L""},
+            {L"Icon1Path", L"C:\\pics\\does-not-exist.png"},
+        };
+        g_stubStrings = imageOnly;
+        g_stubStringCount = (int)(sizeof(imageOnly) / sizeof(imageOnly[0]));
+        ReadSettings(s);
+        Check(ResolveIconStyle(s, 0) == 2,
+              "with no glyph anywhere an image-only slot falls back to Memory");
+
+        const StubSetting noIcons[] = {{L"Icon1", L"None"}};
+        g_stubStrings = noIcons;
+        g_stubStringCount = (int)(sizeof(noIcons) / sizeof(noIcons[0]));
+        ReadSettings(s);
+        Check(s.iconCount == 0 && ResolveIconStyle(s, 0) == 0,
+              "a row with no icon configured stays without one");
+
+        g_stubStrings = savedStrings;
+        g_stubStringCount = savedStringCount;
+    }
+
     printf("\n=== custom icon resampling plan ===\n");
     {
         // The plate diameter follows FontSize, so a loaded file has to be brought
@@ -582,6 +628,7 @@ int main() {
             {4000, 4000, 23},    // extreme: a photo used as an icon
             {512,  512,  23},
             {256,  128,  23},    // non-square
+            {200,  20,   23},    // a banner: the short axis is already under the plate
             {64,   64,   23},
             {32,   32,   23},    // smaller than the plate
             {23,   23,   23},    // exactly plate size
@@ -614,12 +661,25 @@ int main() {
                 int longest = lastW > lastH ? lastW : lastH;
                 Check(longest >= c.target - 1 && longest <= c.target,
                       "the long side is fitted exactly to the plate box");
-                // Aspect ratio preserved within rounding.
-                double srcAspect = (double)c.w / c.h;
-                double dstAspect = (double)lastW / lastH;
-                double drift = srcAspect > dstAspect ? srcAspect / dstAspect
-                                                     : dstAspect / srcAspect;
-                Check(drift < 1.12, "aspect ratio is preserved");
+                // The short side must be what the fit gives, rounded by at most a pixel.
+                // A percentage drift cannot say that for a 200:1 banner, whose short side
+                // is 1 or 2 px either way (the previous 12%-drift check failed on it).
+                const int srcLong = c.w > c.h ? c.w : c.h;
+                const int srcShort = c.w > c.h ? c.h : c.w;
+                const int lastShort = lastW < lastH ? lastW : lastH;
+                const double exactShort = (double)srcShort * (double)c.target / (double)srcLong;
+                printf("    short side %d, exact fit %.2f\n", lastShort, exactShort);
+                Check(lastShort >= 1 && (double)lastShort <= exactShort + 1.0,
+                      "the short side is the exact fit, rounded up by at most a pixel");
+                if (exactShort >= 4.0) {
+                    // Where the short side is several pixels, the ratio has to hold to
+                    // within rounding too.
+                    double srcAspect = (double)c.w / c.h;
+                    double dstAspect = (double)lastW / lastH;
+                    double drift = srcAspect > dstAspect ? srcAspect / dstAspect
+                                                         : dstAspect / srcAspect;
+                    Check(drift < 1.12, "aspect ratio is preserved where rounding cannot dominate");
+                }
             }
         }
 
@@ -638,6 +698,37 @@ int main() {
             ph = big.sizes[i].h;
         }
         Check(allShrink, "no resampling stage enlarges the image");
+
+        // The plan's whole point is that no single stage is a large reduction: with one
+        // big step GDI+ samples only a few source pixels, which is the aliasing this
+        // exists to prevent. The banner is where that used to fail -- the proportional
+        // clamp had a fixed point, so 200x20 spent twelve stages resampling itself 1:1
+        // and then one 8.7x squash (4000x20 ended in a single 173x step).
+        for (const Case &c : cases) {
+            if (c.w <= c.target && c.h <= c.target) continue;
+            DownscalePlan plan = PlanDownscale(c.w, c.h, c.target);
+            const bool landscape = c.w >= c.h;
+            double worstLong = 1.0, worstShort = 1.0;
+            int pw = c.w, ph = c.h;
+            for (int i = 0; i < plan.count; i++) {
+                double rw = (double)pw / plan.sizes[i].w;
+                double rh = (double)ph / plan.sizes[i].h;
+                double rl = landscape ? rw : rh;
+                double rs = landscape ? rh : rw;
+                if (rl > worstLong) worstLong = rl;
+                if (rs > worstShort) worstShort = rs;
+                pw = plan.sizes[i].w;
+                ph = plan.sizes[i].h;
+            }
+            printf("  %4dx%-4d worst step: long %.2fx, short %.2fx\n", c.w, c.h, worstLong,
+                   worstShort);
+            Check(worstLong <= 2.05, "no stage reduces the long edge by more than 2x");
+            // Integer halving truncates: an odd 125 px edge goes to 62, which is a
+            // 2.016x step rather than 2.0x, so the bar is 2.05x and not 2.0x.
+            // The short edge is floored at 1 px on a very wide source, so it may round
+            // its way down a little faster; it must still never be squashed in one go.
+            Check(worstShort <= 2.51, "and the short edge is floored, never squashed");
+        }
 
         // Degenerate inputs must not produce a plan that allocates nonsense.
         DownscalePlan zero = PlanDownscale(0, 0, 23);
