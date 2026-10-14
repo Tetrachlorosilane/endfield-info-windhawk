@@ -32,6 +32,7 @@ endfield-info-windhawk/
 ├── LICENSE                            MIT
 ├── docs/                              规划、设计与交接文档
 │   ├── external-data-island-design.md 设计：外部数据（M1 数据面、M2 事件面均已实现）
+│   ├── font-and-row-metrics-design.md 设计：多字体回退 + 按行字号/高度（含"未配置零成本"闸门）
 │   └── state-and-handover.md          验证状态、真机更正、犯错档案、待办
 │
 ├── 开发工具（不随 mod 交付）——**每个都有自己的 .md，讲怎么跑/要什么/输出什么/坑在哪**
