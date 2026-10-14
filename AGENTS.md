@@ -506,7 +506,8 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   顺带修好的一处：卡片自己的 Pop/Collapse 相位以前跑在 40 ms 轮询上（只有 `StartIntro` 会提到
   16 ms），所以淡出只有两三帧；现在相位与高度动画共用同一个决策点。
 - **关闭卡片与 ttl 到期走同一条路**（`IslandDismiss` → `COLLAPSING`），所以淡出与状态机不会分叉；
-  它**幂等**，第二次点击不会重启淡出。
+  它**幂等**，第二次点击不会重启淡出。**卡片在屏时长由 `IslandCardDuration` 决定**：`ExtEventMs` 是
+  默认值，提供者给的 ttl 只是上限（封顶 `kIslandMaxCardMs`）——值寿命不是展示时长。
 - **合并窗口内"同一件事又来了"只加计数，但 `severity` 必须取两者中更高的那个。** 否则
   "同一个标题，现在变成 critical"这条**升级会被窗口整个吞掉**：条目留在原级别 → 状态机看不到
   `criticalWaiting` → 卡片一直停在 warn。文本取最新的一条（同标题的最新读数是更准的），
@@ -521,56 +522,21 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   看起来像"× 把面板关掉了"）；卡片命中 → 吃掉（点卡片读它不该切换面板）；只有卡片之外才归面板。
 - **"动画期间取两态并集"这条规则仍然不在代码里**：它服务于已移除的宽度动画。现在没有动画窗口期，
   区域表本身就是完整的可点范围；等 M3 的悬停态落地时再回来看是否需要它。
+- **推送只重发，不重采**（`SamplerWakeIsLight` + `RepublishRows`）：`g_extDirty` 叫醒采样线程后，
+  被叫醒的必须是轻路径（只按手上的 `g_values` 重展开文本）；**间隔到期仍要真采样**，否则话多的
+  发布器会让系统行永远不再被重读。`PublishRows` 返回"是否真的变了"，没变不重绘——比较对象必须是
+  `BuildRowLayout` 的输出（它剥掉环标记），拿带标记的文本比会永远判定"变了"。详见 §6 对应三行。
+- **发布器重启预算是"连续"而不是"累计"**（`PublisherEarnedBackRestarts`）：跑满 60 s 就把预算还回来，
+  否则 5 次启动（包括用户重启音乐客户端、或手动踢掉发布器）之后永久禁用，只有重载 mod 能救。
 
 ---
 
-## 6. 已修复的缺陷（回归测试清单）
+## 6. 已修复的缺陷（总表已移出本文）
 
-改相关代码前先看对应断言。表右列是"如果有人改错会看到什么"。
-
-| 缺陷 | 症状 | 关键断言 |
-| :-- | :-- | :-- |
-| 无环行的可用宽度算成 0 | 第一行之后都不显示 | 无环行拿到完整内宽 |
-| 内联环前的尾随空格未计入 | 环前面的空格失效 | 展开文本保留空格 |
-| 自定义颜色压过命名主题 | 主题被自定义配置覆盖 | 命名主题完全胜出 |
-| 环颜色来源混乱 | 环的颜色盖不住 | `:COLOR` > Custom 的 `Ring colour` > 边框色 |
-| 已知变量取不到值被当未知 | 屏幕出现字面 `{gpu.temp}°C` | 已知不可用渲染为 `--` |
-| 高度关键帧带收回段 + 过冲过大 | 弹出→收回→突然弹出 | 高度不得出现可见回落 |
-| 图标盘只画一个且居中 | 涟漪从中间行弹出 | 每行一盘、点位正确 |
-| 波纹未随世界变换 | 涟漪与图标不同坐标系 | 盘心环心逐位相同 |
-| 最内圈半径小于盘半径 | 涟漪与图标不同心 | 环从盘边缘起步向外扩张 |
-| 文字淡入窗口过短且只有一段 | 文字像啪地出现 | 淡入经多个中间透明度且单调不回头 |
-| 大图一步压到图标尺寸 | 图标锯齿 | 逐级折半；各阶段只缩不放 |
-| 缩放时两轴分别钳位 | 非方图被拉伸 | 比例漂移 <12% |
-| 路径引号被当作路径一部分 | 文件明明在却 could not load | 引号/空格被裁剪且不残留 |
-| 图片载入失败不回退字形 | 只剩空盘，像"图标变纯白" | 失败必须回退字形 |
-| 行 `StringFormat` 少了 `NoWrap` | **第一行文字不在一条直线上**（该段首行上浮） | 超宽文本仍是 1 行；真 GDI+ 断言 |
-| 关掉换行后文本不截断 | 文字压到后面的环上 | 每段都落在自己的预算内 |
-| 管道 DACL 写成 `CO`（creator owner） | **每个客户端都被拒绝**（`PermissionError` / `ERROR_ACCESS_DENIED`），连启动 mod 的用户自己都连不上 | 用同一个 SD 建管道、让当前用户连上：`test-layout.cpp` 的 "the pipe DACL admits the user running the mod" |
-| 提供者名从帧行拷贝时未按长度截断 | 客户端连上、`SET` 被接受，行**永远显示 `--`**；且每次重连占一个新槽位，8 次后 `HELLO` 开始回 403 | 用**带换行**的 `HELLO`/`SET` 驱动 handler，断言 `{ext.provider.key}` 查得到（旧代码下红两条） |
-| `CreateNamedPipe` 的 `nMaxInstances` 传 1 而线程数是 4 | 日志写着 `serving 4 pipe instance(s)`，实际 3 个线程以 `CreateNamedPipe failed: 231` 当场退出，只支持 1 个并发客户端 | **没有断言能覆盖**（这是 API 调用点的常量错，宿主里没有真管道）；判别依据是错误码语义——**断言覆盖不到的地方，日志就是防线** |
-| 读用 `INFINITE` 等完成事件，完成事件一旦丢失线程就永久停住 | 客户端**连上了**（`ExtLogClient` 有），之后日志**完全静默**——连 `client done` 都没有，行永远 `--` | 等待加 500 ms 上界 + `PeekNamedPipe` 判定；缓冲有数据却没完成就重投。判别日志：`EXT read#1 result=… got=…`、`read completion never arrived with N bytes queued`、`no frame for 2s and the pipe buffer is empty` |
-| 收起时先把窗口缩到标签高度、再长回来画（`SetExpanded` 里那次 `PlaceWindow`） | 收起瞬间闪出一条"切片"，极短、难复现；鼠标离开检测区延迟后触发 | **无法断言**（这是分层窗口的帧内顺序，不是数值）。判据是流程：窗口尺寸必须与**同一帧提交的位图**一致；收起方向由绘制侧逐帧跟随内容（`if (expanded) PlaceWindow(hwnd);`） |
-| 内联环行的截断预算写成"实测 advance" | 用了 `[[ring:…]]` 的行**永不截断**：文字切在位图外缘（没有 `…`），它自己的环被挤出面板 | `ComputeInlineTextLimit` 的关系断言（run + 后面的环 = 整行） |
-| 收回关键帧把**时长比例**当 **cue** 用 | 收缩在半程就完成、后半个时间轴是死区：可见收回只有 `IntroMs/4`（README 写"一半"），且那半程仍以 16 ms 重绘空转 | `the shrink still has work left at the midpoint` |
-| GPU 的风扇/功耗/显存总量没有有效性标志 | 非 NVIDIA（PDH 回退）机器上 `{gpu.fan}`=0、`{gpu.power}`=0、`{gpu.vram.total}`=0.0——看着像真读数 | `{gpu.fan}` → `--` 等 5 条 unavailable 断言 |
-| 行内展开用 128 字符暂存缓冲 | `{ext.*}` 的值被静默截到 127 字符（设置允许 512，且不带 `…`） | 399 字符的值整段到达行里 |
-| 关掉岛不丢相位 | `POPPING`/`COLLAPSING` 冻结 → `IslandPhaseAnimating` 恒真 → tick 永久钉在 16 ms，卡片也关不掉 | `turning the island off drops a phase that was in flight` |
-| 发布器没有回收路径 | 关掉 `External data`、或删掉最后一行 `{ext.*}` 后，mod 启动的发布器继续跑（读内存/联网）直到卸载 | **没有断言**（真 `CreateProcess`）；判据是日志 `nothing consumes {ext.*} any more; stopping it` |
-| `PlanDownscale` 的比例钳位有不动点 | 短边已小于目标箱的宽扁图（横幅）**一次都不折半**：十几次 1:1 空转之后一次性压 173 倍——正是要修的锯齿形态 | `no stage reduces the long edge by more than 2x`、`the short side is the exact fit, rounded up by at most a pixel` |
-| 图片-only 槽只在"全工程都没有字形"时才借字形 | 混合配置（第 1 行图片、第 2 行 Network）里图片载入失败仍是**空盘**，看着像"图标变纯白" | `an image-only row falls back to the configured glyph`、`with no glyph anywhere an image-only row falls back to Memory` |
-| `Row N icon = None` 与"没设置"无法区分 | 设了 `None` 的行**照样得到继承来的字形**（实测 `Icon1=Memory`+`Icon3=None` → 第 3 行是 Memory），README 的"设成 None 就不要图标"不成立 | `an explicit None leaves that row without a glyph`、`an unconfigured row inherits the first real glyph, not a None` |
-| 全局 `IconPath` 从未被读取（死设置项） | 界面上有"Custom icon file"，填了没有任何效果 | `the global icon applies to a row that has no file of its own`、`a global icon on its own still means plates are drawn` |
-| 多行用同一张图时逐行解码 | 全局图片在大图上会被解码 N 次（峰值内存按行数翻倍） | `every row shares one cache slot, so the file is decoded once`、`a row that names the global file shares row 1's slot` |
-| 合并窗口吞掉同一标题的升级 | 同标题从 warn 变 critical 时卡片仍停在 warn，升级永远看不见 | `an escalation inside the merge window raises the queued level`、`so a card already on screen stands down for it` |
-| 关闭按钮比卡片还高 | 单行卡片（18 px）下按钮被下钳位顶出卡片上沿（y = card.y − 4）→ 卡片外多出一个可点区域 | `the close button fits inside a card of any height`、`and it shrinks to the card when the card is smaller` |
-| 淡出期间点击 × 落到面板行为上 | 卡片正在淡出时再点 × → 面板被切换（看着像"× 关掉了面板"）；点卡片本身同样如此 | `and during the fade it is still swallowed, not handed to the panel`、`a click on the card is swallowed, never the panel's` |
-| `FitTextToWidth` 按进程缓存省略号宽度 | 改字号后被截断的行比预算宽出省略号的差值（实测 24 px 下某个预算超 6.1 px），文字压到后面的环上 | `a trimmed run fits its budget under any second font size`（扫 40..200 全部预算） |
-| sampler 的 join 超时被忽略 | 超时后仍 `DeleteCriticalSection(&g_valuesLock)`：另一条线程可能还握着它，未定义行为 | `a sampler that did not stop leaves its lock alone`、`and so does a failed wait` |
-| 自定义图片不参与入场缩放 | 图片只淡入、不随盘子长大（内置字形那条路径一直会） | `and follows the intro as it scales the plate in`、`while the intro still scales it down` |
-| PDH 的 GPU 数组读只认 `ERROR_SUCCESS` | 计数器刚建好时的第一个采样（`NEW_DATA`）被丢掉 → GPU 读数晚一拍 | `and so is a counter's first sample (new data)` |
-| bridge 的 `$client.Connect(3000)` 无保护 | 瞬时连不上变成未处理异常、脚本当场死掉，mod 看门狗再拉起它——重启预算烧在"再等一秒就能连上"上 | 自检 `连不上管道时返回空值（不抛异常）`；对照（裸 Connect）实测未捕获异常 + exit 1 |
-| bridge 用 `Process.MainWindowTitle` 取曲名 | **开着「桌面歌词」时 `MainWindowTitle` 就是「桌面歌词」**（真机实测 2026-10-14：`Get-Process -Id 15824` → `cloudmusic / 桌面歌词`，而同一 pid 另一个顶层窗口才是「下等马 - 洛天依…」）→ 标题里永远没有「 - 」→ 桥一直停在"没有可用窗口"的等待循环里、**从不连接**，面板 title/lyric 两行永远 `--` | 自检 `曲目标题：桌面歌词窗口不算曲目`、`曲目标题：从多窗口里挑出带「 - 」的那个`、`曲目标题：多个候选取最长的`、`窗口枚举：网易云在跑时能看到它的顶层窗口`；活体输出 `网易云顶层窗口（2 个）：[桌面歌词] [下等马 - …]` |
+那份"缺陷 → 症状 → 关键断言"的总表（47 行）搬到了
+[docs/state-and-handover.md](docs/state-and-handover.md) 的 §13，原因与 §10 相同：AGENTS 受工作区
+**64 KB 指令预算**限制，超出部分会被**静默截断**（实测 65,381 B 被切到 65,244 B）。改相关代码前
+先去那里查对应断言；本文只保留**不变量**（§5）——两者是同一件事的两个视角。
 
 ### 排查心法：先分类，再定位
 

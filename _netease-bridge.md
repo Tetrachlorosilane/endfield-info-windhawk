@@ -40,6 +40,8 @@ pwsh -ExecutionPolicy Bypass -File _netease-bridge.ps1 -Ttl 600000
 | :-- | :-- |
 | `-TtlMs` | 值的寿命，默认 600000（10 分钟）。歌在播就给长一点，别让行里闪 `--` |
 | `-Event` | 换歌时发一条 `EVENT`，让灵动岛弹一次 |
+| `-EventTtlMs` | **卡片**在屏时长，默认 6000 ms。⚠️ 不要用 `-TtlMs`：那是**值的**寿命，把它当卡片时长用，一张卡就占住岛十分钟 |
+| `-EventMinIntervalMs` | 两条岛事件之间的最小间隔，默认 4000 ms；被节流掉的那条下一拍还有机会发 |
 | `-LyricSource` | `auto`（默认）/ `store`（只读客户端页面，需要 CDP 端口）/ `lrc`（只读歌词接口） |
 | `-PositionSource` | `auto`（默认）/ `memory` / `media` / `cdp` / `clock` |
 | `-LeadMs` | **负延迟**：换行提早多少毫秒。`-1`（默认）按来源自动，`0` 关掉 |
@@ -69,6 +71,14 @@ pwsh -ExecutionPolicy Bypass -File _netease-bridge.ps1 -Ttl 600000
 
 ## 坑（都踩过）
 
+* **不要把"值的寿命"当"卡片时长"发。** 协议里 `EVENT` 的 ttl 是**卡片在屏多久**；`SET` 的 ttl
+  才是值活多久。两者默认差了三个数量级（6 秒 vs 10 分钟），而早先这里两处都发 `$TtlMs`——
+  于是每张卡片占住灵动岛十分钟，队列只有 8 格，两张卡就能把它堵住几十分钟，**歌词密集的歌
+  看起来就像脚本坏了**。现在事件走 `-EventTtlMs`（默认 6 秒）✓；mod 侧同时把卡片时长封顶
+  到 60 秒、并会丢弃等太久的旧事件（10 秒 / critical 40 秒）作为兜底 ✓。
+* **歌词密的时候不要每条都弹。** 卡片展示一张要几秒，事件来得比这快只会积压。`-EventMinIntervalMs`
+  （默认 4000）是桥这一侧的节流闸门；被它挡下的那条不算"已播报"，所以下一拍还会重试 ✓。
+
 * **曲名必须枚举顶层窗口，不能看 `Process.MainWindowTitle`。** 真机实测：开着「桌面歌词」时
   `cloudmusic` 的 `MainWindowTitle` **就是「桌面歌词」**，带歌名的窗口是同一个 pid 的另一个
   顶层窗口。按主窗口标题取 → 永远没有「 - 」→ 桥一直停在"没有可用窗口"的等待循环里、
@@ -82,8 +92,10 @@ pwsh -ExecutionPolicy Bypass -File _netease-bridge.ps1 -Ttl 600000
   周期）。`-LeadMs` 默认按来源补掉这两项（`dom` 时合计 1000 ms），觉得抢拍就 `-LeadMs 500`，
   觉得还晚就 `-LeadMs 1500`，想回到旧行为就 `-LeadMs 0`。
 * **连不上管道不是错误**：mod 没跑、或设置里不需要外部数据时，`Connect-PipeClient` 会重试到
-  窗口结束再干净退出（早先这里是裸 `Connect(3000)`，瞬时拒绝会变成未处理异常把脚本打死，
-  mod 看门狗再把它拉起来，重启预算就这么烧掉了）。
+  **60 秒**（`-WaitSeconds`）再干净退出（早先这里是裸 `Connect(3000)`，瞬时拒绝会变成未处理异常
+  把脚本打死，mod 看门狗再把它拉起来，重启预算就这么烧掉了）。退出后由 mod 的重启策略接管：
+  **连续**最多 5 次，跑满一分钟就把预算还回来 ✓。所以 mod 日志里那句
+  `EXT publisher: gave up after 5 restarts` 才是真的放弃——它同时说明"跑满 60 s 会恢复"。
 * **脚本必须带 UTF-8 BOM**：会被 Windows PowerShell 5.1 执行的部分（位置助手）不带 BOM 时
   按 GBK 读，中文会乱码甚至破坏引号。桥自身用 `pwsh` 跑，但改文件时别把 BOM 弄丢。
 * 在线歌词**搜索**接口偶发 `The SSL connection could not be established`；歌词仍能从客户端自己的
