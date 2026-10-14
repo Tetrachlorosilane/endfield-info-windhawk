@@ -821,3 +821,47 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   变成 **1400 增 / 1295 删**；"修"时又整file翻成 LF → 1400/1400。写回前先确认原行尾。
 - **辅助函数名先用 `Select-String` 确认**：自检里我写了 `Check ...`，而那份自检的失败计数是 `$bad`，
   于是整段自检中断、连 `SELFTEST PASSED` 都打不出来；而"移除"时只删掉一半，残留 20 行留了数轮。
+---
+
+## 12. 交接说明（本会话结束时写入）
+
+### 12.1 现在是什么状态
+
+**已验证（有证据）**：
+
+- mod 编译：**恰好 2 条已知警告**，DLL **179712** 字节；回归 **325 断言 × 3 次 `PASSED`**。
+- 设置块：`_settings.py` → `no structural problems found`；独立结构检查 49 条目、顶层 dash 缩进唯一为 0、每条目恰好一个 `$name`/`$description`。
+- 真实管道链：mod 开机自检两帧被服务端完整收到；`_extclient.ps1` 的值**显示在面板上**。
+- `{cpu.ghz}`：用户确认显示**正确**，标称取电源 API 的 **2.20 GHz**（注册表 2.42 被正确忽略）。
+- 看门狗：日志出现 `EXT publisher: started pid=…`，命令行按 `CreateProcessW` 约定正确拆分。
+- 歌词来源（部分打通）：`async:lyric.lyricLines`（实测 **64 / 67** 行）与 `tlyricLines`；**真 currentTime** 来自 `#page_pc_mini_bar` 的 `mm:ss / mm:ss`。
+- bridge 自检 **30 项**（含 8 项 `Select-StoreLineIndex`，不假设长度）全绿。
+
+**未验证 / 待办（按优先级）**：
+
+1. **面板上的歌词是否真的随播放换行**（用户尚未回报）。排查顺序：bridge 手跑输出 → `Get-CdpDomTime` 是否拿到 `curS` → `times` 是否拉到 → 选行索引是否变化。
+2. **发布器重启风暴是否消失**（已改成"等待窗口"而非 `exit 2`）；建议同时设 `External publisher watch process = cloudmusic`。
+3. 作业对象是否收掉**孙进程**、`CREATE_NO_WINDOW` 是否不闪窗、重载无孤儿 —— 三条只能真机看进程列表。
+4. 客户端**升级后** store 自寻址是否仍可用（跑一次 `-ProbeCdp`，它会自寻址并列出可见字段）。
+5. `playingState` 在**暂停**时的取值仍未知（目前不拿它判暂停）。
+6. `_settings.py` 补两条漏检：**同级条目缩进一致性**、**每条目单个 `$name`**（Windhawk 两次报错它都没抓到）。
+7. `ApplyPanelTransform` 的 `unused function` 警告（加 `__attribute__((unused))` 或挪进测试文件）。
+8. 设计文档里 M3 剩下的部分：`ComputeIslandRect` 接管窗口定位。
+9. AGENTS 的章节顺序：`### 10.x` 那段是追加在 §11 之后的，若在意次序可挪进 §10 末尾。
+
+### 12.2 犯错档案（本会话的错误 → 原因 → 防范）
+
+| 错误 | 原因 | 防范 |
+| :-- | :-- | :-- |
+| 设置块缩进错，Windhawk 报 `bad indentation of a sequence entry` | 凭感觉写缩进，而 `_settings.py` 不查这一项 | 抄相邻条目的风格；给 `_settings.py` 补检查 |
+| 条目插在"键"与它自己的 `$name` 之间 → `duplicated mapping key` | 锚点选在 `$name` 上，而它属于**上一行**的条目 | 条目边界是**下一条 `- Key:`**；结构检查保证每条目单 `$name` |
+| 断言里凭空写 `Check` → 自检中断数轮 | 凭记忆用辅助函数名（真实失败计数是 `$bad`） | 插入前先 `Select-String` 找**真正的汇总行**；残留块要整段删除并复核 |
+| 日志清理**误删活代码**（两次，共 6 个编译错误） | 日志与其专用计数器绑定；按**文本**删命中别的函数，按**行号**删又算错一位 | **静默优于删除**（`DBG` 宏保留语句）；删前先编译，只删编译器点名的行 |
+| 20 行补丁在 diff 里变成 1400 行 | `ReadAllText` 读、却 `split` + `join CRLF` 写回 | 写回前确认原行尾；优先 `Replace` + `WriteAllText` |
+| 把 `playingLyricLineNumber` 当"实时当前行"并写进文档 | 单次采样看着对，就当结论 | 至少**两次采样** + 与界面/位置交叉验证；未验证的结论必须标明 |
+| 发布器遇到"暂时没有窗口"就 `exit 2` | 按"人手跑"的思路写，忽略了 mod 的重启预算 | 被托管的进程**不因暂态条件退出**；生命周期交给看门狗/作业对象 |
+| DOM 探测漏掉迷你条时间 | 只找"我以为该有的标签"（`audio/video`、`m:ss`、`style.width`） | 枚举**可见文本形状**（`m:ss / m:ss`），并在**正确的页面**上测 |
+
+### 12.3 接手时先读这几节
+
+1. §0 三条铁律 → 2. §3 构建与测试（两条已知警告 + 沙箱边界）→ 3. §5.6 外部数据（管道 / 发布器 / 看门狗）→ 4. §10 与本节（分清哪些是实测、哪些还没验）。
