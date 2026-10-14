@@ -33,7 +33,7 @@ endfield-info-windhawk/
 ├── docs/                              规划、设计与交接文档
 │   ├── external-data-island-design.md 设计：外部数据（M1 数据面、M2 事件面均已实现）
 │   ├── font-and-row-metrics-design.md 设计：多字体回退 + 按行字号/高度（含"未配置零成本"闸门）
-│   ├── inline-markup-design.md        设计：行内图标/对齐/占位符 + 一次性编译（**未实现**）
+│   ├── inline-markup-design.md        设计：行内图标/对齐/占位符（未实现）+ 一次性编译（**已实现**）
 │   └── state-and-handover.md          验证状态、真机更正、犯错档案、待办
 │
 ├── 开发工具（不随 mod 交付）——**每个都有自己的 .md，讲怎么跑/要什么/输出什么/坑在哪**
@@ -269,7 +269,7 @@ python _preview.py
 | 设置块 → `ReadSettings` | 读 Windhawk 设置，解析主题/颜色/图标/动画 |
 | 设计令牌常量 | 取自原项目 Avalonia 主题的调色板与不透明度层级 |
 | `LookupRaw` / `LookupNumber` / `ResolveToken` / `ExpandTokens` | 变量与格式说明符求值 |
-| `ExpandTokensAndRings` / `BuildRowLayout` | 把一行文本切分成「文字段 + 环段」 |
+| `CompileRowText` → `InstantiateRowProgram` / `BuildRowLayout` | 把一行文本切分成「文字段 + 环段」 |
 | `ComputeRowTextMetrics` | 一行文字可用的宽度 |
 | `ComputeIconGeometry` / `RingRadiusAt` | 图标盘与其波纹的几何（**单一来源**） |
 | `PlanDownscale` / `DownscaleToFit` | 自定义图片的缩放计划与执行 |
@@ -362,7 +362,7 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   改这个常量会同时改变默认配置的外观，改前先看 §5.1 最后那条断言。
 - **`[[size:NN]]` 有两副面孔，区别只在位置**：写在**行首**是**行属性**（`ReadSettings` 的
   `ParseRowMetricTags` 把它从 `rows[]` 里剥掉，同时决定该行的字号与高度下限）；写在**别处**是
-  **段属性**（`ExpandTokensAndRings` 换成 `kSizeMarkStart` + 两位十进制数字 + `kRingMarkEnd`，
+  **段属性**（`InstantiateRowProgram` 换成 `kSizeMarkStart` + 两位十进制数字 + `kRingMarkEnd`，
   `[[/size]]` 换 `kSizeMarkEnd`），由 `BuildRowLayout` 记进 `TextSeg::runFontSize`。
   所以"段内 `[[size:20]]` 当普通文字"这条**只对行高成立**：它照样能改字号，但改的是那一段。
   绘制侧按段取字号（`AcquireRowFont(…, segFontSize)`），段不嵌套——`[[/size]]` 回到该行自己的字号，
@@ -387,7 +387,7 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
     整块面板一个图标都不画，真机上看起来就是"Row icon 选项失效"（2026-10-14）。
 - **每帧的重活是"测量"，而它被缓存掉了**（`RowLayoutPlan` + `EnsureRowPlan`）：选族（覆盖查询）与
   拟合（`FitTextToWidth` 的二分、哨兵、省略号）只在**文本或几何变化时**跑一次，中间那些帧只
-  `DrawString`。**注意前提**：标记解析（`ExpandTokensAndRings` / `BuildRowLayout`）本来就只在
+  `DrawString`。**注意前提**：标记解析（`InstantiateRowProgram` / `BuildRowLayout`）本来就只在
   `PublishRows` 里跑，不在每帧——所以"每帧解析文本"从来不是本项目的成本，别按那个去优化。
   新鲜度键的**每个字段都要有断言**（`RowPlanIsFresh` 的纪元/宽度/内缩/行高/字号/行数/段数）；
   纪元由 `ReleaseFontResources` 与 `PublishRows`（只在内容真的变了时）自增，**新增任何
@@ -613,6 +613,8 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 - **回退族名与标签族名都要过 `FontIsInstalled`**（与主字体同一个列表）。`CreateFontW` 对未知族名会
   **替换**成某个字体，而那个替身会照常回答覆盖查询——于是"回退生效了"是假的，画出来的也不是任何人都
   指定的字体。没装的因此被丢弃（标签随之原文显示，日志一条汇总）。
+- **行内标记在读取设置时编译一次**（`CompileRowText` → `ModSettings::rowProgram[]`，与 `rows[]` 同一份数据），
+  发布路径只展开 `{变量}` 与环的数值字段（`InstantiateRowProgram`），发布期不再解析标签、也不再查链序号。
 
 ---
 

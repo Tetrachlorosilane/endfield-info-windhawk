@@ -411,6 +411,11 @@ static const UINT kMsgIslandEvent = WM_APP + 4;
 
 static const int kMaxRows = 4;
 static const int kMaxRingsPerRow = 4;
+// One row's text, tags and all. This is what `ModSettings::rows[]` holds, and it is also the
+// bound the markup compiler works to: the compiled program for a row is a slice of the same
+// characters, so the two cannot be sized independently without one silently truncating what
+// the other can address.
+static const int kRowTextCap = 256;
 static const int kCursorPollMs = 40;       // proximity responsiveness vs. cost
 static const int kMaxMonitors = 8;
 
@@ -1361,6 +1366,24 @@ static int FontTagIndexOf(const FontTag *tags, int tagCount, const WCHAR *key) {
     return -1;
 }
 
+// The chain registered for the "[[font:...]]" tag whose body is [body,close), or -1 when this
+// settings version has no chain for it -- mis-spelt, not installed, past the chain limit, or
+// simply never registered. Both ends of the font machinery ask exactly this question:
+// CollectRowFontTags to decide whether a chain may be registered at all, and CompileRowText to
+// decide whether a tag may be marked in a row. Factoring it out is what keeps a tag from being
+// registered by one of them and missed by the other (AGENTS 5.7).
+static int RegisteredChainIndex(const FontTag *tags, int tagCount, const WCHAR *body,
+                                const WCHAR *close) {
+    FontChain candidate;
+    int over = 0;
+    ParseFontChainList(body, close, candidate, &over);
+    if (candidate.count == 0) return -1;
+
+    WCHAR key[kMaxFontKeyChars];
+    FontChainKey(candidate, key, kMaxFontKeyChars);
+    return FontTagIndexOf(tags, tagCount, key);
+}
+
 // The cost gate, pure so it can be asserted: a row needs the multi-font path only when it
 // carries a font tag of its own or a global fallback list exists. With neither, the painter
 // never builds a second font and never asks GDI which glyphs exist.
@@ -1372,7 +1395,8 @@ static bool RowNeedsFontPath(bool rowHasTag, bool hasGlobalChain) {
 // be honoured -- which is the row's half of the cost gate. A tag whose name is empty, too
 // long, past the chain limit or not installed is deliberately *not* registered: it then
 // draws as ordinary text, so a typo shows up on screen instead of silently changing the
-// typeface. Pairs with ExpandTokensAndRings, which matches tags by this same canonical key.
+// typeface. Pairs with CompileRowText, which resolves the same tags through the same lookup
+// (RegisteredChainIndex) while it compiles the row.
 static int CollectRowFontTags(const WCHAR *row, FontTag *tags, int *tagCount, int *rejected) {
     int honoured = 0;
     if (!row) return 0;
@@ -1389,23 +1413,22 @@ static int CollectRowFontTags(const WCHAR *row, FontTag *tags, int *tagCount, in
         const int bodyLen = (int)(close - body);
 
         // "[[/font]]" ends a run and needs no registration; anything that is not "font:"
-        // is left for ExpandTokensAndRings to treat as ordinary text.
+        // is left for the compiler to treat as ordinary text.
         if (bodyLen > 5 && _wcsnicmp(body, L"font:", 5) == 0) {
-            FontChain candidate;
-            int over = 0;
-            ParseFontChainList(body + 5, close, candidate, &over);
-
-            WCHAR key[kMaxFontKeyChars];
-            FontChainKey(candidate, key, kMaxFontKeyChars);
-
-            int index = -1;
-            if (candidate.count > 0) {
-                index = FontTagIndexOf(tags, *tagCount, key);
-                if (index < 0 && *tagCount < kMaxFontChains) {
+            int index = RegisteredChainIndex(tags, *tagCount, body + 5, close);
+            if (index < 0 && *tagCount < kMaxFontChains) {
+                // Not in the table yet. Re-parse the list so the registered chain holds the
+                // *filtered* names, and keep the canonical key the lookup used.
+                FontChain candidate;
+                int over = 0;
+                ParseFontChainList(body + 5, close, candidate, &over);
+                if (candidate.count > 0) {
                     FontChain usable = candidate;
                     int gone = 0;
                     FilterChainToInstalled(usable, &gone);
                     if (usable.count > 0) {
+                        WCHAR key[kMaxFontKeyChars];
+                        FontChainKey(candidate, key, kMaxFontKeyChars);
                         wcsncpy(tags[*tagCount].key, key, kMaxFontKeyChars - 1);
                         tags[*tagCount].key[kMaxFontKeyChars - 1] = L'\0';
                         tags[*tagCount].chain = usable;
@@ -1529,8 +1552,262 @@ static int MaxInlineRunSize(const WCHAR *row) {
     return largest;
 }
 
+// ---------------------------------------------------------------------------
+// Row programs: a row's markup, compiled once per settings change
+//
+// A row is written in markup -- [[ring:...]] gauges, [[font:...]] runs, [[size:NN]] runs -- and
+// that markup used to be scanned again on every publish, in the sampler thread. It is now
+// compiled once, while the settings are read, into the program below: a flat, fixed-size,
+// trivially destructible list of elements with no heap and no GDI+ handle. Compiling is *not*
+// rendering and *not* instantiation: the only thing it decides is where the markup is, what
+// each piece is, and which family/size is in force for each literal run.
+//
+// `{}` tokens stay inside the templates on purpose. They are the one part of a row whose value
+// only exists at publication time, which is why expanding them is the whole of the publish
+// path's work (InstantiateRowProgram) -- and why a program can be *asserted* to be free of
+// values: it is a function of the settings alone.
+//
+// The elements form a graph, not a list, for one reason: a [[ring:...]] is the only tag whose
+// success cannot be decided while compiling (its numeric fields may be {tokens}, so ParseRing
+// can only answer with live values). When it does not draw, the tag does not disappear -- it
+// stays literal text -- and the text that follows is *not* post-tag text: the scan resumes at
+// the character after the tag's own '[', where another tag may be recognised. That second
+// continuation is what `failNext` is for.
+//
+// Both continuations and the plain `next` are positions in the same row, so the programs for a
+// row's suffixes share their tails: compiling position k costs at most two elements (one
+// literal run, one tag), a position is compiled at most once, and there are only kRowTextCap
+// positions. Hence kMaxRowParts.
+// ---------------------------------------------------------------------------
+static const int kMaxRowParts = 2 * kRowTextCap + 2;
+
+// One element of a compiled row. The kinds are the markup the expander used to recognise.
+enum RowPartKind : unsigned char {
+    kPartText = 0,     // literal text, {tokens} intact
+    kPartRing,         // [[ring:...]]: drawn, or left as text, at instantiation
+    kPartFontOpen,     // [[font:...]], already resolved to a registered chain
+    kPartFontClose,    // [[/font]]
+    kPartSizeOpen,     // [[size:NN]]
+    kPartSizeClose,    // [[/size]]
+};
+
+struct RowPart {
+    RowPartKind kind;
+    // kPartText: the family chain in force, 1-based like TextSeg::tagChain (0 = main font).
+    // kPartFontOpen: the same number, which is also the digit the marker carries.
+    unsigned char tagChain;
+    // kPartText: the [[size:NN]] run in force, 0 = the row's own size.
+    // kPartSizeOpen: the run's size (kMinRowFontSize..kMaxRowFontSize, so two digits).
+    unsigned char runFontSize;
+    // kPartText: the template, as a slice of the row's own text. kPartRing: the tag's body
+    // after "ring:", which is what ParseRing is handed (after token expansion).
+    short offset;
+    short length;
+    // The next element on the ordinary path, or -1 at the end of the program.
+    short next;
+    // kPartRing / kPartSizeOpen: where to continue when this element cannot be emitted (a ring
+    // ParseRing rejects, or no room for a four-character size marker) and the markup therefore
+    // stays literal text starting with the '[' it was recognised at.
+    short failNext;
+};
+
+// One row's compiled markup. Fixed size, POD: a settings snapshot is copied to the sampler
+// thread as a whole, so this has to be as cheap to copy as the text it belongs to.
+struct RowProgram {
+    RowPart parts[kMaxRowParts];
+    int partCount = 0;
+    int first = -1;      // -1 = this row compiles to nothing (empty text)
+};
+
+// How far the compiler has got: the row being compiled, the chain table its [[font:...]] tags
+// are resolved against, and one memo slot per position. All of it is thrown away when the
+// compile returns -- it is not part of a program.
+struct RowCompiler {
+    const WCHAR *raw;
+    const FontTag *tags;
+    int tagCount;
+    RowProgram *program;
+    // Position -> the first element of the program compiled from it, -1 for "only the end of
+    // the row is left", or kRowNotCompiled. A position is compiled at most once, which is what
+    // keeps the graph finite and lets the suffixes share their tails.
+    int memo[kRowTextCap + 1];
+};
+
+// -1 is a real answer ("nothing left"), so "not compiled yet" needs a value of its own.
+static const int kRowNotCompiled = -2;
+
+// What the markup at a position is. `kind` is kPartText when it is not markup this code
+// honours, in which case the characters are ordinary text (the tolerance rule: a broken tag
+// must never eat the words around it -- AGENTS 5.7).
+struct RowTag {
+    RowPartKind kind;
+    int close;         // index of the "]]" that ends the tag
+    int payload;       // first character after the tag's own prefix ("ring:" / "size:")
+    int payloadLen;
+    int chain;         // kPartFontOpen: the registered chain, 1-based
+    int size;          // kPartSizeOpen: the run's size
+};
+
+// Classifies the markup at `at`, in the expander's own order: a ring first (whether it draws
+// can only be decided with live values), then [[font:...]], then [[size:NN]], then the two
+// closing tags. A [[font:...]] whose chain was never registered -- mis-spelt, not installed,
+// past the chain limit -- comes back as ordinary text, exactly as it did when this decision
+// was made per publish.
+static RowTag ClassifyRowTag(const WCHAR *raw, int at, const FontTag *tags, int tagCount) {
+    RowTag tag = {};
+    tag.kind = kPartText;
+
+    const WCHAR *close = wcsstr(raw + at + 2, L"]]");
+    if (!close) return tag;
+    const int bodyAt = at + 2;
+    const int bodyLen = (int)(close - (raw + bodyAt));
+    const WCHAR *body = raw + bodyAt;
+    tag.close = (int)(close - raw);
+
+    if (bodyLen > 5 && _wcsnicmp(body, L"ring:", 5) == 0) {
+        tag.kind = kPartRing;
+        tag.payload = bodyAt + 5;
+        tag.payloadLen = bodyLen - 5;
+        return tag;
+    }
+    if (bodyLen > 5 && _wcsnicmp(body, L"font:", 5) == 0) {
+        const int chain = RegisteredChainIndex(tags, tagCount, body + 5, close);
+        if (chain >= 0) {
+            tag.kind = kPartFontOpen;
+            tag.chain = chain + 1;
+        }
+        return tag;
+    }
+    if (bodyLen == 5 && _wcsnicmp(body, L"/font", 5) == 0) {
+        tag.kind = kPartFontClose;
+        return tag;
+    }
+    if (bodyLen > 5 && _wcsnicmp(body, L"size:", 5) == 0) {
+        int size = 0;
+        if (ParseInlineSize(body + 5, close, &size)) {
+            tag.kind = kPartSizeOpen;
+            tag.size = size;
+        }
+        return tag;
+    }
+    if (bodyLen == 5 && _wcsnicmp(body, L"/size", 5) == 0) {
+        tag.kind = kPartSizeClose;
+        return tag;
+    }
+    return tag;
+}
+
+// Appends one element with both continuations at "the program ends here". The caller fills in
+// what it needs and links it. Returns -1 only if the part table is full, which the capacity
+// argument above rules out; the guard is there so an impossible case cannot run off the array.
+static int NewRowPart(RowProgram &program, RowPartKind kind) {
+    if (program.partCount >= kMaxRowParts) return -1;
+    const int index = program.partCount++;
+    RowPart &part = program.parts[index];
+    part = RowPart();
+    part.kind = kind;
+    part.next = -1;
+    part.failNext = -1;
+    return index;
+}
+
+static int CompileRowSuffix(RowCompiler &c, int at, int chain, int size) {
+    if (at < 0 || at >= kRowTextCap) return -1;
+    const int compiled = c.memo[at];
+    if (compiled != kRowNotCompiled) return compiled;
+
+    // Where the literal run ends. Everything the scan walks over belongs to it: characters,
+    // {...} token spans (a tag inside one is never markup -- the expander consumes the token
+    // first, so its characters are copied as text), and every tag this code does *not* honour,
+    // which is copied as text one character at a time so that a tag nested in it can still be
+    // recognised -- the scan simply continues one character further on.
+    int textEnd = at;
+    bool foundTag = false;
+    RowTag tag = {};
+    for (;;) {
+        if (textEnd >= kRowTextCap) break;
+        const WCHAR ch = c.raw[textEnd];
+        if (ch == L'\0') break;
+        if (ch == L'{') {
+            const WCHAR *close = wcschr(c.raw + textEnd + 1, L'}');
+            if (close) {
+                textEnd = (int)(close - c.raw) + 1;
+                continue;
+            }
+        }
+        if (ch == L'[' && c.raw[textEnd + 1] == L'[') {
+            tag = ClassifyRowTag(c.raw, textEnd, c.tags, c.tagCount);
+            if (tag.kind != kPartText) {
+                foundTag = true;
+                break;
+            }
+        }
+        textEnd++;
+    }
+
+    int head = -1;
+    if (textEnd > at) {
+        head = NewRowPart(*c.program, kPartText);
+        RowPart &part = c.program->parts[head];
+        part.offset = (short)at;
+        part.length = (short)(textEnd - at);
+        part.tagChain = (unsigned char)chain;
+        part.runFontSize = (unsigned char)size;
+    }
+
+    if (foundTag) {
+        const int index = NewRowPart(*c.program, tag.kind);
+        RowPart &part = c.program->parts[index];
+        switch (tag.kind) {
+            case kPartRing:
+                part.offset = (short)tag.payload;
+                part.length = (short)tag.payloadLen;
+                part.next = (short)CompileRowSuffix(c, tag.close + 2, chain, size);
+                // The tag stays literal text starting with the '[' it was recognised at, so
+                // the scan resumes at the character after *that* one -- not after the tag.
+                part.failNext = (short)CompileRowSuffix(c, textEnd + 1, chain, size);
+                break;
+            case kPartFontOpen:
+                part.tagChain = (unsigned char)tag.chain;
+                part.next = (short)CompileRowSuffix(c, tag.close + 2, tag.chain, size);
+                break;
+            case kPartFontClose:
+                part.next = (short)CompileRowSuffix(c, tag.close + 2, 0, size);
+                break;
+            case kPartSizeOpen:
+                part.runFontSize = (unsigned char)tag.size;
+                part.next = (short)CompileRowSuffix(c, tag.close + 2, chain, tag.size);
+                part.failNext = (short)CompileRowSuffix(c, textEnd + 1, chain, size);
+                break;
+            case kPartSizeClose:
+                part.next = (short)CompileRowSuffix(c, tag.close + 2, chain, 0);
+                break;
+            default:
+                break;
+        }
+        if (head < 0) head = index;
+        else c.program->parts[head].next = (short)index;
+    }
+
+    c.memo[at] = head;
+    return head;
+}
+
+// Compiles one row's raw text into `out`. Pure: it depends on nothing but the text and the
+// chain table the settings carry, so the same row always compiles to the same program.
+//
+// A row is at most kRowTextCap characters (that is all `rows[]` can hold), and that bound is
+// what sizes the memo table and the part table; text past it is not addressable by a program
+// and is not scanned. Defined below, once ModSettings is a complete type.
+static void CompileRowText(const ModSettings &settings, const WCHAR *raw, RowProgram &out);
+
 struct ModSettings {
-    WCHAR rows[kMaxRows][256] = {};
+    WCHAR rows[kMaxRows][kRowTextCap] = {};
+    // The compiled form of rows[], one program per row, built by CompileRowText while the
+    // settings are read. It lives here, next to the text it describes, on purpose: it is the
+    // same data, so a settings snapshot carries both and the two can never disagree about what
+    // a row says. Only {tokens} are left to the publish path (InstantiateRowProgram).
+    RowProgram rowProgram[kMaxRows];
     int rowCount = 0;
     // ClickAction == Toggle: a click shows or hides the panel (default).
     // ClickAction == Proximity: a click switches between mouse-activated and
@@ -1617,6 +1894,24 @@ struct ModSettings {
     bool userSetText = false;
     bool userSetAccent = false;
 };
+
+// The compiler proper, now that ModSettings is complete enough to read its chain table from.
+static void CompileRowText(const ModSettings &settings, const WCHAR *raw, RowProgram &out) {
+    out = RowProgram();
+    if (!raw) return;
+
+    RowCompiler c = {};
+    c.raw = raw;
+    c.tags = settings.tagFonts;
+    c.tagCount = settings.tagFontCount;
+    c.program = &out;
+    for (int i = 0; i <= kRowTextCap; i++) c.memo[i] = kRowNotCompiled;
+
+    // first stays -1 when the row is empty, and RowProgram's other default is partCount = 0:
+    // a settings object that was never compiled therefore instantiates to nothing instead of
+    // walking parts it never filled in.
+    out.first = CompileRowSuffix(c, 0, 0, 0);
+}
 
 // The font size one row is drawn at, and the height its box gets. The height never falls
 // below what that row's font needs (MinimumRowHeightForFont), so growing a row's font grows
@@ -1712,8 +2007,8 @@ static void ReadSettings(ModSettings &s) {
             // know these tags exist.
             int tagFontSize = 0, tagHeight = 0;
             const WCHAR *text = ParseRowMetricTags(value, &tagFontSize, &tagHeight);
-            wcsncpy(s.rows[slot], text, 255);
-            s.rows[slot][255] = L'\0';
+            wcsncpy(s.rows[slot], text, kRowTextCap - 1);
+            s.rows[slot][kRowTextCap - 1] = L'\0';
 
             WCHAR sizeKey[24];
             WCHAR heightKey[24];
@@ -1805,6 +2100,13 @@ static void ReadSettings(ModSettings &s) {
                L"%d distinct chains; they will draw as ordinary text",
                tagRejected, kMaxFontChains);
     }
+
+    // Now that the row text and every chain it may name are final, compile the rows. This is
+    // the whole point of the split: the markup is read here, once per settings change, and the
+    // sampler thread only expands {tokens} into these templates (InstantiateRowProgram). Every
+    // slot is compiled, not just the published ones, so a program always describes the text
+    // sitting next to it.
+    for (int i = 0; i < kMaxRows; i++) CompileRowText(s, s.rows[i], s.rowProgram[i]);
 
     s.panelWidth = ClampInt((int)Wh_GetIntSetting(L"PanelWidth"), 200, 1600);
     s.rowHeight = ClampInt((int)Wh_GetIntSetting(L"RowHeight"), 18, 80);
@@ -4098,7 +4400,7 @@ static void ExpandTokens(const WCHAR *source, const Values &v, WCHAR *out, size_
 // Row layout
 //
 // A row is an alternating sequence of text and gauges, taken from the markers
-// ExpandTokensAndRings leaves behind. Only slice offsets are stored, which keeps
+// InstantiateRowProgram leaves behind. Only slice offsets are stored, which keeps
 // the sampler thread cheap and lets the painter measure text with a real
 // Graphics instead of guessing at glyph widths.
 // ---------------------------------------------------------------------------
@@ -4145,129 +4447,153 @@ static const WCHAR kFontMarkEnd = 0xE003;
 static const WCHAR kSizeMarkStart = 0xE004;
 static const WCHAR kSizeMarkEnd = 0xE005;
 
-// Expands tokens, swaps each ring token for a marker, and returns the gauges in
-// source order.
-static void ExpandTokensAndRings(const WCHAR *source, const Values &v,
-                                 const ModSettings &settings, WCHAR *out, size_t outCount,
-                                 RingSpec *rings, int *ringCount, int maxRings) {
+// Instantiates a compiled row against the current values: expands the {tokens} left in each
+// TEXT template, turns a [[ring:...]] the values allow into a gauge, and writes the same marked
+// string and RingSpec array the row used to be scanned into on every publish. The markers --
+// including the digits they carry -- are what BuildRowLayout strips, so the encoding is part of
+// this function's contract, not an implementation detail.
+//
+// The bounds behaviour is the old per-publish expander's, reproduced on purpose: the walk wants
+// four spare characters, a token expansion fills what is left one character at a time, and a
+// [[size:NN]] marker asks for one more character of headroom than the walk itself does -- when
+// the buffer is exactly that full, the tag is copied as ordinary text instead of being marked.
+// A row is 640 characters of output and at most kRowTextCap of input, so none of that is
+// reachable from the settings, but "byte for byte what the old code produced" has to hold for
+// every buffer the tests and the sampler thread hand in, so every one of the tests is kept.
+static void InstantiateRowProgram(const ModSettings &settings, int row, const Values &v,
+                                  WCHAR *out, size_t outCount, RingSpec *rings, int *ringCount,
+                                  int maxRings) {
     *ringCount = 0;
-    size_t written = 0;
-    const WCHAR *p = source;
-
-    while (*p && written + 4 < outCount) {
-        if (p[0] == L'[' && p[1] == L'[') {
-            const WCHAR *close = wcsstr(p + 2, L"]]");
-            if (close) {
-                const WCHAR *body = p + 2;
-                int bodyLen = (int)(close - body);
-                if (bodyLen > 5 && _wcsnicmp(body, L"ring:", 5) == 0) {
-                    // The ring's own VALUE / MAX can be tokens, so expand the body
-                    // before parsing it.
-                    WCHAR rawBody[192];
-                    WCHAR bodyExpanded[192];
-                    int rawLen = MinInt(bodyLen - 5, 191);
-                    wcsncpy(rawBody, body + 5, rawLen);
-                    rawBody[rawLen] = L'\0';
-                    ExpandTokens(rawBody, v, bodyExpanded, 192);
-                    bool drawn = false;
-                    if (*ringCount < maxRings) {
-                        RingSpec spec;
-                        if (ParseRing(bodyExpanded, (int)wcslen(bodyExpanded), v, settings, spec)) {
-                            out[written++] = kRingMarkStart;
-                            out[written++] = (WCHAR)(L'0' + *ringCount);
-                            out[written++] = kRingMarkEnd;
-                            rings[*ringCount] = spec;
-                            (*ringCount)++;
-                            drawn = true;
-                        }
-                    }
-                    if (drawn) {
-                        p = close + 2;
-                        continue;
-                    }
-                    // Nothing was drawn -- the body did not parse, or the row already has all
-                    // the gauges it may have. Consuming the text here would delete the very
-                    // characters that explain why no gauge appeared, so it falls through and is
-                    // copied as ordinary text (which is what ParseRing's own contract says).
-                }
-                // [[font:Name]] / [[font:A;B]] opens a run in another family, [[/font]]
-                // closes it. The name list was parsed and registered by ReadSettings, so all
-                // this has to do is find it by its canonical text -- a tag that is not in
-                // the table (mis-spelt, uninstalled, past the chain limit, or simply never
-                // registered because the settings changed under it) is left in the text and
-                // draws literally. That is the tolerance rule: a broken tag must never make
-                // a row disappear (docs/font-and-row-metrics-design.md 3).
-                if (bodyLen > 5 && _wcsnicmp(body, L"font:", 5) == 0) {
-                    FontChain candidate;
-                    int over = 0;
-                    ParseFontChainList(body + 5, close, candidate, &over);
-                    WCHAR key[kMaxFontKeyChars];
-                    FontChainKey(candidate, key, kMaxFontKeyChars);
-                    const int chain = FontTagIndexOf(settings.tagFonts, settings.tagFontCount, key);
-                    if (chain >= 0 && written + 4 < outCount) {
-                        out[written++] = kFontMarkStart;
-                        out[written++] = (WCHAR)(L'1' + chain);
-                        out[written++] = kRingMarkEnd;
-                        p = close + 2;
-                        continue;
-                    }
-                    // Not registered: mis-spelt, uninstalled, past the chain limit, or the
-                    // settings changed under this row. It falls through and is copied as
-                    // ordinary text -- eating it here would hide the only visible clue that the
-                    // tag did nothing.
-                }
-                // The closing tag carries no payload, and its index does not matter: the runs
-                // are properly nested by construction, so an end marker inside a run can only
-                // close that run.
-                if (bodyLen == 5 && _wcsnicmp(body, L"/font", 5) == 0) {
-                    if (written + 2 < outCount) out[written++] = kFontMarkEnd;
-                    p = close + 2;
-                    continue;
-                }
-                // [[size:NN]] / [[/size]]: the same mechanism as a font run, for the font
-                // size. A size tag at the very start of the row is a *row* property and was
-                // already consumed by ReadSettings, so anything that reaches this point is a
-                // run inside the text and is marked as one.
-                if (bodyLen > 5 && _wcsnicmp(body, L"size:", 5) == 0) {
-                    int size = 0;
-                    if (ParseInlineSize(body + 5, close, &size) && written + 5 < outCount) {
-                        out[written++] = kSizeMarkStart;
-                        out[written++] = (WCHAR)(L'0' + size / 10);
-                        out[written++] = (WCHAR)(L'0' + size % 10);
-                        out[written++] = kRingMarkEnd;
-                        p = close + 2;
-                        continue;
-                    }
-                    // Not a size this code can draw (a word, an empty value, a number past
-                    // the clamp): leave it as text rather than eating it.
-                }
-                if (bodyLen == 5 && _wcsnicmp(body, L"/size", 5) == 0) {
-                    if (written + 2 < outCount) out[written++] = kSizeMarkEnd;
-                    p = close + 2;
-                    continue;
-                }
-            }
-        }
-        if (*p == L'{') {
-            const WCHAR *end = wcschr(p + 1, L'}');
-            if (end) {
-                WCHAR token[320];
-                int span = MinInt((int)(end - p) + 1, 319);
-                wcsncpy(token, p, span);
-                token[span] = L'\0';
-                WCHAR expanded[kExtMaxValueChars + 1];
-                ExpandTokens(token, v, expanded, kExtMaxValueChars + 1);
-                // Copy with a per-character bounds check, mirroring ExpandTokens.
-                // A single "written + 1 < outCount" guard before the whole run
-                // would let a long expansion overrun the destination.
-                for (const WCHAR *c = expanded; *c && written + 1 < outCount; c++)
-                    out[written++] = *c;
-                p = end + 1;
-                continue;
-            }
-        }
-        out[written++] = *p++;
+    if (row < 0 || row >= kMaxRows) {
+        out[0] = L'\0';
+        return;
     }
+
+    // The text and its program live in the same settings object, so they cannot be paired with
+    // the wrong row: this function is handed the settings, not a program and a string.
+    const WCHAR *raw = settings.rows[row];
+    const RowProgram &program = settings.rowProgram[row];
+    size_t written = 0;
+    int node = program.first;
+
+    while (node >= 0 && node < program.partCount) {
+        // The old expander tested this before every character, and every marker write below
+        // relies on what it guarantees: four free characters.
+        if (written + 4 >= outCount) break;
+        const RowPart &part = program.parts[node];
+
+        if (part.kind == kPartText) {
+            const WCHAR *tpl = raw + part.offset;
+            const int limit = part.length;
+            int i = 0;
+            while (i < limit && written + 4 < outCount) {
+                if (tpl[i] == L'{') {
+                    // A token's '}' is always inside this template: the compiler consumed whole
+                    // token spans while it looked for markup, so a '{' it left here closes here.
+                    int end = i + 1;
+                    while (end < limit && tpl[end] != L'}') end++;
+                    if (end < limit) {
+                        WCHAR token[320];
+                        const int span = MinInt(end - i + 1, 319);
+                        wcsncpy(token, tpl + i, span);
+                        token[span] = L'\0';
+                        WCHAR expanded[kExtMaxValueChars + 1];
+                        ExpandTokens(token, v, expanded, kExtMaxValueChars + 1);
+                        // Copy with a per-character bounds check, mirroring ExpandTokens: a
+                        // single guard for the whole run would let a long expansion overrun the
+                        // destination.
+                        for (const WCHAR *ch = expanded; *ch && written + 1 < outCount; ch++)
+                            out[written++] = *ch;
+                        i = end + 1;
+                        continue;
+                    }
+                }
+                out[written++] = tpl[i++];
+            }
+            // A template that did not fit is where the old expander's walk stopped too: the
+            // head test at the top of this loop ends the program on the next turn.
+            node = part.next;
+            continue;
+        }
+
+        if (part.kind == kPartRing) {
+            // VALUE / MAX / THICK may be {tokens}, so the body is expanded and parsed here:
+            // whether a gauge draws is a question only live values can answer.
+            WCHAR rawBody[192];
+            const int rawLen = MinInt(part.length, 191);
+            wcsncpy(rawBody, raw + part.offset, rawLen);
+            rawBody[rawLen] = L'\0';
+            WCHAR expanded[192];
+            ExpandTokens(rawBody, v, expanded, 192);
+            bool drawn = false;
+            if (*ringCount < maxRings) {
+                RingSpec spec;
+                if (ParseRing(expanded, (int)wcslen(expanded), v, settings, spec)) {
+                    out[written++] = kRingMarkStart;
+                    out[written++] = (WCHAR)(L'0' + *ringCount);
+                    out[written++] = kRingMarkEnd;
+                    rings[*ringCount] = spec;
+                    (*ringCount)++;
+                    drawn = true;
+                }
+            }
+            if (drawn) {
+                node = part.next;
+            } else {
+                // Nothing was drawn -- the body did not parse, or the row already has all the
+                // gauges it may have. Consuming the text here would delete the very characters
+                // that explain why no gauge appeared, so the tag stays literal text (which is
+                // what ParseRing's own contract says) and the walk resumes at the character
+                // after its '[': a tag written inside the body can still be recognised.
+                out[written++] = L'[';
+                node = part.failNext;
+            }
+            continue;
+        }
+
+        if (part.kind == kPartFontOpen) {
+            // The chain was resolved while compiling, so nothing here re-validates a family
+            // name. The old expander also re-tested the walk's own head condition at this
+            // point; nothing had been written since that test, so it could not fail.
+            out[written++] = kFontMarkStart;
+            out[written++] = (WCHAR)(L'0' + part.tagChain);
+            out[written++] = kRingMarkEnd;
+            node = part.next;
+            continue;
+        }
+        if (part.kind == kPartFontClose) {
+            // The old expander asked for two spare characters here where the walk asks for
+            // four, so the stricter test has already passed.
+            out[written++] = kFontMarkEnd;
+            node = part.next;
+            continue;
+        }
+        if (part.kind == kPartSizeOpen) {
+            if (written + 5 < outCount) {
+                out[written++] = kSizeMarkStart;
+                out[written++] = (WCHAR)(L'0' + part.runFontSize / 10);
+                out[written++] = (WCHAR)(L'0' + part.runFontSize % 10);
+                out[written++] = kRingMarkEnd;
+                node = part.next;
+            } else {
+                // Exactly the case the old expander's extra test singled out: one character
+                // less headroom than the marker needs, so the tag is copied as text instead.
+                out[written++] = L'[';
+                node = part.failNext;
+            }
+            continue;
+        }
+        if (part.kind == kPartSizeClose) {
+            out[written++] = kSizeMarkEnd;
+            node = part.next;
+            continue;
+        }
+
+        // An element kind this build does not know: nothing to write, and nothing sensible to
+        // continue with.
+        break;
+    }
+
     out[written] = L'\0';
 }
 
@@ -5657,8 +5983,9 @@ static void ReleaseFontResources() {
 // Placing and fitting a row's runs is the most expensive thing a frame used to do, and it was
 // done *every* frame: each run re-chose its family (glyph-coverage queries) and re-fitted itself
 // with a binary search over MeasureString -- per row, per segment, 25 times a second, for rows
-// whose text had not changed since the last sample. (The markup parsing itself was already out
-// of the frame path: ExpandTokensAndRings/BuildRowLayout only run in PublishRows.)
+// whose text had not changed since the last sample. (The markup itself was already out of the
+// frame path -- it is compiled in ReadSettings, and InstantiateRowProgram/BuildRowLayout only
+// run in PublishRows.)
 //
 // So each row's geometry is computed here once, cached, and read verbatim by the frames in
 // between. What the frame still does per frame is everything that genuinely varies: the ring
@@ -7010,15 +7337,17 @@ static bool PublishRows(const Values &v, const ModSettings &settings) {
     RingSpec rings[kMaxRows][kMaxRingsPerRow];
     int ringCounts[kMaxRows] = {};
 
-    // Expanding reads the external value table, so the whole expansion runs under
+    // Instantiating reads the external value table, so the whole walk runs under
     // g_extLock: a row can never contain a half-written entry. The lock is
     // released before g_valuesLock is taken -- the two are never nested, which is
     // what keeps the lock graph acyclic (docs/external-data-island-design.md 5.6.1).
     bool lockedExt = g_extLockReady;
     if (lockedExt) EnterCriticalSection(&g_extLock);
     for (int r = 0; r < count; r++) {
-        ExpandTokensAndRings(settings.rows[r], v, settings, marked[r], 640,
-                             rings[r], &ringCounts[r], kMaxRingsPerRow);
+        // The markup was compiled when the settings were read; all that is left here is
+        // filling its {tokens} in with the values of this sample.
+        InstantiateRowProgram(settings, r, v, marked[r], 640, rings[r], &ringCounts[r],
+                              kMaxRingsPerRow);
     }
     if (lockedExt) {
         // Publish when the first live value goes stale, so "--" appears then and

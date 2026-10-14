@@ -113,6 +113,31 @@ static void Skip(const char *label) {
     g_skips++;
 }
 
+// One settings object per *site* in this file, in namespace-scope storage, reset on entry.
+//
+// ModSettings now carries a compiled markup program per row, which makes it about 33 KB, and
+// keeping every block's copy on the stack put main's frame past the 1 MB stack this build is
+// given -- and that failure is a stack overflow with no output at all, which reads like a clean
+// run if you only grep for FAIL. The objects are namespace-scope rather than block-scope statics
+// on purpose: a block-scope static of a type with a non-trivial default constructor needs
+// __cxa_guard_acquire/release, which this build would have to import from libc++.dll, and the
+// host is meant to link against nothing but the Win32 libraries. One object per site also means
+// two blocks can never share one, however they nest; the host drives the product from one
+// thread, so there is no sharing to worry about beyond that.
+//
+// The defaults live in an object of their own because a reset has to copy from *something*, and
+// `x = ModSettings()` would materialise a 33 KB temporary in the frame -- the very cost this
+// arrangement exists to avoid.
+static const ModSettings kDefaultSettings = ModSettings();
+static ModSettings g_markRow, g_theme, g_ringPreset, g_ringCustom, g_ringThemed, g_icons,
+    g_iconOnlyFirst, g_iconNone, g_iconPath, g_fontChain, g_fontTagged, g_metricDefault,
+    g_metricHuge, g_metricRow, g_metricIcons, g_metricNoneFirst, g_sizeRun, g_sizeTagged,
+    g_runCase, g_prefixRows, g_geometrySaved, g_geometry, g_planSaved, g_plan, g_extAllow,
+    g_extRows, g_extBad, g_extCfg, g_extSettings, g_islandCfgA, g_islandCfgB, g_publish,
+    g_programCompile, g_programRead;
+
+#define LOCAL_SETTINGS(name, slot) ModSettings &name = slot; slot = kDefaultSettings
+
 // ---- injectable font coverage ---------------------------------------------
 // A fake glyph table plus the counter that makes the *number* of coverage questions
 // assertable. "It picked the right family" is only half of the fallback contract; the other
@@ -143,6 +168,81 @@ static bool FamilyIs(const WCHAR *picked, const WCHAR *name) {
     return picked && wcscmp(picked, name) == 0;
 }
 
+// ---- the row pipeline's two halves -----------------------------------------
+//
+// The product compiles a row's markup once, while the settings are read, and the publish path
+// only instantiates that program against the current values. A test that wants to look at a row
+// has to do the same two things, so this is the one place it does them: the raw text is put
+// into a scratch copy of the settings (which is what ReadSettings does for real), compiled, and
+// then instantiated. Going through one helper, rather than calling the compiler and the
+// instantiator separately, is what keeps a test from pairing a program with text it was not
+// compiled from -- InstantiateRowProgram reads the text out of the settings object itself.
+static void MarkRow(const WCHAR *raw, const Values &v, const ModSettings &settings, WCHAR *out,
+                    int cap, RingSpec *rings, int *ringCount, int maxRings) {
+    LOCAL_SETTINGS(scratch, g_markRow);
+    scratch = settings;
+    wcsncpy(scratch.rows[0], raw, kRowTextCap - 1);
+    scratch.rows[0][kRowTextCap - 1] = L'\0';
+    CompileRowText(scratch, scratch.rows[0], scratch.rowProgram[0]);
+    InstantiateRowProgram(scratch, 0, v, out, (size_t)cap, rings, ringCount, maxRings);
+}
+
+// Field by field, and only over the elements that were written: a program's arrays are
+// oversized by design, so comparing the struct -- or the bytes past partCount -- would call two
+// equal programs different for no reason. Every field is compared, so one changed attribute
+// still reads as a difference.
+static bool RowProgramEqual(const RowProgram &a, const RowProgram &b) {
+    if (a.partCount != b.partCount || a.first != b.first) return false;
+    for (int i = 0; i < a.partCount; i++) {
+        const RowPart &x = a.parts[i];
+        const RowPart &y = b.parts[i];
+        if (x.kind != y.kind || x.tagChain != y.tagChain || x.runFontSize != y.runFontSize ||
+            x.offset != y.offset || x.length != y.length || x.next != y.next ||
+            x.failNext != y.failNext) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The n-th element of a program on its ordinary path, which is the order a publish emits them
+// in. Elements are stored as a graph because a ring that fails has to resume in the middle of
+// its own tag; following `next` is what turns that back into a sequence.
+static const RowPart *ProgramElement(const RowProgram &p, int index) {
+    int node = p.first;
+    for (int i = 0; i < index && node >= 0 && node < p.partCount; i++) {
+        node = p.parts[node].next;
+    }
+    if (node < 0 || node >= p.partCount) return nullptr;
+    return &p.parts[node];
+}
+
+// Whether any element of a program is of this kind -- including the ones only a failing ring
+// can reach. Used to compare a program against the cost gate that decides whether the row
+// needs the multi-font path at all.
+static bool ProgramHasKind(const RowProgram &p, RowPartKind kind) {
+    for (int i = 0; i < p.partCount; i++) {
+        if (p.parts[i].kind == kind) return true;
+    }
+    return false;
+}
+
+// Every TEXT template the ordinary path reaches, concatenated: what a program says when no
+// {token} expands to anything. That is how "compiling did not expand the tokens" is read off a
+// program directly, without instantiating it with values that would hide the answer.
+static void LinearTemplate(const RowProgram &p, const WCHAR *raw, WCHAR *out, int cap) {
+    int used = 0;
+    for (int i = 0; ; i++) {
+        const RowPart *part = ProgramElement(p, i);
+        if (!part) break;
+        if (part->kind != kPartText) continue;
+        for (int j = 0; j < part->length && used + 1 < cap; j++) {
+            out[used++] = raw[part->offset + j];
+        }
+    }
+    out[used] = L'\0';
+}
+
 int main() {
     printf("=== theme vs custom colour precedence ===\n");
     {
@@ -161,7 +261,7 @@ int main() {
         g_stubInts = nullptr;
         g_stubIntCount = 0;
 
-        ModSettings s;
+        LOCAL_SETTINGS(s, g_theme);
         ReadSettings(s);
         printf("  Theme=Midnight with custom colours set:\n");
         printf("    themeIndex=%d bg=%08lX border=%08lX text=%08lX accent=%08lX\n",
@@ -210,11 +310,11 @@ int main() {
     printf("\n=== ring colour precedence ===\n");
     {
         // 1. A per-ring :COLOR field beats everything.
-        ModSettings preset;
+        LOCAL_SETTINGS(preset, g_ringPreset);
         preset.border = kThemes[1].border;
         preset.ringColorUserSet = false;
 
-        ModSettings custom;
+        LOCAL_SETTINGS(custom, g_ringCustom);
         custom.border = 0xFF111111;
         custom.ringColor = 0xFFAB12CD;
         custom.ringColorUserSet = true;
@@ -250,7 +350,7 @@ int main() {
         g_stubStringCount = (int)(sizeof(namedWithRing) / sizeof(namedWithRing[0]));
         g_stubInts = nullptr;
         g_stubIntCount = 0;
-        ModSettings themed;
+        LOCAL_SETTINGS(themed, g_ringThemed);
         ReadSettings(themed);
         printf("  Theme=Midnight + RingColor: ringColorUserSet=%d\n",
                themed.ringColorUserSet ? 1 : 0);
@@ -275,7 +375,7 @@ int main() {
         //
         // The requested behaviour is then checked as well: every row carries its own
         // configurable icon and emits its own ripples.
-        ModSettings s;
+        LOCAL_SETTINGS(s, g_icons);
         s.fontSize = 15;
         s.rowHeight = 30;
 
@@ -302,7 +402,7 @@ int main() {
 
         // Setting only row 1 must give every row a plate, or the default config
         // would look broken on rows 2..4.
-        ModSettings onlyFirst;
+        LOCAL_SETTINGS(onlyFirst, g_iconOnlyFirst);
         onlyFirst.fontSize = 15;
         onlyFirst.rowHeight = 30;
         onlyFirst.icons[0].style = 5;
@@ -422,7 +522,7 @@ int main() {
         }
 
         // With no icon anywhere there is no plate, so there must be no ripple.
-        ModSettings noIcon;
+        LOCAL_SETTINGS(noIcon, g_iconNone);
         Check(IconPlateDiameter(noIcon, 0) == 0.0f, "no icon means no ripple origin");
         Check(!AnyIconConfigured(noIcon), "a default config has no icons at all");
         Check(IconPlateDiameter(s, 0) > 0.0f, "an icon provides a ripple origin");
@@ -660,7 +760,7 @@ int main() {
         // reads as "the icon turned white", not as "that path did not load".
         const StubSetting *savedStrings = g_stubStrings;
         const int savedStringCount = g_stubStringCount;
-        ModSettings s;
+        LOCAL_SETTINGS(s, g_iconPath);
         const WCHAR *global = L"C:\\pics\\global.png";
         const WCHAR *row2File = L"C:\\pics\\row2.png";
 
@@ -1205,8 +1305,7 @@ int main() {
             WCHAR marked[640];
             RingSpec rings[kMaxRingsPerRow];
             int ringCount = 0;
-            ExpandTokensAndRings(row, t, g_settings, marked, 640, rings, &ringCount,
-                                 kMaxRingsPerRow);
+            MarkRow(row, t, g_settings, marked, 640, rings, &ringCount, kMaxRingsPerRow);
             // The expansion must not still contain a brace.
             bool resolved = wcschr(marked, L'{') == nullptr;
             if (!resolved) printf("    {%ls} -> \"%ls\"\n", token, marked);
@@ -1249,8 +1348,7 @@ int main() {
             WCHAR marked[640];
             RingSpec rings[kMaxRingsPerRow];
             int ringCount = 0;
-            ExpandTokensAndRings(e.row, g, g_settings, marked, 640, rings, &ringCount,
-                                 kMaxRingsPerRow);
+            MarkRow(e.row, g, g_settings, marked, 640, rings, &ringCount, kMaxRingsPerRow);
             bool ok = wcscmp(marked, e.expect) == 0;
             wprintf(L"    \"%ls\" -> \"%ls\"  (expect \"%ls\")\n", e.row, marked, e.expect);
             Check(ok, "unavailable/unresolvable token behaviour");
@@ -1289,8 +1387,7 @@ int main() {
         WCHAR marked[640];
         RingSpec rings[kMaxRingsPerRow];
         int ringCount = 0;
-        ExpandTokensAndRings(c.row, v, g_settings, marked, 640, rings, &ringCount,
-                             kMaxRingsPerRow);
+        MarkRow(c.row, v, g_settings, marked, 640, rings, &ringCount, kMaxRingsPerRow);
 
         RowState state;
         state.inlineRing[0] = false;
@@ -1304,6 +1401,235 @@ int main() {
         Check(ringCount == c.expectRings, "ring count");
         Check(state.inlineRing[0] == c.expectInline, "inline flag");
         Check(wcscmp(state.text[0], c.expectText) == 0, "expanded text, spaces preserved");
+    }
+
+    printf("\n=== row programs: the markup is compiled at settings time ===\n");
+    {
+        // The row pipeline is two halves now. CompileRowText reads the markup once, while the
+        // settings are read; InstantiateRowProgram only fills the {tokens} in with the values of
+        // one publish. Everything below is about the first half, because that is the half that
+        // did not exist: what a program records, that it records the same thing twice, and that
+        // instantiating it produces the marked string the old expander produced -- written out
+        // literally, so the expectation is not the old code asking itself.
+        LOCAL_SETTINGS(s, g_programCompile);
+        s.fontSize = 15;
+        s.rowHeight = 30;
+        s.ringSize = 26;
+        s.ringThickness = 4;
+        s.rowCount = 1;
+        // One registered chain, so [[font:Arial]] resolves without consulting the installed
+        // fonts: CompileRowText only *looks up* a chain, it never re-validates a family name.
+        wcscpy(s.tagFonts[0].key, L"Arial");
+        wcscpy(s.tagFonts[0].chain.names[0], L"Arial");
+        s.tagFonts[0].chain.count = 1;
+        s.tagFontCount = 1;
+
+        printf("    ModSettings=%d B, row program=%d B x %d rows\n", (int)sizeof(ModSettings),
+               (int)sizeof(RowProgram), kMaxRows);
+        Check(sizeof(ModSettings) < 64 * 1024,
+              "a settings snapshot stays small enough to copy once per sample");
+
+        // --- the zero-cost shape: an untagged row is one template, nothing else ---
+        const WCHAR plainRow[] = L"CPU 12%  RAM 73%";
+        RowProgram plain;
+        CompileRowText(s, plainRow, plain);
+        printf("    \"%ls\" -> %d element(s)\n", plainRow, plain.partCount);
+        Check(plain.partCount == 1, "an untagged row compiles to exactly one element");
+        Check(plain.first == 0 && plain.parts[0].kind == kPartText, "and that element is TEXT");
+        Check(plain.parts[0].offset == 0 && plain.parts[0].length == (int)wcslen(plainRow),
+              "carrying the whole row as its template");
+        Check(plain.parts[0].next == -1, "with nothing after it");
+        Check(plain.parts[0].tagChain == 0 && plain.parts[0].runFontSize == 0,
+              "and neither a font chain nor a run size in force");
+
+        // --- compiling is not instantiating: {tokens} are values, so they are not compiled ---
+        const WCHAR tokenRow[] = L"{cpu}%  T={gpu.temp}  {ext.music.title}";
+        RowProgram tokenProgram;
+        CompileRowText(s, tokenRow, tokenProgram);
+        WCHAR templateText[256];
+        LinearTemplate(tokenProgram, tokenRow, templateText, 256);
+        wprintf(L"    \"%ls\" -> template \"%ls\"\n", tokenRow, templateText);
+        Check(wcscmp(templateText, tokenRow) == 0,
+              "compiling leaves every {token} in the template: it expands nothing");
+
+        // --- the same row compiles the same way, and the comparison is not blind ---
+        RowProgram again;
+        CompileRowText(s, tokenRow, again);
+        Check(RowProgramEqual(tokenProgram, again),
+              "compiling the same row twice produces the same program");
+        RowProgram mutated = again;
+        mutated.parts[0].tagChain = 1;
+        Check(!RowProgramEqual(tokenProgram, mutated),
+              "and that comparison notices one changed field (it can fail)");
+
+        // --- what a [[font:...]] / [[size:NN]] / [[/size]] run records ---
+        const WCHAR fontRow[] = L"A[[font:Arial]]B[[/font]]C";
+        RowProgram fontProgram;
+        CompileRowText(s, fontRow, fontProgram);
+        const RowPart *f0 = ProgramElement(fontProgram, 0);
+        const RowPart *f1 = ProgramElement(fontProgram, 1);
+        const RowPart *f2 = ProgramElement(fontProgram, 2);
+        const RowPart *f3 = ProgramElement(fontProgram, 3);
+        const RowPart *f4 = ProgramElement(fontProgram, 4);
+        Check(f0 && f0->kind == kPartText && f0->tagChain == 0,
+              "text before [[font:...]] is in the main chain");
+        Check(f1 && f1->kind == kPartFontOpen && f1->tagChain == 1,
+              "[[font:Arial]] records its registered chain");
+        Check(f2 && f2->kind == kPartText && f2->tagChain == 1,
+              "and the run it opens carries that chain");
+        Check(f3 && f3->kind == kPartFontClose, "[[/font]] closes the run");
+        Check(f4 && f4->kind == kPartText && f4->tagChain == 0,
+              "so the text after it is back in the main chain");
+
+        const WCHAR sizeRow[] = L"A[[size:24]]B[[/size]]C";
+        RowProgram sizeProgram;
+        CompileRowText(s, sizeRow, sizeProgram);
+        const RowPart *z0 = ProgramElement(sizeProgram, 0);
+        const RowPart *z1 = ProgramElement(sizeProgram, 1);
+        const RowPart *z2 = ProgramElement(sizeProgram, 2);
+        const RowPart *z3 = ProgramElement(sizeProgram, 3);
+        const RowPart *z4 = ProgramElement(sizeProgram, 4);
+        Check(z0 && z0->kind == kPartText && z0->runFontSize == 0,
+              "text before [[size:NN]] is drawn at the row's own size");
+        Check(z1 && z1->kind == kPartSizeOpen && z1->runFontSize == 24,
+              "[[size:24]] records the run's size");
+        Check(z2 && z2->kind == kPartText && z2->runFontSize == 24,
+              "and the run it opens carries it");
+        Check(z3 && z3->kind == kPartSizeClose, "[[/size]] closes the run");
+        Check(z4 && z4->kind == kPartText && z4->runFontSize == 0,
+              "so the text after it is back at the row's size");
+
+        // --- a tag that cannot be honoured is ordinary text, whole ---
+        const WCHAR badFontRow[] = L"[[font:NoSuchFamilyQZX]]x";
+        RowProgram badFont;
+        CompileRowText(s, badFontRow, badFont);
+        WCHAR badFontTemplate[256];
+        LinearTemplate(badFont, badFontRow, badFontTemplate, 256);
+        Check(badFont.partCount == 1 && badFont.parts[0].kind == kPartText,
+              "an unregistered [[font:...]] is not markup at all");
+        Check(wcscmp(badFontTemplate, badFontRow) == 0,
+              "so it stays in the template character for character");
+
+        const WCHAR badSizeRow[] = L"x[[size:abc]]y";
+        RowProgram badSize;
+        CompileRowText(s, badSizeRow, badSize);
+        WCHAR badSizeTemplate[256];
+        LinearTemplate(badSize, badSizeRow, badSizeTemplate, 256);
+        Check(badSize.partCount == 1, "a malformed [[size:NN]] is not markup either");
+        Check(wcscmp(badSizeTemplate, badSizeRow) == 0, "and it stays literal too");
+
+        // --- the recorded attributes are the ones rendering derives from the markers ---
+        // Walking a program's TEXT elements next to BuildRowLayout's segments: if the two ever
+        // disagreed, a run would be marked as one thing and recorded as another, and the next
+        // consumer of the program (icons, alignment) would inherit the wrong answer.
+        {
+            const WCHAR mixed[] = L"A[[font:Arial]]B[[size:24]]C[[/size]]D[[/font]]E";
+            RowProgram mixedProgram;
+            CompileRowText(s, mixed, mixedProgram);
+            WCHAR marked[640];
+            RingSpec rings[kMaxRingsPerRow];
+            int ringCount = 0;
+            MarkRow(mixed, Values(), s, marked, 640, rings, &ringCount, kMaxRingsPerRow);
+            RowState state = {};
+            BuildRowLayout(marked, ringCount, state, 0);
+
+            int segment = 0;
+            bool attributesMatch = true;
+            bool slicesMatch = true;
+            for (int i = 0;; i++) {
+                const RowPart *part = ProgramElement(mixedProgram, i);
+                if (!part) break;
+                if (part->kind != kPartText) continue;
+                if (segment >= state.segmentCount[0]) {
+                    attributesMatch = false;
+                    break;
+                }
+                const TextSeg &seg = state.segments[0][segment];
+                if (seg.tagChain != part->tagChain || seg.runFontSize != part->runFontSize) {
+                    attributesMatch = false;
+                }
+                if (seg.length != part->length ||
+                    wcsncmp(state.text[0] + seg.offset, mixed + part->offset, part->length) != 0) {
+                    slicesMatch = false;
+                }
+                segment++;
+            }
+            printf("    %d TEXT element(s) vs %d segment(s)\n", segment, state.segmentCount[0]);
+            Check(attributesMatch && segment == state.segmentCount[0],
+                  "every TEXT element carries the chain and size BuildRowLayout derived");
+            Check(slicesMatch, "and its template slice is exactly that segment's text");
+        }
+
+        // --- end to end: the marked string and the ring count, spelled out ---
+        //
+        // The markers are the contract between instantiation and BuildRowLayout, so the
+        // expectations are literal: E000 <digit> E001 wraps a gauge (the digit is its index),
+        // E002 <digit> E001 opens a font run and E003 closes it, E004 <two digits> E001 opens a
+        // size run and E005 closes it. The malformed rows expect their own text back, which is
+        // the tolerance rule seen from this side.
+        {
+            Values v;
+            v.cpu = 12;
+            v.memPercent = 73;
+            struct InstantiateCase {
+                const WCHAR *raw;
+                const WCHAR *expect;
+                int expectRings;
+            };
+            const InstantiateCase cases[] = {
+                {L"CPU 12%  RAM 73%", L"CPU 12%  RAM 73%", 0},
+                {L"cpu {cpu}%  mem {mem}%", L"cpu 12%  mem 73%", 0},
+                {L"x [[ring:50]] y", L"x \xE000" L"0" L"\xE001" L" y", 1},
+                {L"[[ring:10]][[ring:20]]",
+                 L"\xE000" L"0" L"\xE001" L"\xE000" L"1" L"\xE001", 2},
+                {L"T=[[ring:nonsense]]C", L"T=[[ring:nonsense]]C", 0},
+                {L"A[[font:Arial]]B[[/font]]C",
+                 L"A\xE002" L"1" L"\xE001" L"B\xE003" L"C", 0},
+                {L"A[[size:24]]B[[/size]]C",
+                 L"A\xE004" L"24" L"\xE001" L"B\xE005" L"C", 0},
+                {L"x[[size:abc]]y", L"x[[size:abc]]y", 0},
+                {L"[[font:Arial]]c {cpu} [[ring:50]]",
+                 L"\xE002" L"1" L"\xE001" L"c 12 \xE000" L"0" L"\xE001", 1},
+            };
+            for (const InstantiateCase &c : cases) {
+                WCHAR marked[640];
+                RingSpec rings[kMaxRingsPerRow];
+                int ringCount = 0;
+                MarkRow(c.raw, v, s, marked, 640, rings, &ringCount, kMaxRingsPerRow);
+                wprintf(L"    \"%ls\"\n", c.raw);
+                printf("      rings=%d (expect %d)\n", ringCount, c.expectRings);
+                Check(ringCount == c.expectRings, "instantiated ring count");
+                Check(wcscmp(marked, c.expect) == 0, "instantiated marked string, markers and all");
+            }
+        }
+
+        // --- the compile step is ReadSettings', and it agrees with the cost gate ---
+        {
+            const StubSetting rows[] = {
+                {L"Row1", L"CPU {cpu}%"},
+                {L"Row2", L"[[font:Arial]]A[[/font]][[size:20]]B[[/size]][[ring:{cpu}]]"},
+            };
+            g_stubStrings = rows;
+            g_stubStringCount = 2;
+            g_stubInts = nullptr;
+            g_stubIntCount = 0;
+            EnumerateFonts();     // the tag chain has to survive the installed-name filter
+            LOCAL_SETTINGS(rs, g_programRead);
+            ReadSettings(rs);
+            Check(rs.rowCount == 2, "both rows were read");
+            Check(rs.rowProgram[0].partCount == 1 &&
+                      rs.rowProgram[0].parts[0].kind == kPartText,
+                  "ReadSettings compiles the plain row into a single template");
+            Check(!rs.rowFontTag[0] && !ProgramHasKind(rs.rowProgram[0], kPartFontOpen),
+                  "no font tag: the row is off the multi-font path and has no font element");
+            Check((rs.rowFontTag[1] != 0) == ProgramHasKind(rs.rowProgram[1], kPartFontOpen),
+                  "a font tag puts it on that path, and its program agrees");
+            Check(ProgramHasKind(rs.rowProgram[1], kPartRing) &&
+                      ProgramHasKind(rs.rowProgram[1], kPartSizeOpen),
+                  "and the same program carries the gauge and the size run");
+            g_stubStrings = nullptr;
+            g_stubStringCount = 0;
+        }
     }
 
     printf("\n=== font chains and the multi-font cost gate ===\n");
@@ -1534,7 +1860,7 @@ int main() {
             };
             g_stubStrings = withFonts;
             g_stubStringCount = (int)(sizeof(withFonts) / sizeof(withFonts[0]));
-            ModSettings s;
+            LOCAL_SETTINGS(s, g_fontChain);
             ReadSettings(s);
             printf("    \"Fallback fonts\"=Consolas;NoSuch -> %d kept; row1 tag=%d chains=%d\n",
                    s.fallbackFonts.count, s.rowFontTag[0] ? 1 : 0, s.tagFontCount);
@@ -1567,7 +1893,7 @@ int main() {
             };
             g_stubStrings = tagged;
             g_stubStringCount = (int)(sizeof(tagged) / sizeof(tagged[0]));
-            ModSettings s;
+            LOCAL_SETTINGS(s, g_fontTagged);
             ReadSettings(s);
 
             struct RowCase {
@@ -1586,8 +1912,7 @@ int main() {
                 WCHAR marked[640];
                 RingSpec rings[kMaxRingsPerRow];
                 int ringCount = 0;
-                ExpandTokensAndRings(c.row, Values(), s, marked, 640, rings, &ringCount,
-                                     kMaxRingsPerRow);
+                MarkRow(c.row, Values(), s, marked, 640, rings, &ringCount, kMaxRingsPerRow);
                 RowState state;
                 BuildRowLayout(marked, ringCount, state, 0);
                 wprintf(L"    \"%ls\" -> text=\"%ls\" segs=%d\n", c.row, state.text[0],
@@ -1659,7 +1984,7 @@ int main() {
 
         // --- inheritance and the floor under a grown font ---
         {
-            ModSettings d;
+            LOCAL_SETTINGS(d, g_metricDefault);
             d.fontSize = 15;
             d.rowHeight = 30;
             printf("    defaults: floor=%d height=%d top1=%d\n",
@@ -1686,7 +2011,7 @@ int main() {
             Check(RowHeightPx(d, 3) == 52,
                   "a row taller than its font keeps its configured height");
 
-            ModSettings huge;
+            LOCAL_SETTINGS(huge, g_metricHuge);
             huge.fontSize = 15;
             huge.rowHeight = 30;
             huge.rowFontSize[0] = 999;
@@ -1695,7 +2020,7 @@ int main() {
 
         // --- the panel is the sum of the rows, and the rows do not overlap ---
         {
-            ModSettings s;
+            LOCAL_SETTINGS(s, g_metricRow);
             s.fontSize = 15;
             s.rowHeight = 30;
 
@@ -1733,7 +2058,7 @@ int main() {
             // follow the row was a bug the user reported: setting one row larger also redrew
             // its icon larger, which is not what the row asked for, and it dragged the shared
             // text column around with it.
-            ModSettings icons;
+            LOCAL_SETTINGS(icons, g_metricIcons);
             icons.fontSize = 15;
             icons.rowHeight = 30;
             icons.icons[0].style = 2;
@@ -1747,7 +2072,7 @@ int main() {
                   "and the shared text inset is that one plate size");
 
             // A row with no plate must not collapse the inset for the rows that have one.
-            ModSettings noneFirst;
+            LOCAL_SETTINGS(noneFirst, g_metricNoneFirst);
             noneFirst.fontSize = 15;
             noneFirst.rowHeight = 30;
             noneFirst.icons[0].styleSet = true;   // explicit None on row 1
@@ -1765,7 +2090,7 @@ int main() {
         // the single derivation the drawing code now reads: given the two numbers a row has,
         // what size is its text, how tall is its box, how big is its plate.
         {
-            ModSettings s;
+            LOCAL_SETTINGS(s, g_sizeRun);
             s.fontSize = 15;
             s.rowHeight = 30;
             s.icons[0].style = 2;                          // row 1: Memory
@@ -1811,7 +2136,7 @@ int main() {
             };
             g_stubStrings = tagged;
             g_stubStringCount = (int)(sizeof(tagged) / sizeof(tagged[0]));
-            ModSettings s;
+            LOCAL_SETTINGS(s, g_sizeTagged);
             ReadSettings(s);
             printf("    tagged row: text=\"%ls\" size=%d height=%d; row2 size=%d height=%d\n",
                    s.rows[0], s.rowFontSize[0], s.rowHeightPx[0], s.rowFontSize[1],
@@ -1930,11 +2255,10 @@ int main() {
                 WCHAR marked[640];
                 RingSpec rings[kMaxRingsPerRow];
                 int ringCount = 0;
-                ModSettings s;
+                LOCAL_SETTINGS(s, g_runCase);
                 s.fontSize = 15;
                 s.rowHeight = 30;
-                ExpandTokensAndRings(c.row, Values(), s, marked, 640, rings, &ringCount,
-                                     kMaxRingsPerRow);
+                MarkRow(c.row, Values(), s, marked, 640, rings, &ringCount, kMaxRingsPerRow);
                 RowState state;
                 BuildRowLayout(marked, ringCount, state, 0);
                 wprintf(L"    \"%ls\" -> text=\"%ls\" segs=%d\n", c.row, state.text[0],
@@ -1959,7 +2283,7 @@ int main() {
             g_stubStringCount = (int)(sizeof(runRows) / sizeof(runRows[0]));
             g_stubInts = nullptr;         // the previous block's Row3Height must not leak in
             g_stubIntCount = 0;
-            ModSettings s;
+            LOCAL_SETTINGS(s, g_prefixRows);
             ReadSettings(s);
             printf("    rows: base sizes %d %d %d, largest %d %d %d\n", s.rowFontSize[0],
                    s.rowFontSize[1], s.rowFontSize[2], s.rowMaxFontSize[0], s.rowMaxFontSize[1],
@@ -1974,8 +2298,7 @@ int main() {
                 WCHAR marked[640];
                 RingSpec rings[kMaxRingsPerRow];
                 int ringCount = 0;
-                ExpandTokensAndRings(s.rows[1], Values(), s, marked, 640, rings, &ringCount,
-                                     kMaxRingsPerRow);
+                MarkRow(s.rows[1], Values(), s, marked, 640, rings, &ringCount, kMaxRingsPerRow);
                 RowState state;
                 BuildRowLayout(marked, ringCount, state, 0);
                 printf("    the prefix row expands to text=\"%ls\" segs=%d size=%d\n",
@@ -2019,8 +2342,9 @@ int main() {
         // height actually used has to be asserted. Without this the sums above could be perfect
         // while the panel still sized itself with rowHeight * rows.
         {
-            const ModSettings saved = g_settings;
-            ModSettings s;
+            LOCAL_SETTINGS(saved, g_geometrySaved);
+            saved = g_settings;
+            LOCAL_SETTINGS(s, g_geometry);
             s.fontSize = 15;
             s.rowHeight = 30;
             s.rowCount = 3;
@@ -2206,12 +2530,13 @@ int main() {
                     // It is measured through the product's own counter (g_measureCalls, which
                     // every text measurement goes through) rather than by timing anything.
                     {
-                        const ModSettings savedSettings = g_settings;
+                        LOCAL_SETTINGS(savedSettings, g_planSaved);
+                        savedSettings = g_settings;
                         const RowState savedState = g_rowState;
                         const int savedRows = g_publishedRows;
                         const unsigned savedEpoch = g_layoutEpoch;
 
-                        ModSettings s = {};
+                        LOCAL_SETTINGS(s, g_plan);
                         s.fontSize = 15;
                         s.rowHeight = 30;
                         s.panelWidth = 380;
@@ -2227,8 +2552,8 @@ int main() {
                         WCHAR marked[640];
                         RingSpec rings[kMaxRingsPerRow];
                         int ringCount = 0;
-                        ExpandTokensAndRings(s.rows[0], Values(), s, marked, 640, rings, &ringCount,
-                                             kMaxRingsPerRow);
+                        MarkRow(s.rows[0], Values(), s, marked, 640, rings, &ringCount,
+                                kMaxRingsPerRow);
                         RowState staged = {};
                         BuildRowLayout(marked, ringCount, staged, 0);
                         for (int i = 0; i < ringCount; i++) staged.rings[0][i] = rings[i];
@@ -2309,9 +2634,8 @@ int main() {
                             WCHAR marked2[640];
                             RingSpec rings2[kMaxRingsPerRow];
                             int ringCount2 = 0;
-                            ExpandTokensAndRings(L"CPU 99%  RAM 12%  [[ring:80]]  ok", Values(), s,
-                                                 marked2, 640, rings2, &ringCount2,
-                                                 kMaxRingsPerRow);
+                            MarkRow(L"CPU 99%  RAM 12%  [[ring:80]]  ok", Values(), s,
+                                    marked2, 640, rings2, &ringCount2, kMaxRingsPerRow);
                             RowState staged2 = {};
                             BuildRowLayout(marked2, ringCount2, staged2, 0);
                             for (int i = 0; i < ringCount2; i++) staged2.rings[0][i] = rings2[i];
@@ -2553,8 +2877,8 @@ int main() {
             WCHAR marked[640];
             RingSpec rings[kMaxRingsPerRow];
             int ringCount = 0;
-            ExpandTokensAndRings(L"{ext.music.long}", none, g_settings, marked, 640, rings,
-                                 &ringCount, kMaxRingsPerRow);
+            MarkRow(L"{ext.music.long}", none, g_settings, marked, 640, rings, &ringCount,
+                    kMaxRingsPerRow);
             printf("  399-char value -> %d chars in the row\n", (int)wcslen(marked));
             Check(wcscmp(marked, stored) == 0,
                   "a long pushed value reaches the row whole, not cut at 127");
@@ -2611,7 +2935,7 @@ int main() {
         fake.entries[2].ttlMs = 50;
         Check(ExtEvictIndex(fake) == 0, "with equal expiry the oldest update goes");
 
-        ModSettings allow;
+        LOCAL_SETTINGS(allow, g_extAllow);
         Check(ExtProviderAllowed(allow, L"music", 5), "an empty allowlist allows any provider");
         wcsncpy(allow.extProviders, L"music; discord", kExtProviderListChars - 1);
         Check(ExtProviderAllowed(allow, L"music", 5), "a listed provider is allowed");
@@ -2659,13 +2983,13 @@ int main() {
         }
 
         {
-            ModSettings rows;
+            LOCAL_SETTINGS(rows, g_extRows);
             wcsncpy(rows.rows[0], L"CPU {cpu}%  {ext.music.title}", 255);
             rows.rowCount = 1;
             unsigned groups = RequiredGroups(rows);
             Check((groups & G_EXT) != 0, "{ext.*} selects the external group");
             Check((groups & G_CPU) != 0, "and built-in groups are still found");
-            ModSettings bad;
+            LOCAL_SETTINGS(bad, g_extBad);
             wcsncpy(bad.rows[0], L"{ext.}", 255);
             bad.rowCount = 1;
             Check((RequiredGroups(bad) & G_EXT) == 0, "a malformed {ext.} selects nothing");
@@ -2674,7 +2998,7 @@ int main() {
         ExtStoreValue(slot, L"progress", L"0.42", 60000, 128);
         {
             Values v;
-            ModSettings cfg;
+            LOCAL_SETTINGS(cfg, g_extCfg);
             RingSpec ring = {};
             const WCHAR *body = L"{ext.music.progress}:1";
             Check(ParseRing(body, (int)wcslen(body), v, cfg, ring) &&
@@ -2712,7 +3036,7 @@ int main() {
             };
             g_stubInts = extInts;
             g_stubIntCount = (int)(sizeof(extInts) / sizeof(extInts[0]));
-            ModSettings s;
+            LOCAL_SETTINGS(s, g_extSettings);
             ReadSettings(s);
             printf("  ExternalData=%d ttl=%d maxValue=%d providers=%d list=\"%ls\"\n",
                    s.externalData ? 1 : 0, s.extValueTtlMs, s.extMaxValue, s.extMaxProviders,
@@ -3047,7 +3371,7 @@ int main() {
         // The card's target width: the configured minimum is a floor, text widens it,
         // and it is capped by the screen rather than growing without bound (design 12).
         {
-            ModSettings cfg = {};
+            LOCAL_SETTINGS(cfg, g_islandCfgA);
             cfg.rowHeight = 30;
             cfg.islandMinWidth = 260;
             IslandMetrics narrow = {};
@@ -3073,7 +3397,7 @@ int main() {
         // M3: geometry, regions, hit test and dismissal. The property the milestone is
         // judged on is the last one: every visible pixel must belong to some region.
         {
-            ModSettings cfg = {};
+            LOCAL_SETTINGS(cfg, g_islandCfgB);
             cfg.rowHeight = 30;
             cfg.islandMinWidth = 260;
             IslandMetrics m = {};
@@ -3417,9 +3741,12 @@ int main() {
         InitializeCriticalSection(&g_settingsLock);
         InitializeCriticalSection(&g_valuesLock);   // the host never ran WhTool_ModInit
         {
-            ModSettings s;
+            LOCAL_SETTINGS(s, g_publish);
             s.rowCount = 1;
             wcscpy(s.rows[0], L"{ext.music.title}  [[ring:{ext.music.progress}]]");
+            // The settings were built by hand, so the compile step ReadSettings performs has
+            // to be performed here: a row that was never compiled instantiates to nothing.
+            CompileRowText(s, s.rows[0], s.rowProgram[0]);
             const Values v;
             EnterCriticalSection(&g_settingsLock);
             g_settings = s;

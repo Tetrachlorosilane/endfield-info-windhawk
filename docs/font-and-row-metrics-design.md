@@ -154,7 +154,7 @@
 > 回到跟随全局 `Font size`。
 
 落地细节：前缀由 `ParseRowMetricTags` 在 `ReadSettings` 里剥掉，`rows[]` 里存的是**不含标签**的文本，
-所以绘制侧与 `ExpandTokensAndRings` 都不知道这两个标签存在。`0`（无论来自设置项还是标签）
+所以标记编译器（`CompileRowText`）与发布期的 `InstantiateRowProgram` 都不知道这两个标签存在。`0`（无论来自设置项还是标签）
 都表示"没设"，继续往下继承；同一个标签写两次则后一个生效。
 
 ### 5.2 影响面（这就是它必须单独一批的原因）

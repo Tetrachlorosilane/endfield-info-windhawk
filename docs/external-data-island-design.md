@@ -277,8 +277,8 @@ struct ExtProvider {
 
 ### 5.4 与快照的关系
 
-关键事实：**展开 token 的是采样线程**（`PublishRows` → `ExpandTokensAndRings`，
-[4107](../endfield-info-windhawk.wh.cpp#L4107)），HUD 只读已经展开好的 `g_rowState`。
+关键事实：**展开 token 的是采样线程**（`PublishRows` → `InstantiateRowProgram`；标签本身在
+`ReadSettings` 里就编译掉了），HUD 只读已经展开好的 `g_rowState`。
 所以外部值必须让**采样线程**看见，而不是 HUD：
 
 - 不把槽位表塞进 `Values`（[1366](../endfield-info-windhawk.wh.cpp#L1366) 是采集器的固定形状；

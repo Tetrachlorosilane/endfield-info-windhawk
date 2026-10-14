@@ -1,7 +1,8 @@
 # 行内标记语言：图标、对齐、占位符与一次性编译
 
 面向**实现者**。用户向说明写在 [README.md](../README.md)，不变量写进 [AGENTS.md](../AGENTS.md)。
-本文记录 2026-10-14 与用户确认后的设计决定（**尚未实现**），以及为什么这么定。
+本文记录 2026-10-14 与用户确认后的设计决定（**§7 的第 3 步已完成：行内标记在读取设置时编译；
+图标/对齐/占位符仍未实现**），以及为什么这么定。
 
 背景：`Row N icon` 系列设置被用户判定为"失效"（真机原因见
 [state-and-handover](state-and-handover.md) §13：为修错位把空行的图标槽丢了，继承源一起消失）。
@@ -80,8 +81,10 @@
 编译省掉的**只有文本解析**。
 
 > **2026-10-14 实测更正（先量再改）**：**标记解析今天已经在发布时做，不在每帧做**。
-> `ExpandTokensAndRings` 与 `BuildRowLayout` 的唯一调用点是 `PublishRows`
-> （`endfield-info-windhawk.wh.cpp` 的 6893 / 6913 行，采样线程，一次采样一次），
+> （当时的）`ExpandTokensAndRings` 与 `BuildRowLayout` 的唯一调用点是 `PublishRows`
+> （采样线程，一次采样一次；`ExpandTokensAndRings` 后来被
+> §7 第 3 步拆成了 `ReadSettings` 里的 `CompileRowText` + `PublishRows` 里的
+> `InstantiateRowProgram`），
 > `PaintPanel` 只读 `g_rowState`。所以"每帧重新解析文本"这个前提**不成立**，
 > 编译化的收益比原先设想的小；每帧真正在付的是**测量**与**选族**：
 > `FitTextToWidth` 每个文本段一次二分（多次 `MeasureString`）+ 哨兵/省略号测量，
@@ -220,6 +223,16 @@ struct RowMetrics {
    这一步改的是**数据来源**（发布期解析一次 → 读常驻对象），**不是**每帧的绘制流程：
    透明度、悬停、涟漪相位、入场变换照旧每帧算。
    判据：默认配置的断言**逐值不变**；这一步同时是第 4、5 步的结构前提。
+   **已完成**（`CompileRowText` 在 `ReadSettings` 里跑一次，结果存进
+   `ModSettings::rowProgram[]`——与 `rows[]` 同一份数据，因此不可能与它不一致；
+   `InstantiateRowProgram` 在 `PublishRows` 里只展开 `{变量}` 与环的数值字段）。
+   763 → 811 条断言。新断言里最重要的两类是**编译器的形状**（无标签行是单个 TEXT 元素、
+   `tagChain` / `runFontSize` 逐段等于 `BuildRowLayout` 从标记推出来的值、模板里保留
+   `{token}`、坏标签原样留在模板里）与**逐字写出的 marked 串期望表**（含环数）。
+   另外做了一次旧实现 ↔ 新实现的差分对照：随机行（标签片段 + 随机字符）× 8 种输出缓冲区
+   上界 × 3 种环数上界，4 个种子共 40 万条结果，**零差异**，其中 4431 条同时含"留在文字里的
+   `[[`"与"字体标记"——也就是"环画不出来、回退扫描又认出了它里面的标签"这条最绕的路径。
+   还没有做的：`RowLive` 与测量缓存合并（§4 的第 6 条），因为图标/对齐尚未落地。
 4. **加 `[[icon:…]]`（含涟漪开关）**，同时删掉图标设置与行首盘。
 5. **加 `[[gap:…]]` 与 `[[left/center/right]]…[[/…]]`**。
 6. 文档、`_preview.py`、CHANGELOG、缺陷表。
