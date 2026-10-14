@@ -805,23 +805,49 @@ static const double kCueSettle = 0.30;     // THoldB
 static const double kCueContract = 0.36;   // TContract
 #pragma clang diagnostic pop
 static const double kCueContentIn = 0.38;  // TNumIn
-static const double kCueContentReady = 0.66;  // text fully surfaced
+// The style-1 "Fade" intro runs its content from 0 to full over this cue. The
+// stepped Slide fade below used to share that end cue and no longer does -- it is
+// faster now -- so this one keeps its meaning for the Fade branch alone. Do not
+// re-point the stepped fade at it: that would silently speed up the other branch.
+static const double kCueContentReady = 0.66;  // text fully surfaced (Fade style)
 
-// Opacity stages between kCueContentIn and kCueContentReady, as fractions of the
-// whole intro. With kCueContentReady this gives the text fade five steps rising
-// 0 -> 15 -> 40 -> 65 -> 85 -> 100 %, spread over ~0.28 of the intro (about 340 ms
+// The stepped content fade: the span it has at speed 1.0 (which is exactly the
+// distance to kCueContentReady, see the assertion in test-layout.cpp), the
+// multiplier that compresses it, and the four stages inside it. Deriving every cue
+// from those two constants is what makes "how fast do the numbers surface" a
+// one-constant edit, and the stages are fractions *within* the span, so compressing
+// the span leaves the shape of the rise untouched.
+//
+// The fade still starts where it always did (kCueContentIn), i.e. after the shape
+// has settled, because the ordering is deliberate: panel grows, then the numbers surface.
+static const double kCueContentSpan = 0.28;   // = kCueContentReady - kCueContentIn
+static const double kCueTextFadeSpeed = 1.5;  // 1.0 = the un-scaled span above
+static const double kCueContentFull = kCueContentIn + kCueContentSpan / kCueTextFadeSpeed;
+
+// Stage positions as fractions within the fade span: the original absolute offsets
+// 0.06 / 0.13 / 0.19 / 0.24 of the whole intro, divided by the 0.28 span they were
+// spread across. They are fractions of the *span* rather than of the intro so that
+// shrinking the span does not change the shape of the rise.
+static const double kCueTextFadeAt1 = 0.06 / 0.28;
+static const double kCueTextFadeAt2 = 0.13 / 0.28;
+static const double kCueTextFadeAt3 = 0.19 / 0.28;
+static const double kCueTextFadeAt4 = 0.24 / 0.28;
+
+// Opacity stages between kCueContentIn and kCueContentFull, as fractions of the
+// whole intro. With kCueContentFull this gives the text fade five steps rising
+// 0 -> 15 -> 40 -> 65 -> 85 -> 100 %, spread over ~0.19 of the intro (about 224 ms
 // on the 1200 ms default) instead of one 48 ms move.
-static const double kCueTextFade1 = 0.44;
-static const double kCueTextFade2 = 0.51;
-static const double kCueTextFade3 = 0.57;
-static const double kCueTextFade4 = 0.62;
+static const double kCueTextFade1 = kCueContentIn + kCueContentSpan / kCueTextFadeSpeed * kCueTextFadeAt1;
+static const double kCueTextFade2 = kCueContentIn + kCueContentSpan / kCueTextFadeSpeed * kCueTextFadeAt2;
+static const double kCueTextFade3 = kCueContentIn + kCueContentSpan / kCueTextFadeSpeed * kCueTextFadeAt3;
+static const double kCueTextFade4 = kCueContentIn + kCueContentSpan / kCueTextFadeSpeed * kCueTextFadeAt4;
 
-// Collapsing runs at half the arriving duration. The two directions are not
+// Collapsing runs at a quarter of the arriving duration. The two directions are not
 // symmetric in the first place (arriving needs a hold at full height for the
 // content to surface; leaving does not), and matching durations made the collapse
 // feel sluggish: there is nothing to read on the way out, so it only needs to be
-// long enough to look deliberate.
-static const double kCollapseDurationRatio = 0.5;
+// long enough to look deliberate. Half of that still felt slow, hence a quarter.
+static const double kCollapseDurationRatio = 0.25;
 
 // Icon geometry. An icon is an *element* of a row now ([[icon:...]]), not a plate bolted to
 // the row's left edge, so it is sized from the font size in effect where it appears -- the
@@ -1072,6 +1098,8 @@ static IntroFrame EvaluateIntro() {
     }
     if (g_intro.style == 1) {   // Fade: opacity only, height already at rest
         f.height = end;
+        // One continuous move over kCueContentReady, deliberately *not* the stepped
+        // fade's kCueContentFull: this branch was not sped up (see the constants).
         f.contentAlpha = expanding ? EaseOut(Clamp01(cue / kCueContentReady))
                                    : 1.0 - EaseIn(Clamp01(cue));
         f.iconAlpha = f.contentAlpha;
@@ -1094,11 +1122,12 @@ static IntroFrame EvaluateIntro() {
         f.height = EvaluateKeys(cue, growKeys, 2);
     } else {
         // The shrink runs the whole collapse, ending exactly on the end of the
-        // (already halved) timeline. It used to stop at kCollapseDurationRatio -- the
-        // duration ratio used as a *cue* -- which is cue 0.5 of a timeline that had
-        // already been halved: the panel sat at tab height for the second half while
-        // the frame clock kept repainting it at 16 ms, and the visible collapse was
-        // IntroMs/4 rather than the half the README promises. The content fade and the
+        // (already shortened) timeline. It used to stop at kCollapseDurationRatio -- the
+        // duration ratio used as a *cue* -- which is cue 0.25 of a timeline that had
+        // already been shortened by that same ratio: the panel then sat at tab height
+        // for the rest of the animation while the frame clock kept repainting it at
+        // 16 ms, so the visible collapse was a quarter of the timeline it was meant to
+        // run (IntroMs/4 back when the ratio was still 1/2). The content fade and the
         // scale shrink below are still keyed to kCueSettle; nothing draws content while
         // collapsed (PaintPanel takes the tab branch), so they only have to be over by
         // the time the tab is all that is left.
@@ -1147,11 +1176,12 @@ static IntroFrame EvaluateIntro() {
     // Content fades in after the shape has settled, so the arrival reads as
     // "panel grows, then the numbers surface".
     //
-    // The fade is deliberately long and stepped rather than one move: at the
-    // original cue spacing it was 0.38 -> 0.42, which on a 1200 ms intro is 48 ms
-    // and reads as the text simply appearing. Four stages at 0 / 25 / 60 / 100 %
-    // over kCueContentReady - kCueContentIn (= 0.28, so ~340 ms) give the numbers
-    // a visible rise instead of a switch.
+    // The fade is deliberately stepped rather than one move: at the original cue
+    // spacing it was 0.38 -> 0.42, which on a 1200 ms intro is 48 ms and reads as
+    // the text simply appearing. Five stages rising 0 / 15 / 40 / 65 / 85 / 100 %
+    // over kCueContentSpan / kCueTextFadeSpeed (= 0.19 of the intro, ~224 ms at the
+    // default) give the numbers a visible rise instead of a switch. The span is
+    // compressed; the shape of the rise is not -- see the constants above.
     //
     // Every stage eases with KS_InOut, which is slow at both ends, so no stage
     // snaps: they chain into a continuous curve.
@@ -1164,7 +1194,7 @@ static IntroFrame EvaluateIntro() {
             {kCueTextFade4, 0.85, EaseInOut},
             // nullptr easing on the last stage: it lands exactly on full opacity
             // instead of approaching it asymptotically.
-            {kCueContentReady, 1.0, nullptr},
+            {kCueContentFull, 1.0, nullptr},
         };
         f.contentAlpha = EvaluateKeys(cue, contentKeys, 6);
     } else {

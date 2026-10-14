@@ -530,11 +530,19 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   （`if (expanded) PlaceWindow(hwnd);`）。绘制分支里那句 *"SetExpanded already shrank the window
   to the resting (tab) height, so the frame has to grow it back"* 正是这个往返的补偿——
   **补偿存在，说明顺序错了**。
-- **展开与收回刻意不对称**：展开先生长定型、再让内容分层浮现；收回贯穿整段、时长为一半。
+- **展开与收回刻意不对称**：展开先生长定型、再让内容分层浮现；收回贯穿整段、时长为
+  **四分之一**（`kCollapseDurationRatio = 0.25`）。
 - **收回的关键帧 cue 是 `1.0`，不是 `kCollapseDurationRatio`。** 那个常量是**时长比例**；
   把它当 cue 用（`{kCollapseDurationRatio, end}`）会让收缩在半程就结束，剩下半程窗口停在
-  标签高度、而帧时钟仍以 16 ms 重绘它——可见收回只有 `IntroMs/4`（README 写的是"一半"）。
+  标签高度、而帧时钟仍以 16 ms 重绘它——可见收回只有 `IntroMs × ratio²`（当年 ratio 还是
+  1/2，所以是 `IntroMs/4`；现在 ratio 是 1/4，再犯就是 `IntroMs/16`）。
   断言：`the shrink still has work left at the midpoint`。
+- **文字淡入的终点有自己的常量 `kCueContentFull`，不是共用的 `kCueContentReady`。**
+  后者是 `Fade`（`introStyle == 1`）那条纯淡入分支的窗口末端，**那条分支没有提速**，
+  所以改淡入速度时不能去挪它。阶梯淡入的四个中间级是**窗口内的分数**
+  （`kCueTextFadeAt1..4`），窗口 = `kCueContentSpan / kCueTextFadeSpeed`——改速度只动
+  后者一处，升上来的形状不变；起点 `kCueContentIn` 不动（必须晚于 `kCueSettle`，
+  "先长定型、数字再浮现"）。
 - **方向判定用 `start = fromHeight`、`end = toHeight`**，方向由两者大小自然决定。
   曾按方向重排 start/end → 收回时高度反而在增长。
 - **过冲强度 `kPanelBounceStrength = 0.04`**（原项目 0.275）。0.275 在 250px 面板上是

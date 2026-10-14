@@ -983,14 +983,19 @@ int main() {
         g_intro.active = true;
         g_intro.startedAt = GetTickCount() - (DWORD)(0.20 * g_intro.durationMs);
         IntroFrame early = EvaluateIntro();
+        // The "still fading" sample is placed *inside* the fade by deriving it from the
+        // fade's own constants, so it stays inside the window when the span or the speed
+        // changes. A hardcoded cue (this used to be 0.62) falls past the end as soon as
+        // the fade gets faster, and then the check below quietly becomes trivial.
+        const double midCue = kCueContentIn + (kCueContentFull - kCueContentIn) * 0.6;
         g_intro.active = true;
-        g_intro.startedAt = GetTickCount() - (DWORD)(0.62 * g_intro.durationMs);
+        g_intro.startedAt = GetTickCount() - (DWORD)(midCue * g_intro.durationMs);
         IntroFrame mid = EvaluateIntro();
         g_intro.active = true;
-        g_intro.startedAt = GetTickCount() - (DWORD)((kCueContentReady + 0.01) * g_intro.durationMs);
+        g_intro.startedAt = GetTickCount() - (DWORD)((kCueContentFull + 0.01) * g_intro.durationMs);
         IntroFrame late = EvaluateIntro();
-        printf("  content at cue 0.20 = %.3f, 0.62 = %.3f, %.2f = %.3f\n",
-               early.contentAlpha, mid.contentAlpha, kCueContentReady + 0.01, late.contentAlpha);
+        printf("  content at cue 0.20 = %.3f, %.3f = %.3f, %.2f = %.3f\n",
+               early.contentAlpha, midCue, mid.contentAlpha, kCueContentFull + 0.01, late.contentAlpha);
         Check(early.contentAlpha < 0.01, "content hidden while the panel grows");
         // Partly visible late in the fade, and fully visible only once the window
         // has closed: that is the "longer, layered fade" this change is about.
@@ -1029,11 +1034,65 @@ int main() {
                   "the text fade passes through several intermediate opacities");
             Check(monotonicRise, "the text fade never goes backwards");
 
-            // The fade window must be a meaningful share of the intro, not a blink.
-            double window = kCueContentReady - kCueContentIn;
-            printf("  fade window = %.2f of the intro (%d ms at the default)\n",
-                   window, (int)(window * 1200));
-            Check(window >= 0.2, "the text fade occupies a meaningful share of the intro");
+            // (b) The fade's span is the span constant divided by the speed constant, so
+            // a further speed change stays a one-constant edit; a hardcoded (rounded) end
+            // cue would show up here as a deviation. The tolerance is only there because
+            // the span is *measured* as (end - start) and that subtraction does not
+            // round-trip bit-exactly; it is 1e-9, i.e. far below any hand-written cue.
+            const double window = kCueContentFull - kCueContentIn;
+            const double windowError = window - kCueContentSpan / kCueTextFadeSpeed;
+            printf("  fade window = %.6f of the intro (%d ms at the default), error %.2e\n",
+                   window, (int)(window * 1200 + 0.5), windowError);
+            Check(windowError < 1e-9 && windowError > -1e-9,
+                  "the fade span is the span constant divided by the speed constant");
+            // ... and that span constant is still the *un-scaled* window, i.e. the
+            // distance to the shared kCueContentReady the style-1 Fade branch uses.
+            // Moving that shared cue now reddens here instead of silently rescaling this
+            // fade, which is why the stepped fade got its own end cue (kCueContentFull).
+            Check(kCueContentSpan == kCueContentReady - kCueContentIn,
+                  "the span constant is still the un-scaled content-fade window");
+            // The compression is real: at speed 1.0 the two would coincide.
+            Check(kCueContentFull < kCueContentReady,
+                  "the compressed fade ends before the un-scaled window does");
+            // The release contract, which no relationship can pin: a relational check
+            // stays green when the speed itself moves, and "the numbers surface 1.5x
+            // sooner" is the user-facing promise of this change (AGENTS 7.6).
+            Check(kCueTextFadeSpeed >= 1.5,
+                  "the text fade is at least 1.5x faster than the un-scaled window");
+            // Every stage sits inside the compressed span and in order: scaling the end
+            // cue without moving the stages is the mistake this catches.
+            Check(kCueTextFade1 > kCueContentIn && kCueTextFade2 > kCueTextFade1 &&
+                  kCueTextFade3 > kCueTextFade2 && kCueTextFade4 > kCueTextFade3 &&
+                  kCueContentFull > kCueTextFade4,
+                  "the four fade stages stay inside the compressed span, in order");
+        }
+
+        // (a) The fade must reach exactly full opacity at its own end cue and must not be
+        // full just before it. Both samples are taken on a much longer timeline so
+        // GetTickCount's ~16 ms granularity cannot move the cue: on the 1200 ms default
+        // that granularity is worth up to 0.013 of the intro, which would land the
+        // "just before" sample past the end. The end cue is *derived*
+        // (kCueContentFull = kCueContentIn + kCueContentSpan / kCueTextFadeSpeed), so a
+        // keyframe table left at its old cues reddens the first of these two.
+        {
+            const double savedDurationMs = g_intro.durationMs;
+            g_intro.durationMs = 100000.0;
+            g_intro.active = true;
+            g_intro.startedAt =
+                GetTickCount() - (DWORD)((kCueContentFull + 0.001) * g_intro.durationMs);
+            const IntroFrame atEnd = EvaluateIntro();
+            g_intro.active = true;
+            g_intro.startedAt =
+                GetTickCount() - (DWORD)((kCueContentFull - 0.01) * g_intro.durationMs);
+            const IntroFrame beforeEnd = EvaluateIntro();
+            printf("  fade alpha at %.4f = %.4f, at %.4f = %.4f\n",
+                   kCueContentFull + 0.001, atEnd.contentAlpha,
+                   kCueContentFull - 0.01, beforeEnd.contentAlpha);
+            Check(atEnd.contentAlpha == 1.0,
+                  "the text fade reaches exactly full opacity at its own end cue");
+            Check(beforeEnd.contentAlpha < 1.0,
+                  "and it is not yet full just before that");
+            g_intro.durationMs = savedDurationMs;
         }
 
         // Collapsing must shrink across the WHOLE duration, not snap to the tab
@@ -1042,12 +1101,33 @@ int main() {
         //
         // Note the argument order: StartIntro is given (current, target), so a
         // collapse is (expanded, tab) — fromHeight stays the larger value.
+        //
+        // The collapse timeline is *not* recomputed here from the ratio: StartIntro
+        // itself is driven for both directions and the two durations are compared
+        // below, so the assertion is about the product's wiring rather than a copy of
+        // its expression (AGENTS 7.6/7.13 — the test used to multiply the ratio itself).
+        double expandMs = 0.0, collapseMs = 0.0;
+        const int drivenIntroMs = 1200;
+        {
+            const int savedIntroMs = g_settings.introMs;
+            const int savedIntroStyle = g_settings.introStyle;
+            g_settings.introMs = drivenIntroMs;
+            g_settings.introStyle = 0;
+            StartIntro(nullptr, from, to);   // to > from: arriving
+            expandMs = g_intro.durationMs;
+            StartIntro(nullptr, to, from);   // leaving
+            collapseMs = g_intro.durationMs;
+            g_settings.introMs = savedIntroMs;
+            g_settings.introStyle = savedIntroStyle;
+            printf("\n  StartIntro: arriving %.0f ms -> leaving %.0f ms (ratio %.2f)\n",
+                   expandMs, collapseMs, kCollapseDurationRatio);
+        }
         g_intro.active = true;
         g_intro.fromHeight = to;
         g_intro.toHeight = from;
         g_intro.style = 0;
-        // StartIntro halves the duration for a collapse; cue 1.0 is then the end.
-        g_intro.durationMs = 1200.0 * kCollapseDurationRatio;
+        // The collapse timeline the product just computed; cue 1.0 is then the end.
+        g_intro.durationMs = collapseMs;
         printf("\n  collapsing trace (shrink runs the whole collapse duration)\n");
         printf("   cue   height  scale  content\n");
         double lastShrink = to * 2;
@@ -1073,9 +1153,10 @@ int main() {
         Check(atQuarter < to && atQuarter > from, "collapse is still shrinking at the quarter point");
         // ... and it must still have work left at the midpoint. It used to be finished
         // there, because kCollapseDurationRatio (a *duration* ratio) was used as a *cue*
-        // on a timeline that had already been halved: the panel then sat at tab height
-        // for the whole second half while the frame clock kept repainting it, and the
-        // visible collapse was IntroMs/4 instead of the half the README documents.
+        // on a timeline that had already been shortened: the panel then sat at tab height
+        // for the rest while the frame clock kept repainting it, so the visible collapse
+        // was IntroMs/4 back when the ratio was still 1/2 (a sixteenth of the intro if
+        // the same mistake were made now).
         Check(atMid < to - 1.0 && atMid > from,
               "the shrink still has work left at the midpoint");
         Check(atLate < atMid && atLate > from - 0.01,
@@ -1084,7 +1165,7 @@ int main() {
         g_intro.active = true;
         g_intro.fromHeight = to;
         g_intro.toHeight = from;
-        g_intro.durationMs = 1200.0 * kCollapseDurationRatio;
+        g_intro.durationMs = collapseMs;
         g_intro.startedAt = GetTickCount() - (DWORD)(0.25 * g_intro.durationMs);
         IntroFrame shrink = EvaluateIntro();
         printf("  collapsing at cue 0.25: expanding=%d height=%.2f content=%.3f\n",
@@ -1097,18 +1178,27 @@ int main() {
         g_intro.active = true;
         g_intro.fromHeight = to;
         g_intro.toHeight = from;
-        g_intro.durationMs = 1200.0 * kCollapseDurationRatio;
+        g_intro.durationMs = collapseMs;
         g_intro.startedAt = GetTickCount();
         IntroFrame justStarted = EvaluateIntro();
         printf("  collapse first frame height = %.2f (expect ~%.0f)\n",
                justStarted.height, to);
         Check(justStarted.height > to * 0.9, "collapse starts from the expanded height");
 
-        // A collapse must take half the arriving duration. Asserted on the ratio so
-        // it keeps holding if the default intro duration changes.
-        Check(kCollapseDurationRatio == 0.5, "collapse duration is half of the intro");
-        printf("  expanding %d ms -> collapsing %d ms\n", (int)g_intro.durationMs,
-               (int)(g_intro.durationMs * kCollapseDurationRatio));
+        // A collapse must take the configured fraction of the arriving duration, asserted
+        // as a relationship between the two timelines the product's own StartIntro
+        // produced (so it keeps holding if the default intro duration changes, and it
+        // catches the ratio being applied to the wrong direction or dropped entirely).
+        Check(expandMs == (double)drivenIntroMs,
+              "an expansion runs the whole configured duration");
+        Check(collapseMs == expandMs * kCollapseDurationRatio,
+              "the collapse timeline is the configured ratio of the intro");
+        // Plus the release contract itself, which no relationship can pin: a relational
+        // check stays green when the ratio moves, and "closing takes a quarter of the
+        // intro" (twice as fast as the half it used to be) is the user-facing promise.
+        Check(kCollapseDurationRatio == 0.25,
+              "the collapse timeline is a quarter of the intro");
+        printf("  arriving %d ms -> leaving %d ms\n", (int)expandMs, (int)collapseMs);
 
         g_intro.active = false;
     }
