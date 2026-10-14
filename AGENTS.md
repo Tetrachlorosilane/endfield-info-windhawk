@@ -417,6 +417,13 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 - **一段文字在组内与组外的宽度可以不同**：相位 C 用组的右边缘（或列）重新拟合，
   所以"同一串字写在组里更短"是正常的，不是 bug。断言用**关系**（右边缘 ≤ 组右边缘/列右边缘）
   而不是硬编码宽度。
+- **组内的 run 在相位 A 按"组自己的坐标系"拟合，绝不按行流的游标**（`groupOrigin`）：
+  组是整体、在相位 B 才定位的，行流游标对它的落点一无所知。用行流游标曾让
+  `[[center]]ABC[[/center]]` 在**前面有一段长读数**时画出 `AB`（再长一个字整组消失），
+  而组明明落在面板中间、位置完全正确——因为相位 B/C 只会**缩短** run，那一次截断是永久的。
+  断言（前缀 0..40 个 `W` × 三种对齐）：
+  `a group's content survives a long flow run before it (all three alignments)`、
+  `and the group's width counts the characters the flow run was stealing`。
 - **静态数组里的结构体，默认成员初始值必须是 0。** 一个非零的默认值（`int group = -1;`）
   会让编译器把这**整个对象**的镜像放进 `.data`（文件里真实存在），而不是留在 `.bss`
   （只有虚拟大小，不占文件字节）。`RowLayoutPlan::segments[12]` × `g_rowPlans[4]` 因此

@@ -479,6 +479,7 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 | 修上一个错位时把**空行的图标槽**一起丢了 | 只设 `Icon1 = Memory`（`Row 1` 留空）时，继承源"第一个已设的图标"随槽位一起消失 → **整块面板没有图标**，真机上看起来就是"Row icon 选项失效"（2026-10-14 用户报，宿主断言复现：`styles = 0, 0`） | `an icon set on an empty row still covers the rows that are drawn`、`so the text column still leaves room for a plate`；图标槽始终按设置行号存（`IconSlotForRow`） |
 | 桥对同一个 key 有两个发布者 | 标题在"歌名"（store 的 `resourceName`，**没有作者**）与"歌名 - 歌手"之间闪；歌词隔一拍跳回 store 那个**会冻结**的 `playingLyricLineNumber` 行（真机 DryRun 实测：两条 `SET title` 一轮） | `Get-PublishPlan` 的 6 条自检（有序字典 = 重复 key 不可能）+ `Publish` 的运行期点名 |
 | 不读回复的客户端让服务端每帧白等 500 ms | out 缓冲约 1300 条回复，按每秒 4 帧算**五六分钟**后写回复开始超时；管道线程跟不上，积压的值一拍一拍地应用——**上面那条缺陷因此才看得见**（"播放一段时间后作者开始闪、歌词对不准位置"） | `ExtReplyTimeoutsAfter` 的 7 条断言（2 次连续超时才放弃、成功即清零、硬失败不算） |
+| 对齐组被**它前面的文字**截掉内容 | 行里在组之前先有一段长读数时，`[[center]]ABC[[/center]]` 只画出 `AB`（再长一个字母整组消失），而组明明落在面板正中、位置完全正确：相位 A 拿**行流游标**当组的预算，而组是相位 B 才整体定位的；相位 B/C 只会**缩短** run，于是这次截断永久生效（2026-10-15 用户报"位置标签把中间内容的最后一个字吞了"，宿主复现：26 个 `W` + `[[center]]ABC[[/center]]` → `"AB"`） | `a group's content survives a long flow run before it (all three alignments)`、`and the group's width counts the characters the flow run was stealing`（前缀 0..40 个 `W` × 三种对齐；负对照：预算换回 `regionCursor` → 6 条红；组宽少算最后一段 → 同名断言红） |
 
 ---
 

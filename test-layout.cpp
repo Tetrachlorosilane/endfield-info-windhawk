@@ -3391,6 +3391,29 @@ int main() {
         const RowTextMetrics column = ComputeRowTextMetrics(rowW, 0, g_settings.ringSize,
                                                             g_settings.ringRightOffset, false);
 
+        // The text of one group, concatenated from the segments the plan will draw. Elements that
+        // draw nothing of their own (a gauge, an icon, a gap) are skipped: the statements under
+        // test are about the *characters* between the tags.
+        auto groupText = [&](const RowLayoutPlan *plan, int g, WCHAR *out, int cap) {
+            int used = 0;
+            const AlignGroupPlan &group = plan->groups[g];
+            for (int s = group.firstSegment; s <= group.lastSegment && used + 1 < cap; s++) {
+                const RowSegmentPlan &entry = plan->segments[s];
+                if (entry.skip || entry.isRing || entry.isIcon || entry.isGap) continue;
+                for (const WCHAR *ch = entry.slice; *ch && used + 1 < cap; ch++) out[used++] = *ch;
+            }
+            out[used] = L'\0';
+        };
+        // The plan index of the group with this alignment, or -1: reading it by *kind* rather
+        // than by position keeps the lookup from quietly passing when the group the tag asked for
+        // is not the one that was built.
+        auto groupIndexOf = [&](const RowLayoutPlan *plan, int kind) {
+            for (int g = 0; g < plan->alignCount; g++) {
+                if (plan->groups[g].kind == kind) return g;
+            }
+            return -1;
+        };
+
         // (1) The gap follows the font size in effect, the same way the icon diameter does. This
         // one assertion is what separates `[[gap:N]]` from `[[gap:Npx]]`: an implementation that
         // treated every gap as absolute pixels would place the same gap in a 12 px row and a
@@ -3626,6 +3649,202 @@ int main() {
             Check(stray->alignCount == 0, "a closing tag that closes nothing makes no group");
             Check(stray->segmentCount > 0 && !stray->segments[0].isGap,
                   "and the text around it is untouched");
+        }
+
+        // (12) The reported bug: the character that was written just before the closing tag of an
+        // alignment group disappeared from the panel -- `[[center]]ABC[[/center]]` showed `AB`.
+        // The enclosed text, read off the plan the painter consumes, has to be byte-identical to
+        // the text between the tags, for every alignment, for one / two / many characters, and
+        // wherever the group sits in the row. The width the group reports has to be the width of
+        // that text, so the previously swallowed character also has to come back in the pixels.
+        {
+            const WCHAR *names[3] = {L"left", L"center", L"right"};
+            const WCHAR *contents[4] = {L"A", L"AB", L"ABC", L"ABCDEFGHIJ"};
+            const int aligns[3] = {kAlignSegLeft, kAlignSegCenter, kAlignSegRight};
+
+            for (int a = 0; a < 3; a++) {
+                for (int c = 0; c < 4; c++) {
+                    // The group at the start of the row, in the middle (text on both sides), and
+                    // at the end of the row: the three positions its close marker can sit in.
+                    WCHAR rows[3][192];
+                    swprintf(rows[0], 192, L"[[%ls]]%ls[[/%ls]]", names[a], contents[c], names[a]);
+                    swprintf(rows[1], 192, L"x[[%ls]]%ls[[/%ls]]y", names[a], contents[c], names[a]);
+                    swprintf(rows[2], 192, L"xy[[%ls]]%ls[[/%ls]]", names[a], contents[c], names[a]);
+                    const WCHAR *where[3] = {L"alone", L"middle", L"at end"};
+                    for (int w = 0; w < 3; w++) {
+                        const RowLayoutPlan *plan = ensureRow(rows[w], 15);
+                        const int groupIndex = groupIndexOf(plan, aligns[a]);
+                        WCHAR seen[128];
+                        seen[0] = L'\0';
+                        if (groupIndex >= 0) groupText(plan, groupIndex, seen, 128);
+                        printf("    [[%ls]]%ls[[/%ls]] %-6ls -> \"%ls\" (%d seg, align %d)\n",
+                               names[a], contents[c], names[a], where[w], seen, plan->segmentCount,
+                               plan->alignCount);
+                        Check(groupIndex >= 0, "the row's alignment group is in the plan at all");
+                        if (groupIndex < 0) continue;
+                        Check(wcscmp(seen, contents[c]) == 0,
+                              "the group's enclosed text is byte-identical to the text between "
+                              "the tags");
+                        const float expected =
+                            MeasureAdvance(graphics, font, format, contents[c], rowH);
+                        printf("      group width %.2f vs the text's own advance %.2f\n",
+                               (double)plan->groups[groupIndex].width, (double)expected);
+                        Check(plan->groups[groupIndex].width >= expected - 0.5f,
+                              "and the group's width counts the last character too");
+                    }
+                }
+            }
+
+            // The two shapes that are not a matched pair: a group left open, and a close tag with
+            // nothing open. Both must show every character that was typed.
+            {
+                const RowLayoutPlan *unclosed = ensureRow(L"[[center]]ABC", 15);
+                WCHAR seen[64];
+                groupText(unclosed, 0, seen, 64);
+                printf("    unclosed [[center]]ABC -> \"%ls\"\n", seen);
+                Check(wcscmp(seen, L"ABC") == 0, "an unclosed group keeps all of its text");
+
+                const RowLayoutPlan *stray = ensureRow(L"A[[center]]BC[[/left]]D", 15);
+                groupText(stray, 0, seen, 64);
+                printf("    stray [[/left]] inside a group -> group text \"%ls\"\n", seen);
+                Check(wcscmp(seen, L"BC") == 0,
+                      "a stray closing tag cuts nothing out of the group");
+            }
+        }
+
+        // (13) The reported bug: a group is placed by its own tags, so a run *inside* one must
+        // never be fitted against wherever the row's flow happened to leave the cursor.
+        //
+        // With a flow run long enough to reach near the column's right edge,
+        // `[[center]]ABC[[/center]]` drew `AB` -- the last character of the enclosed content was
+        // gone -- and one 'W' later the whole group was gone, while the group itself sat in the
+        // middle of a panel with room to spare. Phase A fitted the grouped run against the flow
+        // cursor ("the widest prefix that fits *there*"), and phases B and C can only ever
+        // *shorten* a run, so that trim was permanent. The rule the code's own phase A comment
+        // states is the opposite -- "phase A fits against the column, and phase C re-fits once the
+        // group sits where it sits" -- and a group's position is not known until phase B.
+        //
+        // The prefix is a flow run of 'W', the widest letter in this font, so the flow cursor
+        // walks from the row's inset out past the column's right edge and each alignment meets
+        // the situation somewhere in the sweep.
+        {
+            const WCHAR *names[3] = {L"left", L"center", L"right"};
+            for (int a = 0; a < 3; a++) {
+                bool keptEveryCharacter = true;
+                bool widthCountsThem = true;
+                bool insideTheColumn = true;
+                int firstBadPrefix = -1;
+                for (int n = 0; n <= 40; n++) {
+                    WCHAR row[192];
+                    int used = 0;
+                    for (int k = 0; k < n; k++) row[used++] = L'W';
+                    swprintf(row + used, 192 - used, L"[[%ls]]ABC[[/%ls]]", names[a], names[a]);
+                    const RowLayoutPlan *plan = ensureRow(row, 15);
+                    if (plan->alignCount != 1) {
+                        keptEveryCharacter = false;
+                        continue;
+                    }
+                    WCHAR seen[128];
+                    groupText(plan, 0, seen, 128);
+                    const float wanted = MeasureAdvance(graphics, font, format, L"ABC", rowH);
+                    if (wcscmp(seen, L"ABC") != 0) {
+                        keptEveryCharacter = false;
+                        if (firstBadPrefix < 0) firstBadPrefix = n;
+                    }
+                    if (plan->groups[0].width < wanted - 0.5f) widthCountsThem = false;
+                    if (plan->groups[0].x + plan->groups[0].width > column.textRight + 0.5f) {
+                        insideTheColumn = false;
+                    }
+                    // Two samples of the sweep, so a failure names the shape that shows it.
+                    if (n == 26 || n == 40) {
+                        printf("    %2d W + [[%ls]]ABC[[/%ls]] -> group \"%ls\" w=%.2f (text "
+                               "%.2f) x=%.2f\n",
+                               n, names[a], names[a], seen, (double)plan->groups[0].width,
+                               (double)wanted, (double)plan->groups[0].x);
+                    }
+                }
+                printf("    [[%ls]]: shortest prefix that loses a character = %d W (of 40)\n",
+                       names[a], firstBadPrefix);
+                Check(keptEveryCharacter,
+                      "a group's content survives a long flow run before it (all three "
+                      "alignments)");
+                Check(widthCountsThem,
+                      "and the group's width counts the characters the flow run was stealing");
+                Check(insideTheColumn, "while the group itself stays inside the text column");
+            }
+        }
+        {
+            // A randomized net under the two blocks above: whatever the markers do to *grouping*,
+            // the characters the plan draws must be exactly the row's own text with the six
+            // alignment tags removed. A stray `[[/left]]` vanishes (that is the documented rule)
+            // and a well-formed tag that is never honoured would draw as text -- the grammar is
+            // only the six tags, so "removed" is what every one of them must be.
+            const WCHAR *pieces[] = {
+                L"A", L"BC", L"xy", L" ", L"[[left]]", L"[[/left]]", L"[[center]]",
+                L"[[/center]]", L"[[right]]", L"[[/right]]", L"Q", L"[[left]]", L"[[/center]]",
+            };
+            const int pieceCount = (int)(sizeof(pieces) / sizeof(pieces[0]));
+            unsigned seed = 12345u;
+            int mismatches = 0;
+            for (int iter = 0; iter < 4000 && mismatches < 6; iter++) {
+                WCHAR row[256];
+                int used = 0;
+                row[0] = L'\0';
+                int count = 1 + (int)(seed % 7);
+                for (int i = 0; i < count; i++) {
+                    seed = seed * 1103515245u + 12345u;
+                    const WCHAR *piece = pieces[(seed >> 16) % pieceCount];
+                    const int len = (int)wcslen(piece);
+                    if (used + len + 1 >= 256) break;
+                    for (int k = 0; k < len; k++) row[used++] = piece[k];
+                    row[used] = L'\0';
+                }
+                if (used == 0) continue;
+                // What the row says once its alignment tags are gone: every one of the six is
+                // well formed, and a stray closer vanishes too (that is the documented rule), so
+                // removing all six substrings is the expected drawn text.
+                WCHAR expected[256];
+                int eused = 0;
+                for (const WCHAR *q = row; *q && eused + 1 < 256;) {
+                    int matched = 0;
+                    if (*q == L'[' && q[1] == L'[') {
+                        static const WCHAR *const tags[] = {
+                            L"[[left]]", L"[[/left]]", L"[[center]]", L"[[/center]]",
+                            L"[[right]]", L"[[/right]]",
+                        };
+                        for (int t = 0; t < 6; t++) {
+                            const int len = (int)wcslen(tags[t]);
+                            if (wcsncmp(q, tags[t], len) == 0) {
+                                q += len;
+                                matched = 1;
+                                break;
+                            }
+                        }
+                    }
+                    if (!matched) expected[eused++] = *q++;
+                }
+                expected[eused] = L'\0';
+                const RowLayoutPlan *plan = ensureRow(row, 15);
+                WCHAR drawn[1024];
+                int dused = 0;
+                for (int s = 0; s < plan->segmentCount && dused + 1 < 1024; s++) {
+                    const RowSegmentPlan &entry = plan->segments[s];
+                    if (entry.skip || entry.isRing || entry.isIcon || entry.isGap) continue;
+                    for (const WCHAR *ch = entry.slice; *ch && dused + 1 < 1024; ch++)
+                        drawn[dused++] = *ch;
+                }
+                drawn[dused] = L'\0';
+                if (wcscmp(drawn, expected) != 0) {
+                    mismatches++;
+                    DumpWide("row     ", row);
+                    DumpWide("drawn   ", drawn);
+                    DumpWide("expected", expected);
+                    printf("      segs=%d align=%d\n", plan->segmentCount, plan->alignCount);
+                }
+            }
+            printf("    fuzz mismatches: %d\n", mismatches);
+            Check(mismatches == 0,
+                  "over 4000 random rows: the alignment markers never change the text");
         }
 
         g_settings = savedSettings;

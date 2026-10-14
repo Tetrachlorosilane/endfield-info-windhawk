@@ -6810,6 +6810,16 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
     // parked behaviour it has always had.
     // -----------------------------------------------------------------------
     float regionCursor = kRowTextLeftInset;
+    // Where the group a run belongs to starts, in phase A's own coordinates. It is the offset of
+    // the group's first segment, and it is what makes "fit a grouped run against the column"
+    // mean the column *of that group* rather than of the row: a group is placed as a unit in
+    // phase B, so the row flow's cursor says nothing about where its runs will be drawn. Fitting
+    // them against the flow cursor was the reported bug -- a long flow run in front of a group
+    // left the cursor near the column's right edge, `[[center]]ABC[[/center]]` was fitted to what
+    // was left there and drew `AB`, and one letter later the whole run was gone, while the group
+    // itself sat in the middle of the panel. Phases B and C only ever *shorten* a run, so that
+    // trim was permanent.
+    float groupOrigin = kRowTextLeftInset;
     for (int s = 0; s < plan.segmentCount; s++) {
         const TextSeg &seg = g_rowState.segments[row][s];
         RowSegmentPlan &entry = plan.segments[s];
@@ -6821,6 +6831,12 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
         if (seg.group == kAlignSegFlow &&
             (s == 0 || g_rowState.segments[row][s - 1].group != kAlignSegFlow)) {
             regionCursor = kRowTextLeftInset;
+        }
+        // A group's own frame starts *here*: its runs are measured from the column's left edge
+        // plus how far this group has come, never from where the row's flow happens to be.
+        if (seg.group != kAlignSegFlow &&
+            (s == 0 || g_rowState.segments[row][s - 1].group != seg.group)) {
+            groupOrigin = regionCursor;
         }
 
         // An element -- gauge, icon or gap -- is placed by the function the natural-width
@@ -6910,9 +6926,22 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
         // untrimmed width, because that is what a group has to be wide enough to hold. So the
         // slice is measured first, fitted against the column, and its fitted width -- not its
         // natural width -- is what the flow advances by, since that is what will be drawn.
+        //
+        // The three cases ask three different questions, and the first one is the reported bug's
+        // line:
+        //   * a run in a **group** is bounded by the column, measured from the group's own frame
+        //     (`groupOrigin` maps to the column's left edge). Its position is not known yet, and
+        //     phase C re-fits it against the group's right edge once it is;
+        //   * a run in the row's own inline flow is bounded by what is left of the column from
+        //     where the flow has got to -- that cursor *is* its position;
+        //   * a parked run's box is the rest of the text column, as it always was.
         float advance = MeasureAdvance(graphics, runFont, format, entry.slice, rowHeight);
         float budget = metrics.textWidth;
-        if (seg.group != kAlignSegFlow || inlineFlow) {
+        if (seg.group != kAlignSegFlow) {
+            budget = FlowTextLimit(metrics.textRight,
+                                   kRowTextLeftInset + (regionCursor - groupOrigin), 0,
+                                   g_settings.ringSize);
+        } else if (inlineFlow) {
             budget = FlowTextLimit(metrics.textRight, regionCursor, 0, g_settings.ringSize);
         } else {
             budget = ComputeParkedRunLimit(metrics.textWidth, regionCursor, 0, g_settings.ringSize);
