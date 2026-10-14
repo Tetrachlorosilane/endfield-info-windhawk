@@ -217,13 +217,25 @@ CPU [[ring:{cpu}]]  DISK [[ring:{disk.system.usage}]]
 | :-- | :-- |
 | `Row N icon` | 内置字形：`None` / `CPU` / `Memory` / `Disk` / `Network` / `GPU` |
 | `Row N icon file` | 用自己的图片覆盖该行字形 |
+| `Custom icon file` | 一张图给**所有行**用（单行的图片仍然优先） |
 
 **没单独设置的行会继承第一个已配置的图标。** 所以只设 `Row 1 icon` 就等于"所有行都用它"；
-想让某行不同就单独设那一行；想让某行不要图标就设成 `None`。
+想让某行不同就单独设那一行；想让某行不要图标就设成 `None`（这一行连 `Custom icon file` 也不画）。
+
+### 一张图给所有行
+
+`Custom icon file` 填一张图的完整路径，**所有没有自己图片的行都会用它**。它比内置字形优先，
+所以默认配置（`Row 1 icon = Memory`）下填上它，四行就一起换成图片。
+
+优先级从高到低：**`Row N icon file`** → **`Row N icon = None`（这一行不画图标）** →
+**`Custom icon file`** → **内置字形（自己的，否则继承第一个已配置的）**。
+
+同一个文件被多行用到时只解码、缩放**一次**，不会因为行数多而重复读取。
 
 ### 用自己的图片
 
-`Row N icon file` 填**完整路径**，支持 **PNG / JPEG / BMP / GIF / TIFF**，不同行可以用不同图片。
+`Row N icon file` 和 `Custom icon file` 都填**完整路径**，支持
+**PNG / JPEG / BMP / GIF / TIFF**，不同行可以用不同图片。
 
 - **路径可以带引号**：`"C:\pics\my icon.png"` 会自动处理，前后空格也会忽略。
 - **建议用 64×64 或更大的透明底 PNG**。图片会被自动缩放到图标尺寸，大图会分级缩小以保证清晰。
@@ -365,8 +377,9 @@ Windhawk 不支持动态下拉框，所以字体需要手输。拼错了就去�
 | `Ring thickness` | 4 | 1-16，环形图线宽 |
 | `Ring right offset` | 12 | 0-200，右停靠时最后一个环距边缘的距离 |
 | `Ring colour` | 空 | 仅 `Custom`；未写 `:COLOR` 的环使用 |
-| `Row N icon` | N=1 为 `Memory`，其余继承 | 每行左端字形 |
-| `Row N icon file` | 空 | 完整路径，覆盖该行字形 |
+| `Row N icon` | N=1 为 `Memory`，其余继承 | 每行左端字形；`None` = 这一行不画图标 |
+| `Row N icon file` | 空 | 完整路径，覆盖该行字形（优先于 `Custom icon file`） |
+| `Custom icon file` | 空 | 完整路径，一张图给所有行用；单行的图片优先 |
 | `Intro animation` | `Slide` | `Slide` / `Fade` / `None` |
 | `Intro duration` | 1200 | 200-4000 ms |
 | `Intro ripples` | 2 | 0-3 道 |
@@ -524,8 +537,9 @@ mod 会用三重手段强制置顶，并每 100 ms 重申一次。如果日志�
 如果是**自己指定的图片**：多半是加载失败，日志里会有一条
 `could not load "..."` 说明原因。常见原因是路径写错，或者文件是 SVG（不支持）。
 
-如果是**内置字形显示成空白**：确认那一行设的不是 `None`——没单独设置的行会继承
-第一个已配置的图标，但如果所有行都是 `None`，就不会有图标。
+如果是**内置字形显示成空白**：确认那一行设的不是 `None`——`None` 表示**这一行不要图标**
+（连 `Custom icon file` 也不画），而没单独设置的行会继承第一个已配置的字形。
+如果所有行都是 `None`，就一个图标都不会有。
 
 </details>
 

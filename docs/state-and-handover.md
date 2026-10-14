@@ -12,11 +12,11 @@
   （头顺序 + `ApplyPanelTransform` 未使用）。
 - 7 个导出入口齐全。
 - 依赖仅系统 DLL：`USER32 / GDI32 / PDH / IPHLPAPI / PSAPI / ADVAPI32 / msvcrt / KERNEL32`。
-- 回归测试全绿（366 条断言，含一段**真启动 GDI+** 的排版断言：
+- 回归测试全绿（380 条断言，含一段**真启动 GDI+** 的排版断言：
   文字不折行、且在预算内）。
 - GDI+ 缩放管线用**已知内容**的图验证过（含透明底、纯 RGB、索引色、灰度+alpha、
   16 位、隔行 PNG）。
-- 外部数据（M1）：编译只剩上面那两条已知警告；回归 **366 条断言**全绿（M1、M2、M3 与 CPU 频率共新增 206 条）；
+- 外部数据（M1）：编译只剩上面那两条已知警告；回归 **380 条断言**全绿（M1、M2、M3 与 CPU 频率共新增 220 条）；
   并做了**负对照**——把展开改成递归后，注入断言确实变红（不是"看着像在守"）。
 - 设置块 46 项 / 10 个选项组，`_settings.py` 报 `no structural problems found`。
 - **mod 的日志格式串**：`-Wformat` **从来没有检查过它们**（2026-10-14 更正）✗。
@@ -261,6 +261,19 @@
 | **图片-only 槽的字形回退**：借"第一个已配置的字形"（一个都没有则 `Memory`）现在对**任何**图片槽生效，不再只在"全工程都没有字形"时才借 | `an image-only slot borrows the configured glyph`、`with no glyph anywhere an image-only slot falls back to Memory`；把回退改回旧条件 → 红 |
 | **`_settings.py` 的两条漏检（待办 #6）**：新增"序列项缩进一致性（顶层 0 列 / 选项 4 空格）"与"每条目恰好一个 `$name` / `$description`"，外加顶层键不重复、同组选项不重复、选项必须在 `$options:` 之后 | 逐条注入实测：5 空格缩进、重复 `$name`、重复键、重复选项各自报错并 exit 1；未改动的块仍 `no structural problems found`，`--write` 幂等（字节不变） |
 
+**第四批（用户要求实现 `IconPath`，2026-10-14；含一个附带缺陷，五处负对照共红 12 条）**：
+
+| 内容 | 断言 / 负对照 |
+| :-- | :-- |
+| **`Custom icon file` 真正生效**（此前是死设置项）：`ModSettings::iconPath`，一张图给所有行用；每行优先级 `Row N icon file` > 显式 `None` > 全局图片 > 内置字形 | `the global icon applies to a row that has no file of its own`、`a global icon on its own still means plates are drawn` |
+| **`Row N icon = None` 现在真的表示"这一行不要图标"**（附带缺陷，探针实测 `Icon1=Memory`+`Icon3=None` → 第 3 行拿到 Memory）：`IconSpec::styleSet` 把"显式 None"与"没设置"分开；`None` 连全局图片一起挡 | `an explicit None leaves that row without a glyph`、`an unconfigured row inherits the first real glyph, not a None` |
+| **相同路径只解码/缩放一次**（用户选择"按路径合并缓存、不加第五槽"）：`ResolveIconSlot` 让解析到同一文件的行共用最低那个槽位，每个文件仍只有一个所有者，按槽释放逻辑不变 | `every row shares one cache slot, so the file is decoded once`、`a row that names the global file shares row 1's slot` |
+| **回退规则改为解析式**：`iconFallbackStyle` 由 `ReadSettings` 算一次，`ResolveIconStyle` 取用（不再把字形写进槽位——全局图片不属于任何槽）；`AnyIconConfigured` 改为问 `IconPlateDiameter`（单一来源），否则"全行 None"会被当成"要留图标边距" | `with no glyph anywhere an image-only row falls back to Memory`、`with nothing configured at all no row gets a plate` |
+| **全局图片排在"继承别的行的文件"之前**：有全局图时单行文件是例外、不扩散；没有全局图时"只设 `Row 1 icon file` 就等于所有行都用它"照旧 | `the per-row file does not leak to the rows the global covers`、`one row's file still covers the rows after it when there is no global image` |
+
+README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$description` 都已同步
+（用户文档现在明确写了四级优先级）。
+
 **其余已确认、尚未修**（按建议顺序）：
 
 | 类别 | 问题（位置见当次复查报告） |
@@ -273,9 +286,8 @@
 | 图标 | 自定义图片不参与入场 `iconScale`（`dw > 2*plateRadius*1.01` 对缓存图恒假） |
 | GPU | PDH 数组读只认 `CStatus == ERROR_SUCCESS`，而 CPU 路径接受 `PDH_CSTATUS_NEW_DATA` |
 | 脚本 | bridge 的 `$client.Connect(3000)` 无 try/catch → 瞬态管道失败即退出，烧掉 mod 的重启预算 |
-| 设置 | `IconPath`（Custom icon file）是死设置项：界面里有、`ReadSettings` 从不读 |
 
-**测试装置（这 366 条断言的可信度）**：`kMinLayoutWidth` 只断言了常量；收回时长由测试自己乘
+**测试装置（这 380 条断言的可信度）**：`kMinLayoutWidth` 只断言了常量；收回时长由测试自己乘
 `kCollapseDurationRatio`（从不调用 `StartIntro`）；"盘心 = 环心"是拿 `g.centerX` 和自己比的
 **恒真**断言；token 覆盖是手抄的 32 个字面量，全文不引用 `kVariables[]`（**新增**变量不会被测到）；
 `Wh_FreeStringSetting` 是空实现（漏 free / double free 都测不出）；GDI+ 段内三处
@@ -290,13 +302,14 @@
 
 **已验证（有证据）**：
 
-- mod 编译：**恰好 2 条已知警告**，DLL **180736** 字节；回归 **366 断言**全绿（2026-10-14 三批修复后为 366）。
+- mod 编译：**恰好 2 条已知警告**，DLL **180736** 字节；回归 **380 断言**全绿（2026-10-14 四批修复后为 380）。
 - 设置块：`_settings.py` → `no structural problems found`；独立结构检查 49 条目、顶层 dash 缩进唯一为 0、每条目恰好一个 `$name`/`$description`。
 - 真实管道链：mod 开机自检两帧被服务端完整收到；`_extclient.ps1` 的值**显示在面板上**。
 - `{cpu.ghz}`：用户确认显示**正确**，标称取电源 API 的 **2.20 GHz**（注册表 2.42 被正确忽略）。⚠️ 但**保存过任何设置之后**它曾回退到注册表值（2026-10-14 修，见 §10.y 头条 1）。
 - 看门狗：日志出现 `EXT publisher: started pid=…`，命令行按 `CreateProcessW` 约定正确拆分。
 - 歌词来源（部分打通）：`async:lyric.lyricLines`（实测 **64 / 67** 行）与 `tlyricLines`；**真 currentTime** 来自 `#page_pc_mini_bar` 的 `mm:ss / mm:ss`。
-- bridge 自检 **30 项**（含 8 项 `Select-StoreLineIndex`，不假设长度）全绿。
+- bridge 自检 **30 项**（含 8 项 Select-StoreLineIndex，不假设长度）全绿。
+- 图标全局覆盖（Custom icon file）与 None 语义：2026-10-14 实现并断言（第四批，见 §10.y）。
 
 **未验证 / 待办（按优先级）**：
 

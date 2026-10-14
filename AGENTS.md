@@ -316,9 +316,21 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 - **用户路径必须裁剪引号与前后空白**（`CopyUserPath`）。
   曾把 `"C:\...\img.png"` 的引号一起传给文件 API → "文件明明在却 could not load"。
 - **图片载入失败必须回退到内置字形。** 否则只剩空盘，看起来像"图标变纯白"，
-  会把人引向完全错误的排查方向。借用规则在 `ReadSettings`：**任何**只有图片的槽都会借到
-  第一个已配置的字形，一个都没有时用 `Memory`——不是"全工程都没有字形"那一种情形才借，
-  混合配置（第 1 行图片、第 2 行 Network）曾经正好漏在缝里。
+  会把人引向完全错误的排查方向。回退值在 `ReadSettings` 里解析一次
+  （`iconFallbackStyle`：第一个显式字形 → 没有任何字形但有图片时用 `Memory` → 否则 0），
+  由 `ResolveIconStyle` 统一取用——**不是**把字形写进槽位：全局图片不属于任何槽位，
+  规则必须放在两者都看得见的地方。
+- **`Row N icon = None` 是"这一行不要图标"，与"没设置"必须可区分。** `IconSpec::styleSet`
+  记录该键是否给了值；没有它，`None` 会落到继承分支，README 的"设成 None 就不要图标"
+  曾**不是真的**（实测：`Icon1=Memory` + `Icon3=None` → 第 3 行拿到 Memory 字形）。
+  `None` 连全局图片一起挡住。
+- **一张图给所有行**（`Custom icon file` → `ModSettings::iconPath`）。每行的优先级：
+  `Row N icon file` > 显式 `None`（不画）> 全局图片 > 内置字形（自己的 → 第一个显式字形）。
+  全局图片排在"继承别的行的文件"**之前**：有全局图时，单行的文件是例外，不该扩散到其余行；
+  没有全局图时，"只设 `Row 1 icon file` 就等于所有行都用它"这条继承照旧。
+- **相同路径的图片只解码/缩放一次**：`ResolveIconSlot` 让解析到同一文件的行**共用最低那个
+  槽位的缓存**（全局图片因此天然只解码一次）。**刻意不加第五个槽、也不做引用计数**——
+  每个文件仍然只有一个所有者，`ReleaseSlotImage` / `DisposeIconImage` 的按槽释放逻辑不变。
 - **自定义图片在载入时按盘径重采样一次**，不在每帧缩放。大图一步压到 23px 会有锯齿，
   且每帧重采样很贵。**逐级折半对"短边已经小于目标箱"的横幅同样成立**：
   `PlanDownscale` 只按比例折半，不把短边钳回目标（那个钳位有不动点，会让宽扁图做十几次
@@ -467,7 +479,10 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 | 关掉岛不丢相位 | `POPPING`/`COLLAPSING` 冻结 → `IslandPhaseAnimating` 恒真 → tick 永久钉在 16 ms，卡片也关不掉 | `turning the island off drops a phase that was in flight` |
 | 发布器没有回收路径 | 关掉 `External data`、或删掉最后一行 `{ext.*}` 后，mod 启动的发布器继续跑（读内存/联网）直到卸载 | **没有断言**（真 `CreateProcess`）；判据是日志 `nothing consumes {ext.*} any more; stopping it` |
 | `PlanDownscale` 的比例钳位有不动点 | 短边已小于目标箱的宽扁图（横幅）**一次都不折半**：十几次 1:1 空转之后一次性压 173 倍——正是要修的锯齿形态 | `no stage reduces the long edge by more than 2x`、`the short side is the exact fit, rounded up by at most a pixel` |
-| 图片-only 槽只在"全工程都没有字形"时才借字形 | 混合配置（第 1 行图片、第 2 行 Network）里图片载入失败仍是**空盘**，看着像"图标变纯白" | `an image-only slot borrows the configured glyph`、`with no glyph anywhere an image-only slot falls back to Memory` |
+| 图片-only 槽只在"全工程都没有字形"时才借字形 | 混合配置（第 1 行图片、第 2 行 Network）里图片载入失败仍是**空盘**，看着像"图标变纯白" | `an image-only row falls back to the configured glyph`、`with no glyph anywhere an image-only row falls back to Memory` |
+| `Row N icon = None` 与"没设置"无法区分 | 设了 `None` 的行**照样得到继承来的字形**（实测 `Icon1=Memory`+`Icon3=None` → 第 3 行是 Memory），README 的"设成 None 就不要图标"不成立 | `an explicit None leaves that row without a glyph`、`an unconfigured row inherits the first real glyph, not a None` |
+| 全局 `IconPath` 从未被读取（死设置项） | 界面上有"Custom icon file"，填了没有任何效果 | `the global icon applies to a row that has no file of its own`、`a global icon on its own still means plates are drawn` |
+| 多行用同一张图时逐行解码 | 全局图片在大图上会被解码 N 次（峰值内存按行数翻倍） | `every row shares one cache slot, so the file is decoded once`、`a row that names the global file shares row 1's slot` |
 
 ### 排查心法：先分类，再定位
 
