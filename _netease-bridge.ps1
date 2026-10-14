@@ -1206,12 +1206,18 @@ if ($SelfTest) {
 # ---------------------------------------------------------------------------
 $track = Get-PlayingTrack
 if (-not $track) {
-    Write-Host "没找到在播放的网易云窗口（进程名匹配 '*$ProcessName*'，标题里要有「 - 」）。"
-    Write-Host "确认它在播放，或用 -ProcessName 指定真实的进程名："
+    # 发布器是被 mod 长期托管的（看门狗 / 作业对象负责收尾），所以"暂时没有窗口"不是退出理由：
+    # 早先这里直接 exit 2，于是 mod 在 18 秒里把它启动了 5 次然后判定失败（真机日志 2026-10-13）。
+    Write-Host ("暂时没有可用的网易云窗口（进程名匹配 '*{0}*'，主窗口标题里要有「 - 」）。" -f $ProcessName)
+    Write-Host "每 5 秒重试；窗口出现就继续。若一直不出现，用 -ProcessName 指定真实进程名。当前有标题的进程："
     Get-Process -ErrorAction SilentlyContinue |
         Where-Object { $_.MainWindowTitle } |
         ForEach-Object { Write-Host ("  {0,-28} {1}" -f $_.ProcessName, $_.MainWindowTitle) }
-    exit 2
+    while (-not $track) {
+        Start-Sleep -Seconds 5
+        $track = Get-PlayingTrack
+    }
+    Write-Host ("已找到窗口：{0}" -f $track.Title)
 }
 
 Write-Host ("曲目：{0} — {1}" -f $track.Title, $track.Artist)
