@@ -1594,6 +1594,19 @@ int main() {
                   "a whitespace-only publisher command has no executable");
             Check(!ExtParsePublisherCommand(L"", exe, 512, args, 512),
                   "an empty publisher command has no executable");
+
+            // 看门狗的名字匹配：大小写不敏感 ✓、带不带 .exe 都认 ✓、空名字不匹配 ✓
+            Check(ExtProcessNameMatches(L"cloudmusic.exe", L"cloudmusic"),
+                  "a watched name without .exe matches the image name");
+            Check(ExtProcessNameMatches(L"cloudmusic", L"cloudmusic.exe"),
+                  "a watched name with .exe also matches");
+            Check(ExtProcessNameMatches(L"CloudMusic.EXE", L"cloudmusic"),
+                  "the watched name match is case-insensitive");
+            Check(!ExtProcessNameMatches(L"cloudmusic_reporter.exe", L"cloudmusic"),
+                  "a longer image name does not match the watched name");
+            Check(!ExtProcessNameMatches(L"", L"cloudmusic") &&
+                      !ExtProcessNameMatches(L"cloudmusic.exe", L""),
+                  "an empty name on either side never matches");
         }
 
         // The nominal clock has two sources: the registry's "~MHz" (what ACPI/BIOS
