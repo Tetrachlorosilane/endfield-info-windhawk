@@ -529,6 +529,7 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 | 自定义图片不参与入场缩放 | 图片只淡入、不随盘子长大（内置字形那条路径一直会） | `and follows the intro as it scales the plate in`、`while the intro still scales it down` |
 | PDH 的 GPU 数组读只认 `ERROR_SUCCESS` | 计数器刚建好时的第一个采样（`NEW_DATA`）被丢掉 → GPU 读数晚一拍 | `and so is a counter's first sample (new data)` |
 | bridge 的 `$client.Connect(3000)` 无保护 | 瞬时连不上变成未处理异常、脚本当场死掉，mod 看门狗再拉起它——重启预算烧在"再等一秒就能连上"上 | 自检 `连不上管道时返回空值（不抛异常）`；对照（裸 Connect）实测未捕获异常 + exit 1 |
+| bridge 用 `Process.MainWindowTitle` 取曲名 | **开着「桌面歌词」时 `MainWindowTitle` 就是「桌面歌词」**（真机实测 2026-10-14：`Get-Process -Id 15824` → `cloudmusic / 桌面歌词`，而同一 pid 另一个顶层窗口才是「下等马 - 洛天依…」）→ 标题里永远没有「 - 」→ 桥一直停在"没有可用窗口"的等待循环里、**从不连接**，面板 title/lyric 两行永远 `--` | 自检 `曲目标题：桌面歌词窗口不算曲目`、`曲目标题：从多窗口里挑出带「 - 」的那个`、`曲目标题：多个候选取最长的`、`窗口枚举：网易云在跑时能看到它的顶层窗口`；活体输出 `网易云顶层窗口（2 个）：[桌面歌词] [下等马 - …]` |
 
 ### 排查心法：先分类，再定位
 

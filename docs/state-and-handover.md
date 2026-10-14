@@ -307,7 +307,23 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 | **sampler join 的等待结果不再丢弃**（超时后仍删 `g_valuesLock` = 在另一条线程可能还握着它时删锁） | `ValuesLockCanBeReleased` 只认 `WAIT_OBJECT_0`：`a sampler that did not stop leaves its lock alone`、`and so does a failed wait`；恒真 → 红 2 条 |
 | **自定义图片随入场缩放**：抽出 `ComputeIconImageDrawSize` = `min(自然尺寸, 盘径) × iconScale`（旧条件只在"比盘大"时乘缩放，而缓存图恰好等于盘径） | `and follows the intro as it scales the plate in`、`while the intro still scales it down`、`at zero scale it draws at zero size`；旧条件 → 红 3 条 |
 | **PDH 状态口径统一**：`PdhValueUsable()` 接受 `VALID_DATA` 与 `NEW_DATA`，三条路径共用（GPU 数组读取此前只认 `ERROR_SUCCESS` → 计数器刚建好的第一个采样被丢） | `and so is a counter's first sample (new data)` 等 5 条；只认 `ERROR_SUCCESS` → 红 1 条 |
-| **bridge 的管道连接加等待窗口**：`Connect-PipeClient` 失败重试、等不到返回 `$null`（此前裸 `Connect(3000)` 抛未处理异常、脚本当场死掉、烧掉 mod 的重启预算） | 自检新增 `连不上管道时返回空值（不抛异常）`（31 项）；对照：换回裸 Connect → **未捕获异常、exit 1**，自检根本跑不完 |
+| **bridge 的管道连接加等待窗口**：`Connect-PipeClient` 失败重试、等不到返回 `$null`（此前裸 `Connect(3000)` 抛未处理异常、脚本当场死掉、烧掉 mod 的重启预算） | 自检新增 `连不上管道时返回空值（不抛异常）`；对照：换回裸 Connect → **未捕获异常、exit 1**，自检根本跑不完 |
+
+**第八批（2026-10-14，用户真机报告"歌词与标题都为空横线"；**根因在示例发布器**，不是 mod）**：
+
+| 内容 | 证据 / 断言 |
+| :-- | :-- |
+| **`Get-PlayingTrack` 改用窗口枚举，不再用 `Process.MainWindowTitle`**：真机上网易云开着「桌面歌词」时 `MainWindowTitle` **就是「桌面歌词」**，带歌名的窗口反而不是主窗口 → 标题里永远没有「 - 」→ 桥一直停在"没有可用窗口"的等待循环、**从不连接管道** → 两行永远 `--` | 现场取证：`Get-Process -Id 15824` → `cloudmusic / 桌面歌词`；`EnumWindows` 列出该 pid 的**两个**顶层窗口 `[桌面歌词] [下等马 - 洛天依Official/ChiliChill乐团]`。修后自检活体输出同两行，且 `-DryRun -Once` 打出 `-> SET netease title … 下等马`、`-> SET netease lyric … 练就这套拳叫` |
+| **按窗口所属 pid 反查进程名**，而不是"先列出全部进程再筛 pid"：进程**列表**在受限环境里只给一部分（实测沙箱里 `Get-Process`/`tasklist`/Toolhelp 都只看到 13 个进程），而 `Get-Process -Id` 可靠——否则这段在受限环境里永远返回空 | 自检 `窗口枚举：网易云在跑时能看到它的顶层窗口`；活体输出 2 个窗口（正是靠这条路才在沙箱里也拿到证据） |
+| 自检新增 5 项（4 项纯函数 + 1 项活体），并把窗口列表**打印出来**当活体证据 | `曲目标题：桌面歌词窗口不算曲目`、`…挑出带「 - 」的那个`、`…多个候选取最长`、`…空标题与空数组都不算`、`窗口枚举：…`；总计 **36 项**全绿 |
+
+> 这条与交接文档 §12 早就记下的真机事实**同源**（"桌面歌词不是进程主窗口，`MainWindowTitle` 看不到它，
+> 必须 `EnumWindows` 按标题找"）——脚本当初没照做。**教训：文档里的真机事实要当约束用**，
+> 光记下来不等于用上了。
+>
+> 附带观察（不影响功能）：在线歌词**搜索**接口在本机报 `The SSL connection could not be established`
+> （两个端点都失败），但歌词仍从播放器自己的 store 取到了（`-> SET netease lyric … 练就这套拳叫`），
+> 所以搜索只是"store 里没有时的兜底"。要不要修这条另说。
 
 **其余已确认、尚未修**：**本会话复查列出的项目已全部处理完**。剩下的都是真机项（见 §12.1）
 与 AGENTS §7.13 末尾记的测试装置信任边界（`PaintPanel` 调用点、`StartIntro` 接线）。
@@ -330,8 +346,14 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 - `{cpu.ghz}`：用户确认显示**正确**，标称取电源 API 的 **2.20 GHz**（注册表 2.42 被正确忽略）。⚠️ 但**保存过任何设置之后**它曾回退到注册表值（2026-10-14 修，见 §10.y 头条 1）。
 - 看门狗：日志出现 `EXT publisher: started pid=…`，命令行按 `CreateProcessW` 约定正确拆分。
 - 歌词来源（部分打通）：`async:lyric.lyricLines`（实测 **64 / 67** 行）与 `tlyricLines`；**真 currentTime** 来自 `#page_pc_mini_bar` 的 `mm:ss / mm:ss`。
-- bridge 自检 **31 项**（含 8 项 Select-StoreLineIndex，不假设长度）全绿。
+- bridge 自检 **36 项**（含 8 项 Select-StoreLineIndex 与 5 项窗口/曲名判定，都不假设长度或环境）全绿。
 - 图标全局覆盖（Custom icon file）与 None 语义：2026-10-14 实现并断言（第四批，见 §10.y）。
+- **曲名来源（真机定论，2026-10-14）**：网易云开着「桌面歌词」时 `cloudmusic` 的 `MainWindowTitle`
+  **就是「桌面歌词」**，带歌名的窗口是同一 pid 的**另一个顶层窗口**
+  （`Get-Process -Id 15824` → `cloudmusic / 桌面歌词`；`EnumWindows` 给出
+  `[桌面歌词] [下等马 - 洛天依Official/ChiliChill乐团]`）。**取曲名只能枚举顶层窗口，不能看
+  MainWindowTitle**——与 §12 里"桌面歌词不是主窗口"那条同源，示例发布器当初没照做，
+  于是面板两行一直 `--`（第八批已修）。
 
 **未验证 / 待办（按优先级）**：
 
