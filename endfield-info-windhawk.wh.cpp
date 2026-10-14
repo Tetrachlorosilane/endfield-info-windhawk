@@ -1546,21 +1546,110 @@ enum RowPartKind : unsigned char {
     kPartSizeOpen,     // [[size:NN]]
     kPartSizeClose,    // [[/size]]
     kPartIcon,         // [[icon:...]]: a built-in glyph or an image file
+    kPartGap,          // [[gap:...]]: empty horizontal space, in em or in px
+    kPartAlignOpen,    // [[left]] / [[center]] / [[right]]: opens a group
+    kPartAlignClose,   // [[/left]] / [[/center]] / [[/right]]: closes one
 };
 
 // An icon's own two attributes, packed into the single byte `RowPart::glyphFlags`. They are
 // packed rather than given a byte each because kMaxRowParts is 514 and a RowPart is copied with
 // every settings snapshot: a second byte per element costs 2 KB of every sample. The glyph names
-// run 0..5, so three bits are enough.
+// run 0..5, so three bits are enough. A gap reuses two more bits of the same byte for its unit,
+// for the same reason -- see `kGapUnitMask`.
 static const unsigned char kIconGlyphMask = 0x07;
 static const unsigned char kIconRippleOn = 0x08;    // ":ripple"
 static const unsigned char kIconRippleOff = 0x10;   // ":noripple"
+
+// A gap's unit, in the two bits above an icon's glyph and ripple flags. The unit is *not*
+// recoverable from the number (a `[[gap:1.5]]` in a 24 px run and a `[[gap:36px]]` are the same
+// 36 px but mean different things to the next font-size change), so it has to be stored. The
+// same byte is reused because an element is either an icon or a gap, never both.
+static const unsigned char kGapUnitMask = 0x60;
+static const unsigned char kGapUnitEm = 0x00;    // the value is tenths of an em
+static const unsigned char kGapUnitPx = 0x20;    // the value is hundredths of a pixel
 
 // The glyph drawn for an image icon whose file cannot be decoded: `Memory`, which is what the
 // old settings resolved to when none of them named a glyph ("an image that cannot be loaded
 // falls back to the Memory glyph"). The reason is unchanged -- an empty disc reads as "the
 // icon turned white", which sends the reader off in the wrong direction.
 static const int kIconImageFallbackGlyph = 2;
+
+// The four alignment modes a segment can sit in. `Flow` is "no group": the segment is placed by
+// the row's own rules. The other three are the *group* a segment belongs to, and a group is
+// placed as a unit (see `AlignGroupPlan`). The numbers are also the digits the alignment markers
+// carry, which is why they start at 0 and are contiguous.
+//
+// The names carry the `Seg` infix because `kAlignCenter` is already GDI+'s StringAlignment
+// constant, and this header resolves GDI+ by hand rather than including it: two different
+// meanings under one name is exactly the kind of collision that reads as working code.
+enum RowAlign : unsigned char {
+    kAlignSegFlow = 0,
+    kAlignSegLeft = 1,
+    kAlignSegCenter = 2,
+    kAlignSegRight = 3,
+};
+static const int kAlignKindCount = 3;   // LEFT..RIGHT; FLOW is "no group"
+
+// ---------------------------------------------------------------------------
+// [[gap:...]]: empty horizontal space.
+//
+// The unit is decided by how the tag is written, and the two units are *not* interchangeable:
+// a bare number is a font-size multiple (`[[gap:1.5]]` = 1.5 x the size in effect at that
+// element), a number with a `px` suffix is absolute pixels (`[[gap:12px]]`). Only the first
+// scales with the row's -- or the run's -- size, which is the whole reason both exist.
+//
+// The two numbers the compiler stores are in *the unit's own* resolution, and the field is wide
+// enough for either because a RowPart is copied with every settings snapshot:
+//
+//   em: hundredths of an em    (so [[gap:1.5]] is stored as 150)
+//   px: hundredths of a pixel  (so [[gap:12px]] is stored as 1200 -- which is why the field is
+//                               a `short` and not the byte the value's *name* suggests)
+//
+// The *pixel* cap is kMaxGapPx (99 px) and applies after the em conversion, so the em limit here
+// is not the same thing: a legal 320 em tag in a small row is a legal small gap, and it is the
+// pixel clamp -- not this parse limit -- that decides whether it survives.
+//
+// Sub-resolution precision is *dropped*, not rounded: 1.555 em is a 1.55 em gap. Rounding to
+// nearest would make `[[gap:1.55]]` and `[[gap:1.54]]` report the same stored number and hide
+// the decision, while truncation at least never makes a gap wider than the writer asked for.
+// ---------------------------------------------------------------------------
+static const int kGapMaxEmHundredths = 32000;      // 320.00 em; past this the tag stays text
+static const int kGapMaxPxHundredths = 9999;       // 99.99 px; past this the tag stays text
+// What the marker's four decimal digits can carry, in hundredths of a pixel. This is *why* the
+// gap cap below is what it is: the marker is the only place a gap's pixels are stored, so a gap
+// that four digits cannot write down would be silently truncated into a different gap.
+static const int kGapMarkerMaxValue = 9999;
+
+// The four decimal digits of a gap's pixel value, most significant first, as '0'..'9'.
+//
+// `value` is hundredths of a pixel, and the cap below keeps it at or under 9900, so the places are
+// 1000 / 100 / 10 / 1. Writing the leading place as 10000 (as an earlier version did, for a cap
+// of 512 px) produced `(51200 / 10000) % 10` -- the *second* digit -- and every gap of 100 px or
+// more came out with its two leading digits swapped.
+static void GapMarkerDigits(int value, WCHAR out[4]) {
+    if (value < 0) value = 0;
+    out[3] = (WCHAR)(L'0' + value % 10);
+    out[2] = (WCHAR)(L'0' + (value / 10) % 10);
+    out[1] = (WCHAR)(L'0' + (value / 100) % 10);
+    out[0] = (WCHAR)(L'0' + (value / 1000) % 10);
+}
+
+// The one and only clamp of a gap's *pixel* result. A gap of zero is allowed and has to stay
+// zero (a negative or NaN advance would move the rest of the row the wrong way), and an absurd
+// one is capped rather than allowed to push the row off the panel. Every path that turns a
+// compiled gap into pixels comes through here -- see the assertion
+// "an absurd but valid gap is clamped to the cap rather than running off the panel".
+//
+// The cap is 99 px because that is the widest gap the marker's four digits can write down
+// (kGapMarkerMaxValue): the marker is the only place a gap's pixels live between instantiation
+// and layout, so "the clamp" and "what the marker can carry" are the same number, not two numbers
+// that happen to agree.
+static const float kMaxGapPx = 99.0f;
+
+static float ClampGapPx(float px) {
+    if (!(px > 0.0f)) return 0.0f;   // also catches NaN, which no comparison would
+    return px < kMaxGapPx ? px : kMaxGapPx;
+}
 
 struct RowPart {
     RowPartKind kind;
@@ -1571,6 +1660,8 @@ struct RowPart {
     // kPartSizeOpen: the run's size (kMinRowFontSize..kMaxRowFontSize, so two digits).
     unsigned char runFontSize;
     // kPartIcon: the built-in glyph (kIconGlyphMask) plus the :ripple / :noripple override.
+    // kPartIcon and kPartGap: the *unit* of a gap (`kGapUnitEm` / `kGapUnitPx`) sits above the
+    // glyph's three bits, where an icon never looks.
     unsigned char glyphFlags;
     // kPartText: the template, as a slice of the row's own text. kPartRing: the tag's body
     // after "ring:", which is what ParseRing is handed (after token expansion).
@@ -1580,10 +1671,19 @@ struct RowPart {
     short length;
     // The next element on the ordinary path, or -1 at the end of the program.
     short next;
-    // kPartRing / kPartSizeOpen / kPartIcon: where to continue when this element cannot be
-    // emitted (a ring ParseRing rejects, no room for a marker, no room for the element) and the
-    // markup therefore stays literal text starting with the '[' it was recognised at.
+    // kPartRing / kPartSizeOpen / kPartIcon / kPartGap: where to continue when this element
+    // cannot be emitted (a ring ParseRing rejects, no room for a marker, no room for the
+    // element) and the markup therefore stays literal text starting with the '[' it was
+    // recognised at.
     short failNext;
+    // kPartAlignOpen: which group this tag opens (kAlignSegLeft..kAlignSegRight).
+    unsigned char align;
+    // kPartGap: the gap as the compiler parsed it -- hundredths of an em when the unit is em,
+    // hundredths of a pixel when it is px. Multiplying by the font size is *not* done here:
+    // compilation happens once per settings change and a gap may sit inside a [[size:NN]] run,
+    // so the size in effect is only known at instantiation (see GapPixels). A `short`, not the
+    // byte the number's size suggests: 655.35 px does not fit in one.
+    short gap;
 };
 
 // One row's compiled markup. Fixed size, POD: a settings snapshot is copied to the sampler
@@ -1623,7 +1723,69 @@ struct RowTag {
     int size;          // kPartSizeOpen: the run's size
     int glyph;         // kPartIcon: the built-in glyph, 1..5
     int ripple;        // kPartIcon: kIconRippleOn / kIconRippleOff, 0 = leave it to the row
+    int align;         // kPartAlignOpen: kAlignSegLeft / kAlignSegCenter / kAlignSegRight
+    int gap;           // kPartGap: the tag's number, in its unit's own resolution
+    unsigned char gapUnit;   // kPartGap: kGapUnitEm / kGapUnitPx
 };
+
+// The [[gap:...]] body, parsed while compiling. `outHundredths` is in the unit's own resolution
+// (see the banner above), which is what gets stored in the element. Anything this function cannot
+// read whole -- an empty body, a stray suffix, a second '.', a '-', a letter, an out-of-range
+// number -- returns false and the tag stays literal text, like every other bad tag. A *valid*
+// number whose pixels end up past the cap is not a parse failure: it is clamped, deliberately,
+// so the writer can see that something happened instead of a tag that vanished.
+static bool ParseGapTag(const WCHAR *body, int bodyLen, int *outValue, unsigned char *outUnit) {
+    if (!body || bodyLen <= 0 || !outValue || !outUnit) return false;
+
+    int at = 0;
+    while (at < bodyLen && (body[at] == L' ' || body[at] == L'\t')) at++;
+    int end = bodyLen;
+    while (end > at && (body[end - 1] == L' ' || body[end - 1] == L'\t')) end--;
+    if (end <= at) return false;
+
+    unsigned char unit = kGapUnitEm;
+    if (end - at >= 2 && (body[end - 2] == L'p' || body[end - 2] == L'P') &&
+        (body[end - 1] == L'x' || body[end - 1] == L'X')) {
+        unit = kGapUnitPx;
+        end -= 2;
+        if (end <= at) return false;
+    }
+
+    int whole = 0, frac = 0, fracDigits = 0;
+    bool sawDigit = false, sawDot = false;
+    for (int i = at; i < end; i++) {
+        const WCHAR ch = body[i];
+        if (ch >= L'0' && ch <= L'9') {
+            sawDigit = true;
+            if (sawDot) {
+                // A third decimal digit is dropped rather than rejected: the tag is
+                // well-formed, it is just finer than the stored resolution.
+                if (fracDigits < 2) frac = frac * 10 + (int)(ch - L'0');
+                fracDigits++;
+            } else if (whole < 1000000) {
+                whole = whole * 10 + (int)(ch - L'0');
+            }
+        } else if (ch == L'.') {
+            if (sawDot) return false;   // "1.2.3"
+            sawDot = true;
+        } else {
+            return false;               // '-' includes it: a negative gap is not a gap
+        }
+    }
+    if (!sawDigit) return false;
+
+    // Hundredths of the tag's own unit. One decimal digit is 10 hundredths of a unit, two are
+    // themselves, none are zero.
+    const int hundredths = whole * 100 + frac * (fracDigits == 1 ? 10 : 1);
+    const int limit = unit == kGapUnitPx ? kGapMaxPxHundredths : kGapMaxEmHundredths;
+    if (hundredths > limit) return false;
+
+    // Stored in the unit's own resolution; the em case is multiplied by the font size later,
+    // the px case is already a pixel measurement.
+    *outValue = hundredths;
+    *outUnit = unit;
+    return true;
+}
 
 // The icon tag's body, parsed while compiling: a built-in glyph name, or `file=<path>`, each
 // optionally followed by `:ripple` / `:noripple`. Returns false for anything else, which is
@@ -1679,9 +1841,11 @@ static bool ParseIconTag(const WCHAR *body, int bodyLen, RowTag &tag) {
 
 // Classifies the markup at `at`, in the expander's own order: a ring first (whether it draws
 // can only be decided with live values), then [[font:...]], then [[size:NN]], then [[icon:...]],
-// then the two closing tags. A [[font:...]] whose chain was never registered -- mis-spelt, not
-// installed, past the chain limit -- comes back as ordinary text, exactly as it did when this
-// decision was made per publish. So does an icon tag this function cannot make sense of.
+// then [[gap:...]], then the three alignment tags, then the closing tags. A [[font:...]] whose
+// chain was never registered -- mis-spelt, not installed, past the chain limit -- comes back as
+// ordinary text, exactly as it did when this decision was made per publish. So do an icon tag
+// this function cannot make sense of, a malformed gap, and an alignment tag with an unknown word
+// in it.
 static RowTag ClassifyRowTag(const WCHAR *raw, int at, const FontTag *tags, int tagCount) {
     RowTag tag = {};
     tag.kind = kPartText;
@@ -1729,6 +1893,56 @@ static RowTag ClassifyRowTag(const WCHAR *raw, int at, const FontTag *tags, int 
     }
     if (bodyLen == 5 && _wcsnicmp(body, L"/size", 5) == 0) {
         tag.kind = kPartSizeClose;
+        return tag;
+    }
+    if (bodyLen > 4 && _wcsnicmp(body, L"gap:", 4) == 0) {
+        int gap = 0;
+        unsigned char unit = kGapUnitEm;
+        if (ParseGapTag(body + 4, bodyLen - 4, &gap, &unit)) {
+            tag.kind = kPartGap;
+            tag.gap = gap;
+            tag.gapUnit = unit;
+        }
+        return tag;
+    }
+    // The three alignment groups, opening and closing. Matched case-*sensitively* on purpose:
+    // the word has to be exactly the tag, and a comparison that ignores case is one more libc
+    // function whose behaviour on wchar_t could differ between the host and Windhawk's runtime.
+    // `[[LEFT]]` is therefore not an alignment tag -- it stays text, like any other bad tag.
+    if (bodyLen == 4 && body[0] == L'l' && body[1] == L'e' && body[2] == L'f' && body[3] == L't') {
+        tag.kind = kPartAlignOpen;
+        tag.align = kAlignSegLeft;
+        return tag;
+    }
+    if (bodyLen == 6 && body[0] == L'c' && body[1] == L'e' && body[2] == L'n' &&
+        body[3] == L't' && body[4] == L'e' && body[5] == L'r') {
+        tag.kind = kPartAlignOpen;
+        tag.align = kAlignSegCenter;
+        return tag;
+    }
+    if (bodyLen == 5 && body[0] == L'r' && body[1] == L'i' && body[2] == L'g' &&
+        body[3] == L'h' && body[4] == L't') {
+        tag.kind = kPartAlignOpen;
+        tag.align = kAlignSegRight;
+        return tag;
+    }
+    // A closing tag carries no word: what a `[[/...]]` closes is decided by the *order* of the
+    // markers in the marked string (see kAlignMarkStart), so `[[/left]]`, `[[/center]]` and
+    // `[[/right]]` are one kind, and a close tag that closes nothing simply has no marker to cut
+    // a group at.
+    if (bodyLen == 5 && body[0] == L'/' && body[1] == L'l' && body[2] == L'e' &&
+        body[3] == L'f' && body[4] == L't') {
+        tag.kind = kPartAlignClose;
+        return tag;
+    }
+    if (bodyLen == 7 && body[0] == L'/' && body[1] == L'c' && body[2] == L'e' &&
+        body[3] == L'n' && body[4] == L't' && body[5] == L'e' && body[6] == L'r') {
+        tag.kind = kPartAlignClose;
+        return tag;
+    }
+    if (bodyLen == 6 && body[0] == L'/' && body[1] == L'r' && body[2] == L'i' &&
+        body[3] == L'g' && body[4] == L'h' && body[5] == L't') {
+        tag.kind = kPartAlignClose;
         return tag;
     }
     return tag;
@@ -1827,6 +2041,27 @@ static int CompileRowSuffix(RowCompiler &c, int at, int chain, int size) {
                 part.length = (short)tag.payloadLen;
                 part.next = (short)CompileRowSuffix(c, tag.close + 2, chain, size);
                 part.failNext = (short)CompileRowSuffix(c, textEnd + 1, chain, size);
+                break;
+            case kPartGap:
+                // The unit rides in the icon byte's spare bits and the number in `gap`; the
+                // pixel value is *not* computed here (see GapPixels): the size in effect is
+                // only known when the program is instantiated. The run size is carried the way
+                // a TEXT element carries it, so a gap inside [[size:24]] scales with the run.
+                part.glyphFlags = tag.gapUnit;
+                part.runFontSize = (unsigned char)size;
+                part.gap = (short)tag.gap;
+                part.next = (short)CompileRowSuffix(c, tag.close + 2, chain, size);
+                // A gap the instantiator cannot emit (no room for the marker) stays literal,
+                // like the other tags that carry a payload.
+                part.failNext = (short)CompileRowSuffix(c, textEnd + 1, chain, size);
+                break;
+            case kPartAlignOpen:
+                part.align = (unsigned char)tag.align;
+                part.next = (short)CompileRowSuffix(c, tag.close + 2, chain, size);
+                part.failNext = (short)CompileRowSuffix(c, textEnd + 1, chain, size);
+                break;
+            case kPartAlignClose:
+                part.next = (short)CompileRowSuffix(c, tag.close + 2, chain, size);
                 break;
             default:
                 break;
@@ -1989,6 +2224,27 @@ static int ElementFontSizePx(const ModSettings &settings, int row, int runFontSi
 // a second copy of this multiplication is exactly how the icon and its ripple would drift apart.
 static float IconDiameterForFontSize(int fontSizePx) {
     return (float)fontSizePx * (float)kIconPlateRatio;
+}
+
+// A gap's pixels, from the compiled element and the size in effect where it sits.
+//
+// This is the *only* place the em unit is multiplied by a font size, and it asks the same
+// `ElementFontSizePx` the icon diameter does -- so a gap and the icon next to it inside the same
+// `[[size:24]]` run scale together. Writing the multiplication a second time at the drawing end
+// is exactly how the two would drift apart (design 5: one owner per derived size).
+//
+// The stored number is in the unit's own resolution, so the em branch is the only branch that
+// consults the font at all; the px branch is already pixels.
+static float GapPixels(const ModSettings &settings, int row, const RowPart &part) {
+    float px;
+    if ((part.glyphFlags & kGapUnitMask) == kGapUnitPx) {
+        px = (float)part.gap / 100.0f;
+    } else {
+        // The stored number is hundredths of an em: `size * (gap / 100)`.
+        px = (float)part.gap * (float)ElementFontSizePx(settings, row, part.runFontSize) /
+             100.0f;
+    }
+    return ClampGapPx(px);
 }
 
 // Whether one icon element plays the intro ripples. Its own `:ripple` / `:noripple` wins;
@@ -4000,11 +4256,46 @@ static RowTextMetrics ComputeRowTextMetrics(float panelWidth, int ringCount, int
 // The rule is "the run plus the gauges still to come must fit the row", which is
 // the same relation the parked path gets from ComputeRowTextMetrics; the gauges
 // keep their width so they stay on screen, and the text is what gives way.
-// Factored out so that relation is assertable instead of implied by the paint loop.
-static float ComputeInlineTextLimit(float textRight, float cursor, int ringsAfter, int ringSize) {
+//
+// The right bound a run's budget is measured against: the nearer of the text column's right
+// edge and the right edge of the alignment group the run sits in.
+//
+// This is the relation the "every fitted run stays inside the panel" assertion is about, and it
+// is a function rather than two expressions on purpose: budgeting a run inside a group from the
+// *group's left edge* plus a fixed budget looks right in a diff and puts the run off the panel,
+// because the group's own offset is added afterwards. A run's budget has to come from the edge
+// it may not cross.
+static float RunBudgetRightEdge(float columnTextRight, float groupRightEdge) {
+    return groupRightEdge < columnTextRight ? groupRightEdge : columnTextRight;
+}
+
+// How much room a *flowing* text run may use: from the cursor to the right edge it may not
+// cross, less the width of the gauges still to come (they keep their width so they stay on
+// screen; the text is what gives way).
+//
+// One function for both a row's inline flow and a run inside an alignment group: the two differ
+// only in *which* edges they pass in, and the arithmetic is the same. It used to be written only
+// for the inline case, which is exactly how a grouped run could end up budgeted from the wrong
+// edge. The parked case asks the same function with the text column's own right edge, one
+// function below.
+static float FlowTextLimit(float right, float cursor, int ringsAfter, int ringSize) {
     if (ringsAfter < 0) ringsAfter = 0;
-    const float limit = textRight - cursor - (float)ringsAfter * ((float)ringSize + 4.0f);
+    const float limit = right - cursor - (float)ringsAfter * ((float)ringSize + 4.0f);
     return limit > 0.0f ? limit : 0.0f;
+}
+
+// How much room a *parked* run gets. The gauges of a parked row sit to the right of the text
+// column, so the column is the whole inner width and a run may use `textWidth` minus how far the
+// cursor has already travelled from the inset.
+//
+// The column's right edge is therefore `inset + textWidth`, and this function hands that edge and
+// the cursor to the same arithmetic the flowing path uses -- the two differ in which edge they
+// are given, never in the sum. Getting this the other way round (passing the *width* where an
+// edge belongs) collapses every parked run's budget to the 1 px floor, which the painter renders
+// as an empty run: the entire row's text disappears, which is the failure `kMinLayoutWidth`
+// exists to keep visible rather than silent.
+static float ComputeParkedRunLimit(float textWidth, float cursor, int ringsAfter, int ringSize) {
+    return FlowTextLimit(kRowTextLeftInset + textWidth, cursor, ringsAfter, ringSize);
 }
 
 // The floor both the trim budget and the DrawString box use. A zero-width box makes GDI+
@@ -4311,6 +4602,11 @@ static void ExpandTokens(const WCHAR *source, const Values &v, WCHAR *out, size_
 // ---------------------------------------------------------------------------
 static const int kMaxSegments = 12;
 
+// How many alignment groups one row can have. A group costs an opening marker and a closing
+// one; they are the only markers whose number is a *group* rather than an element index, and
+// the marker carries a single decimal digit, so this is also what that digit can hold.
+static const int kMaxAlignGroups = 10;
+
 struct TextSeg {
     int offset;
     int length;
@@ -4321,18 +4617,26 @@ struct TextSeg {
     // This run's own font size, or 0 for "the row's size". A [[size:NN]] run may start and
     // end anywhere in the text, so -- like the family -- the size has to live per segment.
     int runFontSize = 0;
+    // Which alignment group this segment sits in, or -1 for "the row's own flow". Groups do not
+    // nest (an alignment tag inside one closes it and opens a new one), so this is a single
+    // number and not a stack.
+    int group = -1;
 };
 
-// A segment is either text or an element. Text is a slice of RowState::text; the two elements
-// have their own encodings, both negative so that the old "offset < 0" test cannot silently
-// treat an icon as a gauge:
+// A segment is either text or an element. Text is a slice of RowState::text; the elements have
+// their own encodings, all negative so that the old "offset < 0" test cannot silently treat an
+// icon as a gauge:
 //
 //   offset == kRingSegOffset  -> a gauge, `length` is the index into RowState::rings
 //   offset == kIconSegOffset  -> an icon,  `length` is the index of its element in the row's
 //                                compiled program (RowProgram::parts), which is where the
 //                                glyph, the ripple override and the image path slice live.
+//   offset == kGapSegOffset   -> a gap,   `length` is its width in hundredths of a pixel, as the
+//                                marker carried it (a gap's pixels are data, not an index: only
+//                                instantiation knows the size in effect, and it clamps there).
 static const int kRingSegOffset = -1;
 static const int kIconSegOffset = -2;
+static const int kGapSegOffset = -3;
 
 struct RowState {
     WCHAR text[kMaxRows][640];
@@ -4367,6 +4671,19 @@ static const WCHAR kSizeMarkEnd = 0xE005;
 // nothing has to be copied through a side table to reach the painter. Three digits, because
 // kMaxRowParts is 514; the payload terminator is kRingMarkEnd, as for the other tags.
 static const WCHAR kIconMarkStart = 0xE006;
+// A [[gap:...]] element. Its payload is the gap's **pixel** width, rounded to hundredths and
+// written as four decimal digits: unlike the other tags there is no second source to consult,
+// because a gap's pixels are not in the row text and not in a table -- the element's stored
+// number has to be multiplied by the size in effect, which is a fact about the marked string's
+// surroundings rather than about the tag. Four digits carry 0.00..655.35 px, and the value is
+// clamped (ClampGapPx) long before that. The payload terminator is kRingMarkEnd.
+static const WCHAR kGapMarkStart = 0xE007;
+// An alignment group. The start marker carries the alignment as a digit (kAlignSegLeft..
+// kAlignSegRight) and its end marker is the *bare* start marker -- "the marker ends here" with no
+// digit, so a group is `start + digit + end` and a close is `start + end`. What a close closes is
+// decided by position, not by a word: groups do not nest, so the marker that follows an open is
+// its close. A `[[/left]]` with nothing open has no marker at all and cuts nothing.
+static const WCHAR kAlignMarkStart = 0xE008;
 
 // Instantiates a compiled row against the current values: expands the {tokens} left in each
 // TEXT template, turns a [[ring:...]] the values allow into a gauge, and writes the same marked
@@ -4396,6 +4713,10 @@ static void InstantiateRowProgram(const ModSettings &settings, int row, const Va
     const RowProgram &program = settings.rowProgram[row];
     size_t written = 0;
     int node = program.first;
+    // Whether an alignment group is open right now. This is the whole of the state the group
+    // markers need: groups do not nest, and a close is a marker at a position (see
+    // kAlignMarkStart).
+    bool groupOpen = false;
 
     while (node >= 0 && node < program.partCount) {
         // The old expander tested this before every character, and every marker write below
@@ -4529,18 +4850,97 @@ static void InstantiateRowProgram(const ModSettings &settings, int row, const Va
             }
             continue;
         }
+        if (part.kind == kPartGap) {
+            // The gap's pixels are resolved here, not at compile time: the size in effect is a
+            // fact about this instantiation (GapPixels). The value is rounded to hundredths and
+            // written as four digits, which is the *same* resolution ParseGapTag accepted for a
+            // px gap, so nothing readable is lost. The marker asks for seven characters of
+            // headroom where the walk guarantees four, so, exactly as for [[size:NN]], a full
+            // buffer turns the tag back into ordinary text.
+            const float px = GapPixels(settings, row, part);
+            int hundredths = (int)(px * 100.0f + 0.5f);
+            if (hundredths > kGapMarkerMaxValue) hundredths = kGapMarkerMaxValue;
+            if (hundredths < 0) hundredths = 0;
+            if (written + 7 < outCount) {
+                WCHAR digits[4];
+                GapMarkerDigits(hundredths, digits);
+                out[written++] = kGapMarkStart;
+                out[written++] = digits[0];
+                out[written++] = digits[1];
+                out[written++] = digits[2];
+                out[written++] = digits[3];
+                out[written++] = kRingMarkEnd;
+                node = part.next;
+            } else {
+                out[written++] = L'[';
+                node = part.failNext;
+            }
+            continue;
+        }
+        if (part.kind == kPartAlignOpen) {
+            // An alignment group. Groups do not nest, so opening one while another is open is
+            // the *close* of the previous group -- that is the "an alignment tag inside a group
+            // closes the outer one and opens a new one at that point" rule, and it is why one
+            // `groupOpen` flag is the whole of the state. Each marker is start + payload +
+            // terminator, the terminator being the same kRingMarkEnd every other marker uses.
+            if (written + 5 < outCount) {
+                if (groupOpen) {
+                    out[written++] = kAlignMarkStart;
+                    out[written++] = kRingMarkEnd;
+                }
+                out[written++] = kAlignMarkStart;
+                out[written++] = (WCHAR)(L'0' + part.align);
+                out[written++] = kRingMarkEnd;
+                groupOpen = true;
+                node = part.next;
+            } else {
+                // No room for the marker: the tag stays literal text, and the scan resumes after
+                // its own '[' so a tag written inside it can still be recognised.
+                out[written++] = L'[';
+                node = part.failNext;
+            }
+            continue;
+        }
+        if (part.kind == kPartAlignClose) {
+            // A close tag is a marker only when something is open. A stray `[[/left]]` therefore
+            // disappears -- it is a well-formed tag with nothing to do, and leaving it on screen
+            // would be the one case where markup text reaches the panel without saying why.
+            if (groupOpen && written + 3 < outCount) {
+                out[written++] = kAlignMarkStart;
+                out[written++] = kRingMarkEnd;
+                groupOpen = false;
+            }
+            node = part.next;
+            continue;
+        }
 
         // An element kind this build does not know: nothing to write, and nothing sensible to
         // continue with.
         break;
     }
 
+    // An unclosed group ends where the row ends: the close marker is written here rather than
+    // left implicit, so "the group stops at the row's end" is one fact with one owner -- this
+    // line and the alignment markers BuildRowLayout reads. A group left open by a row that ran
+    // out of buffer is closed the same way, which is what keeps the layout from having to treat
+    // "the marked string ends" as a third kind of group end.
+    if (groupOpen && written + 3 < outCount) {
+        out[written++] = kAlignMarkStart;
+        out[written++] = kRingMarkEnd;
+        groupOpen = false;
+    }
+
     out[written] = L'\0';
 }
 
 // Splits the marked string into text / element segments. A ring segment is encoded
-// as offset = kRingSegOffset with length = ring index; an icon segment as
-// offset = kIconSegOffset with length = the index of its element in the row's program.
+// as offset = kRingSegOffset with length = ring index; an icon segment as offset = kIconSegOffset
+// with length = the index of its element in the row's program; a gap segment as
+// offset = kGapSegOffset.
+//
+// The alignment markers are cut here and never reach a segment: what a segment carries is the
+// *group number* it ended up in, and a group is a run of consecutive segments. Groups do not
+// nest, so the number is enough -- there is no stack and no group end marker to look for.
 static void BuildRowLayout(const WCHAR *marked, int ringCount, RowState &state, int row) {
     state.segmentCount[row] = 0;
     state.ringCount[row] = ringCount;
@@ -4555,6 +4955,8 @@ static void BuildRowLayout(const WCHAR *marked, int ringCount, RowState &state, 
     int tagChain = 0;
     // And the size the next text segment is drawn at, 0 = the row's own size.
     int runFontSize = 0;
+    // The group the *next* segment belongs to, -1 = the row's own flow.
+    int group = -1;
 
     // A text run ends at a marker, and every marker below flushes the run in progress before
     // moving on. That is what keeps a segment from spanning two tags -- the run that follows
@@ -4567,21 +4969,68 @@ static void BuildRowLayout(const WCHAR *marked, int ringCount, RowState &state, 
             seg.length = position - textStart;
             seg.tagChain = tagChain;
             seg.runFontSize = runFontSize;
+            seg.group = group;
             textStart = position;
         }
     };
 
     for (const WCHAR *p = marked; *p; p++) {
+        if (*p == kAlignMarkStart) {
+            // A group boundary. `start + digit + end` opens one, `start + end` closes the open
+            // one; either way the run in progress belongs to the group that was in force while
+            // it was written, so it is flushed first. A boundary with no digit while no group is
+            // open has nothing to do at all -- that is the stray `[[/left]]`.
+            flushText();
+            if (p[1] >= L'0' && p[1] <= L'9') {
+                group = (int)(p[1] - L'0');
+                while (p[1] && p[1] != kRingMarkEnd) p++;
+                if (p[1] == kRingMarkEnd) p++;
+            } else if (group >= 0) {
+                group = -1;
+                if (p[1] == kRingMarkEnd) p++;
+            } else if (p[1] == kRingMarkEnd) {
+                p++;
+            }
+            continue;
+        }
         if (*p == kRingMarkStart) {
             flushText();
             if (ringIndex < ringCount && state.segmentCount[row] < kMaxSegments) {
                 TextSeg &seg = state.segments[row][state.segmentCount[row]++];
                 seg.offset = kRingSegOffset;
                 seg.length = ringIndex;
+                seg.group = group;
                 if (sawText) state.inlineRing[row] = true;
             }
             ringIndex++;
             // Skip the digits and the end marker that follow.
+            while (p[1] && p[1] != kRingMarkEnd) p++;
+            if (p[1] == kRingMarkEnd) p++;
+            continue;
+        }
+        if (*p == kGapMarkStart) {
+            // A gap is an element of the flow with a width of its own and nothing to draw. The
+            // pixels are in the marker's four digits, and the layout reads them back out of the
+            // string here -- the element that produced them is not reachable from this function
+            // and does not have to be.
+            flushText();
+            if (state.segmentCount[row] < kMaxSegments) {
+                TextSeg &seg = state.segments[row][state.segmentCount[row]++];
+                seg.offset = kGapSegOffset;
+                // The pixels are in the marker's four digits, not in the program: the element
+                // carries the *unit* and the number as the writer typed them, and only
+                // instantiation knows the size in effect. So the width is read back out of the
+                // string here -- which is why the gap is the one element whose marker payload is
+                // data rather than an index.
+                int hundredths = -1;
+                if (p[1] >= L'0' && p[1] <= L'9' && p[2] >= L'0' && p[2] <= L'9' &&
+                    p[3] >= L'0' && p[3] <= L'9' && p[4] >= L'0' && p[4] <= L'9') {
+                    hundredths = ((int)(p[1] - L'0')) * 1000 + ((int)(p[2] - L'0')) * 100 +
+                                 ((int)(p[3] - L'0')) * 10 + (int)(p[4] - L'0');
+                }
+                seg.length = hundredths;
+                seg.group = group;
+            }
             while (p[1] && p[1] != kRingMarkEnd) p++;
             if (p[1] == kRingMarkEnd) p++;
             continue;
@@ -4606,6 +5055,7 @@ static void BuildRowLayout(const WCHAR *marked, int ringCount, RowState &state, 
                     seg.length = element;
                     seg.tagChain = tagChain;
                     seg.runFontSize = runFontSize;
+                    seg.group = group;
                 }
             }
             while (p[1] && p[1] != kRingMarkEnd) p++;
@@ -4658,6 +5108,7 @@ static void BuildRowLayout(const WCHAR *marked, int ringCount, RowState &state, 
         seg.length = position - textStart;
         seg.tagChain = tagChain;
         seg.runFontSize = runFontSize;
+        seg.group = group;
     }
     state.text[row][out] = L'\0';
 }
@@ -5948,7 +6399,13 @@ static void ReleaseFontResources() {
 struct RowSegmentPlan {
     bool isRing = false;    // a gauge: `x` is its centre, the rest is unused
     bool isIcon = false;    // an inline icon: `x` is its left edge, `diameter` its box
+    bool isGap = false;     // empty space: `x` is where the space begins, `advance` its width
     bool skip = false;      // nothing to draw (empty run)
+    // Which alignment group this segment belongs to, or -1 for the row's own flow. Element
+    // segments are placed by the same rules wherever they sit, so the painter never has to know
+    // -- but the *tests* do, because "the group's width is the sum of its parts" and "a run's
+    // budget comes from the group's right edge" are both statements about this grouping.
+    int group = -1;
     WCHAR slice[640] = {};  // the text as it will be drawn (already fitted)
     // The family this run resolved to, "" for the panel's main one. The *name* is stored, not
     // the GpFont: a font object lives in an 8-slot cache that later rows can evict, so a plan
@@ -5968,6 +6425,17 @@ struct RowSegmentPlan {
     float diameter = 0.0f;
 };
 
+// One alignment group, as the plan resolved it. A group's segments are consecutive (groups do
+// not nest and a new alignment tag closes the previous group), so a range of indices says
+// everything about which segments are in it.
+struct AlignGroupPlan {
+    int kind = 0;         // kAlignSegLeft / kAlignSegCenter / kAlignSegRight
+    int firstSegment = 0; // index of the group's first segment in the row
+    int lastSegment = -1; // index of its last, -1 for a group with nothing in it
+    float x = 0.0f;       // where the group starts on the panel
+    float width = 0.0f;   // the sum of its parts, measured with the same fitted runs it draws
+};
+
 struct RowLayoutPlan {
     bool valid = false;
     // The key. Anything not listed here is either derived from the text (covered by the
@@ -5979,6 +6447,11 @@ struct RowLayoutPlan {
     int rowFontSize = 0;
     int segmentCount = 0;
     RowSegmentPlan segments[kMaxSegments];
+    // The row's alignment groups, in the order the marked string opened them. A row with no
+    // alignment tag has alignCount == 0 and every segment at group == -1, which is the shape it
+    // had before these tags existed.
+    AlignGroupPlan groups[kMaxAlignGroups];
+    int alignCount = 0;
 };
 static RowLayoutPlan g_rowPlans[kMaxRows];
 
@@ -6026,19 +6499,52 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
     }
 
     const RowProgram &program = g_settings.rowProgram[row];
-    float cursor = kRowTextLeftInset;
+    plan.alignCount = 0;
+
+    // Pass one: measure every element and place it in its own *frame of reference*. An element
+    // outside every group is placed in panel coordinates (its cursor starts at the row's own
+    // padding); an element inside one starts at zero, because where the group goes is only known
+    // once the group's width is, and that depends on how the runs in it fit. Pass two shifts each
+    // group as a unit.
+    //
+    // -----------------------------------------------------------------------
+    // Phase A: measure every element and place it in its own frame of reference.
+    //
+    // An element outside every group is placed in panel coordinates (its cursor starts at the
+    // row's own padding). An element inside one starts at zero, because where the group goes is
+    // only known once the group's width is -- and the group's width is a property of its parts,
+    // not of where it ends up.
+    //
+    // Text is fitted in phase A too, but **not** against the group's right edge: that edge is
+    // the group's own width, which is what this phase is in the middle of computing. Fitting it
+    // against "the cursor so far" would make the first element of a group a zero-width budget,
+    // and the group would measure itself out of a run that had already been trimmed to nothing.
+    // So phase A fits against the column, and phase C re-fits once the group sits where it sits.
+    //
+    // A gauge inside a group flows like every other element of it (a group is content, and a
+    // parked gauge has no defined position inside one); a gauge outside every group keeps the
+    // parked behaviour it has always had.
+    // -----------------------------------------------------------------------
+    float regionCursor = kRowTextLeftInset;
     for (int s = 0; s < plan.segmentCount; s++) {
         const TextSeg &seg = g_rowState.segments[row][s];
         RowSegmentPlan &entry = plan.segments[s];
         entry = RowSegmentPlan();
+        entry.group = seg.group;
+
+        // Every ungrouped stretch of the row starts at the row's own padding: the cursor is
+        // shared with the group that may sit in front of it, so leaving a group puts it back.
+        if (seg.group < 0 && (s == 0 || g_rowState.segments[row][s - 1].group >= 0)) {
+            regionCursor = kRowTextLeftInset;
+        }
 
         if (seg.offset == kRingSegOffset) {
-            // A gauge: the frame needs its centre and nothing else from here.
             entry.isRing = true;
             const float outer = (float)g_settings.ringSize;
-            if (inlineFlow) {
-                entry.x = cursor + outer / 2.0f;
-                cursor = entry.x + outer / 2.0f + 4.0f;
+            if (inlineFlow || seg.group >= 0) {
+                entry.x = regionCursor + outer / 2.0f;
+                entry.advance = outer + 4.0f;
+                regionCursor = entry.x + outer / 2.0f + 4.0f;
             } else {
                 entry.x = parkX;
                 parkX += outer + 4.0f;
@@ -6064,7 +6570,7 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
             if (entry.glyph == 0) entry.glyph = kIconImageFallbackGlyph;
             entry.fontSize = ElementFontSizePx(g_settings, row, seg.runFontSize);
             entry.diameter = IconDiameterForFontSize(entry.fontSize);
-            entry.x = cursor;
+            entry.x = regionCursor;
             entry.ripple = IconElementRipples(icon.glyphFlags & (kIconRippleOn | kIconRippleOff),
                                               s == firstIconSegment);
             if (icon.length > 0) {
@@ -6078,7 +6584,21 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
             }
             // The element occupies its own box, and the glyphs that follow it keep their
             // distance from the disc.
-            cursor += entry.diameter + (float)kIconContentGap;
+            entry.advance = entry.diameter + (float)kIconContentGap;
+            regionCursor += entry.advance;
+            continue;
+        }
+
+        if (seg.offset == kGapSegOffset) {
+            // A gap: empty space in the row's flow, with no content and nothing to draw. Its
+            // width arrived in the marker's four digits and BuildRowLayout read them back into
+            // `seg.length` -- hundredths of a pixel -- so no compiled element is consulted here
+            // and the clamp (ClampGapPx) happened at instantiation, once. A zero gap is a zero
+            // advance rather than a negative one.
+            entry.isGap = true;
+            entry.x = regionCursor;
+            entry.advance = seg.length > 0 ? (float)seg.length / 100.0f : 0.0f;
+            regionCursor += entry.advance;
             continue;
         }
 
@@ -6126,44 +6646,167 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
             continue;
         }
 
-        // The run's budget. A parked run gets the row's text width minus whatever the
-        // elements before it already took (an icon written first pushes the text right, and
-        // the text must not be allowed to run under the parked gauges because of it).
-        float limit = metrics.textWidth - (cursor - kRowTextLeftInset);
-        if (inlineFlow) {
-            int ringsAfter = 0;
-            for (int k = s + 1; k < plan.segmentCount; k++) {
-                if (g_rowState.segments[row][k].offset == kRingSegOffset) ringsAfter++;
-            }
-            limit = ComputeInlineTextLimit(metrics.textRight, cursor, ringsAfter,
-                                           g_settings.ringSize);
-        }
-        const float budget = LayoutWidthFloor(limit);
-
-        // The run's own width, in pixels: what the next element -- gauge, icon or another run
-        // of text -- is placed after. It is measured for every run, parked or not, because a
-        // parked row is a flow too: only its *gauges* are parked at the right edge. Keeping the
-        // whole budget as a parked run's advance (what this did at first) made the second text
-        // run of `[[ring:x]] A[[font:...]]B` start a full text width further right, i.e. with
-        // its box hanging under the parked gauge; the pre-inline-icon code had the opposite
-        // failure, starting it back at the row's inset on top of the first run.
+        // The gap between this run and the next element is this run's own measured width, and
+        // the fit is only so the *string* is drawable: what phase A must not lose is the run's
+        // untrimmed width, because that is what a group has to be wide enough to hold. So the
+        // slice is measured first, fitted against the column, and its fitted width -- not its
+        // natural width -- is what the flow advances by, since that is what will be drawn.
         float advance = MeasureAdvance(graphics, runFont, format, entry.slice, rowHeight);
+        float budget = metrics.textWidth;
+        if (seg.group >= 0 || inlineFlow) {
+            budget = FlowTextLimit(metrics.textRight, regionCursor, 0, g_settings.ringSize);
+        } else {
+            budget = ComputeParkedRunLimit(metrics.textWidth, regionCursor, 0, g_settings.ringSize);
+        }
         entry.fitted = FitTextToWidth(graphics, runFont, format, entry.slice,
-                                      (int)(sizeof(entry.slice) / sizeof(entry.slice[0])), budget,
-                                      rowHeight);
+                                      (int)(sizeof(entry.slice) / sizeof(entry.slice[0])),
+                                      LayoutWidthFloor(budget), rowHeight);
         if (entry.fitted) {
             advance = MeasureAdvance(graphics, runFont, format, entry.slice, rowHeight);
         }
-        entry.x = cursor;
+        entry.x = regionCursor;
         entry.advance = advance;
-        // The box a *parked* run is drawn in is still the rest of the row's text column: the
-        // format is left-aligned, so a wider box draws the same glyphs in the same place, and
-        // the parked path has always sized its box that way. An inline run's box is its own
-        // width, which is what the gauges after it are placed against.
-        entry.boxWidth = inlineFlow ? LayoutWidthFloor(advance) : budget;
-        // Every run leaves the cursor where it ended, parked or not: the runs that follow it
-        // start where this one stopped.
-        cursor += advance;
+        entry.boxWidth = (inlineFlow || seg.group >= 0) ? LayoutWidthFloor(advance) : budget;
+        regionCursor += advance;
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase B: the groups, as the runs of consecutive segments the marked string's alignment
+    // markers cut. A group's width is the sum of its parts -- read off the parts phase A placed,
+    // with no second summation that could disagree with the flow's -- and it is then positioned
+    // against the row's text column: left, centred, or right.
+    //
+    // A group wider than the column is clamped to the column's left edge. That is the deliberate
+    // degradation to left-aligned: the group starts on the panel, and the runs in it are re-fitted
+    // against the column in phase C, so nothing but a fixed-size element (an icon, a gauge) can
+    // reach past the right edge.
+    // -----------------------------------------------------------------------
+    plan.alignCount = 0;
+    for (int s = 0; s < plan.segmentCount; s++) {
+        const int g = g_rowState.segments[row][s].group;
+        // A group is open until a segment belonging to a different one appears; `lastSegment = -1`
+        // is what "still open" means here, so the group that runs to the row's end is closed by
+        // the same line as every other group -- there is no second rule for the last one.
+        if (s > 0 && plan.alignCount > 0 && plan.groups[plan.alignCount - 1].lastSegment < 0 &&
+            g != g_rowState.segments[row][plan.groups[plan.alignCount - 1].firstSegment].group) {
+            plan.groups[plan.alignCount - 1].lastSegment = s - 1;
+        }
+        if (g < 0) continue;
+        if (s > 0 && g == g_rowState.segments[row][s - 1].group) continue;
+        if (plan.alignCount >= kMaxAlignGroups) break;
+        AlignGroupPlan &group = plan.groups[plan.alignCount++];
+        group.kind = g <= kAlignKindCount ? g : kAlignSegLeft;
+        group.firstSegment = s;
+        group.lastSegment = -1;
+    }
+    if (plan.alignCount > 0 && plan.groups[plan.alignCount - 1].lastSegment < 0) {
+        plan.groups[plan.alignCount - 1].lastSegment = plan.segmentCount - 1;
+    }
+
+    for (int g = 0; g < plan.alignCount; g++) {
+        AlignGroupPlan &group = plan.groups[g];
+        if (group.lastSegment < group.firstSegment) {
+            group.width = 0.0f;
+            group.x = kRowTextLeftInset;
+            continue;
+        }
+        // The group's width is the sum of its parts' advances -- one summation, and the parts
+        // were placed by the flow above, so nothing here can disagree with it. (Deriving it from
+        // the last part's right edge minus the first part's left edge reads the same and is not:
+        // the segments have already been shifted by the time this runs for a later group, and the
+        // subtraction then measures the distance from the shift, not the content.)
+        float width = 0.0f;
+        for (int s = group.firstSegment; s <= group.lastSegment; s++) {
+            width += plan.segments[s].advance;
+        }
+        group.width = width;
+        float x = kRowTextLeftInset;
+        if (group.kind == kAlignSegCenter) {
+            x = kRowTextLeftInset + (metrics.textWidth - group.width) / 2.0f;
+        } else if (group.kind == kAlignSegRight) {
+            x = kRowTextLeftInset + metrics.textWidth - group.width;
+        }
+        if (x < kRowTextLeftInset) x = kRowTextLeftInset;
+        if (x > metrics.textRight) x = metrics.textRight;
+        group.x = x;
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase C: shift each group onto the panel, and re-fit the text runs inside it against the
+    // faces the shift gives them.
+    //
+    // This is where a run's budget finally comes from the group's right edge -- which is now
+    // known -- and never past the panel's column, so the relation "a run stays inside the panel"
+    // holds for a centred or right-aligned group too. Re-fitting can only shorten a run, so the
+    // group's width (phase B, from the untrimmed parts) remains an upper bound of what is drawn:
+    // it stays inside the column, and no run can leave the panel. A parked row is a flow too,
+    // so its runs are re-fitted the same way; only its *gauges* are parked at the right edge.
+    // -----------------------------------------------------------------------
+    for (int g = 0; g < plan.alignCount; g++) {
+        const AlignGroupPlan &group = plan.groups[g];
+        if (group.lastSegment < group.firstSegment) continue;
+        const float shift = group.x - plan.segments[group.firstSegment].x;
+        for (int s = group.firstSegment; s <= group.lastSegment; s++) {
+            plan.segments[s].x += shift;
+            plan.segments[s].group = g;
+        }
+    }
+    for (int s = 0; s < plan.segmentCount; s++) {
+        RowSegmentPlan &entry = plan.segments[s];
+        if (entry.skip || entry.isRing || entry.isIcon || entry.isGap || entry.fontSize <= 0) {
+            continue;
+        }
+        const TextSeg &seg = g_rowState.segments[row][s];
+        GpFont *runFont =
+            entry.family[0] ? AcquireRowFont(graphics, entry.family, entry.fontSize)
+                            : (entry.fontSize == rowFontSizePx
+                                   ? rowMainFont
+                                   : AcquireRowFont(graphics, g_settings.fontFamily,
+                                                    entry.fontSize));
+        if (!runFont) continue;
+
+        int ringsAfter = 0;
+        for (int k = s + 1; k < plan.segmentCount; k++) {
+            if (g_rowState.segments[row][k].offset == kRingSegOffset) ringsAfter++;
+        }
+        float budget;
+        if (seg.group >= 0 || inlineFlow) {
+            // What the run may use: from where it is to the nearer of the panel's text column and
+            // its own group's right edge -- the group's *final* edge, since the group has already
+            // been placed when this runs. Both edges are absolute panel coordinates, which is what
+            // `entry.x` is too.
+            const int gi = entry.group;
+            const float groupRight =
+                gi >= 0 && gi < plan.alignCount ? plan.groups[gi].x + plan.groups[gi].width
+                                                : metrics.textRight;
+            const float right = RunBudgetRightEdge(metrics.textRight, groupRight);
+            budget = FlowTextLimit(right, entry.x, ringsAfter, g_settings.ringSize);
+        } else {
+            budget = ComputeParkedRunLimit(metrics.textWidth, entry.x, ringsAfter,
+                                           g_settings.ringSize);
+        }
+        WCHAR original[640];
+        wcsncpy(original, entry.slice, 639);
+        original[639] = L'\0';
+        if (FitTextToWidth(graphics, runFont, format, entry.slice,
+                           (int)(sizeof(entry.slice) / sizeof(entry.slice[0])),
+                           LayoutWidthFloor(budget), rowHeight)) {
+            entry.fitted = true;
+            entry.advance = MeasureAdvance(graphics, runFont, format, entry.slice, rowHeight);
+        }
+        if (wcscmp(original, entry.slice) != 0) {
+            // The trim changed what this run draws, so the *next* element of its group starts
+            // somewhere else. Walk the rest of the group along by the difference, or the elements
+            // after a trimmed run would overlap it.
+            const float delta = MeasureAdvance(graphics, runFont, format, original, rowHeight) -
+                                entry.advance;
+            const int group = entry.group;
+            for (int k = s + 1; k < plan.segmentCount; k++) {
+                if (plan.segments[k].group != group) break;
+                plan.segments[k].x -= delta;
+            }
+        }
+        entry.boxWidth = (inlineFlow || seg.group >= 0) ? LayoutWidthFloor(entry.advance) : budget;
     }
 }
 
@@ -6445,6 +7088,14 @@ static void PaintPanel(HWND hwnd) {
                     for (int s = 0; s < g_rowState.segmentCount[r]; s++) {
                         const TextSeg &seg = g_rowState.segments[r][s];
                         const RowSegmentPlan &planned = plan->segments[s];
+                        if (planned.isGap) {
+                            // A gap is empty space: the plan already moved the cursor past it
+                            // (its `advance` is the width) and there is nothing to paint. It is
+                            // an element of the row's flow like an icon, so it is skipped here
+                            // rather than left to fall through into the text branch, where it
+                            // would be drawn as an empty run at the gap's x.
+                            continue;
+                        }
                         if (seg.offset == kRingSegOffset) {
                             // A gauge.
                             int ringIndex = seg.length;

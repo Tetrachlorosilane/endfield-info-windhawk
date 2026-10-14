@@ -134,7 +134,7 @@ static ModSettings g_markRow, g_theme, g_ringPreset, g_ringCustom, g_ringThemed,
     g_fontChain, g_fontTagged, g_metricDefault, g_metricHuge, g_metricRow, g_sizeRun,
     g_sizeTagged, g_runCase, g_prefixRows, g_geometrySaved, g_geometry, g_planSaved, g_plan,
     g_extAllow, g_extRows, g_extBad, g_extCfg, g_extSettings, g_islandCfgA, g_islandCfgB,
-    g_publish, g_programCompile, g_programRead;
+    g_publish, g_programCompile, g_programRead, g_gapCompile, g_gapLayout, g_gapSaved, g_gapPlan;
 
 #define LOCAL_SETTINGS(name, slot) ModSettings &name = slot; slot = kDefaultSettings
 
@@ -241,6 +241,42 @@ static void LinearTemplate(const RowProgram &p, const WCHAR *raw, WCHAR *out, in
         }
     }
     out[used] = L'\0';
+}
+
+// A wide string with every non-printing character spelled out, so a marker mismatch can be read
+// instead of guessed at. `%ls` prints a private-use code point as *nothing*, which is how a row
+// that looked right in a log turned out not to be byte-equal to what was expected.
+static void DumpWide(const char *label, const WCHAR *text) {
+    printf("    %s = \"", label);
+    for (const WCHAR *p = text; *p; p++) {
+        if (*p >= 0x20 && *p < 0x7F) printf("%lc", (wint_t)*p);
+        else printf("{%04X}", (unsigned)*p);
+    }
+    printf("\"\n");
+}
+
+// True when a marked string is exactly `expected`. On a mismatch both sides are printed with
+// DumpWide, so a failure names the character that differs rather than showing two strings that
+// look the same.
+static bool MarkedEquals(const WCHAR *marked, const WCHAR *expected) {
+    if (wcscmp(marked, expected) == 0) return true;
+    DumpWide("actual  ", marked);
+    DumpWide("expected", expected);
+    return false;
+}
+
+// The pixel width a gap marker carries, in hundredths of a pixel, or -1 when the row has no gap
+// marker. The marker is `kGapMarkStart + four decimal digits + kRingMarkEnd`; reading it back
+// through one function keeps the test from spelling the digits out twice (and from getting them
+// wrong once, which it did).
+static int GapMarkerHundredths(const WCHAR *marked) {
+    const WCHAR *at = wcschr(marked, kGapMarkStart);
+    if (!at || at[1] < L'0' || at[1] > L'9' || at[2] < L'0' || at[2] > L'9' ||
+        at[3] < L'0' || at[3] > L'9' || at[4] < L'0' || at[4] > L'9') {
+        return -1;
+    }
+    return ((int)(at[1] - L'0')) * 1000 + ((int)(at[2] - L'0')) * 100 +
+           ((int)(at[3] - L'0')) * 10 + (int)(at[4] - L'0');
 }
 
 int main() {
@@ -653,6 +689,243 @@ int main() {
                           "and a row with no icon is one plain text segment");
                 }
             }
+        }
+    }
+
+    printf("\n=== gaps and alignment groups: the tags ===\n");
+    {
+        // `[[gap:...]]` and `[[left]]`/`[[center]]`/`[[right]]` ... `[[/...]]`. Two properties
+        // are settled here, before any measurement: what the compiler makes of the markup, and
+        // that a row with none of it is *unchanged* -- not "changed but rendered the same".
+        LOCAL_SETTINGS(s, g_gapCompile);
+        s.fontSize = 15;
+        s.rowHeight = 30;
+        s.ringSize = 26;
+        s.ringThickness = 4;
+
+        // --- the units ---
+        // The unit decides the stored resolution: tenths of an em, hundredths of a pixel. That
+        // is not cosmetic -- `[[gap:1.5]]` stored in pixels would stop scaling with the row, and
+        // the assertion further down is what catches that.
+        struct GapCase {
+            const WCHAR *body;
+            bool ok;
+            unsigned char unit;
+            int value;          // in the unit's own resolution
+        };
+        const GapCase gaps[] = {
+            {L"1.5", true, kGapUnitEm, 150},
+            {L"1", true, kGapUnitEm, 100},
+            {L"12px", true, kGapUnitPx, 1200},
+            {L"0", true, kGapUnitEm, 0},
+            {L"0px", true, kGapUnitPx, 0},
+            {L"1.555", true, kGapUnitEm, 155},   // sub-resolution digits are dropped
+            {L"  2.5  ", true, kGapUnitEm, 250}, // padding around the tag is the writer's
+            {L"3PX", true, kGapUnitPx, 300},     // the unit is case-insensitive
+            {L"320.01", false, 0, 0},            // past the em limit
+            {L"99.99px", true, kGapUnitPx, 9999},  // the widest gap the marker can write down
+            {L"", false, 0, 0},
+            {L"abc", false, 0, 0},
+            {L"-1", false, 0, 0},
+            {L"1.2.3", false, 0, 0},
+            {L"px", false, 0, 0},
+            {L"1pt", false, 0, 0},
+            {L"1.5 px", false, 0, 0},            // only 'px' directly after the number
+            {L"100px", false, 0, 0},             // past the pixel limit: four digits cannot hold it
+            {L"999.6px", false, 0, 0},
+        };
+        for (const GapCase &c : gaps) {
+            int value = -1;
+            unsigned char unit = 0xFF;
+            const bool ok = ParseGapTag(c.body, (int)wcslen(c.body), &value, &unit);
+            const bool same = ok == c.ok && (!ok || (unit == c.unit && value == c.value));
+            wprintf(L"    [[gap:%ls]] -> ok=%d unit=%d value=%d\n", c.body, ok ? 1 : 0,
+                    (int)unit, value);
+            Check(same, "the gap's body decides its unit and its value, or the tag is text");
+        }
+
+        // --- the compiled shapes ---
+        struct ShapeCase {
+            const WCHAR *row;
+            bool gap;
+            bool alignOpen;
+            bool alignClose;
+            bool literal;
+        };
+        const ShapeCase shapes[] = {
+            {L"a[[gap:1.5]]b", true, false, false, false},
+            {L"a[[gap:12px]]b", true, false, false, false},
+            {L"[[gap:abc]]", false, false, false, true},
+            {L"[[gap:]]", false, false, false, true},
+            {L"a[[left]]b", false, true, false, false},
+            {L"a[[center]]b[[/center]]c", false, true, true, false},
+            {L"a[[right]]b[[/right]]", false, true, true, false},
+            {L"a[[leftish]]b", false, false, false, true},
+            {L"a[[/left]]b", false, false, true, false},
+        };
+        for (const ShapeCase &c : shapes) {
+            wcsncpy(s.rows[0], c.row, kRowTextCap - 1);
+            s.rows[0][kRowTextCap - 1] = L'\0';
+            CompileRowText(s, s.rows[0], s.rowProgram[0]);
+            const RowProgram &p = s.rowProgram[0];
+            wprintf(L"    \"%ls\" -> %d element(s)\n", c.row, p.partCount);
+            Check(ProgramHasKind(p, kPartGap) == c.gap, "a gap tag compiles to a gap element");
+            Check(ProgramHasKind(p, kPartAlignOpen) == c.alignOpen,
+                  "an alignment tag compiles to a group opener");
+            Check(ProgramHasKind(p, kPartAlignClose) == c.alignClose,
+                  "and a closing tag to a group closer");
+            if (c.literal) {
+                WCHAR templateText[640];
+                LinearTemplate(p, s.rows[0], templateText, 640);
+                Check(wcscmp(templateText, c.row) == 0,
+                      "a tag this code cannot read stays in the text template");
+            }
+        }
+
+        // --- the compiled element carries the unit and the size in effect ---
+        {
+            wcsncpy(s.rows[0], L"a[[gap:1.5]]b[[gap:12px]]c", kRowTextCap - 1);
+            s.rows[0][kRowTextCap - 1] = L'\0';
+            CompileRowText(s, s.rows[0], s.rowProgram[0]);
+            const RowProgram &p = s.rowProgram[0];
+            const RowPart *first = nullptr;
+            const RowPart *second = nullptr;
+            for (int i = 0; i < p.partCount; i++) {
+                if (p.parts[i].kind != kPartGap) continue;
+                if (!first) first = &p.parts[i];
+                else if (!second) second = &p.parts[i];
+            }
+            Check(first && second, "both gaps compiled to elements");
+            if (first && second) {
+                Check((first->glyphFlags & kGapUnitMask) == kGapUnitEm,
+                      "the first gap is in ems");
+                Check((second->glyphFlags & kGapUnitMask) == kGapUnitPx,
+                      "the second gap is in pixels");
+                Check(first->gap == 150 && second->gap == 1200,
+                      "each element keeps its own number, not a shared one");
+            }
+        }
+        // A gap inside a [[size:24]] run has to record that run size, or it would scale with the
+        // row and the whole point of the em unit would be lost on tagged rows.
+        {
+            wcsncpy(s.rows[0], L"[[size:24]]a[[gap:1]]b[[/size]]", kRowTextCap - 1);
+            s.rows[0][kRowTextCap - 1] = L'\0';
+            CompileRowText(s, s.rows[0], s.rowProgram[0]);
+            const RowProgram &p = s.rowProgram[0];
+            const RowPart *gap = nullptr;
+            for (int i = 0; i < p.partCount && !gap; i++) {
+                if (p.parts[i].kind == kPartGap) gap = &p.parts[i];
+            }
+            Check(gap && gap->runFontSize == 24,
+                  "a gap in a [[size:NN]] run carries the run's size");
+        }
+
+        // --- the marked string: the unit is already resolved to pixels there ---
+        {
+            s.rowFontSize[0] = 10;
+            s.rowHeightPx[0] = 30;
+            s.rowMaxFontSize[0] = 10;
+            s.rowCount = 1;
+
+            WCHAR marked[640];
+            RingSpec rings[kMaxRingsPerRow];
+            int ringCount = 0;
+            MarkRow(L"a[[gap:1.5]]b", Values(), s, marked, 640, rings, &ringCount, kMaxRingsPerRow);
+            wprintf(L"    \"a[[gap:1.5]]b\" at 10 px -> \"%ls\"\n", marked);
+            Check(wcschr(marked, kGapMarkStart) != nullptr, "a gap is marked in the row");
+            // The marker's payload is the gap in hundredths of a pixel (15.00 px here). It is
+            // written out and read back rather than spelled digit by digit: the marker is a
+            // contract between InstantiateRowProgram and BuildRowLayout, so what has to hold is
+            // the *round trip*, and a hand-derived expectation of "0015" is how this assertion
+            // spent a while disagreeing with a product that was right.
+            Check(GapMarkerHundredths(marked) == 1500,
+                  "1.5 em at 10 px is 15.00 px, written into the marker");
+            Check(wcschr(marked, L'[') == nullptr, "and the tag itself is gone from the text");
+
+            // The row's size doubles, so the *same* tag must double: that is the difference
+            // between the two units, and it is decided by the tag's own syntax.
+            s.rowFontSize[0] = 20;
+            s.rowMaxFontSize[0] = 20;
+            MarkRow(L"a[[gap:1.5]]b", Values(), s, marked, 640, rings, &ringCount, kMaxRingsPerRow);
+            wprintf(L"    same tag at 20 px -> \"%ls\"\n", marked);
+            Check(GapMarkerHundredths(marked) == 3000,
+                  "the same em gap is twice the pixels at twice the size");
+
+            // The px unit does not follow the size, which is the whole reason both units exist.
+            MarkRow(L"a[[gap:12px]]b", Values(), s, marked, 640, rings, &ringCount,
+                    kMaxRingsPerRow);
+            Check(GapMarkerHundredths(marked) == 1200,
+                  "a px gap is the same pixels whatever the row's size is");
+
+            // The clamp. 100 em at 48 px is 4800 px of empty space, which is well past the cap --
+            // a valid tag that the writer can still see was honoured, not a tag that vanished.
+            s.rowFontSize[0] = 48;
+            s.rowMaxFontSize[0] = 48;
+            MarkRow(L"a[[gap:100]]b", Values(), s, marked, 640, rings, &ringCount,
+                    kMaxRingsPerRow);
+            const int clamped = GapMarkerHundredths(marked);
+            printf("    100 em at 48 px -> %d hundredths of a pixel (cap %.0f)\n", clamped,
+                   (double)kMaxGapPx);
+            Check(clamped == (int)(kMaxGapPx * 100.0f + 0.5f),
+                  "an absurd but valid gap is clamped to the cap rather than running off the panel");
+        }
+
+        // --- an alignment group in the marked string ---
+        {
+            WCHAR marked[640];
+            RingSpec rings[kMaxRingsPerRow];
+            int ringCount = 0;
+
+            // Groups do not nest: the second opener closes the first group at that point, so
+            // there is exactly one OPEN marker per group and one CLOSE per group, in order.
+            MarkRow(L"a[[left]]b[[center]]c[[/center]]d", Values(), s, marked, 640, rings,
+                    &ringCount, kMaxRingsPerRow);
+            wprintf(L"    nested openers -> \"%ls\"\n", marked);
+            Check(MarkedEquals(marked,
+                               L"a" L"\xE008" L"1" L"\xE001" L"b" L"\xE008" L"\xE001" L"\xE008"
+                               L"2" L"\xE001" L"c" L"\xE008" L"\xE001" L"d"),
+                  "an alignment tag inside a group closes it and opens a new one");
+
+            // An unclosed group ends at the row's end: the close marker is written by the
+            // instantiator, not inferred by the layout from "the string ran out".
+            MarkRow(L"[[center]]abc", Values(), s, marked, 640, rings, &ringCount,
+                    kMaxRingsPerRow);
+            wprintf(L"    unclosed     -> \"%ls\"\n", marked);
+            Check(MarkedEquals(marked, L"\xE008" L"2" L"\xE001" L"abc" L"\xE008" L"\xE001"),
+                  "an unclosed group is closed at the row's end");
+
+            // A close tag with nothing open has nothing to cut, and disappears: a well-formed
+            // tag with no job is not a reason to print markup at the user.
+            MarkRow(L"abc[[/left]]def", Values(), s, marked, 640, rings, &ringCount,
+                    kMaxRingsPerRow);
+            Check(MarkedEquals(marked, L"abcdef"), "a stray closing tag cuts nothing and vanishes");
+
+            // Mixed content in a group: text, an icon and a gap all keep their own markers.
+            MarkRow(L"[[right]][[icon:CPU]][[gap:1]]x[[/right]]", Values(), s, marked, 640,
+                    rings, &ringCount, kMaxRingsPerRow);
+            Check(wcschr(marked, kIconMarkStart) != nullptr &&
+                      wcschr(marked, kGapMarkStart) != nullptr &&
+                      wcschr(marked, kAlignMarkStart) != nullptr,
+                  "a group can hold text, an icon and a gap at once");
+        }
+
+        // --- the zero-cost property: no tag, no new elements, no new markers ---
+        {
+            const WCHAR plainRow[] = L"CPU 12%  RAM 73%";
+            RowProgram plain;
+            CompileRowText(s, plainRow, plain);
+            Check(plain.partCount == 1 && plain.parts[0].kind == kPartText,
+                  "a plain row is still one text element (the new tags cost nothing unconfigured)");
+            Check(!ProgramHasKind(plain, kPartGap) && !ProgramHasKind(plain, kPartAlignOpen) &&
+                      !ProgramHasKind(plain, kPartAlignClose),
+                  "and holds none of the new element kinds");
+
+            WCHAR marked[640];
+            RingSpec rings[kMaxRingsPerRow];
+            int ringCount = 0;
+            MarkRow(plainRow, Values(), s, marked, 640, rings, &ringCount, kMaxRingsPerRow);
+            Check(MarkedEquals(marked, plainRow),
+                  "which instantiate to exactly the row's own text, with no marker in it");
         }
     }
 
@@ -1271,19 +1544,26 @@ int main() {
     {
         const float right = inl.textRight;      // the row's right inset
         const float cursor = 12.0f;             // where a run at the left edge starts
-        Check(ComputeInlineTextLimit(right, cursor, 0, 26) == right - cursor,
+        Check(FlowTextLimit(right, cursor, 0, 26) == right - cursor,
               "an inline run with no gauge after it may use the whole row");
-        Check(ComputeInlineTextLimit(right, cursor, 1, 26) == right - cursor - (26.0f + 4.0f),
+        Check(FlowTextLimit(right, cursor, 1, 26) == right - cursor - (26.0f + 4.0f),
               "one gauge after the run is reserved out of its budget");
-        Check(ComputeInlineTextLimit(right, cursor, 2, 26) <
-                  ComputeInlineTextLimit(right, cursor, 1, 26),
+        Check(FlowTextLimit(right, cursor, 2, 26) <
+                  FlowTextLimit(right, cursor, 1, 26),
               "each further gauge costs the run more");
         // The relation, not the arithmetic: run + the gauges that follow it = the row.
-        Check(ComputeInlineTextLimit(right, cursor, 2, 26) + cursor + 2.0f * (26.0f + 4.0f) ==
+        Check(FlowTextLimit(right, cursor, 2, 26) + cursor + 2.0f * (26.0f + 4.0f) ==
                   right,
               "the run plus the gauges after it exactly fill the row");
-        Check(ComputeInlineTextLimit(right, 500.0f, 1, 26) == 0.0f,
+        Check(FlowTextLimit(right, 500.0f, 1, 26) == 0.0f,
               "a run already past the right inset gets nothing, never a negative budget");
+        // The parked path asks the same arithmetic with the column's right edge. Passing the
+        // column's *width* where an edge belongs used to be the shape of this call, and it
+        // collapsed every parked run's budget to the floor -- which draws nothing at all.
+        RowTextMetrics parkedColumn = ComputeRowTextMetrics(420.0f, 0, 26, 12, false);
+        Check(ComputeParkedRunLimit(parkedColumn.textWidth, cursor, 0, 26) ==
+                  parkedColumn.textRight - cursor,
+              "a parked run gets the same column, measured from its own cursor");
     }
 
     // A pathological configuration must clamp at zero rather than go negative.
@@ -2968,7 +3248,302 @@ int main() {
                         g_layoutEpoch = savedEpoch + 1;
                     }
 
-                    // The trailing-space sentinel: GDI+ MeasureString deliberately ignores
+                    // --- gaps and alignment groups in a real layout plan ---
+    //
+    // Everything above settles what the tags compile to. This is where they are *placed*: the
+    // assertions below are read off the same `RowLayoutPlan` the painter consumes, with real
+    // GDI+ fonts and real measurements, because "the gap scales with the row", "the group is
+    // centred" and "a run stays inside the panel" are all statements about pixels.
+    {
+        LOCAL_SETTINGS(savedSettings, g_gapSaved);
+        savedSettings = g_settings;
+        const RowState savedState = g_rowState;
+        const int savedRows = g_publishedRows;
+        const unsigned savedEpoch = g_layoutEpoch;
+
+        const float rowW = 420.0f;
+        const int rowFont = 15;
+        const float rowH = 30.0f;
+
+        // Builds one row's plan and hands the plan back. The plan is a fixed slot per row, so the
+        // caller reads what it needs before the next call.
+        auto ensureRow = [&](const WCHAR *text, int fontPx) -> const RowLayoutPlan * {
+            LOCAL_SETTINGS(s2, g_gapPlan);
+            s2.fontSize = fontPx;
+            s2.rowHeight = (int)rowH;
+            s2.panelWidth = (int)rowW;
+            s2.ringSize = 26;
+            s2.ringRightOffset = 12;
+            s2.rowCount = 1;
+            s2.rowFontSize[0] = fontPx;
+            s2.rowMaxFontSize[0] = fontPx;
+            wcsncpy(s2.rows[0], text, kRowTextCap - 1);
+            s2.rows[0][kRowTextCap - 1] = L'\0';
+            CompileRowText(s2, s2.rows[0], s2.rowProgram[0]);
+            g_settings = s2;
+
+            WCHAR marked2[640];
+            RingSpec rings2[kMaxRingsPerRow];
+            int ringCount2 = 0;
+            InstantiateRowProgram(s2, 0, Values(), marked2, 640, rings2, &ringCount2,
+                                  kMaxRingsPerRow);
+            RowState staged2 = {};
+            BuildRowLayout(marked2, ringCount2, staged2, 0);
+            for (int i = 0; i < ringCount2; i++) staged2.rings[0][i] = rings2[i];
+            g_rowState = staged2;
+            g_publishedRows = 1;
+            g_layoutEpoch++;
+            return EnsureRowPlan(graphics, font, format, 0, 1, rowW, fontPx, rowH, false);
+        };
+        // The row's text column, from the product: the left edge every group is placed against
+        // and the right edge no run may cross. Re-deriving these here would be testing a copy.
+        const RowTextMetrics column = ComputeRowTextMetrics(rowW, 0, g_settings.ringSize,
+                                                            g_settings.ringRightOffset, false);
+
+        // (1) The gap follows the font size in effect, the same way the icon diameter does. This
+        // one assertion is what separates `[[gap:N]]` from `[[gap:Npx]]`: an implementation that
+        // treated every gap as absolute pixels would place the same gap in a 12 px row and a
+        // 24 px row, and this goes red.
+        {
+            const RowLayoutPlan *small = ensureRow(L"A[[gap:1.5]]B", 12);
+            const float smallGap = small->segments[1].advance;
+            const RowLayoutPlan *big = ensureRow(L"A[[gap:1.5]]B", 24);
+            const float bigGap = big->segments[1].advance;
+            printf("    1.5 em: %.2f px at 12, %.2f px at 24 (icon ratio %.2f)\n", (double)smallGap,
+                   (double)bigGap, kIconPlateRatio);
+            Check(small->segmentCount == 3 && small->segments[1].isGap,
+                  "a gap between two runs is a gap element in the plan");
+            Check(bigGap > smallGap + 10.0f, "a gap written in ems scales with the font size");
+            Check(smallGap == 12.0f * 1.5f && bigGap == 24.0f * 1.5f,
+                  "and it is the font-size multiple the tag asked for");
+            // Both derived sizes come from the same font size, each through its own single
+            // multiplication: the gap is `n` em and the icon is kIconPlateRatio em, so their ratio
+            // is the ratio of those two constants and changes with neither row nor run size.
+            Check(smallGap / IconDiameterForFontSize(12) ==
+                      bigGap / IconDiameterForFontSize(24),
+                  "the gap's em unit and the icon's diameter scale from the same font size");
+        }
+
+        // (2) The px unit does not follow the size, which is the whole reason both units exist.
+        {
+            const RowLayoutPlan *small = ensureRow(L"A[[gap:12px]]B", 12);
+            const RowLayoutPlan *big = ensureRow(L"A[[gap:12px]]B", 24);
+            printf("    12 px: %.2f px at 12, %.2f px at 24\n", (double)small->segments[1].advance,
+                   (double)big->segments[1].advance);
+            Check(small->segments[1].advance == 12.0f && big->segments[1].advance == 12.0f,
+                  "a gap written in px is the same pixels whatever the row's size is");
+        }
+
+        // (3) A zero gap is allowed, and advances nothing rather than becoming negative or NaN.
+        // The plan is a fixed slot per row, so each side is captured as a value.
+        {
+            const RowLayoutPlan *zero = ensureRow(L"A[[gap:0]]B", 15);
+            const float zeroAdvance = zero->segments[1].advance;
+            const float zeroTextX = zero->segments[2].x;
+            const float firstRunRight = zero->segments[0].x + zero->segments[0].advance;
+            Check(zeroAdvance == 0.0f, "a zero gap is a zero advance");
+            printf("    zero gap: advance=%.2f  first run ends at %.2f, next starts at %.2f\n",
+                   (double)zeroAdvance, (double)firstRunRight, (double)zeroTextX);
+            Check(zeroTextX == firstRunRight,
+                  "so the run after it starts exactly where the run before it ended");
+        }
+
+        // (4) A clamped gap stays a gap: finite, positive, and inside the panel.
+        {
+            const RowLayoutPlan *huge = ensureRow(L"A[[gap:100]]B", 48);
+            const float gap = huge->segments[1].advance;
+            printf("    [[gap:100]] at 48 px -> %.2f px (cap %.0f)\n", (double)gap,
+                   (double)kMaxGapPx);
+            Check(huge->segments[1].isGap, "an absurd gap is still a gap element");
+            Check(gap == kMaxGapPx, "and its width is the cap, not the number the writer typed");
+            Check(gap > 0.0f && gap < rowW, "which is a real, on-panel advance");
+        }
+
+        // (5) The icon's own diameter counts towards the group's width, and the group's width is
+        // the sum of its parts -- measured off the parts the plan draws.
+        {
+            const RowLayoutPlan *plan = ensureRow(L"[[left]][[icon:CPU]][[gap:1.5]]abc[[/left]]", 15);
+            const float diameter = IconDiameterForFontSize(15);
+            const float gap = 15.0f * 1.5f;
+            const RowSegmentPlan &icon = plan->segments[0];
+            const RowSegmentPlan &gapSeg = plan->segments[1];
+            const RowSegmentPlan &text = plan->segments[2];
+            printf("    icon+gap+text: group x=%.2f w=%.2f (icon %.2f at %.2f, gap %.2f, "
+                   "text %.2f at %.2f)\n",
+                   (double)plan->groups[0].x, (double)plan->groups[0].width, (double)diameter,
+                   (double)icon.x, (double)gapSeg.advance, (double)text.advance, (double)text.x);
+            // Measured from the parts the plan draws, not from the group's own field: the two
+            // must agree, and the field is what a stale derivation would have got wrong.
+            const float drawnWidth = icon.advance + gapSeg.advance + text.advance;
+            Check(plan->alignCount == 1 && plan->groups[0].kind == kAlignSegLeft,
+                  "the row has one left-aligned group");
+            Check(diameter > 5.0f, "the icon has a real diameter to account for");
+            Check(icon.isIcon && gapSeg.isGap && !text.isGap && !text.isIcon,
+                  "the group holds an icon, a gap and a text run");
+            Check(gapSeg.advance == gap, "the gap in the group is still the em multiple");
+            Check(icon.x + diameter + (float)kIconContentGap == gapSeg.x,
+                  "the gap starts after the icon's own box");
+            Check(plan->groups[0].x == text.x - (icon.advance + gapSeg.advance),
+                  "the text starts a whole icon and gap after the group's left edge");
+            Check(plan->groups[0].width == drawnWidth,
+                  "the group's width is the sum of its parts, icon diameter included");
+            Check(plan->groups[0].width > diameter + gap,
+                  "which is more than the icon and the gap alone");
+        }
+
+        // (6) Centred means the group's midpoint is the column's midpoint -- not the column's
+        // left edge, which is what an implementation that ignored the group would place it at.
+        {
+            const RowLayoutPlan *plan = ensureRow(L"[[center]]CPU[[/center]]", 15);
+            const AlignGroupPlan &group = plan->groups[0];
+            const float mid = group.x + group.width / 2.0f;
+            const float columnMid = kRowTextLeftInset + column.textWidth / 2.0f;
+            printf("    centred: x=%.2f w=%.2f mid=%.2f (column mid %.2f)\n", (double)group.x,
+                   (double)group.width, (double)mid, (double)columnMid);
+            Check(plan->alignCount == 1 && group.kind == kAlignSegCenter,
+                  "the row has one centred group");
+            Check(group.width > 0.0f, "the group has a width to centre");
+            Check(mid >= columnMid - 0.5f && mid <= columnMid + 0.5f,
+                  "a centred group's midpoint is the text column's midpoint");
+            Check(group.x > kRowTextLeftInset + 1.0f,
+                  "so a centred group does not start at the left edge");
+        }
+
+        // (7) Right means the group's right edge is the column's right edge.
+        {
+            const RowLayoutPlan *plan = ensureRow(L"[[right]]CPU[[/right]]", 15);
+            const AlignGroupPlan &group = plan->groups[0];
+            printf("    right-aligned: x=%.2f w=%.2f right=%.2f (column right %.2f)\n",
+                   (double)group.x, (double)group.width, (double)(group.x + group.width),
+                   (double)column.textRight);
+            Check(group.kind == kAlignSegRight, "the row has one right-aligned group");
+            Check(group.x + group.width == column.textRight,
+                  "a right-aligned group ends at the text column's right edge");
+        }
+
+        // (8) Every fitted run stays inside the panel. A grouped run's budget may not be its own
+        // measured width (the mistake `ComputeInlineTextLimit`'s comment records: FitTextToWidth's
+        // first test is "does it already fit", so a run handed its own width is never trimmed),
+        // and it may not be the group's left edge plus a fixed width either -- the group's offset
+        // is added after the fit. The fixture is a left-aligned group holding a capped gap and a
+        // run long enough to need trimming.
+        {
+            const WCHAR *longRun = L"12345678901234567890123456789012345678901234567890";
+            WCHAR row[192];
+            swprintf(row, 192, L"[[left]][[gap:99px]]%ls[[/left]]", longRun);
+            const RowLayoutPlan *plan = ensureRow(row, 15);
+            const AlignGroupPlan &group = plan->groups[0];
+            printf("    grouped run: group x=%.2f w=%.2f | text x=%.2f adv=%.2f right=%.2f "
+                   "(column right %.2f)\n",
+                   (double)group.x, (double)group.width, (double)plan->segments[1].x,
+                   (double)plan->segments[1].advance,
+                   (double)(plan->segments[1].x + plan->segments[1].advance),
+                   (double)column.textRight);
+            Check(plan->segmentCount == 2 && plan->segments[0].isGap &&
+                      !plan->segments[1].isGap,
+                  "the group is a gap and a run");
+            Check(plan->segments[1].advance > 0.0f, "the grouped run has a real width");
+            Check(plan->segments[1].x + plan->segments[1].advance <= column.textRight + 0.5f,
+                  "every fitted run stays inside the panel (its right edge is bounded by the "
+                  "column, or by its group)");
+            Check(group.x >= kRowTextLeftInset, "and the group never starts off the panel's edge");
+        }
+
+        // (9) A group wider than the column degrades to left-aligned: it does not start off the
+        // panel on the left, and its runs are still fitted inside the column. A text run is
+        // trimmed to the column, so a group only comes out wider than the column when a
+        // *fixed-size* part makes it so -- an icon, or a gap wider than a whole column. Both are
+        // in the row below, and both are content, so this is the shape a writer can reach.
+        {
+            WCHAR row[160];
+            swprintf(row, 160, L"[[center]][[icon:CPU]][[gap:99px]][[icon:Memory]][[gap:99px]]"
+                               L"[[icon:Disk]][[/center]]");
+            const RowLayoutPlan *plan = ensureRow(row, 48);
+            const AlignGroupPlan &group = plan->groups[0];
+            printf("    over-wide group: x=%.2f w=%.2f (column width %.2f, %d segments)\n",
+                   (double)group.x, (double)group.width, (double)column.textWidth,
+                   plan->segmentCount);
+            Check(group.width > column.textWidth, "the group really is wider than the column");
+            Check(group.x == kRowTextLeftInset, "an over-wide group is clamped to the left edge");
+            Check(plan->segments[0].x == kRowTextLeftInset,
+                  "so its first element starts at the column's left edge, on the panel");
+            for (int s = 0; s < plan->segmentCount; s++) {
+                if (plan->segments[s].isIcon || plan->segments[s].isGap) continue;
+                Check(plan->segments[s].x + plan->segments[s].advance <= column.textRight + 0.5f,
+                      "and its text runs are still fitted inside the column");
+            }
+        }
+
+        // (10) A gap inside a group is ordinary content: the group's placement moves it exactly
+        // as far as it moves the runs beside it.
+        {
+            const float gapPx = 15.0f * 1.5f;
+            const RowLayoutPlan *grouped =
+                ensureRow(L"[[right]][[gap:1.5]]CPU[[/right]]", 15);
+            const float groupedAdv =
+                grouped->segmentCount > 0 ? grouped->segments[0].advance : -1.0f;
+            const int groupedIsGap = grouped->segmentCount > 0 && grouped->segments[0].isGap;
+            const float groupedX = grouped->segmentCount > 0 ? grouped->segments[0].x : -1.0f;
+            const float nextX = grouped->segmentCount > 1 ? grouped->segments[1].x : -1.0f;
+            const int groupedCount = grouped->segmentCount;
+            const int groupedAlign = grouped->alignCount;
+            const float groupedGroupX = groupedAlign > 0 ? grouped->groups[0].x : -1.0f;
+            const RowLayoutPlan *loose = ensureRow(L"CPU[[gap:1.5]]x", 15);
+            const float looseAdv = loose->segments[1].advance;
+            printf("    gap in a right group: segs=%d align=%d x=%.2f adv=%.2f isGap=%d next=%.2f "
+                   "(loose gap %.2f, group x %.2f)\n",
+                   groupedCount, groupedAlign, (double)groupedX, (double)groupedAdv, groupedIsGap,
+                   (double)nextX, (double)looseAdv, (double)groupedGroupX);
+            Check(groupedIsGap, "a gap inside a group is a gap element");
+            Check(groupedAdv == gapPx, "the alignment group does not change the gap's width");
+            Check(nextX == groupedX + gapPx, "the run after the gap starts one gap further right");
+            Check(groupedX == groupedGroupX, "and the gap is placed at the group's own left edge");
+            // A gap is ordinary content: the group's placement moves it too. In a left-aligned
+            // group it would sit at the column's inset, so a right-aligned one landing somewhere
+            // else is the group's own offset reaching the gap.
+            Check(groupedX != kRowTextLeftInset,
+                  "a right-aligned group carries the gap away from the column's inset");
+        }
+
+        // (11) Groups do not nest, and an unclosed group ends at the row's end. Both are read off
+        // the plan's group list, which is built from the markers in order.
+        {
+            const RowLayoutPlan *nested =
+                ensureRow(L"a[[left]]b[[center]]c[[/center]]d", 15);
+            printf("    nested openers -> %d group(s): kind %d (segs %d..%d), kind %d (segs %d..%d)"
+                   "\n",
+                   nested->alignCount, nested->groups[0].kind, nested->groups[0].firstSegment,
+                   nested->groups[0].lastSegment, nested->groups[1].kind,
+                   nested->groups[1].firstSegment, nested->groups[1].lastSegment);
+            Check(nested->alignCount == 2,
+                  "two openers are two groups, not one nested inside the other");
+            Check(nested->groups[0].kind == kAlignSegLeft &&
+                      nested->groups[1].kind == kAlignSegCenter,
+                  "and each keeps its own alignment");
+            Check(nested->groups[0].lastSegment < nested->groups[1].firstSegment,
+                  "the groups are consecutive, never overlapping");
+
+            const RowLayoutPlan *unclosed = ensureRow(L"[[center]]abc", 15);
+            printf("    unclosed -> %d group(s), covers segs %d..%d of %d\n",
+                   unclosed->alignCount, unclosed->groups[0].firstSegment,
+                   unclosed->groups[0].lastSegment, unclosed->segmentCount);
+            Check(unclosed->alignCount == 1, "an unclosed group is still one group");
+            Check(unclosed->groups[0].lastSegment == unclosed->segmentCount - 1,
+                  "and it ends at the row's own end, not past it");
+
+            const RowLayoutPlan *stray = ensureRow(L"abc[[/left]]def", 15);
+            Check(stray->alignCount == 0, "a closing tag that closes nothing makes no group");
+            Check(stray->segmentCount > 0 && !stray->segments[0].isGap,
+                  "and the text around it is untouched");
+        }
+
+        g_settings = savedSettings;
+        g_rowState = savedState;
+        g_publishedRows = savedRows;
+        g_layoutEpoch = savedEpoch + 1;
+    }
+
+    // The trailing-space sentinel: GDI+ MeasureString deliberately ignores
                     // trailing spaces, so "9%  " would advance no further than "9%" and an
                     // inline gauge would land on top of the '%'. Measured here with the
                     // real font; remove the sentinel from MeasureAdvance and this goes red.

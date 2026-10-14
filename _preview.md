@@ -20,10 +20,11 @@ python _preview.py
 = 默认面板：默认行高 30 px，`PanelRowsHeight` 就是 3 × 30 = **90 px**，与预览图的高度一致
 （`kPanelTopOffset` / `kTabHeight` 不进面板高度，它们是窗口位置与收起态的事）。
 
-`ROWS[DEFAULT_ROWS:]`（第 4 行）是**额外**的语法示例，不在默认配置里：
-`[[icon:file=…]]` 图片图标（预览不载文件，画的是回退字形）加一个**右停靠**的环。
+`ROWS[DEFAULT_ROWS:]`（第 4、5 行）是**额外**的语法示例，不在默认配置里：
+第 4 行是 `[[icon:file=…]]` 图片图标（预览不载文件，画的是回退字形）加一个**右停靠**的环；
+第 5 行是 `[[gap:…]]` 的两种单位加一个 `[[center]]…[[/center]]` 对齐组。
 脚本每次跑都会把这两组打印出来（`rows 1-3 = the shipped default rows …` /
-`rows 4-4 = extra syntax sample(s) …`），README 的图注里也写着，别让读者以为默认有四行。
+`rows 4-5 = extra syntax sample(s) …`），README 的图注里也写着，别让读者以为默认有五行。
 
 改默认行时**两边都要改**：设置块里的 `Row1..Row3` 与这里的 `ROWS[:DEFAULT_ROWS]`。
 
@@ -36,9 +37,10 @@ Python 与 **Pillow**（`from PIL import Image, ImageDraw, ImageFont`）。
 
 ## 输出与判读
 
-一行 `wrote <路径>  <W>x<H>  (N rows, M rings, K icons)`。脚本把所有绘制合成好之后才保存，
-所以**没有别的判据行**——图对不对要用眼睛看：底板是棋盘格，用来让面板的 alpha 可见；
-图标盘、环的轨道与扇形、文字与图标的先后顺序都应该和 mod 画的一致。
+一行 `wrote <路径>  <W>x<H>  (N rows, M rings, K icons, G gaps, A groups)`。
+脚本把所有绘制合成好之后才保存，所以**没有别的判据行**——图对不对要用眼睛看：
+底板是棋盘格，用来让面板的 alpha 可见；图标盘、环的轨道与扇形、文字与图标的先后顺序
+都应该和 mod 画的一致。
 
 ## 行是"流"：预览和实现共用的那条规则
 
@@ -55,6 +57,23 @@ Python 与 **Pillow**（`from PIL import Image, ImageDraw, ImageFont`）。
 - `draw_icon_element()` ↔ `PaintIconElement` + `IconElementCenter`：盘心 = 元素左边界 + 半径，
   垂直居中在该行；`draw_ring()` ↔ `DrawRing`（整圈轨道 + 从 12 点顺时针的弧；
   PIL 的角度从 3 点起算，所以 `start=-90`）。
+
+### `[[gap:…]]` 与对齐组：预览模拟了什么、没模拟什么
+
+**模拟了**（第 5 行就是给它们看的）：`parse_gap()` ↔ `ParseGapTag` 的单位判定
+（裸数字 = 字号倍数、`px` 后缀 = 绝对像素）与容错（读不出来就当普通文字）；
+`parse_row()` 里对齐标签被切成元素上的 `group` 字段，**不嵌套**（第二个开标签关掉前一个）；
+`gap_px()` 与 `GAP_MAX_PX = 99` ↔ `kMaxGapPx` 与标记能写的四位数；
+`group_start()` 把一组元素量成一个整体再按左/中/右放到文字列上，放不下就退化成靠左。
+
+**没模拟**（都在产品侧有断言，要确认请跑 `test-layout.cpp`）：
+
+- **宽度用 PIL 量，不是 GDI+ 量**。组的居中/靠右位置因此会和真机差几个像素，
+  这看的是一组的**相对位置**，不是逐像素对齐。
+- **组里的文字不会被截断**：产品在相位 C 会把组内每一段按它到组右边缘（或面板右边缘）
+  的预算再拟合一次，预览没有这一步。所以预览里组比文字列宽时，文字可能画到面板外。
+- **`[[ring:…]]` 在组内的位置**：产品的组内环按流排（和写在文字中间一样），
+  预览的环仍然是整行末尾/右停靠两种摆法之一——`ROWS` 里没有"组内带环"的示例。
 
 ## 坑
 
