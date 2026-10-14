@@ -467,7 +467,7 @@ int main() {
         printf("   cue   height  scale  content\n");
         double lastShrink = to * 2;
         bool shrinkMonotonic = true;
-        double atQuarter = 0.0, atShrinkEnd = 0.0;
+        double atQuarter = 0.0, atMid = 0.0, atLate = 0.0;
         for (int step = 0; step <= 10; step++) {
             double cue = step / 10.0;
             g_intro.startedAt = GetTickCount() - (DWORD)(cue * g_intro.durationMs);
@@ -477,16 +477,24 @@ int main() {
             if (f.height > lastShrink + 0.01) shrinkMonotonic = false;
             lastShrink = f.height;
             if (step == 2) atQuarter = f.height;
-            if (step == 5) atShrinkEnd = f.height;
+            if (step == 5) atMid = f.height;
+            if (step == 9) atLate = f.height;
         }
-        printf("  height at cue 0.25 = %.1f, at cue 0.50 = %.1f "
-               "(tab is %.0f, expanded is %.0f)\n", atQuarter, atShrinkEnd, from, to);
+        printf("  height at cue 0.25 = %.1f, 0.50 = %.1f, 0.90 = %.1f "
+               "(tab is %.0f, expanded is %.0f)\n", atQuarter, atMid, atLate, from, to);
         Check(shrinkMonotonic, "collapse height only ever shrinks");
         // At the quarter point it must be genuinely between the two, proving the
         // shrink is spread over the duration rather than completed up front.
-        // (A quarter, not a half: the shrink completes at kCollapseDurationRatio.)
         Check(atQuarter < to && atQuarter > from, "collapse is still shrinking at the quarter point");
-        Check(atShrinkEnd <= from + 0.01, "collapse has reached the tab by the duration end");
+        // ... and it must still have work left at the midpoint. It used to be finished
+        // there, because kCollapseDurationRatio (a *duration* ratio) was used as a *cue*
+        // on a timeline that had already been halved: the panel then sat at tab height
+        // for the whole second half while the frame clock kept repainting it, and the
+        // visible collapse was IntroMs/4 instead of the half the README documents.
+        Check(atMid < to - 1.0 && atMid > from,
+              "the shrink still has work left at the midpoint");
+        Check(atLate < atMid && atLate > from - 0.01,
+              "and it keeps shrinking past the midpoint without passing the tab");
 
         g_intro.active = true;
         g_intro.fromHeight = to;
@@ -762,6 +770,30 @@ int main() {
     RowTextMetrics inl = ComputeRowTextMetrics(W, 2, 26, 12, true);
     Check(inl.textWidth == none.textWidth, "inline gauges do not reserve width");
 
+    // The budget an inline run is trimmed against is a different question: the run
+    // starts where it starts, so its limit has to count the gauges that still follow
+    // it. It used to be handed the run's own measured width as its budget, and
+    // FitTextToWidth can never exceed that (its first test is "does it already fit?"),
+    // so a row using [[ring:...]] was never truncated at all: the text ran to the bitmap
+    // edge with no ellipsis and pushed its own gauge off the panel.
+    {
+        const float right = inl.textRight;      // the row's right inset
+        const float cursor = 12.0f;             // where a run at the left edge starts
+        Check(ComputeInlineTextLimit(right, cursor, 0, 26) == right - cursor,
+              "an inline run with no gauge after it may use the whole row");
+        Check(ComputeInlineTextLimit(right, cursor, 1, 26) == right - cursor - (26.0f + 4.0f),
+              "one gauge after the run is reserved out of its budget");
+        Check(ComputeInlineTextLimit(right, cursor, 2, 26) <
+                  ComputeInlineTextLimit(right, cursor, 1, 26),
+              "each further gauge costs the run more");
+        // The relation, not the arithmetic: run + the gauges that follow it = the row.
+        Check(ComputeInlineTextLimit(right, cursor, 2, 26) + cursor + 2.0f * (26.0f + 4.0f) ==
+                  right,
+              "the run plus the gauges after it exactly fill the row");
+        Check(ComputeInlineTextLimit(right, 500.0f, 1, 26) == 0.0f,
+              "a run already past the right inset gets nothing, never a negative budget");
+    }
+
     // A pathological configuration must clamp at zero rather than go negative.
     RowTextMetrics tiny = ComputeRowTextMetrics(200.0f, 4, 64, 40, false);
     printf("  tiny panel    : right=%.1f width=%.1f\n", tiny.textRight, tiny.textWidth);
@@ -828,6 +860,15 @@ int main() {
             {L"{gpu.temp|0}", L"--"},
             {L"T={gpu.temp}C", L"T=--C"},
             {L"{gpu.thermal}", L"{gpu.thermal}"},   // unknown token stays visible
+            // The same rule for the fields the PDH fallback cannot read at all. They had
+            // no validity flag, so the panel invented a reading: "0 %" of fan, "0.0" GB
+            // of VRAM. The whole point of gpuTempValid is that "cannot read it" and
+            // "reads zero" are different things.
+            {L"{gpu.fan}", L"--"},
+            {L"{gpu.power}", L"--"},
+            {L"{gpu.vram.used}", L"--"},
+            {L"{gpu.vram.total}", L"--"},
+            {L"F={gpu.fan}rpm", L"F=--rpm"},
         };
         for (const Expect &e : expects) {
             WCHAR marked[640];
@@ -1092,6 +1133,28 @@ int main() {
               "a stored value resolves");
         Check(text && wcscmp(text, L"Now Playing: Blue Hour") == 0,
               "the stored value is trimmed before it is shown");
+
+        // A value the settings allow has to survive the trip into a row. It used to be
+        // cut at 127 characters by a 128-char scratch buffer on the way, so
+        // "External value length = 512" bought 127 visible characters and never said so.
+        {
+            WCHAR stored[400];
+            for (int i = 0; i < 399; i++) stored[i] = (WCHAR)(L'a' + (i % 26));
+            stored[399] = L'\0';
+            ExtStoreValue(slot, L"long", stored, 60000, kExtMaxValueChars);
+            Values none = {};
+            WCHAR marked[640];
+            RingSpec rings[kMaxRingsPerRow];
+            int ringCount = 0;
+            ExpandTokensAndRings(L"{ext.music.long}", none, g_settings, marked, 640, rings,
+                                 &ringCount, kMaxRingsPerRow);
+            printf("  399-char value -> %d chars in the row\n", (int)wcslen(marked));
+            Check(wcscmp(marked, stored) == 0,
+                  "a long pushed value reaches the row whole, not cut at 127");
+            // Do not leave a live value behind: the deadline assertions below check that
+            // nothing live means no deadline.
+            ExtInvalidate(slot, L"long");
+        }
         Check(ExtLookup(L"ext.MUSIC.Title", (int)wcslen(L"ext.MUSIC.Title"), &text) == ER_VALUE,
               "provider and key match case-insensitively");
         Check(ExtLookup(L"ext.music.nope", (int)wcslen(L"ext.music.nope"), &text) == ER_EXPIRED,
@@ -1544,6 +1607,27 @@ int main() {
             Check(DesiredTickMs() == 16, "the panel's own intro asks for it as well");
             g_intro.active = savedIntroActive;
             g_islandView = savedView;
+
+            // Turning the island off has to drop a phase that is in flight. Nothing
+            // drives the machine while the feature is off, so the phase stayed POPPING
+            // forever, IslandPhaseAnimating kept the tick pinned at 16 ms for the rest of
+            // the session, and the stale card could not even be dismissed (that path is
+            // gated on the same switch). UpdateIsland is the only thing that advances the
+            // state machine, so it is where the phase has to be dropped.
+            {
+                const bool savedIsland = g_settings.islandEnabled;
+                const bool savedCardValid = g_islandCardValid;
+                g_settings.islandEnabled = false;
+                g_islandView.state = IS_POPPING;
+                g_islandView.phaseStarted = GetTickCount() - 10000;
+                UpdateIsland();
+                Check(g_islandView.state == IS_IDLE,
+                      "turning the island off drops a phase that was in flight");
+                Check(DesiredTickMs() == kCursorPollMs,
+                      "and the tick falls back off the frame rate with it");
+                g_settings.islandEnabled = savedIsland;
+                g_islandCardValid = savedCardValid;
+            }
         }
 
         // Effective CPU clock: Windows exposes a *ratio* (PDH "% Processor
@@ -1628,6 +1712,44 @@ int main() {
             ProcPowerInfo nothing[1] = {};
             Check(CpuNominalFromInfo(nothing, 1, 2.42) == 2.42,
                   "and when the API reports nothing, the registry value stands");
+        }
+
+        // Which source wins has to survive the *second* registry read. ReadCpuStatic()
+        // runs again on every settings-version change, and an unconditional write to
+        // g_cpuGhzMax there reverted a 2.20 GHz nominal to the registry's 2.42 for the
+        // rest of the session -- the power API is only ever tried once, so nothing put
+        // it back. The latch is what keeps the two apart, so this drives the real
+        // ReadCpuStatic() rather than re-deriving the rule here.
+        {
+            const double savedNominal = g_cpuGhzMax;
+            const double savedFromApi = g_cpuGhzFromApi;
+
+            // Ask the product itself what the registry alone would hand out, rather
+            // than reading the registry a second way here: the fallback's *source* is
+            // what is under test, so the test must not compute it independently.
+            g_cpuGhzFromApi = 0.0;
+            g_cpuGhzMax = 0.0;
+            ReadCpuStatic();
+            const double registryFallback = g_cpuGhzMax;
+
+            // A nominal no registry value can equal, so "the registry overwrote it" is
+            // never mistaken for "the latch held".
+            g_cpuGhzFromApi = 3.3;   // the power API has answered
+            g_cpuGhzMax = 3.3;
+            ReadCpuStatic();
+            Check(g_cpuGhzMax == 3.3,
+                  "a later registry read does not undo the power API's nominal");
+
+            if (registryFallback > 0.0) {
+                printf("  registry fallback = %.2f GHz, API answer = 3.30 GHz (both paths live)\n",
+                       registryFallback);
+            } else {
+                printf("  no ~MHz here: the second registry read had nothing to write, so "
+                       "the check above cannot fail on this machine\n");
+            }
+
+            g_cpuGhzMax = savedNominal;
+            g_cpuGhzFromApi = savedFromApi;
         }
 
         // The pipe's DACL has to actually admit this user. Getting it wrong is

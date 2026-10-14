@@ -392,6 +392,10 @@ static bool ExtIsExtToken(const WCHAR *name, int len);
 static void ExtStart(const ModSettings &snap);
 static void ExtStop();
 static void ExtPublisherTick();
+// The sampler reaps the publisher when nothing consumes {ext.*} any more, so it needs
+// these two before their definitions.
+static bool ExtPublisherAlive();
+static void ExtPublisherStop();
 
 // ---------------------------------------------------------------------------
 // Minimal GDI+ surface, resolved at runtime.
@@ -1029,12 +1033,18 @@ static IntroFrame EvaluateIntro() {
         };
         f.height = EvaluateKeys(cue, growKeys, 2);
     } else {
-        // The shrink finishes at kCollapseDurationRatio, which on a collapse is
-        // cue 1.0 by construction (IntroCue measures against the halved duration).
-        // The content fade is keyed to the same point.
+        // The shrink runs the whole collapse, ending exactly on the end of the
+        // (already halved) timeline. It used to stop at kCollapseDurationRatio -- the
+        // duration ratio used as a *cue* -- which is cue 0.5 of a timeline that had
+        // already been halved: the panel sat at tab height for the second half while
+        // the frame clock kept repainting it at 16 ms, and the visible collapse was
+        // IntroMs/4 rather than the half the README promises. The content fade and the
+        // scale shrink below are still keyed to kCueSettle; nothing draws content while
+        // collapsed (PaintPanel takes the tab branch), so they only have to be over by
+        // the time the tab is all that is left.
         const IntroKey shrinkKeys[] = {
             {0.0, start, nullptr},
-            {kCollapseDurationRatio, end, EaseInOut},
+            {1.0, end, EaseInOut},
         };
         f.height = EvaluateKeys(cue, shrinkKeys, 2);
     }
@@ -1494,6 +1504,12 @@ struct Values {
     // counter path has no equivalent. Without this flag a PDH-only machine
     // reported "0C", which looks like a real (and alarming) reading.
     bool gpuTempValid = false;
+    // Fan, power and the VRAM counters are read one by one, and the PDH fallback has no
+    // equivalent for the first two or for the total. They carried no flag, so "this
+    // machine cannot read it" was rendered as a very real-looking 0 -- the same failure
+    // gpuTempValid exists to prevent, one field over.
+    bool gpuFanValid = false, gpuPowerValid = false;
+    bool vramUsedValid = false, vramTotalValid = false;
     double vramUsedGb = 0, vramTotalGb = 0, gpuFan = 0, gpuPower = 0;
     WCHAR gpuName[64] = L"GPU";
 
@@ -2127,11 +2143,18 @@ static void ExtInvalidate(int slot, const WCHAR *key) {
 static bool g_cpuPrimed = false;
 static ULONGLONG g_prevIdle = 0, g_prevKernel = 0, g_prevUser = 0;
 
-// CPU identity is static for the process lifetime and is read on the loader
-// thread, so it lives in globals rather than in the published Values snapshot
-// (writing into that snapshot from two threads would be a data race).
+// CPU identity is static for the process lifetime, so it lives in globals rather
+// than in the published Values snapshot (writing into that snapshot from two
+// threads would be a data race). ReadCpuStatic() runs on the sampler thread, and
+// again on every settings-version change, so everything it writes must be safe to
+// write a second time -- see g_cpuGhzFromApi.
 static WCHAR g_cpuName[64] = L"CPU";
 static double g_cpuGhzMax = 1.0;
+// >0 once the power API has supplied the nominal. From that point the registry's
+// "~MHz" must never win again: ReadCpuStatic() re-reads the registry whenever the
+// settings change, which used to revert a 2.20 GHz nominal to the registry's 2.42
+// for the rest of the session, because CpuNominalEnsure only tries the API once.
+static double g_cpuGhzFromApi = 0.0;
 static int g_cpuCores = 0, g_cpuThreads = 0;
 
 static void ReadCpuStatic() {
@@ -2155,7 +2178,10 @@ static void ReadCpuStatic() {
         size = sizeof(mhz);
         if (RegQueryValueExW(key, L"~MHz", nullptr, &type, (LPBYTE)&mhz, &size) == ERROR_SUCCESS &&
             mhz > 0) {
-            g_cpuGhzMax = mhz / 1000.0;
+            // Fallback only: the power API's value outranks the registry's, and this
+            // function re-runs on every settings change, so writing unconditionally
+            // here silently reverted the nominal once the API had already answered.
+            if (g_cpuGhzFromApi <= 0.0) g_cpuGhzMax = mhz / 1000.0;
         }
         RegCloseKey(key);
     }
@@ -2192,8 +2218,11 @@ static void ReadCpuStatic() {
 // The registry's "~MHz" is what ACPI/BIOS reports and is not always the nominal clock
 // (measured: 2.42 GHz on a CPU whose nominal is 2.20 GHz). The power manager knows the
 // real one: PROCESSOR_POWER_INFORMATION.MaxMhz. So the API wins and the registry value
-// stays as the fallback. powrprof is loaded on demand through GetProcAddress, the same
-// way iphlpapi and nvml are, so the import table does not change.
+// stays as the fallback -- which is why the two are told apart by separate globals:
+// ReadCpuStatic() re-reads the registry on every settings change, so without
+// g_cpuGhzFromApi a later registry read would undo the API's answer for good (the API
+// is only ever tried once). powrprof is loaded on demand through GetProcAddress, the
+// same way iphlpapi and nvml are, so the import table does not change.
 struct ProcPowerInfo {
     ULONG number;
     ULONG maxMhz;
@@ -2254,6 +2283,9 @@ static void CpuNominalEnsure() {
     Wh_Log(L"CPU clock: nominal %.2f GHz from the power API (registry said %.2f)", nominal,
            fallback);
     g_cpuGhzMax = nominal;
+    // Latch the source: from here on the registry value is only a fallback, even
+    // though ReadCpuStatic() will read it again on the next settings change.
+    g_cpuGhzFromApi = nominal;
 }
 
 // ---------------------------------------------------------------------------
@@ -2728,15 +2760,23 @@ void GpuBackend::Sample(Values &v) {
             if (getMemory(device, &mem) == 0) {
                 v.vramUsedGb = mem.used / 1073741824.0;
                 v.vramTotalGb = mem.total / 1073741824.0;
+                v.vramUsedValid = true;
+                v.vramTotalValid = true;
             }
         }
         if (getFan) {
             unsigned int fan = 0;
-            if (getFan(device, &fan) == 0) v.gpuFan = fan;
+            if (getFan(device, &fan) == 0) {
+                v.gpuFan = fan;
+                v.gpuFanValid = true;
+            }
         }
         if (getPower) {
             unsigned int mw = 0;
-            if (getPower(device, &mw) == 0) v.gpuPower = mw / 1000.0;
+            if (getPower(device, &mw) == 0) {
+                v.gpuPower = mw / 1000.0;
+                v.gpuPowerValid = true;
+            }
         }
     } else if (kind == Pdh) {
         if (PdhCollectQueryData(query) == ERROR_SUCCESS) {
@@ -2759,6 +2799,7 @@ void GpuBackend::Sample(Values &v) {
                                 if (value > best) best = value;
                             }
                             v.vramUsedGb = best / 1073741824.0;
+                            v.vramUsedValid = true;
                         }
                         free(buffer);
                     }
@@ -2799,7 +2840,14 @@ static const WCHAR *LookupRaw(const WCHAR *name, int len, const Values &v, WCHAR
     if (MATCH(L"time")) return v.timeText;
     if (MATCH(L"date")) return v.dateText;
     if (MATCH(L"uptime")) return v.uptimeText;
-    if (MATCH(L"gpu.vram.total")) { swprintf(scratch, scratchCount, L"%.1f", v.vramTotalGb); return scratch; }
+    if (MATCH(L"gpu.vram.total")) {
+        // No VRAM total on this machine (the PDH fallback cannot read it): the row must
+        // show "--", not "0.0". Returning nullptr lets ResolveToken fall through to
+        // LookupNumber, which answers with the same validity flag.
+        if (!v.vramTotalValid) return nullptr;
+        swprintf(scratch, scratchCount, L"%.1f", v.vramTotalGb);
+        return scratch;
+    }
     if (MATCH(L"cpu.cores")) { swprintf(scratch, scratchCount, L"%d", v.cores); return scratch; }
     if (MATCH(L"cpu.threads")) { swprintf(scratch, scratchCount, L"%d", v.threads); return scratch; }
     if (MATCH(L"net.nics")) { swprintf(scratch, scratchCount, L"%d", v.netNics); return scratch; }
@@ -2836,10 +2884,10 @@ static bool LookupNumber(const WCHAR *name, int len, const Values &v, double &ou
     if (MATCH(L"gpu")) { out = v.gpuValid ? v.gpu : 0; return v.gpuValid; }
     if (MATCH(L"gpu.mem")) { out = v.gpuValid ? v.gpuMem : 0; return v.gpuValid; }
     if (MATCH(L"gpu.temp")) { out = v.gpuTemp; return v.gpuTempValid; }
-    if (MATCH(L"gpu.fan")) { out = v.gpuFan; return true; }
-    if (MATCH(L"gpu.power")) { out = v.gpuPower; return true; }
-    if (MATCH(L"gpu.vram.used")) { out = v.vramUsedGb; return true; }
-    if (MATCH(L"gpu.vram.total")) { out = v.vramTotalGb; return true; }
+    if (MATCH(L"gpu.fan")) { out = v.gpuFan; return v.gpuFanValid; }
+    if (MATCH(L"gpu.power")) { out = v.gpuPower; return v.gpuPowerValid; }
+    if (MATCH(L"gpu.vram.used")) { out = v.vramUsedGb; return v.vramUsedValid; }
+    if (MATCH(L"gpu.vram.total")) { out = v.vramTotalGb; return v.vramTotalValid; }
 #undef MATCH
     return false;
 }
@@ -3018,6 +3066,26 @@ static RowTextMetrics ComputeRowTextMetrics(float panelWidth, int ringCount, int
     m.textWidth = m.textRight - inset;
     if (m.textWidth < 0.0f) m.textWidth = 0.0f;
     return m;
+}
+
+// How much room an *inline* text run may use, measured from where it starts.
+//
+// A right-parked row hands the text whatever is left after the gauges; an inline
+// row has to work out its own limit, and it used to work it out by measuring the
+// run and then passing that same number as the budget -- so FitTextToWidth could
+// never shorten anything (its first test is "does it already fit?"), which meant a
+// row using [[ring:...]] was never truncated: the text ran to the bitmap edge with
+// no ellipsis and pushed its own gauge off the panel. The README promises the
+// opposite ("the part that does not fit is cut and marked with ...").
+//
+// The rule is "the run plus the gauges still to come must fit the row", which is
+// the same relation the parked path gets from ComputeRowTextMetrics; the gauges
+// keep their width so they stay on screen, and the text is what gives way.
+// Factored out so that relation is assertable instead of implied by the paint loop.
+static float ComputeInlineTextLimit(float textRight, float cursor, int ringsAfter, int ringSize) {
+    if (ringsAfter < 0) ringsAfter = 0;
+    const float limit = textRight - cursor - (float)ringsAfter * ((float)ringSize + 4.0f);
+    return limit > 0.0f ? limit : 0.0f;
 }
 
 // Colour of a ring gauge. Precedence, highest first:
@@ -3265,8 +3333,15 @@ static void ExpandTokens(const WCHAR *source, const Values &v, WCHAR *out, size_
         int nameLen = (int)(pipe - (p + 1));
         int specLen = (*pipe == L'|') ? (int)(end - pipe - 1) : 0;
 
-        WCHAR value[128];
-        LookupResult result = ResolveToken(p + 1, nameLen, pipe + 1, specLen, v, value, 128);
+        // Sized for the longest external value the settings allow, not 128: a pushed
+        // value used to be silently cut to 127 characters on its way into a row, so a
+        // long value lost its tail with no ellipsis at all, even though "External value
+        // length" can be set to 512. ExtSanitize marks the *stored* value with an
+        // ellipsis when the provider exceeds that setting; this buffer must not add a
+        // second, invisible cap on top of it.
+        WCHAR value[kExtMaxValueChars + 1];
+        LookupResult result = ResolveToken(p + 1, nameLen, pipe + 1, specLen, v, value,
+                                           kExtMaxValueChars + 1);
         if (result == LR_UNKNOWN) {
             // Not a variable at all: keep it visible so a typo is obvious.
             size_t span = (size_t)(end - p + 1);
@@ -3366,8 +3441,8 @@ static void ExpandTokensAndRings(const WCHAR *source, const Values &v,
                 int span = MinInt((int)(end - p) + 1, 319);
                 wcsncpy(token, p, span);
                 token[span] = L'\0';
-                WCHAR expanded[384];
-                ExpandTokens(token, v, expanded, 384);
+                WCHAR expanded[kExtMaxValueChars + 1];
+                ExpandTokens(token, v, expanded, kExtMaxValueChars + 1);
                 // Copy with a per-character bounds check, mirroring ExpandTokens.
                 // A single "written + 1 < outCount" guard before the whole run
                 // would let a long expansion overrun the destination.
@@ -4710,20 +4785,30 @@ static void PaintPanel(HWND hwnd) {
                         wcsncpy(slice, g_rowState.text[r] + seg.offset, length);
                         slice[length] = L'\0';
 
-                        float advance = 0.0f;
+                        // How much room this run may use. Right-parked gauges leave the
+                        // text whatever they do not need; an inline run has to count the
+                        // gauges that still follow it, or a long run pushes them off the
+                        // panel (and FitTextToWidth gets a budget it can never exceed,
+                        // so the run was never trimmed at all -- see
+                        // ComputeInlineTextLimit).
+                        float limit = metrics.textWidth;
                         if (inlineFlow) {
-                            // Measure so an inline gauge lands right after the text,
-                            // including any spaces written before it.
-                            advance = MeasureAdvance(graphics, font, format, slice,
-                                                     (float)g_settings.rowHeight);
-                        } else {
-                            // Right-parked gauges: the text gets the width that is
-                            // left over, so a run that does not fit is trimmed
-                            // rather than overrunning the gauges. With no gauges
-                            // this is the full inner width, which a plain text row
-                            // needs in order to be visible at all.
-                            advance = metrics.textWidth;
+                            int ringsAfter = 0;
+                            for (int k = s + 1; k < g_rowState.segmentCount[r]; k++) {
+                                if (g_rowState.segments[r][k].offset < 0) ringsAfter++;
+                            }
+                            limit = ComputeInlineTextLimit(metrics.textRight, cursor, ringsAfter,
+                                                           g_settings.ringSize);
                         }
+                        float budget = limit > kMinLayoutWidth ? limit : kMinLayoutWidth;
+
+                        // The run's own width is what an inline gauge is placed after
+                        // (including the spaces written before it); a parked run is
+                        // drawn in its whole budget instead.
+                        float advance = inlineFlow
+                                            ? MeasureAdvance(graphics, font, format, slice,
+                                                             (float)g_settings.rowHeight)
+                                            : budget;
 
                         // Trim to the space this segment is actually allowed to
                         // occupy. GDI+ does not clip text to the layout box, so
@@ -4731,7 +4816,6 @@ static void PaintPanel(HWND hwnd) {
                         // gauge that follows it. The fit is measured through the same
                         // helper used for the advance, so a fitted run costs exactly
                         // what it reports.
-                        float budget = advance > kMinLayoutWidth ? advance : kMinLayoutWidth;
                         bool fitted = FitTextToWidth(graphics, font, format, slice,
                                                      sizeof(slice) / sizeof(slice[0]),
                                                      budget, (float)g_settings.rowHeight);
@@ -5163,7 +5247,25 @@ static void UpdateIntro(HWND hwnd) {
 // step; the machine itself already runs, so its transitions are real and logged
 // rather than waiting for the drawing to exist.
 static void UpdateIsland() {
-    if (!g_settings.islandEnabled || !g_islandLockReady) return;
+    if (!g_settings.islandEnabled) {
+        // Turning the island off has to stop its phase too. Nothing drives the machine
+        // while the feature is off, so a phase caught mid-flight stayed POPPING or
+        // COLLAPSING for the rest of the session: IslandPhaseAnimating() stayed true,
+        // ApplyTickRate pinned the tick at 16 ms, and the stale card could not even be
+        // dismissed (the click path is gated on the same switch).
+        if (g_islandView.state != IS_IDLE) {
+            if (g_islandLogs < 8) {
+                Wh_Log(L"EXT island: disabled mid-phase (%s); dropping it",
+                       IslandStateName(g_islandView.state));
+                g_islandLogs++;
+            }
+            g_islandView.state = IS_IDLE;
+            g_islandView.showing = ES_INFO;
+            g_islandCardValid = false;
+        }
+        return;
+    }
+    if (!g_islandLockReady) return;
 
     IslandEvent local[kIslandQueueMax];
     int count = 0;
@@ -5569,14 +5671,29 @@ static void SamplerIteration() {
     // External providers start lazily, and only when a row actually references
     // {ext.*}: the same shape as the GPU backends below, and it is what keeps
     // "off" free of cost.
-    if ((groups & G_EXT) && settings.externalData && !g_extStartAttempted) {
+    const bool extConsumed = (groups & G_EXT) != 0 && settings.externalData;
+    if (extConsumed && !g_extStartAttempted) {
         g_extStartAttempted = true;
         ExtStart(settings);
     }
-    if ((groups & G_EXT) && settings.externalData) {
+    if (extConsumed) {
         // Cheap every-pass call: starts the configured publisher, supervises it with a
         // bounded restart policy, and stops it the moment the command is cleared.
         ExtPublisherTick();
+    } else {
+        // Nothing consumes {ext.*} any more -- the switch is off, or the last row that
+        // referenced it is gone -- so the publisher this mod started has to go with it.
+        // It used to keep running (the tick was simply not called any more), which means
+        // a bridge doing memory reads or network calls kept doing them after the user
+        // turned the feature off, until the mod was unloaded. Stop() is idempotent and
+        // also closes the job object, so it runs on every pass either way; the log line
+        // is emitted only when there really was a process. No assertion can cover this
+        // (it is a real CreateProcess), so the log is the defence -- same as the
+        // nMaxInstances case in AGENTS §6.
+        if (ExtPublisherAlive()) {
+            Wh_Log(L"EXT publisher: nothing consumes {ext.*} any more; stopping it");
+        }
+        ExtPublisherStop();
     }
 
     Values v;
@@ -6666,8 +6783,9 @@ static void ExtStop() {
 static void PushSettings(int updateMs) {
     // No allocation: the HUD thread reads g_settings under the same lock the
     // loader thread writes it with. That keeps this DLL free of any C++ runtime
-    // import (new/delete is what pulls in libc++.dll), so it stays a ~125 KB
-    // self-contained mod instead of a ~590 KB statically-linked one.
+    // import (new/delete is what pulls in libc++.dll), so it stays a ~176 KB
+    // self-contained mod (measured 180736 B on 2026-10-14) instead of a ~590 KB
+    // statically-linked one.
     // The refresh interval comes from the caller's copy rather than from the
     // global, so it cannot disagree with the settings that were just swapped in.
     InterlockedExchange(&g_refreshMs, updateMs);

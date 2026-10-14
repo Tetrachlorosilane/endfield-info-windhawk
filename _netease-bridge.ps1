@@ -1328,7 +1328,9 @@ try {
             }            # 首选来源：CDP store —— 精确到客户端自己的当前行 ✓；它的行时间顺便当位置 ✓
             # （用户实测：内存扫描极不稳定 ✗ → CDP/store 优先 ✓、内存降为次选 ✓。
             #   注意：store 的 lineTimeSec 是**行起始时间** ✓，会按行跳变；要连续毫秒仍需内存/SMTC ✓）
-            $positionMs = $null
+            # ⚠ 下面这行 `$positionMs = $null` **必须留在 DOM 那一段之前**：它后面再出现一次，
+            #   就会把刚取到的真 currentTime 清掉，位置只能退回 store 的行起始时间（= 冻结的
+            #   playingLyricLineNumber 那一行），歌词于是永远停在同一行 ✗（2026-10-14 修）。
             $storeLine = $null
             if ($LyricSource -in 'auto', 'store') {
                 $ss = Get-CdpStoreState
