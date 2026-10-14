@@ -217,7 +217,19 @@ deliberate trade for accuracy, and it only happens when you asked for it.
     - Primary: The Windows primary monitor
 - PanelWidth: 420
   $name: 'Panel width (px)'
-  $description: '200-1600.'
+  $description: '200-1600. The panel width when Panel sizing is Fixed. In Fit content mode it is only the reference width the row measurement is taken at, and the panel is as wide as its widest row needs instead.'
+- PanelSizing: Fixed
+  $name: 'Panel sizing'
+  $description: 'Fixed keeps the panel at Panel width. Fit content makes the panel as wide as its widest row needs, clamped between Panel minimum width and Panel maximum width; longer text is cut off with an ellipsis, so nothing spills out of the panel.'
+  $options:
+    - Fixed: Always Panel width
+    - Fit content: Follow the rows
+- PanelMinWidth: 200
+  $name: 'Panel minimum width (px)'
+  $description: '200-1600. Only used when Panel sizing is Fit content. The panel never narrows below this. If it is larger than Panel maximum width the panel stays at the maximum instead.'
+- PanelMaxWidth: 1600
+  $name: 'Panel maximum width (px)'
+  $description: '200-1600. Only used when Panel sizing is Fit content. The panel never grows past this, and never past the monitor width minus 24 px, whichever is smaller.'
 - RowHeight: 30
   $name: 'Row height (px)'
   $description: '18-80.'
@@ -514,6 +526,31 @@ static const int kStringFormatNoWrap = 0x00001000;
 // run away entirely, which is what made every row after the first disappear. Matches
 // the floor FitTextToWidth is given, so the box and the fit agree on the budget.
 static const float kMinLayoutWidth = 1.0f;
+
+// `Panel sizing` modes. 0 is the default and keeps today's behaviour exactly: the panel is
+// `Panel width` and nothing measures anything, so the cost of the content-driven width in the
+// default configuration is zero. Defined here rather than next to the width resolver because
+// `ModSettings` needs them. See "How wide the panel is" for the resolution rules.
+static const int kPanelSizingFixed = 0;    // the configured `Panel width`, as always
+static const int kPanelSizingFit = 1;      // the widest row's natural width, clamped
+
+// Chrome the panel owes a row on each side, in pixels. It is `kRowTextLeftInset` /
+// `kRowTextRightInset` written once as the panel's own padding: a row's natural content width
+// plus this twice is the width the row needs, and the row text column then divides exactly into
+// the panel (`textWidth == contentWidth`). Deriving it from the insets by hand would leave the
+// last few pixels of a fitted panel unused, which reads as a panel that stopped growing early.
+static const int kPanelSidePadding = 12;
+
+// The narrowest panel that can still exist: a row's own text inset on both sides. It is the
+// guard rail behind the `Panel minimum width` setting's own 200 floor, so there is no
+// configuration -- including an inverted min/max -- that can produce a zero- or negative-width
+// bitmap or a window narrower than its own chrome.
+static const int kPanelMinAbsoluteWidth = 2 * kPanelSidePadding;
+
+// The hard ceiling on any resolved width, mirroring `Panel width`'s own 200..1600 range: the
+// settings are read clamped to it, and the fallback paths clamp to it too, so a width can never
+// grow past what the setting itself can express.
+static const int kMaxPanelWidth = 1600;
 // InterpolationModeHighQualityBicubic. Used for the one-off downscale at load time;
 // the per-frame path never resamples at all.
 static const int kInterpolationHighQualityBicubic = 7;
@@ -2125,7 +2162,14 @@ struct ModSettings {
     // always shown, which is a display *mode*, not a visibility setting.
     bool clickToggle = true;
     int monitorMode = 0;           // 0 topmost, 1 primary
+    // The panel's width. In `Fixed` mode panelWidth *is* the width, exactly as it always was.
+    // In `Fit content` mode it is the width the measurement pass is run at (and the width used
+    // before the first resolution), while the panel's real width is resolved from the rows by
+    // EnsurePanelWidth on the HUD thread -- see "How wide the panel is" above.
     int panelWidth = 420;
+    int panelSizing = kPanelSizingFixed;    // kPanelSizingFixed / kPanelSizingFit
+    int panelMinWidth = 200;                // floor for the resolved width (Fit content only)
+    int panelMaxWidth = 1600;               // cap for the resolved width (Fit content only)
     int rowHeight = 30;
     int cornerRadius = 22;
     int borderThickness = 1;
@@ -2457,6 +2501,15 @@ static void ReadSettings(ModSettings &s) {
     for (int i = 0; i < kMaxRows; i++) CompileRowText(s, s.rows[i], s.rowProgram[i]);
 
     s.panelWidth = ClampInt((int)Wh_GetIntSetting(L"PanelWidth"), 200, 1600);
+    PCWSTR panelSizing = Wh_GetStringSetting(L"PanelSizing");
+    s.panelSizing = (panelSizing && wcscmp(panelSizing, L"Fit content") == 0) ? kPanelSizingFit
+                                                                             : kPanelSizingFixed;
+    Wh_FreeStringSetting(panelSizing);
+    // Both ends clamped into the same absolute range as the fixed width (the setting's own
+    // floor is the panel's chrome floor, kPanelMinAbsoluteWidth). An inverted pair is *defined*
+    // rather than left as an undefined "narrower than its own chrome": see ResolvePanelWidth.
+    s.panelMinWidth = ClampInt((int)Wh_GetIntSetting(L"PanelMinWidth"), 200, 1600);
+    s.panelMaxWidth = ClampInt((int)Wh_GetIntSetting(L"PanelMaxWidth"), 200, 1600);
     s.rowHeight = ClampInt((int)Wh_GetIntSetting(L"RowHeight"), 18, 80);
     s.cornerRadius = ClampInt((int)Wh_GetIntSetting(L"CornerRadius"), 0, 60);
     s.borderThickness = ClampInt((int)Wh_GetIntSetting(L"BorderThickness"), 0, 8);
@@ -3276,6 +3329,16 @@ struct IslandMetrics {
     int bodyChars;
 };
 
+// The card's own metrics, from the card that is actually on screen. One helper, so the width
+// the painter draws the card at and the width the resting geometry reports cannot be derived
+// from two different readings of the same card.
+static IslandMetrics IslandCardMetrics() {
+    IslandMetrics m = {};
+    m.titleChars = (int)wcslen(g_islandCard.title);
+    m.bodyChars = (int)wcslen(g_islandCard.body);
+    return m;
+}
+
 // The card's target width. Pure so the two properties that matter can be asserted
 // (design 12): it is never narrower than the user's configured minimum, and it never
 // grows without bound. The estimate is coarse on purpose -- the painter measures the
@@ -3297,6 +3360,127 @@ static int ComputeIslandCardWidth(const IslandMetrics &m, const ModSettings &cfg
     if (cap < 120) cap = 120;                         // keep it inside the setting's range
     if (width > cap) width = cap;
     return width;
+}
+
+// ---------------------------------------------------------------------------
+// How wide the panel is
+//
+// `Panel width` used to be *the* width: the bitmap, the window rectangle, the hit test and
+// the row text column all read that one number. In `Fit content` mode the width is instead
+// what the rows actually need, so it is **resolved on the HUD side** -- the same publish that
+// fills the row layout plans measures them -- and everything downstream reads the resolved
+// value. Nothing that runs before the rows exist can know the width, which is why the
+// resolver lives next to the measurement and why `ModSettings::panelWidth` is only the
+// *fixed-mode* width and the reference width the measurement pass measures at.
+//
+// Three invariants, all of them asserted in test-layout.cpp:
+//
+//   1. the resolved width is what the DIB, the window rect, the hit test and the row text
+//      column all use -- one owner, so the window and its bitmap cannot disagree;
+//   2. for one state (same settings, same publish generation, same card state) the width is
+//      a constant across frames. A width that varies per frame is the width *animation* this
+//      project has removed four times, and it flickers exactly because a frame can resize the
+//      window without yet having submitted a matching bitmap;
+//   3. the cap also passes the screen clamp, and every degenerate configuration is defined
+//      rather than left to chance (see ResolvePanelWidth).
+// ---------------------------------------------------------------------------
+
+// Which term produced the width. Recorded (not a bare int) because "the cap won" and "the
+// floor won" are the two facts this feature turns on, and both are asserted.
+enum PanelWidthClamp {
+    PWC_NONE = 0,    // the content is the width
+    PWC_MIN = 1,     // the `Panel minimum width` floor won
+    PWC_MAX = 2,     // the configured `Panel maximum width` won
+    PWC_SCREEN = 3,  // the monitor clamp (`screen - 24`) won over the configured maximum
+};
+
+struct PanelWidth {
+    int width = 0;
+    PanelWidthClamp clamp = PWC_NONE;
+};
+
+// The cap, after the screen clamp the island card already uses (design 12: a bound that is the
+// screen rather than an arbitrary number). `screenWidth == 0` means "unknown" -- there is no
+// monitor to ask about yet -- and then the configured maximum stands alone rather than a
+// zero-width screen silently collapsing the cap to the floor.
+static int PanelWidthCap(int configuredMax, int screenWidth) {
+    int cap = configuredMax;
+    if (screenWidth > 0 && screenWidth - 24 < cap) cap = screenWidth - 24;
+    return cap < kPanelMinAbsoluteWidth ? kPanelMinAbsoluteWidth : cap;
+}
+
+// The floor: at least what the panel's own chrome needs, even if the user asked for less.
+// `Panel minimum width` is read clamped to 200 (>= kPanelMinAbsoluteWidth), so this is the
+// invariant restated where the width is actually decided rather than trusted from a distance --
+// and it is also what answers a direct call with a smaller minimum, which is how the clamp
+// assertions reach the floor.
+static int PanelWidthFloor(int configuredMin) {
+    return configuredMin > kPanelMinAbsoluteWidth ? configuredMin : kPanelMinAbsoluteWidth;
+}
+
+// The one place a width is decided. Pure, and total: every input has an answer.
+//
+//   * below the floor            -> the floor wins (`PWC_MIN`)
+//   * above the cap              -> the cap wins (`PWC_MAX`, or `PWC_SCREEN` when the monitor
+//                                   is what capped it)
+//   * between them               -> the content is the width (`PWC_NONE`)
+//
+// The degenerate cases, decided here rather than left undefined:
+//
+//   * **min > max** (even after both are clamped): a clamp cannot be satisfied by both ends,
+//     so **the cap wins** and the panel is a constant `cap`, i.e. the configuration degrades
+//     to fixed-width. That is the reading a user typing a smaller maximum than minimum most
+//     likely wants ("this is as wide as it may ever be"), and it is deterministic;
+//   * **a min above the screen clamp** (e.g. 1600 on a 1280 monitor): the floor is the user's
+//     explicit minimum, so the floor wins and the panel may exceed the screen. The clamp is
+//     there to stop the *content* from growing without bound, not to override a width the
+//     user pinned by hand -- and the text beyond the cap is trimmed, so nothing spills;
+//   * **a maximum below kPanelMinAbsoluteWidth** (only reachable through the screen clamp):
+//     raised to the chrome floor, because a panel narrower than its own padding is not a
+//     panel;
+//   * `contentWidth < 0` is treated as 0.
+static PanelWidth ResolvePanelWidth(int contentWidth, int configuredMin, int configuredMax,
+                                    int screenWidth) {
+    PanelWidth out;
+    if (contentWidth < 0) contentWidth = 0;
+    const int floorWidth = PanelWidthFloor(configuredMin);
+    const int capWidth = PanelWidthCap(configuredMax, screenWidth);
+    if (capWidth < floorWidth) {
+        // Inverted range: the cap wins outright, which is the documented degradation.
+        out.width = capWidth;
+        out.clamp = PWC_MAX;
+        return out;
+    }
+    if (contentWidth < floorWidth) {
+        out.width = floorWidth;
+        out.clamp = PWC_MIN;
+        return out;
+    }
+    if (contentWidth > capWidth) {
+        out.width = capWidth;
+        // Which of the two caps is the one in force: the screen clamp only exists when it is
+        // strictly inside the configured maximum, since both were compared against the content.
+        out.clamp = screenWidth > 0 && screenWidth - 24 < configuredMax ? PWC_SCREEN : PWC_MAX;
+        return out;
+    }
+    out.width = contentWidth;
+    out.clamp = PWC_NONE;
+    return out;
+}
+
+// Does the content decide the width at all? False in Fixed mode, which is the whole "Fixed mode
+// is free" gate: nothing downstream of this asks for a measurement when it returns false.
+static bool PanelWidthIsContentDriven(const ModSettings &settings) {
+    return settings.panelSizing == kPanelSizingFit;
+}
+
+// The width the panel needs for `contentWidth` pixels of content: the content plus the chrome on
+// both sides. Separated from ResolvePanelWidth so the em/px padding and the clamp can be
+// asserted on their own (and so a caller that already has a width to resolve does not have to
+// re-derive it).
+static int PanelWidthForContent(int contentWidth) {
+    if (contentWidth < 0) contentWidth = 0;
+    return contentWidth + 2 * kPanelSidePadding;
 }
 
 // The clickable rectangle while the island is up is the card's own rectangle, derived
@@ -6512,6 +6696,65 @@ static bool RowPlanIsFresh(const RowLayoutPlan &plan, unsigned epoch, int rows, 
            plan.segmentCount == segmentCount;
 }
 
+// Places one *element* of a row -- a gauge, an icon or a gap -- and reports how far it advances
+// the cursor. Returns true for those three and false for a text run, which is the caller's to
+// measure (its advance depends on the font and on whether it had to be trimmed, both of which
+// live in the caller's context).
+//
+// This is shared on purpose, and it is the reason `Fit content` mode can measure a row's natural
+// width without a second copy of the placement arithmetic. The measurement pass and
+// BuildRowPlan walk the same segments through the same function, so "the width the panel was
+// sized for" and "the width the row is actually laid out at" cannot drift apart: a row whose
+// icon got a different gap in one of the two paths would be measured against a width it does
+// not draw in.
+//
+// `inlineFlow` and the parked cursor are passed rather than read, because the parked gauge
+// position is accumulated by the caller's loop (parked gauges are placed from the right edge in
+// their own coordinate space, not in the row's flow), and the natural pass must not move it.
+static bool RowElementAdvance(const ModSettings &settings, int row, const TextSeg &seg,
+                              bool inlineFlow, float *parkX, RowSegmentPlan &entry, float *advance) {
+    if (seg.offset == kRingSegOffset) {
+        entry.isRing = true;
+        const float outer = (float)settings.ringSize;
+        if (inlineFlow || seg.group != kAlignSegFlow) {
+            *advance = outer + 4.0f;
+        } else {
+            entry.x = *parkX;
+            *parkX += outer + 4.0f;
+            *advance = 0.0f;
+        }
+        return true;
+    }
+
+    if (seg.offset == kIconSegOffset) {
+        // An inline icon. The element index the marker carried is the program element that
+        // describes it: the glyph, the ripple override and the path slice.
+        const int element = seg.length;
+        if (element < 0 || element >= settings.rowProgram[row].partCount ||
+            settings.rowProgram[row].parts[element].kind != kPartIcon) {
+            entry.skip = true;
+            *advance = 0.0f;
+            return true;
+        }
+        entry.isIcon = true;
+        *advance = IconDiameterForFontSize(
+                       ElementFontSizePx(settings, row, seg.runFontSize)) +
+                   (float)kIconContentGap;
+        return true;
+    }
+
+    if (seg.offset == kGapSegOffset) {
+        // A gap: empty space in the row's flow. Its width arrived in the marker's four digits and
+        // BuildRowLayout read them back into `seg.length` (hundredths of a pixel); a zero gap is
+        // a zero advance rather than a negative one.
+        entry.isGap = true;
+        *advance = seg.length > 0 ? (float)seg.length / 100.0f : 0.0f;
+        return true;
+    }
+
+    return false;
+}
+
 // Fills one row's plan. This is the code the frame used to run: choose each run's family from
 // the run itself, fit it to its own budget, remember where it goes -- and now also place the
 // icon elements, which occupy a box of their own and push what follows them along.
@@ -6580,67 +6823,41 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
             regionCursor = kRowTextLeftInset;
         }
 
-        if (seg.offset == kRingSegOffset) {
-            entry.isRing = true;
-            const float outer = (float)g_settings.ringSize;
-            if (inlineFlow || seg.group != kAlignSegFlow) {
-                entry.x = regionCursor + outer / 2.0f;
-                entry.advance = outer + 4.0f;
-                regionCursor = entry.x + outer / 2.0f + 4.0f;
-            } else {
-                entry.x = parkX;
-                parkX += outer + 4.0f;
+        // An element -- gauge, icon or gap -- is placed by the function the natural-width
+        // measurement also walks, so the two paths cannot drift apart. It hands back the advance
+        // and (for an inline gauge) leaves `entry.x` itself, because an inline gauge advances
+        // from its centre in two halves.
+        float elementAdvance = 0.0f;
+        if (RowElementAdvance(g_settings, row, seg, inlineFlow, &parkX, entry, &elementAdvance)) {
+            if (entry.isRing && (inlineFlow || seg.group != kAlignSegFlow)) {
+                entry.x = regionCursor + (float)g_settings.ringSize / 2.0f;
+            } else if (entry.isIcon && !entry.skip) {
+                const RowPart &icon = program.parts[seg.length];
+                // The element's own glyph, or Memory when it is an image: the disc must never be
+                // left empty (see kIconImageFallbackGlyph). The painter prefers the image and
+                // only falls back to this.
+                entry.glyph = icon.glyphFlags & kIconGlyphMask;
+                if (entry.glyph == 0) entry.glyph = kIconImageFallbackGlyph;
+                entry.fontSize = ElementFontSizePx(g_settings, row, seg.runFontSize);
+                entry.diameter = IconDiameterForFontSize(entry.fontSize);
+                entry.x = regionCursor;
+                entry.ripple =
+                    IconElementRipples(icon.glyphFlags & (kIconRippleOn | kIconRippleOff),
+                                       s == firstIconSegment);
+                if (icon.length > 0) {
+                    // The path is a slice of the row's own text, with the quotes and padding the
+                    // user wrote; CopyUserPath is the same trimmer the settings path always used.
+                    WCHAR rawPath[MAX_PATH + 2];
+                    const int pathLen = MinInt(icon.length, MAX_PATH + 1);
+                    wcsncpy(rawPath, g_settings.rows[row] + icon.offset, pathLen);
+                    rawPath[pathLen] = L'\0';
+                    CopyUserPath(entry.path, MAX_PATH, rawPath);
+                }
+            } else if (entry.isGap) {
+                entry.x = regionCursor;
             }
-            continue;
-        }
-
-        if (seg.offset == kIconSegOffset) {
-            // An inline icon. The element index the marker carried is the program element
-            // that describes it: the glyph, the ripple override and the path slice.
-            const int element = seg.length;
-            if (element < 0 || element >= program.partCount ||
-                program.parts[element].kind != kPartIcon) {
-                entry.skip = true;
-                continue;
-            }
-            const RowPart &icon = program.parts[element];
-            entry.isIcon = true;
-            // The element's own glyph, or Memory when it is an image: the disc must never be
-            // left empty (see kIconImageFallbackGlyph). The painter prefers the image and only
-            // falls back to this.
-            entry.glyph = icon.glyphFlags & kIconGlyphMask;
-            if (entry.glyph == 0) entry.glyph = kIconImageFallbackGlyph;
-            entry.fontSize = ElementFontSizePx(g_settings, row, seg.runFontSize);
-            entry.diameter = IconDiameterForFontSize(entry.fontSize);
-            entry.x = regionCursor;
-            entry.ripple = IconElementRipples(icon.glyphFlags & (kIconRippleOn | kIconRippleOff),
-                                              s == firstIconSegment);
-            if (icon.length > 0) {
-                // The path is a slice of the row's own text, with the quotes and padding the
-                // user wrote; CopyUserPath is the same trimmer the settings path always used.
-                WCHAR rawPath[MAX_PATH + 2];
-                const int pathLen = MinInt(icon.length, MAX_PATH + 1);
-                wcsncpy(rawPath, g_settings.rows[row] + icon.offset, pathLen);
-                rawPath[pathLen] = L'\0';
-                CopyUserPath(entry.path, MAX_PATH, rawPath);
-            }
-            // The element occupies its own box, and the glyphs that follow it keep their
-            // distance from the disc.
-            entry.advance = entry.diameter + (float)kIconContentGap;
-            regionCursor += entry.advance;
-            continue;
-        }
-
-        if (seg.offset == kGapSegOffset) {
-            // A gap: empty space in the row's flow, with no content and nothing to draw. Its
-            // width arrived in the marker's four digits and BuildRowLayout read them back into
-            // `seg.length` -- hundredths of a pixel -- so no compiled element is consulted here
-            // and the clamp (ClampGapPx) happened at instantiation, once. A zero gap is a zero
-            // advance rather than a negative one.
-            entry.isGap = true;
-            entry.x = regionCursor;
-            entry.advance = seg.length > 0 ? (float)seg.length / 100.0f : 0.0f;
-            regionCursor += entry.advance;
+            entry.advance = elementAdvance;
+            regionCursor += elementAdvance;
             continue;
         }
 
@@ -6885,6 +7102,273 @@ static const RowLayoutPlan *EnsureRowPlan(GpGraphics *graphics, GpFont *rowMainF
     return &plan;
 }
 
+// ---------------------------------------------------------------------------
+// Resolving the panel's width from the rows (Fit content mode)
+//
+// This is a *second* pass over the same segments, run before the plans are built at the width
+// it produces. It cannot be folded into BuildRowPlan: that one fits every run against a budget
+// derived from the width, so its output is a property of the width rather than an input to it.
+// What the natural pass measures is what each run *would* take untrimmed -- the same
+// RowElementAdvance the plan builder calls for elements, plus one untrimmed MeasureAdvance per
+// text run -- and the largest such width is the width the panel needs.
+//
+// The cost is paid once per state change (see EnsurePanelWidth), and the measurement goes
+// through MeasureAdvance like everything else, so `[perf]` `meas=` shows it and a frame that
+// reuses its plan still measures nothing.
+// ---------------------------------------------------------------------------
+
+struct RowTextMeasure {
+    GpGraphics *graphics;
+    GpStringFormat *format;
+};
+
+// How far the cursor travels over one row segment when nothing is trimmed. Beside
+// RowElementAdvance, and built on it, so the two agree about elements by construction: an
+// element's span is exactly the advance the plan loop adds for it. A text run's span is the
+// untrimmed measurement plus the same `ringsAfter` gutter the plan subtracts from a run's
+// budget (`FlowTextLimit`), which is what makes "the run plus the gauges after it" mean the same
+// thing on both sides.
+static float NaturalSegmentSpan(const ModSettings &settings, int row, int segment,
+                                const RowTextMeasure &measure) {
+    const TextSeg &seg = g_rowState.segments[row][segment];
+    if (seg.offset == kRingSegOffset || seg.offset == kIconSegOffset || seg.offset == kGapSegOffset) {
+        float elementAdvance = 0.0f;
+        RowSegmentPlan scratch;
+        float parked = 0.0f;   // an element contributes its own advance, never a parked gauge
+        RowElementAdvance(settings, row, seg, true, &parked, scratch, &elementAdvance);
+        return elementAdvance;
+    }
+    if (seg.length <= 0) return 0.0f;
+    const int fontSize = ElementFontSizePx(settings, row, seg.runFontSize);
+    GpFont *runFont = AcquireRowFont(measure.graphics, settings.fontFamily, fontSize);
+    if (!runFont) return 0.0f;
+    // The untrimmed string. `exactLength` is what keeps the measurement inside the run: the
+    // row's text buffer holds every run of the row, one after another.
+    const int length = MinInt(seg.length, 640);
+    const float runWidth = MeasureAdvance(measure.graphics, runFont, measure.format,
+                                          g_rowState.text[row] + seg.offset,
+                                          (float)RowHeightPx(settings, row), length);
+    int ringsAfter = 0;
+    for (int k = segment + 1; k < g_rowState.segmentCount[row]; k++) {
+        if (g_rowState.segments[row][k].offset == kRingSegOffset) ringsAfter++;
+    }
+    return runWidth + (float)ringsAfter * ((float)settings.ringSize + 4.0f);
+}
+
+// The natural (untrimmed) width of the runs from `fromSegment` on, in the row's own flow
+// coordinates: how far the cursor would travel if nothing had to be trimmed, with every run
+// measured at its own font size.
+//
+// Elements go through RowElementAdvance with `inlineFlow` true, i.e. every gauge is treated as
+// flowing. That is deliberate: a parked row's gauges sit at the right edge in a coordinate space
+// of their own, and "how wide is this row's content" is a question about the text column, not
+// about where the gauges are parked. Asking the parked question here would need a width to
+// compute an offset from - the width this function exists to produce.
+static float NaturalFlowingAdvance(const ModSettings &settings, int row, int fromSegment,
+                                   const RowTextMeasure &measure) {
+    float width = 0.0f;
+    for (int s = fromSegment; s < g_rowState.segmentCount[row]; s++) {
+        width += NaturalSegmentSpan(settings, row, s, measure);
+    }
+    return width;
+}
+
+// One row's natural content width: what the row would need if it were drawn with nothing
+// trimmed, from the row's first element to the last, plus the chrome the panel owes a row.
+static int MeasureRowNaturalWidth(const ModSettings &settings, int row,
+                                  const RowTextMeasure &measure) {
+    return (int)(NaturalFlowingAdvance(settings, row, 0, measure) + 0.5f);
+}
+
+// What the panel would have to be wide to hold every row's content untrimmed. Rows are one
+// column, so the widest row decides; a row wider than the cap is trimmed by the plan builder,
+// which is why the cap is a *bound* and not a promise about the text.
+static int MeasurePanelContentWidth(const ModSettings &settings, int rows,
+                                    const RowTextMeasure &measure) {
+    int widest = 0;
+    if (rows > kMaxRows) rows = kMaxRows;
+    for (int r = 0; r < rows; r++) {
+        const int natural = MeasureRowNaturalWidth(settings, r, measure);
+        if (natural > widest) widest = natural;
+    }
+    return widest;
+}
+
+// The last width every part of the frame agrees on: the bitmap is created at it, the window is
+// placed at it (`PlaceWindow` writes `g_restWidth`, which the hit test reads back), and the row
+// plans are fitted at it. `PaintPanel` resolves it from the rows *before* any of those read it.
+//
+// `ComputeGeometry` only **seeds** it, from the configured width, and only while it is still
+// unset (the first frame, before anything has been resolved). It must not re-seed a later call:
+// `ComputeGeometry` also runs on every expand/collapse and settings change, so a seed that
+// overwrote whatever had been resolved would hand a mid-animation frame the configured width
+// while the window and the bitmap were built from the resolved one -- the "window resized,
+// bitmap not" mismatch this whole area is about. The seed is a fallback for a width that has
+// never been resolved; the resolved width then outlives it.
+static int g_panelWidth = 0;
+// How many times the width was actually resolved (as opposed to answered from the cache). It is
+// the width's half of `g_measureCalls`: "the width is constant for a state" means this number
+// does not move while the state does, and the regression test asserts exactly that. Only the HUD
+// thread touches it.
+static DWORD g_panelWidthResolves = 0;
+// The width the last frame's bitmap was created at. Only the panel path writes it, and it exists
+// so the regression test can assert the one thing that cannot be seen from a single number: that
+// the bitmap and the window rectangle were built from the *same* resolved width. A frame whose
+// window was resized but whose bitmap was not is the flicker this whole area is about.
+static int g_lastBitmapWidth = 0;
+
+// The panel's width, cached against everything it is derived from: the settings (epoch), the
+// published rows, the card, and the monitor. Recomputed only when one of those changes -- a
+// width that is re-derived every frame is the width *animation* this project removed four
+// times, and it flickers because a frame can resize the window without having submitted a
+// matching bitmap yet.
+//
+// In Fixed mode this returns the configured width without measuring anything at all: that is
+// the "Fixed mode is free" gate, and it is asserted by the measurement counter.
+static PanelWidth EnsurePanelWidth(HWND hwnd, GpGraphics *graphics, GpStringFormat *format,
+                                   bool cardUp) {
+    int screenWidth = 0;
+    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info = {};
+    info.cbSize = sizeof(info);
+    if (monitor && GetMonitorInfoW(monitor, &info)) {
+        screenWidth = (int)(info.rcMonitor.right - info.rcMonitor.left);
+    }
+
+    // Static, so the cache outlives a frame; written and read only on the HUD thread.
+    static bool resolved = false;
+    static unsigned resolvedEpoch = 0;
+    static int resolvedRows = -1;
+    static bool resolvedCardUp = false;
+    static int resolvedScreenWidth = -1;
+    static PanelWidth cached;
+
+    // The card's own width rule wins outright while a card is up (the island is untouched by
+    // this feature): its width is resolved by ComputeIslandRect, which the hit test's rectangles
+    // are built from as well, so this only reports it as the resting width.
+    if (cardUp) {
+        cached.width = ComputeIslandCardWidth(IslandCardMetrics(), g_settings, screenWidth);
+        cached.clamp = PWC_NONE;
+        resolvedEpoch = g_layoutEpoch;
+        resolvedRows = g_publishedRows;
+        resolvedCardUp = true;
+        resolvedScreenWidth = screenWidth;
+        return cached;
+    }
+
+    const bool contentDriven = PanelWidthIsContentDriven(g_settings);
+    if (resolved && resolvedEpoch == g_layoutEpoch && resolvedRows == g_publishedRows &&
+        resolvedCardUp == cardUp && resolvedScreenWidth == screenWidth) {
+        return cached;
+    }
+    g_panelWidthResolves++;
+
+    PanelWidth out;
+    if (!contentDriven || !graphics) {
+        // Fixed: `Panel width` *is* the width, and no natural measurement runs in this mode.
+        // The second case is the same fallback for the one frame before any graphics exist:
+        // the configured width keeps that frame drawable, and the next one resolves for real.
+        out.width = ClampInt(g_settings.panelWidth, kPanelMinAbsoluteWidth, kMaxPanelWidth);
+        out.clamp = PWC_NONE;
+    } else {
+        RowTextMeasure measure = {graphics, format};
+        const int content = MeasurePanelContentWidth(g_settings, g_publishedRows, measure);
+        out = ResolvePanelWidth(PanelWidthForContent(content), g_settings.panelMinWidth,
+                                g_settings.panelMaxWidth, screenWidth);
+        // Logged where the width is resolved, not per frame (a state change is what resolves it),
+        // and the numbers are the discriminating ones: the content width it came from, what the
+        // clamp was, and which term won. `clamp` is 0 none / 1 floor / 2 maximum / 3 screen.
+        Wh_Log(L"Panel width: %s content=%dpx -> %dpx clamp=%d (configured %d, screen %d)",
+               contentDriven ? L"fit" : L"fixed", content, out.width, (int)out.clamp,
+               g_settings.panelWidth, screenWidth);
+    }
+    cached = out;
+    resolved = true;
+    resolvedEpoch = g_layoutEpoch;
+    resolvedRows = g_publishedRows;
+    resolvedCardUp = cardUp;
+    resolvedScreenWidth = screenWidth;
+    return cached;
+}
+
+// A Graphics to measure text with, when the measurement has to happen *before* the frame's own
+// bitmap exists -- which is the case for the panel width, because the width decides the bitmap.
+//
+// Created once and kept: this is the one thing in the width path that would otherwise be a
+// per-frame allocation, and a `CreateDIBSection` + a GDI+ bitmap every frame is exactly the kind
+// of cost this project refuses to pay. Nothing is ever drawn into it; a Graphics is only needed
+// because MeasureString hangs off one. Null while GDI+ is not started yet, and the caller then
+// falls back to the configured width for that frame.
+static GpGraphics *MeasureGraphics() {
+    static HBITMAP dib = nullptr;
+    static void *bits = nullptr;
+    static GpBitmap *bitmap = nullptr;
+    static GpGraphics *graphics = nullptr;
+    static bool tried = false;
+    if (graphics) return graphics;
+    if (tried) return nullptr;      // GDI+ was not up; one attempt per process is enough
+    tried = true;
+
+    static const int kScratch = 16;
+    BITMAPINFO info = {};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = kScratch;
+    info.bmiHeader.biHeight = -kScratch;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    dib = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!dib || !bits) {
+        if (dib) {
+            DeleteObject(dib);
+            dib = nullptr;
+        }
+        return nullptr;
+    }
+    if (g_gdiplus.CreateBitmapFromScan0(kScratch, kScratch, kScratch * 4, kPixelFormat32bppPARGB,
+                                        (BYTE *)bits, &bitmap) != 0 ||
+        !bitmap) {
+        DeleteObject(dib);
+        dib = nullptr;
+        bitmap = nullptr;
+        return nullptr;
+    }
+    if (g_gdiplus.GetImageGraphicsContext((GpImage *)bitmap, &graphics) != 0 || !graphics) {
+        g_gdiplus.DisposeImage((GpImage *)bitmap);
+        DeleteObject(dib);
+        dib = nullptr;
+        bitmap = nullptr;
+        graphics = nullptr;
+        return nullptr;
+    }
+    g_gdiplus.SetTextRenderingHint(graphics, kTextHintAntiAliasGridFit);
+    return graphics;
+}
+
+// The width one frame draws with -- one number, one owner.
+//
+// The bitmap is created at this width, the window is placed at it (`PlaceWindow` writes
+// `g_restWidth`, which the hit test then reads back off the window rectangle), and in `Fit
+// content` mode it is the width the rows were measured for. It is a function rather than an
+// assignment chain because "the window and the bitmap agree" is exactly the property this area
+// keeps breaking, and a function is the only shape a regression test can call directly: the
+// assertion is on the number the painter hands to `CreateDIBSection` *and* to `SetWindowPos`,
+// not on a copy of the expression (AGENTS 7.8).
+//
+// While a card is up the card's own width rule wins outright: the island is untouched by the
+// content-driven width, and its width comes from `ComputeIslandRect` -- the same rectangle
+// function the hit test's regions are built from -- so the card cannot be painted at one size
+// and accepted at another. `EnsurePanelWidth` asks for the same width, which is what keeps the
+// resting width and the painted card equal.
+static int FrameWidthFor(int resolvedPanelWidth, bool cardUp, const ModSettings &settings,
+                         const IslandMetrics &cardMetrics, int screenWidth) {
+    if (cardUp) {
+        const PanelRect monitorRect = {0, 0, screenWidth, 0};
+        return ComputeIslandRect(cardMetrics, settings, monitorRect, 0, 0).w;
+    }
+    return resolvedPanelWidth;
+}
+
 static void PaintPanel(HWND hwnd) {
     // Card mode: a static width, applied here and now. The width used to animate, and
     // that is what flickered: resizing from the timer left one frame in which the window
@@ -6894,32 +7378,52 @@ static void PaintPanel(HWND hwnd) {
     // height -- the fade below is what carries the transition.
     const bool cardUp = g_settings.islandEnabled && g_islandCardValid &&
                         g_islandView.state != IS_IDLE;
-    int width = g_settings.panelWidth;
-    if (cardUp) {
-        IslandMetrics metrics = {};
-        metrics.titleChars = (int)wcslen(g_islandCard.title);
-        metrics.bodyChars = (int)wcslen(g_islandCard.body);
-        int monitorWidth = 0;
-        HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-        MONITORINFO info = {};
-        info.cbSize = sizeof(info);
-        if (monitor && GetMonitorInfoW(monitor, &info)) {
-            monitorWidth = (int)(info.rcMonitor.right - info.rcMonitor.left);
+
+    // -----------------------------------------------------------------------
+    // Every width in this frame is resolved *before* the bitmap exists.
+    //
+    // In `Fit content` mode the panel is as wide as its widest row needs, so the width is not
+    // known from the settings at all -- and it cannot be resolved after the DIB without either
+    // resizing the window behind the bitmap's back (the flicker this area has produced four
+    // times) or drawing at one width and submitting another. So the resolution and the natural
+    // measurement run here, through the scratch bitmap's Graphics, and the real DIB is then
+    // created at the resolved width. Fixed mode does not measure anything and resolves to
+    // `Panel width`, exactly as before.
+    // -----------------------------------------------------------------------
+    int width = g_panelWidth > 0 ? g_panelWidth : g_settings.panelWidth;
+    {
+        GpGraphics *scratch = MeasureGraphics();
+        GpStringFormat *measureFormat = scratch ? CreateRowStringFormat() : nullptr;
+        if (measureFormat) {
+            const PanelWidth resolved = EnsurePanelWidth(hwnd, scratch, measureFormat, cardUp);
+            g_panelWidth = resolved.width;
+            // The frame's width, from the product function the regression test calls too. While a
+            // card is up that is the card's own width rule; otherwise it is the resolved panel
+            // width -- which is what `Panel width` stops being in `Fit content` mode. The monitor
+            // is only asked about when a card actually needs it.
+            int monitorWidth = 0;
+            if (cardUp) {
+                HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                MONITORINFO info = {};
+                info.cbSize = sizeof(info);
+                if (monitor && GetMonitorInfoW(monitor, &info)) {
+                    monitorWidth = (int)(info.rcMonitor.right - info.rcMonitor.left);
+                }
+            }
+            width = FrameWidthFor(g_panelWidth, cardUp, g_settings, IslandCardMetrics(),
+                                  monitorWidth);
+            g_gdiplus.DeleteStringFormat(measureFormat);
         }
-        // The width comes from the shared geometry function -- the same one the hit test's
-        // rectangles are built from -- so the card cannot be drawn at one size and
-        // accepted at another. Only the width transfers into bitmap space: the bitmap the
-        // painter is about to fill *is* the card, so its local origin is (0,0) by
-        // definition, while the function's x centres it inside the monitor.
-        const PanelRect monitorRect = {0, 0, monitorWidth, 0};
-        width = ComputeIslandRect(metrics, g_settings, monitorRect, 0, 0).w;
     }
     // Resize before the bitmap exists, never after: inside one frame the window and the
-    // layered blit are then always the same size, so no band can be left behind.
+    // layered blit are then always the same size, so no band can be left behind. The card
+    // leaving is the same statement in the other direction: `width` has already gone back to
+    // the panel's own resolved width, so the window follows it there before the frame is drawn.
     if (width != g_restWidth) {
         g_restWidth = width;
         PlaceWindow(hwnd);
     }
+    g_lastBitmapWidth = width;
     // The card's own fade, driven by its phase: in while popping, out while collapsing.
     // Without it the text sat at full opacity and then vanished when the machine reached
     // Idle, which reads as a flash instead of a transition.
@@ -7409,6 +7913,15 @@ static void ComputeGeometry() {
     // than a multiplication. The floor is still the collapsed tab: the panel never disappears.
     g_panelHeight = PanelRowsHeight(g_settings, g_visibleRows);
     g_displayHeight = g_expanded ? g_panelHeight : kTabHeight;
+    // The width is seeded here -- and *only* here -- because this is the first thing to run
+    // before a frame, and `PlaceWindow` can be reached before `PaintPanel` while a card is up.
+    // It is a seed, not an assignment: once `PaintPanel` has resolved the width from the rows
+    // (Fit content), a later `ComputeGeometry` (an expand, a collapse, a settings change) must
+    // leave it alone. Re-seeding it here is exactly how a frame ends up with the height of one
+    // state and the width of another -- see the comment on `g_panelWidth`.
+    if (g_panelWidth <= 0) {
+        g_panelWidth = ClampInt(g_settings.panelWidth, kPanelMinAbsoluteWidth, kMaxPanelWidth);
+    }
 
     RefreshMonitors();
     g_anchorIndex = g_settings.monitorMode == 1 ? PrimaryMonitorIndex() : TopmostMonitorIndex();
@@ -7425,9 +7938,11 @@ static bool ForceTopmost(HWND hwnd);
 static void PlaceWindow(HWND hwnd) {
     if (g_anchorIndex < 0 || g_anchorIndex >= g_monitorCount) return;
     const RECT &rect = g_monitors[g_anchorIndex].rect;
-    // A zero here would mean a zero-width window, so the resting width falls back to
-    // the configured panel width until UpdateIsland sets a card's target.
-    if (g_restWidth <= 0) g_restWidth = g_settings.panelWidth;
+    // A zero here would mean a zero-width window, so the resting width falls back to the
+    // resolved panel width (which `ComputeGeometry` seeds) until the painter sets a card's
+    // target. `Panel width` is *not* the fallback any more: in Fit content mode the configured
+    // width is not the width the panel is drawn at.
+    if (g_restWidth <= 0) g_restWidth = g_panelWidth > 0 ? g_panelWidth : g_settings.panelWidth;
     int x = rect.left + (rect.right - rect.left - g_restWidth) / 2;
     int y = rect.top + kPanelTopOffset;
 
@@ -9474,10 +9989,17 @@ BOOL WhTool_ModInit() {
         return FALSE;
     }
 
+    // `panel=` is the *configured* width, which is what this one line is for (it is logged
+    // before the HUD thread has resolved anything). In `Fit content` mode the width that ends
+    // up on screen comes from the rows, so it is reported separately as soon as it is known.
     Wh_Log(L"Started: rows=%d clickAction=%s monitor=%d update=%dms panel=%dx%d rings=%d/%d",
            g_settings.rowCount, g_settings.clickToggle ? L"toggle" : L"proximity",
            g_settings.monitorMode, g_settings.updateMs, g_settings.panelWidth,
            g_panelHeight, g_settings.ringSize, g_settings.ringThickness);
+    if (PanelWidthIsContentDriven(g_settings)) {
+        Wh_Log(L"Panel width: Fit content, min=%d max=%d (measured at the %d px reference)",
+               g_settings.panelMinWidth, g_settings.panelMaxWidth, g_settings.panelWidth);
+    }
     return TRUE;
 }
 

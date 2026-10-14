@@ -247,7 +247,7 @@
 | 修复 | 断言（把修复改回旧写法后**实测变红**） |
 | :-- | :-- |
 | **内联环行的截断预算**：抽出 `ComputeInlineTextLimit`，内联段按"整行 − 光标 − 后面的环"给预算（此前用自身实测 advance，恒不触发截断 → 用 `[[ring:…]]` 的行永不截断、环被挤出面板） | `an inline run with no gauge after it may use the whole row`、`one gauge after the run is reserved out of its budget`、`the run plus the gauges after it exactly fill the row`、`a run already past the right inset gets nothing, never a negative budget` |
-| **收回时间轴**：关键帧 cue 改为 `1.0`（此前把 `kCollapseDurationRatio` 当 cue → 收缩半程即止、后半个时间轴以 16 ms 空转；可见收回只有 `IntroMs/4`） | `the shrink still has work left at the midpoint`、`and it keeps shrinking past the midpoint without passing the tab` |
+| **收回时间轴**：关键帧 cue 改为 `1.0`（此前把 `kCollapseDurationRatio` 当 cue → 收缩半程即止、后半个时间轴以 16 ms 空转；可见收回只有 `IntroMs/4`）**(2026-10-15 补：当时 ratio 是 1/2，所以 1/4 是缺陷；现在 ratio 本身是 1/4，`IntroMs/4` 是设计值——这一行已经是历史记录)** | `the shrink still has work left at the midpoint`、`and it keeps shrinking past the midpoint without passing the tab` |
 | **GPU 有效性标志**：`gpuFanValid` / `gpuPowerValid` / `vramUsedValid` / `vramTotalValid`（此前 PDH 回退机上 `{gpu.fan}`=0、`{gpu.power}`=0、`{gpu.vram.total}`=0.0） | 5 条 `{gpu.fan}` / `{gpu.power}` / `{gpu.vram.*}` → `--` |
 | **`{ext.*}` 行内长度**：暂存缓冲改为 `kExtMaxValueChars + 1`（此前 128 → 静默截到 127 字符，而设置允许 512） | `a long pushed value reaches the row whole, not cut at 127`（399 字符整段到达） |
 | **关掉岛丢相位**：`UpdateIsland` 在 `islandEnabled == false` 时把 `POPPING`/`COLLAPSING` 复位为 `IS_IDLE`（此前状态冻结 → tick 永久 16 ms、卡片也关不掉） | `turning the island off drops a phase that was in flight`、`and the tick falls back off the frame rate with it` |
@@ -299,8 +299,12 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 断言数 380 → **434**（第五批，+54：列表改遍历后按注册项计，加上新增的行级几何与下限检查）→ **460**（第六批，+26：灵动岛三条）→ **478**（第七批，+18：剩余五项）。
 **测试装置现在仍有的信任边界**（诚实记录）：`PaintPanel` 的**调用点**依旧不可断言（需要真窗口），
 所以内联预算只测到 `ComputeInlineTextLimit`／`LayoutWidthFloor` 本身，绘制分支里怎么用它们靠读代码；
-`StartIntro` 的关键帧接线没被驱动（收回时长由测试自己乘 `kCollapseDurationRatio` 算出，这是 §7.6 的
-"断言关系"，但也意味着接线错误测不到）；GDI+ 段的像素阈值全是关系式，换字体会让具体数值变但关系不变。
+`StartIntro` 的关键帧接线**已不再是未驱动**（2026-10-15 更正）：`fdf5806` 起宿主直接调
+`StartIntro(nullptr, from, to)` 两个方向各一次，收回时长由产品自己按 `kCollapseDurationRatio`
+算出，测试不再自己乘一遍（断言见 `StartIntro: arriving … -> leaving …` 那一段与
+"the shrink still has work left at the midpoint"）。**仍然**不可断言的是 `SetExpanded` /
+`PaintPanel` 的**调用点**与调用顺序（需要真窗口）；GDI+ 段的像素阈值全是关系式，
+换字体会让具体数值变但关系不变。
 
 **第六批已修（2026-10-14；灵动岛三条，五处负对照共红 15 条）**：
 
@@ -355,7 +359,8 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 | 顺手修正 README 两处与实测不符：`-LyricSource store` 原写"精确到客户端自己的当前行"（实测**冻结**）；参数表里的位置顺序与下一行自相矛盾 | README 的发布器一节 |
 
 **其余已确认、尚未修**：**本会话复查列出的项目已全部处理完**。剩下的都是真机项（见 §12.1）
-与 AGENTS §7.13 末尾记的测试装置信任边界（`PaintPanel` 调用点、`StartIntro` 接线）。
+与 AGENTS §7.13 末尾记的测试装置信任边界（`PaintPanel` 的**调用点**；`StartIntro` 接线自
+`fdf5806` 起已由宿主驱动两个方向，2026-10-15 更正——见本文件前面的更正条）。
 
 **观察记录（不是缺陷，留给真机）**：`FitTextToWidth` 每次多量一次省略号宽度；这发生在
 "某段超预算"的帧里，与旁边的二分测量同量级。若真机上发现滚动文本的帧时间有变化，
@@ -444,7 +449,7 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 | 读用 `INFINITE` 等完成事件，完成事件一旦丢失线程就永久停住 | 客户端**连上了**（`ExtLogClient` 有），之后日志**完全静默**——连 `client done` 都没有，行永远 `--` | 等待加 500 ms 上界 + `PeekNamedPipe` 判定；缓冲有数据却没完成就重投。判别日志：`EXT read#1 result=… got=…`、`read completion never arrived with N bytes queued`、`no frame for 2s and the pipe buffer is empty` |
 | 收起时先把窗口缩到标签高度、再长回来画（`SetExpanded` 里那次 `PlaceWindow`） | 收起瞬间闪出一条"切片"，极短、难复现；鼠标离开检测区延迟后触发 | **无法断言**（这是分层窗口的帧内顺序，不是数值）。判据是流程：窗口尺寸必须与**同一帧提交的位图**一致；收起方向由绘制侧逐帧跟随内容（`if (expanded) PlaceWindow(hwnd);`） |
 | 内联环行的截断预算写成"实测 advance" | 用了 `[[ring:…]]` 的行**永不截断**：文字切在位图外缘（没有 `…`），它自己的环被挤出面板 | `ComputeInlineTextLimit` 的关系断言（run + 后面的环 = 整行） |
-| 收回关键帧把**时长比例**当 **cue** 用 | 收缩在半程就完成、后半个时间轴是死区：可见收回只有 `IntroMs/4`（README 写"一半"），且那半程仍以 16 ms 重绘空转 | `the shrink still has work left at the midpoint` |
+| 收回关键帧把**时长比例**当 **cue** 用 | 收缩在半程就完成、后半个时间轴是死区：可见收回只有 `IntroMs/4`（README 写"一半"），且那半程仍以 16 ms 重绘空转。**(2026-10-15 补：当时 `kCollapseDurationRatio` 是 1/2，所以 `IntroMs/4` 是缺陷；该常量现在是 1/4，`IntroMs/4` 就是设计值——这一行是历史记录，别按它去"修"收回时长)** | `the shrink still has work left at the midpoint` |
 | GPU 的风扇/功耗/显存总量没有有效性标志 | 非 NVIDIA（PDH 回退）机器上 `{gpu.fan}`=0、`{gpu.power}`=0、`{gpu.vram.total}`=0.0——看着像真读数 | `{gpu.fan}` → `--` 等 5 条 unavailable 断言 |
 | 行内展开用 128 字符暂存缓冲 | `{ext.*}` 的值被静默截到 127 字符（设置允许 512，且不带 `…`） | 399 字符的值整段到达行里 |
 | 关掉岛不丢相位 | `POPPING`/`COLLAPSING` 冻结 → `IslandPhaseAnimating` 恒真 → tick 永久钉在 16 ms，卡片也关不掉 | `turning the island off drops a phase that was in flight` |
@@ -525,3 +530,24 @@ PowerShell 只用来读、测量、跑门禁。判据：任何把源文件当管
 **同一个数**，并让测试通过一个 helper（`GapMarkerHundredths`）**读回**标记，
 而不是在断言里手写数字串。判据：凡是"把数值编码进定长标记"的地方，
 编码能表达的**范围**与调用方钳位的范围必须是同一个常量。
+
+---
+
+## 15. 内容自适应面板宽度（2026-10-15）
+
+新增设置项 `Panel sizing`（`Fixed` 默认 / `Fit content`）、`Panel minimum width`（200）、
+`Panel maximum width`（1600）；`Panel width` 保留原义（Fixed 的宽度，Fit content 下的测量基准）。
+设计与全部规则、退化情形、断言清单见 [panel-width-design.md](panel-width-design.md)。
+
+**这一次新增的东西里没有新的"屏幕缺陷"**（功能是新加的，不是修旧 bug），但**留下两条方法论记录**：
+
+| 内容 | 依据 / 断言 |
+| :-- | :-- |
+| **恒真断言又出现了一次（第五处）**：帧内宽度断言在 `ComputeGeometry()` 之后把解析宽度**重新写回** `g_panelWidth`（本意是"恢复"），于是无论产品做什么，后面比的都是测试自己刚写进去的值——负对照（让绘制路径读配置宽度）**实测照样全绿**。修法是两半：产品侧 `ComputeGeometry` 只在**未设置**时播种（`if (g_panelWidth <= 0)`，它会在展开/收起/改设置时被调到）；测试侧按产品的顺序走一遍、中间不补写 | `ComputeGeometry leaves a resolved width alone (it only seeds an unset one)`；负对照实测 3 条红（另两条：`the window and the bitmap agree, and the width is the resolved one`、`which is not the configured Panel width (900)`）。与 §7.13 / 第七批那条"看着在守，其实没有"是同一类 |
+| **"每帧重算"与"逐帧变化"是两件事**：去掉 `EnsurePanelWidth` 的缓存（每帧重算）只红一条（`and the next two frames resolve it zero more times`）——宽度**仍然是同一个数**，因为它本来就是那个状态的纯函数。要红到 `so all three frames of that state have the same width` / `and the same state still produces the same width`，必须让宽度真的**随帧变化**（负对照把解析次数掺进宽度：实测 3 条红）。判据：断言要指向**要防的那个性质**（变化），而不是指向一个恰好也能防住它的代理（重算） |
+| **只写不读的文件级 static 是 `_deadcode.py` 的盲区**：该工具只扫**结构体字段**（`x.field` / `x->field`），不看文件作用域的 `static` 变量。这次带了两个进来：`g_panelWidthClamp`（写两次、一次没读）与 `g_lastBitmapWidth`（只写）。处理：删掉前者，把 clamp 记进解析点的日志（`Panel width: fit content=… clamp=…`，判别性数值）；后者保留并由宿主真读一次（`and the window rectangle is the width of the bitmap being submitted`）。**判据：新增文件级 static 时自己数一遍读点**，别指望门禁报出来 |
+
+**验证**：宿主 **1059 检查**、`PASSED (0 failure(s), 1 skipped)`（跳过的仍是受限沙箱里的管道 DACL）；
+`build.ps1` 1 条已知警告、DLL **201,216 B**；`_settings.py` / `_logfmt.py` / `_deadcode.py` 全绿；
+`.data` raw **1024 B**（与父提交 `fdf5806` 的 196,608 B / `.data` 1024 B 相比，宽度这次改动
+没有把任何静态数组拖进文件镜像——§5.1 那条"非零默认值"的判据继续成立）。

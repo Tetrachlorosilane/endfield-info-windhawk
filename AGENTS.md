@@ -34,6 +34,7 @@ endfield-info-windhawk/
 │   ├── external-data-island-design.md 设计：外部数据（M1 数据面、M2 事件面均已实现）
 │   ├── font-and-row-metrics-design.md 设计：多字体回退 + 按行字号/高度（含"未配置零成本"闸门）
 │   ├── platform-notes.md              GDI+ 导出名/常量、NVML 加载缺陷（原 AGENTS §8）
+│   ├── panel-width-design.md          设计：面板宽度（Fixed / Fit content、三条不变量、负对照清单）
 │   ├── inline-markup-design.md        设计：行内图标 + 留白/对齐（**§7 第 3、4、5 步均已实现**）+ 一次性编译（**已实现**）
 │   └── state-and-handover.md          验证状态、真机更正、犯错档案、待办
 │
@@ -441,6 +442,19 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   ```
 - **岛上的卡片不受行高影响**：它有自己的行距，取的是全局 `Row height`。卡片不是"一行"，
   它盖在行上面；如果它的行距跟着下面的行变，一个正在淡出的卡片会在中途改尺寸。
+- **「面板有多宽」只有一个所有者：`EnsurePanelWidth`**（Fit content = `ResolvePanelWidth`，
+  Fixed = `Panel width`）。宽度**在 HUD 侧从实测内容解析**（设置期量不出来：没有行程序、
+  字号、`GpGraphics`），`ModSettings::panelWidth` 因此只是 Fixed 的宽度 + 测量基准宽度。
+- **解析出的宽度对一个状态恒定，并在位图与 `PlaceWindow` 之前确定**：
+  `EnsurePanelWidth` → `FrameWidthFor` → `PlaceWindow` → `CreateDIBSection`，
+  同一帧窗口与位图是同一个数。**每帧重算就是被移除过四次的宽度动画**（§7.12）；
+  缓存键（纪元 + 已发布行 + 卡片态 + 显示器宽）不能省。
+- **`ComputeGeometry` 只「播种」宽度（`if (g_panelWidth <= 0)`），不覆盖已解析的值。**
+  它还会在展开/收起/改设置时被调用，覆盖一次就是"窗口用解析值、几何用配置值"。
+  第一版断言在它之后把解析值补写回去，于是**恒真**（§7.13）——现在产品侧不覆盖、
+  测试侧按同样的顺序走。上限过屏幕钳位（monitor − 24），下限**不**过；
+  `min > max` 退化成常数。规则、退化情形与全部断言见
+  [docs/panel-width-design.md](docs/panel-width-design.md)。**改宽度代码前先读它**。
 
 ### 5.2 配色
 
@@ -530,6 +544,12 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   （`if (expanded) PlaceWindow(hwnd);`）。绘制分支里那句 *"SetExpanded already shrank the window
   to the resting (tab) height, so the frame has to grow it back"* 正是这个往返的补偿——
   **补偿存在，说明顺序错了**。
+- **宽度不是动画通道，也不许变成动画通道。** `EnsurePanelWidth` 只在一个**状态**改变时
+  重新解析宽度（缓存键见 §5.1），解析发生在位图与 `PlaceWindow` **之前**，所以"窗口尺寸的
+  变化必须与它提交的位图在同一帧内一致"这条在宽度方向上是靠**顺序**满足的，不是靠补偿：
+  `FrameWidthFor` → `PlaceWindow` → `CreateDIBSection(width)`。Fit content 模式下
+  展开/收起**不改宽度**（行没变，宽度就没变），卡片来了又走才让它换到卡片自己的规则再换回来。
+  **不要因为"宽度现在会变了"就把逐帧过渡加回来**——那正是 §7.12 里改了四轮的那个闪烁。
 - **展开与收回刻意不对称**：展开先生长定型、再让内容分层浮现；收回贯穿整段、时长为
   **四分之一**（`kCollapseDurationRatio = 0.25`）。
 - **收回的关键帧 cue 是 `1.0`，不是 `kCollapseDurationRatio`。** 那个常量是**时长比例**；

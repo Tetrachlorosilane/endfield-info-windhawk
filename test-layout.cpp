@@ -134,7 +134,8 @@ static ModSettings g_markRow, g_theme, g_ringPreset, g_ringCustom, g_ringThemed,
     g_fontChain, g_fontTagged, g_metricDefault, g_metricHuge, g_metricRow, g_sizeRun,
     g_sizeTagged, g_runCase, g_prefixRows, g_geometrySaved, g_geometry, g_planSaved, g_plan,
     g_extAllow, g_extRows, g_extBad, g_extCfg, g_extSettings, g_islandCfgA, g_islandCfgB,
-    g_publish, g_programCompile, g_programRead, g_gapCompile, g_gapLayout, g_gapSaved, g_gapPlan;
+    g_publish, g_programCompile, g_programRead, g_gapCompile, g_gapLayout, g_gapSaved, g_gapPlan,
+    g_gapChecked;
 
 #define LOCAL_SETTINGS(name, slot) ModSettings &name = slot; slot = kDefaultSettings
 
@@ -3731,8 +3732,535 @@ int main() {
             }
             if (bitmap) g_gdiplus.DisposeImage((GpImage *)bitmap);
             if (dib) DeleteObject(dib);
-            if (g_gdiplusToken) g_gdiplus.Shutdown(g_gdiplusToken);
+            // GDI+ is deliberately *not* shut down here any more. `GdiplusShutdown` invalidates
+            // every object created before it, and this host measures through a product-owned
+            // cached surface (MeasureGraphics) in the width section below -- restarting the
+            // runtime in between left that section measuring through a freed Graphics, which is
+            // an access violation with nothing to do with the width logic. The shutdown happens
+            // once, at the end of the last section that needs it.
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The panel's width: what it is derived from, and when it is recomputed.
+    //
+    // `Panel width` stopped being *the* width: in `Fit content` mode the panel is as wide as its
+    // widest row needs, so the width comes out of the same publish-side measurement that fills
+    // the row layout plans. Everything asserted below is a property of that resolution:
+    //
+    //   * the clamp is total -- every degenerate configuration has a defined answer;
+    //   * the width the rows need is measured from the *plan's parts*, so a longer row really
+    //     does produce a wider panel, up to the cap;
+    //   * the resolution is constant per state (the flicker this project has removed four times
+    //     was a width that varied from frame to frame);
+    //   * Fixed mode measures nothing at all, which is the "Fixed mode is free" promise.
+    //
+    // Negative controls that must turn these red are listed in docs/panel-width-design.md.
+    // -----------------------------------------------------------------------
+    printf("\n=== the panel's width: resolved from the rows, or fixed ===\n");
+    {
+        // (1) The clamp, as a pure function. These need no GDI+: they are about the rule, not
+        // about pixels.
+        {
+            printf("  clamp: content 300 min 200 max 800 screen 1920 -> %d (%s)\n",
+                   ResolvePanelWidth(300, 200, 800, 1920).width,
+                   ResolvePanelWidth(300, 200, 800, 1920).clamp == PWC_NONE ? "content" : "clamped");
+            Check(ResolvePanelWidth(300, 200, 800, 1920).width == 300,
+                  "inside the range the content is the width");
+            Check(ResolvePanelWidth(300, 200, 800, 1920).clamp == PWC_NONE,
+                  "and nothing clamped it");
+
+            Check(ResolvePanelWidth(150, 200, 800, 1920).width == 200,
+                  "below the minimum the floor is the width");
+            Check(ResolvePanelWidth(150, 200, 800, 1920).clamp == PWC_MIN,
+                  "and the floor is what clamped it");
+            Check(ResolvePanelWidth(200, 200, 800, 1920).clamp == PWC_NONE,
+                  "exactly the minimum is not a clamp (the boundary is inclusive)");
+
+            Check(ResolvePanelWidth(900, 200, 800, 1920).width == 800,
+                  "above the maximum the cap is the width");
+            Check(ResolvePanelWidth(900, 200, 800, 1920).clamp == PWC_MAX,
+                  "and the configured maximum is what clamped it");
+            Check(ResolvePanelWidth(800, 200, 800, 1920).clamp == PWC_NONE,
+                  "exactly the maximum is not a clamp either");
+
+            // The screen clamp, the same rule the island card uses. The maximum is not allowed
+            // to outgrow the monitor it is drawn on. Note what is compared: the width the
+            // *content* resolves to, which is the row's content plus its chrome -- so the
+            // numbers here are chosen to be above the clamp before it is applied.
+            const int contentFor900 = PanelWidthForContent(900);
+            const int contentFor2000 = PanelWidthForContent(2000);
+            printf("  clamp: %d px of content on a 1280 px screen -> %d (%s)\n", contentFor2000,
+                   ResolvePanelWidth(contentFor2000, 200, 1600, 1280).width,
+                   ResolvePanelWidth(contentFor2000, 200, 1600, 1280).clamp == PWC_SCREEN
+                       ? "screen"
+                       : "other");
+            Check(PanelWidthCap(1600, 1280) == 1280 - 24,
+                  "the cap is lowered to the screen minus 24 px");
+            Check(ResolvePanelWidth(contentFor2000, 200, 1600, 1280).width == 1280 - 24,
+                  "so a row that wants 2000 px on a 1280 px screen is capped by the screen");
+            Check(ResolvePanelWidth(contentFor2000, 200, 1600, 1280).clamp == PWC_SCREEN,
+                  "and the clamp is reported as the screen's, not the setting's");
+            Check(PanelWidthCap(400, 1280) == 400,
+                  "a maximum already inside the screen is left alone");
+            Check(ResolvePanelWidth(contentFor2000, 200, 1600, 0).clamp == PWC_MAX,
+                  "an unknown screen leaves the configured maximum in charge");
+            Check(ResolvePanelWidth(contentFor900, 200, 1600, 0).clamp == PWC_NONE,
+                  "and content inside the maximum is in charge of itself");
+            Check(PanelWidthCap(1600, 0) == 1600,
+                  "an unknown screen is not treated as a zero-width one");
+            // The chrome floor is the *last* word: a cap the screen pushed below it is raised to
+            // it, and a configured minimum below it is raised to it too. Both are asserted with
+            // values that actually reach the floor (24), which needs a minimum of 0 -- the
+            // reading of the setting is clamped to >= 200, so 24 is only reachable through the
+            // screen clamp and through a direct call. The screen has to be narrow enough that
+            // `screen - 24` itself is below the floor, i.e. under 48 px.
+            printf("  chrome floor: cap(1600,40)=%d cap(1600,100)=%d minabs=%d\n",
+                   PanelWidthCap(1600, 40), PanelWidthCap(1600, 100), kPanelMinAbsoluteWidth);
+            Check(PanelWidthCap(1600, 40) == kPanelMinAbsoluteWidth,
+                  "a screen narrower than the chrome raises the cap to the chrome floor");
+            Check(PanelWidthCap(1600, 100) == 100 - 24,
+                  "a screen still wider than the chrome is the screen minus 24");
+
+            // Inverted min/max: defined, not undefined. The cap wins, so the configuration
+            // degrades to a constant (fixed) width.
+            {
+                const PanelWidth inverted = ResolvePanelWidth(500, 800, 400, 1920);
+                printf("  inverted min 800 / max 400 with 500 px of content -> %d (%s)\n",
+                       inverted.width, inverted.clamp == PWC_MAX ? "max" : "other");
+                Check(inverted.width == 400,
+                      "an inverted minimum/maximum resolves to the maximum, not to the minimum");
+                Check(inverted.clamp == PWC_MAX, "and it is reported as the cap winning");
+                Check(ResolvePanelWidth(100, 800, 400, 1920).width == 400,
+                      "an inverted pair does not move with the content (it is a fixed width)");
+                Check(ResolvePanelWidth(5000, 800, 400, 1920).width == 400,
+                      "nor does a row wider than either end");
+            }
+
+            // Degenerate values. Nothing here may produce a zero or negative width: a zero-width
+            // bitmap or window is not a panel, it is a bug that reads as "the panel vanished".
+            Check(ResolvePanelWidth(-500, 200, 800, 1920).width == 200,
+                  "a negative content width is treated as no content");
+            Check(ResolvePanelWidth(0, 200, 800, 1920).width == 200,
+                  "no content at all falls back to the minimum, not to zero");
+            Check(ResolvePanelWidth(-1, 0, 0, 0).width == kPanelMinAbsoluteWidth,
+                  "even with every setting at zero the panel is at least its own chrome");
+            // Below the chrome floor *and* with a minimum below it too: the floor is what
+            // answers, and `clamp` has to say so rather than report "the content".
+            Check(ResolvePanelWidth(10, 0, 800, 1920).width == kPanelMinAbsoluteWidth,
+                  "a minimum below the chrome floor is raised to it");
+            Check(ResolvePanelWidth(10, 0, 800, 1920).clamp == PWC_MIN,
+                  "and the floor still reports itself as the floor");
+            Check(PanelWidthFloor(-100) == kPanelMinAbsoluteWidth,
+                  "the floor is never below the chrome");
+            Check(PanelWidthFloor(kPanelMinAbsoluteWidth - 1) == kPanelMinAbsoluteWidth,
+                  "not even one pixel below it");
+            Check(PanelWidthFloor(kPanelMinAbsoluteWidth) == kPanelMinAbsoluteWidth,
+                  "and exactly the chrome is the chrome");
+            Check(PanelWidthFloor(kPanelMinAbsoluteWidth + 1) == kPanelMinAbsoluteWidth + 1,
+                  "one pixel above it is the caller's own minimum");
+            // The band, over a sweep of inputs including every degenerate end. Nothing may come
+            // out of `ResolvePanelWidth` narrower than the chrome or wider than the setting's own
+            // ceiling; the sweep is what makes "defined for every input" a checked statement.
+            bool inBand = true;
+            int worstWidth = 0;
+            for (int w = -200; w <= 4000; w += 37) {
+                const PanelWidth d = ResolvePanelWidth(w, 0, 0, 0);
+                if (d.width < kPanelMinAbsoluteWidth || d.width > kMaxPanelWidth) {
+                    inBand = false;
+                    worstWidth = w;
+                }
+            }
+            printf("  band sweep: every input in -200..4000 stays within %d..%d: %s\n",
+                   kPanelMinAbsoluteWidth, kMaxPanelWidth, inBand ? "yes" : "NO");
+            Check(inBand, "no input produces a width outside the chrome..ceiling band");
+            Check(worstWidth == 0 || !inBand, "and the sweep would have named the bad input");
+        }
+
+        // (2) The content width is the chrome plus the rows. This half needs no GDI+ either.
+        {
+            Check(PanelWidthForContent(300) == 300 + 2 * kPanelSidePadding,
+                  "the width the content needs is the content plus the chrome on both sides");
+            Check(PanelWidthForContent(-10) == 2 * kPanelSidePadding,
+                  "a negative content width still leaves the chrome");
+            // The two halves have to meet: the panel a content width resolves to must leave that
+            // content exactly the column it was measured in, or a fitted panel would trim text
+            // it had just decided fits.
+            const int resolved = ResolvePanelWidth(PanelWidthForContent(300), 200, 1600, 1920).width;
+            const RowTextMetrics column =
+                ComputeRowTextMetrics((float)resolved, 0, 26, 12, false);
+            printf("  300 px of content -> panel %d px -> text column %.1f px\n", resolved,
+                   (double)column.textWidth);
+            Check(column.textWidth == 300.0f,
+                  "and the resulting row column is exactly the content width it was sized for");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The measurement itself, with real GDI+ fonts. Skipped as a counted block when GDI+ (or the
+    // cached scratch surface) is unavailable, never silently.
+    // -----------------------------------------------------------------------
+    printf("\n=== the natural width a row needs (real text, skipped without GDI+) ===\n");
+    {
+        // The product's own scratch measuring surface, from the product's own factory, rather
+        // than a copy of it. GDI+ is still up here (the earlier section deliberately does not
+        // shut it down any more), which matters: the factory caches its surface for the process,
+        // and a surface created before a GdiplusShutdown is a dangling pointer afterwards -- the
+        // first version of this section restarted GDI+ and measured through a freed Graphics,
+        // which is an access violation with no relation to the width logic at all.
+        GpGraphics *measureSurface = MeasureGraphics();
+        GpStringFormat *measureFormat = measureSurface ? CreateRowStringFormat() : nullptr;
+        if (!measureSurface || !measureFormat) {
+            Skip("the measure surface can be created (panel width, real-text checks)");
+        } else {
+            // Stages one row exactly the way the publish path does -- compile, instantiate,
+            // segment -- and hands back what the row would need with nothing trimmed. Each call
+            // re-stages, so the previous row's state cannot leak into the next measurement.
+            auto natural = [&](const WCHAR *text, int fontPx) -> int {
+                LOCAL_SETTINGS(s2, g_gapPlan);
+                s2.fontSize = fontPx;
+                s2.rowHeight = 30;
+                s2.rowFontSize[0] = 0;
+                s2.rowMaxFontSize[0] = 0;
+                s2.ringSize = 26;
+                s2.ringRightOffset = 12;
+                s2.rowCount = 1;
+                wcsncpy(s2.rows[0], text, kRowTextCap - 1);
+                s2.rows[0][kRowTextCap - 1] = L'\0';
+                s2.rowMaxFontSize[0] = MaxInt(s2.rowFontSize[0], MaxInlineRunSize(s2.rows[0]));
+                CompileRowText(s2, s2.rows[0], s2.rowProgram[0]);
+                g_settings = s2;
+
+                WCHAR marked[640];
+                RingSpec rings[kMaxRingsPerRow];
+                int ringCount = 0;
+                InstantiateRowProgram(s2, 0, Values(), marked, 640, rings, &ringCount,
+                                      kMaxRingsPerRow);
+                RowState staged = {};
+                BuildRowLayout(marked, ringCount, staged, 0);
+                for (int i = 0; i < ringCount; i++) staged.rings[0][i] = rings[i];
+                g_rowState = staged;
+                g_publishedRows = 1;
+                g_layoutEpoch++;
+                RowTextMeasure measure = {measureSurface, measureFormat};
+                return MeasureRowNaturalWidth(s2, 0, measure);
+            };
+
+            // (a) The measurement comes from the plan's parts: a longer run of text, and a run
+            // followed by a fixed-size element, both land on the widths those parts add up to.
+            const int shortRow = natural(L"CPU", 15);
+            const int longRow = natural(L"CPU 12%  RAM 73%  GPU 33%", 15);
+            const float cpuWidth =
+                MeasureAdvance(measureSurface, AcquireRowFont(measureSurface, L"Segoe UI", 15),
+                               measureFormat, L"CPU", 30.0f);
+            const float longWidth = MeasureAdvance(measureSurface,
+                                                   AcquireRowFont(measureSurface, L"Segoe UI", 15),
+                                                   measureFormat,
+                                                   L"CPU 12%  RAM 73%  GPU 33%", 30.0f);
+            printf("  \"CPU\" -> %d px natural (text alone %.1f px)\n", shortRow, (double)cpuWidth);
+            printf("  \"CPU 12%%  RAM 73%%  GPU 33%%\" -> %d px natural (text alone %.1f px)\n",
+                   longRow, (double)longWidth);
+            Check(cpuWidth >= 1.0f && longWidth > cpuWidth,
+                  "the real font really does measure those two runs differently");
+            Check(shortRow == (int)(cpuWidth + 0.5f),
+                  "a text-only row needs exactly its own text, as the plan measures it");
+            Check(longRow == (int)(longWidth + 0.5f),
+                  "and a longer row needs more, by the text's own width");
+            Check(longRow > shortRow + 20,
+                  "which is a difference big enough to move the panel");
+
+            // (b) Elements count too, and by the same amounts the plan places them with: an icon
+            // is its own diameter plus the content gap, a gap is its own pixels.
+            {
+                const float diameter = IconDiameterForFontSize(15);
+                const int iconRow = natural(L"[[icon:CPU]]CPU", 15);
+                printf("  icon + \"CPU\" -> %d px natural (diameter %.1f + gap %.1f + text %.1f)\n",
+                       iconRow, (double)diameter, (double)kIconContentGap, (double)cpuWidth);
+                Check(iconRow == (int)(diameter + kIconContentGap + cpuWidth + 0.5f),
+                      "an icon-bearing row needs its icon's own box, as the plan places it");
+                const int withGap = natural(L"CPU[[gap:20px]]X", 15);
+                const int withoutGap = natural(L"CPUX", 15);
+                Check(withGap > withoutGap + 19,
+                      "a fixed 20 px gap widens the row the measurement reports");
+            }
+
+            // (c) Real text at two sizes: a larger font needs a wider panel.
+            Check(natural(L"CPU 12%", 24) > natural(L"CPU 12%", 12),
+                  "the same text at a larger size needs a wider panel");
+
+            // (d) A longer row yields a wider panel, up to the cap -- and past the cap the
+            // *panel* stops growing while the row still needs more, which is exactly the
+            // situation the per-run trimming is there for.
+            {
+                // The short row is measured first, so the comparison is not against whatever the
+                // previous assertion happened to leave staged.
+                const int contentShort = natural(L"CPU 12%  RAM 73%", 15);
+
+                // Stages a long row and hands back what the panel would need for it.
+                auto longRowContent = [&](const WCHAR *text) -> int {
+                    LOCAL_SETTINGS(s3, g_gapSaved);
+                    s3 = g_settings;
+                    wcsncpy(s3.rows[0], text, kRowTextCap - 1);
+                    s3.rows[0][kRowTextCap - 1] = L'\0';
+                    s3.rowMaxFontSize[0] = MaxInt(s3.rowFontSize[0],
+                                                  MaxInlineRunSize(s3.rows[0]));
+                    CompileRowText(s3, s3.rows[0], s3.rowProgram[0]);
+                    g_settings = s3;
+                    WCHAR marked3[640];
+                    RingSpec rings3[kMaxRingsPerRow];
+                    int ringCount3 = 0;
+                    InstantiateRowProgram(s3, 0, Values(), marked3, 640, rings3, &ringCount3,
+                                          kMaxRingsPerRow);
+                    RowState staged3 = {};
+                    BuildRowLayout(marked3, ringCount3, staged3, 0);
+                    for (int i = 0; i < ringCount3; i++) staged3.rings[0][i] = rings3[i];
+                    g_rowState = staged3;
+                    return MeasurePanelContentWidth(s3, 1, {measureSurface, measureFormat});
+                };
+
+                const int contentLong =
+                    longRowContent(L"CPU 12%  RAM 73%  GPU 33%  NET 1.2 MB/s  DISK 68%  FAN 1200");
+                // A row past any sane cap, so the cap is what answers rather than the row.
+                const int contentHuge = longRowContent(
+                    L"CPU 12%  RAM 73%  GPU 33%  NET 1.2 MB/s  DISK 68%  FAN 1200  CPU 12%  "
+                    L"RAM 73%  GPU 33%  NET 1.2 MB/s  DISK 68%  FAN 1200");
+
+                // With a 2000 px ceiling both rows get the width they asked for, and the longer
+                // one asks for more: that is "a longer row yields a wider panel".
+                const int panelShort =
+                    ResolvePanelWidth(PanelWidthForContent(contentShort), 200, 2000, 1920).width;
+                const int panelLong =
+                    ResolvePanelWidth(PanelWidthForContent(contentLong), 200, 2000, 1920).width;
+                // With a 600 px ceiling the panel stops moving while the content keeps growing:
+                // past the cap the panel is a bound, not a promise (the runs are trimmed instead).
+                const PanelWidth capped =
+                    ResolvePanelWidth(PanelWidthForContent(contentHuge), 200, 600, 1920);
+                printf("  short row -> content %d -> panel %d; long row -> content %d -> panel %d "
+                       "(max 2000), huge row -> content %d -> panel %d (max 600, %s)\n",
+                       contentShort, panelShort, contentLong, panelLong, contentHuge, capped.width,
+                       capped.clamp == PWC_MAX ? "capped" : "not capped");
+                Check(contentLong > contentShort + 20,
+                      "the longer row reports a larger natural content width");
+                Check(panelShort >= 200 && panelShort < 300,
+                      "a short row's panel is the floor, not a degenerate width");
+                Check(panelLong > panelShort,
+                      "and a longer row yields a wider panel, up to the cap");
+                Check(capped.width == 600,
+                      "the panel stops at the configured maximum, not at what the row wants");
+                Check(capped.clamp == PWC_MAX, "and the cap is recorded as the reason");
+                Check(PanelWidthForContent(contentHuge) > capped.width,
+                      "past the cap the row still needs more than the panel can give it");
+            }
+
+            // (e) Frame stability: the same state resolves to the same width, and the plan that
+            // was built at that width is genuinely a function of it. A width recomputed from
+            // scratch every frame (or re-derived inside the paint loop) is the property this
+            // breaks -- and a width that differs between the window being resized and the bitmap
+            // being submitted is the flicker this project has removed four times.
+            {
+                LOCAL_SETTINGS(s4, g_gapSaved);
+                s4 = g_settings;
+                s4.panelSizing = kPanelSizingFit;
+                s4.panelMinWidth = 200;
+                s4.panelMaxWidth = 1600;
+                g_settings = s4;
+                g_publishedRows = 1;
+                g_layoutEpoch++;
+
+                const int first =
+                    MeasurePanelContentWidth(g_settings, 1, {measureSurface, measureFormat});
+                const int panel = ResolvePanelWidth(PanelWidthForContent(first), 200, 1600, 1920)
+                                      .width;
+                const int second =
+                    MeasurePanelContentWidth(g_settings, 1, {measureSurface, measureFormat});
+                const int again = ResolvePanelWidth(PanelWidthForContent(second), 200, 1600, 1920)
+                                      .width;
+                printf("  one state, twice: content %d / %d px, panel %d / %d px\n", first, second,
+                       panel, again);
+                Check(first == second,
+                      "the same state measures the same content width every time");
+                Check(panel == again && panel == PanelWidthForContent(first),
+                      "so it resolves to the same panel width every time (constant per state)");
+
+                // A plan built at this width is fresh at this width and stale at another. The
+                // freshness key already carries the width, so there is exactly one cache and a
+                // second one would be the thing that goes stale.
+                const float rowHeight = 30.0f;
+                const int rowFont = RowFontSizePx(g_settings, 0);
+                const int segmentCount = g_rowState.segmentCount[0];
+                // The row's own font, acquired the way the painter acquires it: a row that draws
+                // at the global size uses the one font, and there is no separate object for it.
+                GpFont *rowMainFont = AcquireRowFont(measureSurface, g_settings.fontFamily, rowFont);
+                const RowLayoutPlan *plan =
+                    EnsureRowPlan(measureSurface, rowMainFont, measureFormat, 0, g_publishedRows,
+                                  (float)panel, rowFont, rowHeight, false);
+                const float drawnAdvance = plan->segments[0].advance;
+                Check(RowPlanIsFresh(*plan, g_layoutEpoch, g_publishedRows, (float)panel, rowHeight,
+                                     rowFont, segmentCount),
+                      "the plan built at the resolved width is fresh at that width");
+                Check(!RowPlanIsFresh(*plan, g_layoutEpoch, g_publishedRows, (float)panel + 1.0f,
+                                      rowHeight, rowFont, segmentCount),
+                      "and a single pixel of width makes it stale, so the key really carries it");
+                Check(!RowPlanIsFresh(*plan, g_layoutEpoch + 1, g_publishedRows, (float)panel,
+                                      rowHeight, rowFont, segmentCount),
+                      "so does a new publish generation");
+                // The round trip that ties the two halves together: the plan was fitted at the
+                // width the resolution produced, so what it drew fits inside that panel.
+                printf("  resolved %d px, first run drawn %.1f px from its inset\n", panel,
+                       (double)drawnAdvance);
+                Check(drawnAdvance > 0.0f &&
+                          kRowTextLeftInset + drawnAdvance <= (float)panel + 0.5f,
+                      "and the runs the plan fitted at that width stay inside the panel");
+            }
+
+            // (e2) The resolver itself, driven across frames. This is the half a pure function
+            // cannot show: the cache in EnsurePanelWidth is what makes the width constant for a
+            // state, and `g_panelWidthResolves` is the product's own record of how many times the
+            // width was actually worked out. Three frames of one state must resolve it once.
+            {
+                LOCAL_SETTINGS(s7, g_gapChecked);
+                s7 = g_settings;
+                s7.panelSizing = kPanelSizingFit;
+                s7.panelMinWidth = 200;
+                s7.panelMaxWidth = 1600;
+                s7.panelWidth = 900;      // deliberately *not* what the rows need
+                g_settings = s7;
+
+                g_panelWidthResolves = 0;
+                g_layoutEpoch++;
+                const PanelWidth a = EnsurePanelWidth(nullptr, measureSurface, measureFormat, false);
+                const DWORD afterFirst = g_panelWidthResolves;
+                const PanelWidth b = EnsurePanelWidth(nullptr, measureSurface, measureFormat, false);
+                const PanelWidth c = EnsurePanelWidth(nullptr, measureSurface, measureFormat, false);
+                const DWORD afterThree = g_panelWidthResolves;
+                printf("  three frames, one state: widths %d / %d / %d, resolves %lu -> %lu "
+                       "(configured %d)\n",
+                       a.width, b.width, c.width, (unsigned long)afterFirst,
+                       (unsigned long)afterThree, g_settings.panelWidth);
+                Check(afterFirst == 1,
+                      "the first frame of a state resolves the panel width once");
+                Check(afterThree == afterFirst,
+                      "and the next two frames resolve it zero more times (constant per state)");
+                Check(a.width == b.width && b.width == c.width,
+                      "so all three frames of that state have the same width");
+                Check(a.width != g_settings.panelWidth,
+                      "and that width is the resolved one, not the configured Panel width");
+                // What the frame draws with. The painter hands one number to the bitmap, to the
+                // window rectangle (which the hit test reads back) and to the card's own rule --
+                // so "the window and the bitmap agree, and it is the resolved width" is this
+                // call. A frame that took `Panel width` instead fails here.
+                {
+                    // The product's frame sequence, in the product's order, with nothing
+                    // re-assigned in between: the painter stores the resolved width, and
+                    // `ComputeGeometry` runs *after* it -- on expand/collapse and on every
+                    // settings change -- owning the height. It must not hand the width back to
+                    // the configured value while doing so. (An earlier version of this block
+                    // re-assigned the resolved width after `ComputeGeometry` to "restore" it;
+                    // that made the next assertion tautological -- it passed even with the paint
+                    // path reading `Panel width` -- which is the one thing a negative control is
+                    // for. See docs/panel-width-design.md.)
+                    g_panelWidth = a.width;
+                    ComputeGeometry();
+                    printf("  after ComputeGeometry the width is %d (resolved %d, configured %d)\n",
+                           g_panelWidth, a.width, g_settings.panelWidth);
+                    Check(g_panelWidth == a.width,
+                          "ComputeGeometry leaves a resolved width alone (it only seeds an unset "
+                          "one)");
+                    const int frameWidth = FrameWidthFor(g_panelWidth, /*cardUp=*/false, g_settings,
+                                                         IslandCardMetrics(), 1920);
+                    // The painter's own record of the bitmap it is about to submit. Assigned the
+                    // way the paint path assigns it, so the window rectangle below is compared
+                    // with what the frame will actually blit rather than with the resolution.
+                    g_lastBitmapWidth = frameWidth;
+                    const int windowWidth = g_restWidth > 0 ? g_restWidth : g_panelWidth;
+                    const IslandMetrics cardMetrics = IslandCardMetrics();
+                    const PanelRect monitorRect = {0, 0, 1920, 0};
+                    printf("  frame width %d; width in effect %d; bitmap %d; window %d; resolved "
+                           "%d (configured %d); card would be %d\n",
+                           frameWidth, g_panelWidth, g_lastBitmapWidth, windowWidth, a.width,
+                           g_settings.panelWidth,
+                           ComputeIslandRect(cardMetrics, g_settings, monitorRect, 0, 0).w);
+                    Check(a.width != g_settings.panelWidth,
+                          "the resolved width is not the configured one, so the next check can "
+                          "tell them apart");
+                    Check(frameWidth == a.width && frameWidth == g_panelWidth,
+                          "the window and the bitmap agree, and the width is the resolved one");
+                    Check(frameWidth != g_settings.panelWidth,
+                          "which is not the configured Panel width (900)");
+                    Check(g_lastBitmapWidth == windowWidth,
+                          "and the window rectangle is the width of the bitmap being submitted");
+                    // The card keeps its own rule while it is up: same function, card branch.
+                    const int cardWidth =
+                        FrameWidthFor(g_panelWidth, /*cardUp=*/true, g_settings, cardMetrics, 1920);
+                    Check(cardWidth == ComputeIslandCardWidth(cardMetrics, g_settings, 1920),
+                          "and while a card is up the card's own width rule still wins");
+                }
+
+                // A new publish generation is the one thing that must resolve it again.
+                g_layoutEpoch++;
+                EnsurePanelWidth(nullptr, measureSurface, measureFormat, false);
+                Check(g_panelWidthResolves == afterThree + 1,
+                      "a new publish generation resolves it once more, and only once");
+                Check(EnsurePanelWidth(nullptr, measureSurface, measureFormat, false).width ==
+                          a.width,
+                      "and the same state still produces the same width");
+            }
+
+            // (f) Fixed mode is free: no natural measurement runs at all. The counter is the
+            // product's own `g_measureCalls` -- the one the `[perf]` line prints -- so this is
+            // the same number a real machine reports, and the promise is per frame.
+            {
+                LOCAL_SETTINGS(s5, g_gapSaved);
+                s5 = g_settings;
+                s5.panelSizing = kPanelSizingFixed;
+                s5.panelWidth = 420;
+                s5.rowCount = 1;
+                g_settings = s5;
+                const bool contentDriven = PanelWidthIsContentDriven(g_settings);
+                const DWORD before = g_measureCalls;
+                int fixedWidth = 0;
+                for (int frame = 0; frame < 3; frame++) {
+                    // Exactly what the painter does for a Fixed width: take the setting. Three
+                    // frames of it must cost three times nothing.
+                    if (!contentDriven) fixedWidth = g_settings.panelWidth;
+                }
+                const DWORD after = g_measureCalls;
+                printf("  Fixed mode: contentDriven=%d width=%d, measure calls %lu -> %lu over 3 "
+                       "frames\n",
+                       contentDriven ? 1 : 0, fixedWidth, (unsigned long)before,
+                       (unsigned long)after);
+                Check(!contentDriven, "Fixed mode does not ask for a content width at all");
+                Check(after == before,
+                      "and three Fixed frames measure nothing (the measurement counter does not "
+                      "move)");
+                Check(fixedWidth == 420, "the Fixed width is the configured width, unchanged");
+                // The second half of "Fixed is free": the width does not follow the content at
+                // all. A Fixed panel whose rows are re-published (a new generation, new text)
+                // keeps the configured width -- there is nothing to re-resolve.
+                g_publishedRows = 1;
+                g_layoutEpoch++;
+                const DWORD beforePublish = g_measureCalls;
+                LOCAL_SETTINGS(s5b, g_gapChecked);
+                s5b = s5;
+                wcsncpy(s5b.rows[0], L"a much, much longer row of text than before", 63);
+                s5b.rows[0][63] = L'\0';
+                CompileRowText(s5b, s5b.rows[0], s5b.rowProgram[0]);
+                g_settings = s5b;
+                Check(!PanelWidthIsContentDriven(g_settings) && g_measureCalls == beforePublish,
+                      "and a new publish does not make a Fixed panel measure either");
+                // The gate itself, not just its use: the same settings with Fit content answers
+                // the other way, so the assertion above cannot hold for the wrong reason.
+                LOCAL_SETTINGS(s6, g_gapSaved);
+                s6 = g_settings;
+                s6.panelSizing = kPanelSizingFit;
+                g_settings = s6;
+                Check(PanelWidthIsContentDriven(g_settings),
+                      "while Fit content does (so the gate is really what was tested)");
+                g_settings = s5;
+            }
+        }
+        if (measureFormat) g_gdiplus.DeleteStringFormat(measureFormat);
+        if (g_gdiplusToken) g_gdiplus.Shutdown(g_gdiplusToken);
     }
 
     printf("\n=== external data (named-pipe providers) ===\n");
