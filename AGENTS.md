@@ -144,15 +144,24 @@ $wc = 'D:\Program Files\Windhawk\Compiler'
 & "$env:TEMP\layouttest.exe"
 ```
 
-期望最后一行 `PASSED (0 failure(s))`。
+期望最后一行 `PASSED (0 failure(s))`，或者——在这个受限沙箱里**就是**——
+`PASSED (0 failure(s), 1 skipped)`。**skipped 不为 0 时必须逐条解释**：每条跑不起来的检查
+都打印成 `SKIP` 并计入这个数字，就是为了让"通过"和"根本没跑"不再长得一样
+（宿主自己打印 `SKIPPED: n check(s) ...` 那行也在）。
 
-> **受限沙箱会跳过一条断言**：命名管道客户端在 DSH 的受限模式下被拒绝
-> （连"完全不给安全描述符"的对照管道也打不开，`err=5`），所以 DACL 那条会打印
-> `this environment refuses pipe clients ... the DACL check is skipped here`。
-> **跳过不等于通过**——要验证 DACL 得在普通终端里跑一次。
-> 实测边界：**只读**打开可以（`GENERIC_READ` → `opened=1`），而 `GENERIC_WRITE`、
-> `FILE_WRITE_DATA`、`GENERIC_ALL` 全部 `err=5`。因此宿主**没法**做管道端到端测试
-> （客户端要写），管道读写路径只能靠真机日志——§10 的"未验证"里也记着这条。
+> **受限沙箱会跳过管道 DACL 那条**：命名管道客户端在 DSH 的受限模式下被拒绝
+> （连"完全不给安全描述符"的对照管道也打不开，`err=5`），于是那条打印
+> `the pipe DACL admits the user running the mod (no pipe clients here)  SKIP`，
+> 末行变成 `PASSED (0 failure(s), 1 skipped)`。**跳过不等于通过**——要验证 DACL 得在普通
+> 终端里跑一次。实测边界：**只读**打开可以（`GENERIC_READ` → `opened=1`），而
+> `GENERIC_WRITE`、`FILE_WRITE_DATA`、`GENERIC_ALL` 全部 `err=5`。因此宿主**没法**做管道
+> 端到端测试（客户端要写），管道读写路径只能靠真机日志——§10 的"未验证"里也记着这条。
+
+> 宿主还替产品守了三件它自己容易犯的事：**设置字符串的所有权**（桩按真实 API 每次发放新内存，
+> 漏 free / double free / 泄漏都会在末段 `=== settings string ownership ===` 里报出来）、
+> **变量注册表**（token 覆盖直接遍历 `kVariables[]`，注册了却不实现会被抓）、
+> **宽度下限**（`LayoutWidthFloor` 由产品提供，测试不再抄一遍表达式）。
+> 这三条原来都属于"看着有、其实没有"。
 
 > **mod 的日志格式串不在这里检查——而且编译器根本查不了宽格式。** 这一段曾经写着
 > "宿主打桩了真的 `Wh_Log`，所以每个 `Wh_Log(L"...%s", ...)` 都会走 `-Wformat`"，
@@ -176,8 +185,9 @@ $wc = 'D:\Program Files\Windhawk\Compiler'
 
 测试**最后一段会真启动 GDI+**（`g_gdiplus.Load()` + `Startup`），用真字体量
 "这段文字会不会折行、会不会冲出预算"。这是唯一能守住 §5.1 那条
-"文字不得折行"的办法：纯函数测不了 GDI+ 的排版行为。GDI+ 起不来时该段会打印
-`GDI+ did not start; section skipped` 而不是失败，所以在没有 GDI+ 的环境里测试仍可用。
+"文字不得折行"的办法：纯函数测不了 GDI+ 的排版行为。GDI+ 起不来时该段打印一行
+`SKIP` 并计入末行的 `skipped` 数（不再是一句容易被忽略的 "section skipped"），
+所以没有 GDI+ 的环境里测试仍可用，但**不会被误读成全绿**。
 
 > **踩过的坑**：脚本里要加 `if (-not (Test-Path $out)) { exit 1 }` 守卫。
 > 曾出现编译失败但脚本仍执行了**上一次的旧 exe**，得出"改了没效果"的错误结论。
@@ -555,6 +565,18 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
     定位方法也不是按层猜，而是**把事件流程读出来**：谁在什么时候调 `PlaceWindow`、谁调
     `PaintPanel`、一拍之内两者的先后。用户一句"检查鼠标离开检测区后的渲染事件流程"比我自己
     猜四轮都有效——**症状说不清层的时候，去读调用顺序，而不是继续调参数**。
+13. **恒真断言、"抄一份表达式"和"静默跳过"是同一类失效：看着在守，其实没有。**
+    2026-10-14 一次清掉四处，每一处都用"把它要防的改动回去、必须变红"验证过：
+    — `if (firstY == panelH / 2.0f) Check(rowCount == 1, …)`：条件与结论代数等价；
+    — "盘心 = 环心"：拿同一个结构体的字段和自己比；
+    — 测试里又抄一遍 `width > kMinLayoutWidth ? … : …`：测的是那份副本
+      （产品现在提供 `LayoutWidthFloor`，绘制与测试都调它）；
+    — 三处 `printf("… section skipped")`：**"跑不起来"和"通过"长得一模一样**——
+      `CreateRowStringFormat` 一旦返回 null，GDI+ 段那些 NoWrap/预算断言全部消失，
+      而末行照样写 `PASSED`。
+    现在的规矩：跑不起来的检查打印 `SKIP` 并**计入末行的 skipped 数**；产品自身的前置条件
+    （格式建不出来）算**失败**；字符串所有权、变量注册表这类"桩替产品守"的东西要真的能报错。
+    判据与第 8、9 条相同——**断言的价值只等于"改坏它会不会红"**，与字数无关。
 
 ---
 
@@ -630,10 +652,9 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 2. 在 `LookupRaw`（格式化字符串）或 `LookupNumber`（数值）里实现。
 3. 若是数值变量，加进 `IsKnownNumberVariable`，这样"本机取不到"时会渲染 `--`
    而不是字面文本。
-4. 在 `test-layout.cpp` 的 token 覆盖列表里加一行。**注意那张列表与 `kVariables[]` 之间
-   没有任何自动对应**（全文不引用 `kVariables[]`，它只查"展开后还剩不剩花括号"，而
-   `Values` 是手工填满的）：**加进 `kVariables[]` 却忘了这张列表，测试照样全绿**——
-   已用变异实验证实。两处一起改。
+4. 更新 `test-layout.cpp` 时**不需要**再维护第二份 token 列表：那一节现在直接遍历
+   `kVariables[]`，注册了却不实现（或没给采集组）会当场变红。README 的「变量速查」表
+   仍要手改——它是给用户看的，没有任何东西比对它。
 5. 更新 README 的「变量速查」表。
 
 > `{ext.*}` 是**运行期**变量，**不要**注册进 `kVariables[]`：那张表是编译期的采集通路清单，

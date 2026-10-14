@@ -12,11 +12,11 @@
   （头顺序 + `ApplyPanelTransform` 未使用）。
 - 7 个导出入口齐全。
 - 依赖仅系统 DLL：`USER32 / GDI32 / PDH / IPHLPAPI / PSAPI / ADVAPI32 / msvcrt / KERNEL32`。
-- 回归测试全绿（380 条断言，含一段**真启动 GDI+** 的排版断言：
+- 回归测试全绿（434 条断言，含一段**真启动 GDI+** 的排版断言：
   文字不折行、且在预算内）。
 - GDI+ 缩放管线用**已知内容**的图验证过（含透明底、纯 RGB、索引色、灰度+alpha、
   16 位、隔行 PNG）。
-- 外部数据（M1）：编译只剩上面那两条已知警告；回归 **380 条断言**全绿（M1、M2、M3 与 CPU 频率共新增 220 条）；
+- 外部数据（M1）：编译只剩上面那两条已知警告；回归 **434 条断言**全绿（M1、M2、M3 与 CPU 频率共新增 274 条）；
   并做了**负对照**——把展开改成递归后，注入断言确实变红（不是"看着像在守"）。
 - 设置块 46 项 / 10 个选项组，`_settings.py` 报 `no structural problems found`。
 - **mod 的日志格式串**：`-Wformat` **从来没有检查过它们**（2026-10-14 更正）✗。
@@ -274,6 +274,23 @@
 README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$description` 都已同步
 （用户文档现在明确写了四级优先级）。
 
+**第五批（修测试装置自身，2026-10-14；六处，逐处都有变异负对照）**：
+
+| 缺口 | 修法 | 负对照（改回去 → 红） |
+| :-- | :-- | :-- |
+| 三处 `printf("… section skipped")` **不增加失败数** | 新增 `Skip()`：打印 `SKIP` 并计入末行的 `skipped`；**产品自身的前置条件算失败**（`CreateRowStringFormat` 返回 null → `Check(false, …)`）。末行现在是 `PASSED (0 failure(s), 1 skipped)` | 让 `CreateRowStringFormat` 早返回 → 那条变 FAIL，且受它影响没跑的检查显示 `Segoe UI is installed (real-text checks) SKIP`（旧写法下末行仍是 PASSED） |
+| 两条**恒真**断言 | 删掉"盘心 = 环心"（同一结构体字段自比）与 `if (firstY == panelH/2) Check(rowCount == 1, …)`（条件与结论代数等价），换成**每行**：`each plate is centred in its own row`、`and the whole plate fits inside that row`、`the plate stays inside the panel's left edge` | `IconPlateCenterForRow` 的 Y 改回 `rowHeight / 2` → 7 条 FAIL（旧断言在第 2..4 行全部漏过） |
+| `kMinLayoutWidth` 只断言了常量、GDI+ 段还**抄了一遍表达式** | 新增产品的 `LayoutWidthFloor()`，绘制（预算与 DrawString 框）与测试都调它；断言 0 / 负数 / 半格 / 正常值 / 恰为下限五例 | `LayoutWidthFloor` 改成 `return width;` → 3 条 FAIL |
+| 尾随空格哨兵 U+2502 **无断言** | 在真 GDI+ 段用真字体量 `"CPU 12%"` 与 `"CPU 12%   "`（实测 62.4 vs 75.1 px） | 把哨兵改成 `L'\0'` → 两者都是 50.3 px，断言 FAIL |
+| 桩的 `Wh_FreeStringSetting` 是空实现（漏 free / double free 都测不出） | 桩按真实 API **每次发放新内存**并记账：每笔发放可查、重复释放/释放非发放指针会打印并置错、末段 `=== settings string ownership ===` 报出未释放数（实测 351 次发放 / 0 未释放） | 删掉 mod 里一处 `Wh_FreeStringSetting(theme)` → `every settings string the run asked for was released` FAIL，并报 13 个未释放 |
+| token 覆盖是**手抄**的 32 个字面量，与 `kVariables[]` 无对应 | 直接遍历 `kVariables[]`，并加"每个注册项都要有采集组"（`group != G_NONE`） | 往 `kVariables[]` 加一个未实现的 `{L"disk", G_SYS}` → `every registered variable resolves` FAIL |
+
+断言数 380 → **434**（+54：列表改遍历后按注册项计，加上新增的行级几何与下限检查）。
+**测试装置现在仍有的信任边界**（诚实记录）：`PaintPanel` 的**调用点**依旧不可断言（需要真窗口），
+所以内联预算只测到 `ComputeInlineTextLimit`／`LayoutWidthFloor` 本身，绘制分支里怎么用它们靠读代码；
+`StartIntro` 的关键帧接线没被驱动（收回时长由测试自己乘 `kCollapseDurationRatio` 算出，这是 §7.6 的
+"断言关系"，但也意味着接线错误测不到）；GDI+ 段的像素阈值全是关系式，换字体会让具体数值变但关系不变。
+
 **其余已确认、尚未修**（按建议顺序）：
 
 | 类别 | 问题（位置见当次复查报告） |
@@ -287,13 +304,6 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 | GPU | PDH 数组读只认 `CStatus == ERROR_SUCCESS`，而 CPU 路径接受 `PDH_CSTATUS_NEW_DATA` |
 | 脚本 | bridge 的 `$client.Connect(3000)` 无 try/catch → 瞬态管道失败即退出，烧掉 mod 的重启预算 |
 
-**测试装置（这 380 条断言的可信度）**：`kMinLayoutWidth` 只断言了常量；收回时长由测试自己乘
-`kCollapseDurationRatio`（从不调用 `StartIntro`）；"盘心 = 环心"是拿 `g.centerX` 和自己比的
-**恒真**断言；token 覆盖是手抄的 32 个字面量，全文不引用 `kVariables[]`（**新增**变量不会被测到）；
-`Wh_FreeStringSetting` 是空实现（漏 free / double free 都测不出）；GDI+ 段内三处
-`section skipped` **不增加失败数**；尾随空格哨兵 U+2502 无断言。
-"跳过 = 通过"与"改坏不会红"都已被变异实验证实。
-
 ---
 
 ## 12. 交接说明（本会话结束时写入）
@@ -302,7 +312,7 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 
 **已验证（有证据）**：
 
-- mod 编译：**恰好 2 条已知警告**，DLL **180736** 字节；回归 **380 断言**全绿（2026-10-14 四批修复后为 380）。
+- mod 编译：**恰好 2 条已知警告**，DLL **180736** 字节；回归 **434 断言**全绿（2026-10-14 五批修复后为 434，含 1 条环境性 SKIP）。
 - 设置块：`_settings.py` → `no structural problems found`；独立结构检查 49 条目、顶层 dash 缩进唯一为 0、每条目恰好一个 `$name`/`$description`。
 - 真实管道链：mod 开机自检两帧被服务端完整收到；`_extclient.ps1` 的值**显示在面板上**。
 - `{cpu.ghz}`：用户确认显示**正确**，标称取电源 API 的 **2.20 GHz**（注册表 2.42 被正确忽略）。⚠️ 但**保存过任何设置之后**它曾回退到注册表值（2026-10-14 修，见 §10.y 头条 1）。
