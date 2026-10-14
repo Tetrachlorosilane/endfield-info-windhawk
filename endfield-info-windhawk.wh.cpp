@@ -4617,10 +4617,13 @@ struct TextSeg {
     // This run's own font size, or 0 for "the row's size". A [[size:NN]] run may start and
     // end anywhere in the text, so -- like the family -- the size has to live per segment.
     int runFontSize = 0;
-    // Which alignment group this segment sits in, or -1 for "the row's own flow". Groups do not
-    // nest (an alignment tag inside one closes it and opens a new one), so this is a single
-    // number and not a stack.
-    int group = -1;
+    // Which alignment group this segment sits in: `kAlignSegFlow` (0) for "the row's own flow",
+    // otherwise the group's marker digit (1..3). Groups do not nest (an alignment tag inside one
+    // closes it and opens a new one), so this is a single number and not a stack.
+    //
+    // 0 rather than -1 on purpose: `TextSeg` is the element type of `RowState::segments`, a
+    // static array, and a non-zero default here would move that whole array's image into `.data`.
+    int group = kAlignSegFlow;
 };
 
 // A segment is either text or an element. Text is a slice of RowState::text; the elements have
@@ -4955,8 +4958,15 @@ static void BuildRowLayout(const WCHAR *marked, int ringCount, RowState &state, 
     int tagChain = 0;
     // And the size the next text segment is drawn at, 0 = the row's own size.
     int runFontSize = 0;
-    // The group the *next* segment belongs to, -1 = the row's own flow.
-    int group = -1;
+    // The group the *next* segment belongs to. **0 means the row's own flow** (`kAlignSegFlow`),
+    // and a real group is a marker digit, which `InstantiateRowProgram` writes as
+    // `L'0' + part.align` with `part.align >= kAlignSegLeft` -- so 1..3, never 0.
+    //
+    // The zeros are load-bearing for size, not just for meaning: `RowState` and `RowLayoutPlan`
+    // are static arrays, and a *non-zero* default member initializer anywhere inside one forces
+    // the compiler to emit that object's whole image into `.data` instead of leaving it in
+    // `.bss`. `group = -1` here cost 93 KB of file image once already (see AGENTS 5.1).
+    int group = kAlignSegFlow;
 
     // A text run ends at a marker, and every marker below flushes the run in progress before
     // moving on. That is what keeps a segment from spanning two tags -- the run that follows
@@ -4985,8 +4995,8 @@ static void BuildRowLayout(const WCHAR *marked, int ringCount, RowState &state, 
                 group = (int)(p[1] - L'0');
                 while (p[1] && p[1] != kRingMarkEnd) p++;
                 if (p[1] == kRingMarkEnd) p++;
-            } else if (group >= 0) {
-                group = -1;
+            } else if (group != kAlignSegFlow) {
+                group = kAlignSegFlow;
                 if (p[1] == kRingMarkEnd) p++;
             } else if (p[1] == kRingMarkEnd) {
                 p++;
@@ -6401,11 +6411,16 @@ struct RowSegmentPlan {
     bool isIcon = false;    // an inline icon: `x` is its left edge, `diameter` its box
     bool isGap = false;     // empty space: `x` is where the space begins, `advance` its width
     bool skip = false;      // nothing to draw (empty run)
-    // Which alignment group this segment belongs to, or -1 for the row's own flow. Element
+    // Which alignment group this segment belongs to: `kAlignSegFlow` (0) for the row's own flow,
+    // otherwise the group's marker digit (1..3), exactly as `TextSeg::group` carries it. Element
     // segments are placed by the same rules wherever they sit, so the painter never has to know
     // -- but the *tests* do, because "the group's width is the sum of its parts" and "a run's
     // budget comes from the group's right edge" are both statements about this grouping.
-    int group = -1;
+    //
+    // 0 rather than -1 on purpose: `RowSegmentPlan` is the element type of
+    // `RowLayoutPlan::segments`, and `g_rowPlans` is a static array. A non-zero default here put
+    // 93,696 bytes of zeroed memory into the DLL's file image once (AGENTS 5.1).
+    int group = kAlignSegFlow;
     WCHAR slice[640] = {};  // the text as it will be drawn (already fitted)
     // The family this run resolved to, "" for the panel's main one. The *name* is stored, not
     // the GpFont: a font object lives in an 8-slot cache that later rows can evict, so a plan
@@ -6427,13 +6442,15 @@ struct RowSegmentPlan {
 
 // One alignment group, as the plan resolved it. A group's segments are consecutive (groups do
 // not nest and a new alignment tag closes the previous group), so a range of indices says
-// everything about which segments are in it.
+// everything about which segments are in it. Every group is a maximal run of consecutive
+// segments carrying the same group number, so both ends are known as soon as the run is scanned
+// and neither needs an "unset" sentinel -- which is what keeps this struct zero-initializable.
 struct AlignGroupPlan {
-    int kind = 0;         // kAlignSegLeft / kAlignSegCenter / kAlignSegRight
-    int firstSegment = 0; // index of the group's first segment in the row
-    int lastSegment = -1; // index of its last, -1 for a group with nothing in it
-    float x = 0.0f;       // where the group starts on the panel
-    float width = 0.0f;   // the sum of its parts, measured with the same fitted runs it draws
+    int kind = kAlignSegFlow;  // kAlignSegLeft / kAlignSegCenter / kAlignSegRight
+    int firstSegment = 0;      // index of the group's first segment in the row
+    int lastSegment = 0;       // index of its last (inclusive; a group always has >= 1 segment)
+    float x = 0.0f;            // where the group starts on the panel
+    float width = 0.0f;        // the sum of its parts, measured with the same fitted runs it draws
 };
 
 struct RowLayoutPlan {
@@ -6448,8 +6465,8 @@ struct RowLayoutPlan {
     int segmentCount = 0;
     RowSegmentPlan segments[kMaxSegments];
     // The row's alignment groups, in the order the marked string opened them. A row with no
-    // alignment tag has alignCount == 0 and every segment at group == -1, which is the shape it
-    // had before these tags existed.
+    // alignment tag has alignCount == 0 and every segment at group == kAlignSegFlow, which is the
+    // shape it had before these tags existed.
     AlignGroupPlan groups[kMaxAlignGroups];
     int alignCount = 0;
 };
@@ -6501,12 +6518,6 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
     const RowProgram &program = g_settings.rowProgram[row];
     plan.alignCount = 0;
 
-    // Pass one: measure every element and place it in its own *frame of reference*. An element
-    // outside every group is placed in panel coordinates (its cursor starts at the row's own
-    // padding); an element inside one starts at zero, because where the group goes is only known
-    // once the group's width is, and that depends on how the runs in it fit. Pass two shifts each
-    // group as a unit.
-    //
     // -----------------------------------------------------------------------
     // Phase A: measure every element and place it in its own frame of reference.
     //
@@ -6534,14 +6545,15 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
 
         // Every ungrouped stretch of the row starts at the row's own padding: the cursor is
         // shared with the group that may sit in front of it, so leaving a group puts it back.
-        if (seg.group < 0 && (s == 0 || g_rowState.segments[row][s - 1].group >= 0)) {
+        if (seg.group == kAlignSegFlow &&
+            (s == 0 || g_rowState.segments[row][s - 1].group != kAlignSegFlow)) {
             regionCursor = kRowTextLeftInset;
         }
 
         if (seg.offset == kRingSegOffset) {
             entry.isRing = true;
             const float outer = (float)g_settings.ringSize;
-            if (inlineFlow || seg.group >= 0) {
+            if (inlineFlow || seg.group != kAlignSegFlow) {
                 entry.x = regionCursor + outer / 2.0f;
                 entry.advance = outer + 4.0f;
                 regionCursor = entry.x + outer / 2.0f + 4.0f;
@@ -6653,7 +6665,7 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
         // natural width -- is what the flow advances by, since that is what will be drawn.
         float advance = MeasureAdvance(graphics, runFont, format, entry.slice, rowHeight);
         float budget = metrics.textWidth;
-        if (seg.group >= 0 || inlineFlow) {
+        if (seg.group != kAlignSegFlow || inlineFlow) {
             budget = FlowTextLimit(metrics.textRight, regionCursor, 0, g_settings.ringSize);
         } else {
             budget = ComputeParkedRunLimit(metrics.textWidth, regionCursor, 0, g_settings.ringSize);
@@ -6666,15 +6678,21 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
         }
         entry.x = regionCursor;
         entry.advance = advance;
-        entry.boxWidth = (inlineFlow || seg.group >= 0) ? LayoutWidthFloor(advance) : budget;
+        entry.boxWidth =
+            (inlineFlow || seg.group != kAlignSegFlow) ? LayoutWidthFloor(advance) : budget;
         regionCursor += advance;
     }
 
     // -----------------------------------------------------------------------
     // Phase B: the groups, as the runs of consecutive segments the marked string's alignment
-    // markers cut. A group's width is the sum of its parts -- read off the parts phase A placed,
-    // with no second summation that could disagree with the flow's -- and it is then positioned
-    // against the row's text column: left, centred, or right.
+    // markers cut. A group's width is the sum of its parts -- one summation, over the parts phase
+    // A placed -- and it is then positioned against the row's text column: left, centred, or
+    // right.
+    //
+    // A group is a *maximal run* of consecutive segments carrying the same group number, so both
+    // ends are known as the run is scanned and no "still open" sentinel is needed. That matters
+    // beyond style: a sentinel would be a non-zero default in a struct that lives in a static
+    // array (see `AlignGroupPlan`).
     //
     // A group wider than the column is clamped to the column's left edge. That is the deliberate
     // degradation to left-aligned: the group starts on the panel, and the runs in it are re-fitted
@@ -6682,39 +6700,31 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
     // reach past the right edge.
     // -----------------------------------------------------------------------
     plan.alignCount = 0;
-    for (int s = 0; s < plan.segmentCount; s++) {
+    for (int s = 0; s < plan.segmentCount;) {
         const int g = g_rowState.segments[row][s].group;
-        // A group is open until a segment belonging to a different one appears; `lastSegment = -1`
-        // is what "still open" means here, so the group that runs to the row's end is closed by
-        // the same line as every other group -- there is no second rule for the last one.
-        if (s > 0 && plan.alignCount > 0 && plan.groups[plan.alignCount - 1].lastSegment < 0 &&
-            g != g_rowState.segments[row][plan.groups[plan.alignCount - 1].firstSegment].group) {
-            plan.groups[plan.alignCount - 1].lastSegment = s - 1;
+        if (g == kAlignSegFlow) {
+            s++;
+            continue;
         }
-        if (g < 0) continue;
-        if (s > 0 && g == g_rowState.segments[row][s - 1].group) continue;
+        int end = s;
+        while (end + 1 < plan.segmentCount && g_rowState.segments[row][end + 1].group == g) end++;
         if (plan.alignCount >= kMaxAlignGroups) break;
         AlignGroupPlan &group = plan.groups[plan.alignCount++];
         group.kind = g <= kAlignKindCount ? g : kAlignSegLeft;
         group.firstSegment = s;
-        group.lastSegment = -1;
-    }
-    if (plan.alignCount > 0 && plan.groups[plan.alignCount - 1].lastSegment < 0) {
-        plan.groups[plan.alignCount - 1].lastSegment = plan.segmentCount - 1;
+        group.lastSegment = end;
+        s = end + 1;
     }
 
     for (int g = 0; g < plan.alignCount; g++) {
         AlignGroupPlan &group = plan.groups[g];
-        if (group.lastSegment < group.firstSegment) {
-            group.width = 0.0f;
-            group.x = kRowTextLeftInset;
-            continue;
-        }
-        // The group's width is the sum of its parts' advances -- one summation, and the parts
-        // were placed by the flow above, so nothing here can disagree with it. (Deriving it from
-        // the last part's right edge minus the first part's left edge reads the same and is not:
-        // the segments have already been shifted by the time this runs for a later group, and the
-        // subtraction then measures the distance from the shift, not the content.)
+        // Every group has at least one segment (it is created *from* one), so firstSegment ..
+        // lastSegment is always a valid, non-empty range -- there is no empty-group case to guard.
+        // The width is the sum of the parts' advances, and the parts were placed by the flow
+        // above, so nothing here can disagree with it. (Deriving it from the last part's right edge
+        // minus the first part's left edge reads the same and is not: the segments have already
+        // been shifted by the time this runs for a later group, and the subtraction then measures
+        // the distance from the shift, not the content.)
         float width = 0.0f;
         for (int s = group.firstSegment; s <= group.lastSegment; s++) {
             width += plan.segments[s].advance;
@@ -6732,59 +6742,36 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
     }
 
     // -----------------------------------------------------------------------
-    // Phase C: shift each group onto the panel, and re-fit the text runs inside it against the
+    // Phase C: shift each group onto the panel and re-fit the text runs inside it against the
     // faces the shift gives them.
     //
-    // This is where a run's budget finally comes from the group's right edge -- which is now
-    // known -- and never past the panel's column, so the relation "a run stays inside the panel"
-    // holds for a centred or right-aligned group too. Re-fitting can only shorten a run, so the
-    // group's width (phase B, from the untrimmed parts) remains an upper bound of what is drawn:
-    // it stays inside the column, and no run can leave the panel. A parked row is a flow too,
-    // so its runs are re-fitted the same way; only its *gauges* are parked at the right edge.
+    // This is where a run's budget comes from the group's right edge -- known by now -- and never
+    // past the panel's column, so the relation "a run stays inside the panel" holds for a centred
+    // or right-aligned group too. Re-fitting can only shorten a run, so the group's width (phase
+    // B, from the parts as phase A sized them) stays an upper bound of what is drawn: the group
+    // stays inside the column, and no run can leave the panel. A parked row is a flow too, so its
+    // runs are re-fitted the same way; only its *gauges* are parked at the right edge.
+    //
+    // `group` keeps meaning "which group this segment is in" for the whole plan -- it is never
+    // overwritten with a plan index, which is why the phases can be read in any order.
     // -----------------------------------------------------------------------
-    for (int g = 0; g < plan.alignCount; g++) {
-        const AlignGroupPlan &group = plan.groups[g];
-        if (group.lastSegment < group.firstSegment) continue;
-        const float shift = group.x - plan.segments[group.firstSegment].x;
-        for (int s = group.firstSegment; s <= group.lastSegment; s++) {
-            plan.segments[s].x += shift;
-            plan.segments[s].group = g;
-        }
-    }
-    for (int s = 0; s < plan.segmentCount; s++) {
+    //
+    // Re-fits one run against `budget`, and walks the elements that follow it *inside its own
+    // region* along by the difference when the trim changed what it draws -- otherwise they would
+    // overlap the shortened run.
+    auto refitRun = [&](int s, int lastOfRegion, float budget, bool flowing) {
         RowSegmentPlan &entry = plan.segments[s];
         if (entry.skip || entry.isRing || entry.isIcon || entry.isGap || entry.fontSize <= 0) {
-            continue;
+            return;
         }
-        const TextSeg &seg = g_rowState.segments[row][s];
         GpFont *runFont =
             entry.family[0] ? AcquireRowFont(graphics, entry.family, entry.fontSize)
                             : (entry.fontSize == rowFontSizePx
                                    ? rowMainFont
                                    : AcquireRowFont(graphics, g_settings.fontFamily,
                                                     entry.fontSize));
-        if (!runFont) continue;
+        if (!runFont) return;
 
-        int ringsAfter = 0;
-        for (int k = s + 1; k < plan.segmentCount; k++) {
-            if (g_rowState.segments[row][k].offset == kRingSegOffset) ringsAfter++;
-        }
-        float budget;
-        if (seg.group >= 0 || inlineFlow) {
-            // What the run may use: from where it is to the nearer of the panel's text column and
-            // its own group's right edge -- the group's *final* edge, since the group has already
-            // been placed when this runs. Both edges are absolute panel coordinates, which is what
-            // `entry.x` is too.
-            const int gi = entry.group;
-            const float groupRight =
-                gi >= 0 && gi < plan.alignCount ? plan.groups[gi].x + plan.groups[gi].width
-                                                : metrics.textRight;
-            const float right = RunBudgetRightEdge(metrics.textRight, groupRight);
-            budget = FlowTextLimit(right, entry.x, ringsAfter, g_settings.ringSize);
-        } else {
-            budget = ComputeParkedRunLimit(metrics.textWidth, entry.x, ringsAfter,
-                                           g_settings.ringSize);
-        }
         WCHAR original[640];
         wcsncpy(original, entry.slice, 639);
         original[639] = L'\0';
@@ -6795,18 +6782,54 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
             entry.advance = MeasureAdvance(graphics, runFont, format, entry.slice, rowHeight);
         }
         if (wcscmp(original, entry.slice) != 0) {
-            // The trim changed what this run draws, so the *next* element of its group starts
-            // somewhere else. Walk the rest of the group along by the difference, or the elements
-            // after a trimmed run would overlap it.
-            const float delta = MeasureAdvance(graphics, runFont, format, original, rowHeight) -
-                                entry.advance;
-            const int group = entry.group;
-            for (int k = s + 1; k < plan.segmentCount; k++) {
-                if (plan.segments[k].group != group) break;
-                plan.segments[k].x -= delta;
-            }
+            const float delta =
+                MeasureAdvance(graphics, runFont, format, original, rowHeight) - entry.advance;
+            for (int k = s + 1; k <= lastOfRegion; k++) plan.segments[k].x -= delta;
         }
-        entry.boxWidth = (inlineFlow || seg.group >= 0) ? LayoutWidthFloor(entry.advance) : budget;
+        // A flowing (or grouped) run's box is its own width, which is what the elements after it
+        // are placed against. A parked run's box is still the rest of the row's text column: the
+        // format is left-aligned, so a wider box draws the same glyphs in the same place, and the
+        // parked path has always sized its box that way.
+        entry.boxWidth = flowing ? LayoutWidthFloor(entry.advance) : budget;
+    };
+
+    for (int g = 0; g < plan.alignCount; g++) {
+        const AlignGroupPlan &group = plan.groups[g];
+        const float shift = group.x - plan.segments[group.firstSegment].x;
+        for (int s = group.firstSegment; s <= group.lastSegment; s++) plan.segments[s].x += shift;
+
+        const float groupRight = group.x + group.width;
+        const float right = RunBudgetRightEdge(metrics.textRight, groupRight);
+        for (int s = group.firstSegment; s <= group.lastSegment; s++) {
+            int ringsAfter = 0;
+            for (int k = s + 1; k < plan.segmentCount; k++) {
+                if (g_rowState.segments[row][k].offset == kRingSegOffset) ringsAfter++;
+            }
+            const float budget =
+                FlowTextLimit(right, plan.segments[s].x, ringsAfter, g_settings.ringSize);
+            refitRun(s, group.lastSegment, budget, true);
+        }
+    }
+
+    // The runs outside every group. `inlineFlow` decides which edge they are budgeted from, and a
+    // run walks the rest of its own *ungrouped stretch* along when it is trimmed.
+    for (int s = 0; s < plan.segmentCount; s++) {
+        if (plan.segments[s].group != kAlignSegFlow) continue;
+        int end = s;
+        while (end + 1 < plan.segmentCount &&
+               plan.segments[end + 1].group == kAlignSegFlow) {
+            end++;
+        }
+        int ringsAfter = 0;
+        for (int k = s + 1; k < plan.segmentCount; k++) {
+            if (g_rowState.segments[row][k].offset == kRingSegOffset) ringsAfter++;
+        }
+        const float budget =
+            inlineFlow ? FlowTextLimit(metrics.textRight, plan.segments[s].x, ringsAfter,
+                                       g_settings.ringSize)
+                       : ComputeParkedRunLimit(metrics.textWidth, plan.segments[s].x, ringsAfter,
+                                               g_settings.ringSize);
+        refitRun(s, end, budget, inlineFlow);
     }
 }
 

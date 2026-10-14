@@ -416,6 +416,29 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 - **一段文字在组内与组外的宽度可以不同**：相位 C 用组的右边缘（或列）重新拟合，
   所以"同一串字写在组里更短"是正常的，不是 bug。断言用**关系**（右边缘 ≤ 组右边缘/列右边缘）
   而不是硬编码宽度。
+- **静态数组里的结构体，默认成员初始值必须是 0。** 一个非零的默认值（`int group = -1;`）
+  会让编译器把这**整个对象**的镜像放进 `.data`（文件里真实存在），而不是留在 `.bss`
+  （只有虚拟大小，不占文件字节）。`RowLayoutPlan::segments[12]` × `g_rowPlans[4]` 因此
+  一次把 **93,696 字节**的纯零内存写进了 DLL：191,488 → 290,304，而 `.text` 只涨了 5.2 KB
+  （**这条是量出来的**：`git worktree` 建父提交编译，再比 PE 段表）。
+  所以 `RowSegmentPlan::group` / `TextSeg::group` 的"没有组"是 **`kAlignSegFlow` = 0**
+  （标记里的组号是 1..3，0 空着），`AlignGroupPlan::lastSegment` 也不再需要 -1——
+  组就是"同号连续段的最大区间"，两端一扫描就知道。
+  **判据：会进静态数组的结构体，新增字段的默认值只能是 0**；真要非零，就只在对象本身
+  很小的静态量上用（或让该对象走运行期构造）。量法（标准库解析 PE 段表，看 `.data` 的 raw）：
+  ```python
+  # .data raw 应保持 ~1 KB；涨到几十 KB 就是非零默认值把对象拖进了文件镜像
+  import struct, sys
+  d = open(sys.argv[1], 'rb').read()
+  e = struct.unpack_from('<I', d, 0x3C)[0]
+  n = struct.unpack_from('<H', d, e + 6)[0]
+  opt = struct.unpack_from('<H', d, e + 20)[0]
+  for i in range(n):
+      o = e + 24 + opt + i * 40
+      nm = d[o:o+8].rstrip(b'\0').decode()
+      vs, va, raw, pra = struct.unpack_from('<IIII', d, o + 8)
+      print(f"{nm:10} {vs:>9} {raw:>9}")
+  ```
 - **岛上的卡片不受行高影响**：它有自己的行距，取的是全局 `Row height`。卡片不是"一行"，
   它盖在行上面；如果它的行距跟着下面的行变，一个正在淡出的卡片会在中途改尺寸。
 
