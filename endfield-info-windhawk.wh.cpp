@@ -63,6 +63,16 @@ not installed, or is one of more than six distinct chains is drawn as ordinary
 text rather than silently changing the typeface. The same applies to a
 `[[ring:...]]` that cannot be built: you see what you wrote.
 
+## Row sizes
+
+Rows do not have to match. `Row N font size` and `Row N height` give one row its
+own metrics (`0` inherits `Font size` / `Row height`), and a tag at the *start* of
+the row's text overrides the setting: `[[size:18]]` and `[[h:44]]`, in any order
+and repeatable (the last one wins). The panel is as tall as its rows add up to,
+and a row is never shorter than its own font needs - growing a font grows the row
+rather than letting the glyphs spill into the next one. A tag written anywhere but
+the start is ordinary text and is drawn as such.
+
 ## Rings, icons and themes
 
 * Ring gauges are drawn where you write them: right-docked by default, or inline
@@ -143,6 +153,30 @@ deliberate trade for accuracy, and it only happens when you asked for it.
 - Row4: ""
   $name: 'Row 4'
   $description: 'Same syntax as row 1.'
+- Row1FontSize: 0
+  $name: 'Row 1 font size (px)'
+  $description: '0 inherits Font size. A row can also set its own at the start of its text, with [[size:18]], which wins over this setting.'
+- Row1Height: 0
+  $name: 'Row 1 height (px)'
+  $description: '0 inherits Row height. A row is never shorter than its own font needs, and a row-prefix [[h:44]] wins over this setting.'
+- Row2FontSize: 0
+  $name: 'Row 2 font size (px)'
+  $description: '0 inherits Font size. [[size:18]] at the start of row 2 wins over this setting.'
+- Row2Height: 0
+  $name: 'Row 2 height (px)'
+  $description: '0 inherits Row height. [[h:44]] at the start of row 2 wins over this setting.'
+- Row3FontSize: 0
+  $name: 'Row 3 font size (px)'
+  $description: '0 inherits Font size. [[size:18]] at the start of row 3 wins over this setting.'
+- Row3Height: 0
+  $name: 'Row 3 height (px)'
+  $description: '0 inherits Row height. [[h:44]] at the start of row 3 wins over this setting.'
+- Row4FontSize: 0
+  $name: 'Row 4 font size (px)'
+  $description: '0 inherits Font size. [[size:18]] at the start of row 4 wins over this setting.'
+- Row4Height: 0
+  $name: 'Row 4 height (px)'
+  $description: '0 inherits Row height. [[h:44]] at the start of row 4 wins over this setting.'
 - Theme: Endfield
   $name: 'Theme'
   $description: 'A colour preset. A named theme is used as-is. Pick Custom to make the colour fields below take effect.'
@@ -1380,6 +1414,73 @@ static int CollectRowFontTags(const WCHAR *row, FontTag *tags, int *tagCount, in
     return honoured;
 }
 
+// ---------------------------------------------------------------------------
+// Per-row metrics: one row's font size and box height
+//
+// Three sources, in this order of precedence: a row-prefix tag ([[size:NN]] / [[h:NN]]), the
+// Row N setting, then the global Font size / Row height. A zero at either of the first two
+// means "not set", which is the whole of the inheritance rule.
+//
+// The tags are read from the *start* of the row only. A row's height is a property of the
+// row, so a tag in the middle of the text would have to mean "this row changes height
+// halfway through", which has no sensible meaning; it stays ordinary text instead.
+// ---------------------------------------------------------------------------
+static const int kMinRowHeight = 18;        // the Row height setting's own clamp
+static const int kMaxRowHeight = 80;
+static const int kMinRowFontSize = 9;       // the Font size setting's own clamp
+static const int kMaxRowFontSize = 48;
+// The vertical slack the shipped defaults have (row height 30 for a 15 px font). A row needs
+// about that much room for a descender plus a ring, so it is also the floor for a row whose
+// font has grown: without it a 30 px font in a 30 px row overlaps its neighbours, because
+// GDI+ does not clip a glyph to the layout box.
+static const int kRowHeightFontSlack = 15;
+
+// One metric tag, e.g. [[h:44]], at p. Only digits are accepted, so [[h:4x]] stays text.
+static bool ParseMetricTag(const WCHAR *p, const WCHAR *name, int *out) {
+    const size_t nameLen = wcslen(name);
+    if (p[0] != L'[' || p[1] != L'[') return false;
+    if (_wcsnicmp(p + 2, name, nameLen) != 0) return false;
+    if (p[2 + nameLen] != L':') return false;
+
+    const WCHAR *digits = p + 3 + nameLen;
+    const WCHAR *close = wcsstr(digits, L"]]");
+    if (!close || close == digits) return false;
+
+    int value = 0;
+    for (const WCHAR *c = digits; c < close; c++) {
+        if (*c < L'0' || *c > L'9') return false;
+        value = value * 10 + (int)(*c - L'0');
+        if (value > 999) return false;      // not a size anyone meant; treat it as text
+    }
+    *out = value;
+    return true;
+}
+
+// Reads the row-prefix tags and returns the first character that is not part of one, so the
+// caller can store the row's text without them. A repeated tag overwrites the earlier one.
+static const WCHAR *ParseRowMetricTags(const WCHAR *row, int *fontSize, int *height) {
+    *fontSize = 0;
+    *height = 0;
+    if (!row) return L"";
+
+    const WCHAR *p = row;
+    for (;;) {
+        int value = 0;
+        // Height is asked first because it is the row's own property, while a size tag only
+        // says how big the content is. The two write separate fields, so the order cannot
+        // make one depend on the other -- reading the height first just keeps that visible.
+        if (ParseMetricTag(p, L"h", &value)) {
+            *height = value;
+        } else if (ParseMetricTag(p, L"size", &value)) {
+            *fontSize = value;
+        } else {
+            break;
+        }
+        p = wcsstr(p + 2, L"]]") + 2;
+    }
+    return p;
+}
+
 struct ModSettings {
     WCHAR rows[kMaxRows][256] = {};
     int rowCount = 0;
@@ -1394,6 +1495,12 @@ struct ModSettings {
     int borderThickness = 1;
     int fontSize = 15;
     WCHAR fontFamily[64] = L"Segoe UI";
+    // Per-row overrides, paired with the *published* row order: empty rows are skipped, so the
+    // Nth row on screen is not necessarily the Nth Row setting, and every per-row setting is
+    // read against the settings number but stored at the row that ends up being drawn. 0 in
+    // either means "inherit the global setting".
+    int rowFontSize[kMaxRows] = {};
+    int rowHeightPx[kMaxRows] = {};
     // Global candidate list for characters the main family cannot draw ("Fallback fonts"),
     // plus the chains registered from [[font:...]] tags found in the rows. A count of zero
     // means "not configured", which is what keeps the whole multi-font path switched off.
@@ -1451,7 +1558,50 @@ struct ModSettings {
     bool userSetAccent = false;
 };
 
+// The font size one row is drawn at, and the height its box gets. The height never falls
+// below what that row's font needs (MinimumRowHeightForFont), so growing a row's font grows
+// its row rather than letting the glyphs spill into the next one.
+static int MinimumRowHeightForFont(int fontSize) {
+    return fontSize + kRowHeightFontSlack;
+}
+
+static int RowFontSizePx(const ModSettings &settings, int row) {
+    const int wanted = (row >= 0 && row < kMaxRows && settings.rowFontSize[row] > 0)
+                           ? settings.rowFontSize[row]
+                           : settings.fontSize;
+    return ClampInt(wanted, kMinRowFontSize, kMaxRowFontSize);
+}
+
+static int RowHeightPx(const ModSettings &settings, int row) {
+    const int wanted = (row >= 0 && row < kMaxRows && settings.rowHeightPx[row] > 0)
+                           ? settings.rowHeightPx[row]
+                           : settings.rowHeight;
+    return MaxInt(wanted, MinimumRowHeightForFont(RowFontSizePx(settings, row)));
+}
+
+// Top edge of one row, and the height of `count` rows together. These two are the single
+// source the painter, the icon geometry and the intro's target height all read, so they
+// cannot disagree about where a row starts or how tall the panel is.
+static int RowTopPx(const ModSettings &settings, int row) {
+    int top = 0;
+    for (int i = 0; i < row && i < kMaxRows; i++) top += RowHeightPx(settings, i);
+    return top;
+}
+
+static int PanelRowsHeight(const ModSettings &settings, int count) {
+    int height = 0;
+    for (int i = 0; i < count && i < kMaxRows; i++) height += RowHeightPx(settings, i);
+    return height;
+}
+
 static void ReadSettings(ModSettings &s) {
+    // Settings row number (1-based, the `RowN` key) -> the index the row is published at, or
+    // -1 for a row that was left empty. The two differ as soon as a row is skipped, and every
+    // per-row setting is *written* against the settings number while everything the painter
+    // touches is indexed by the published one, so the mapping has to be explicit.
+    int rowSlotOf[kMaxRows];
+    for (int i = 0; i < kMaxRows; i++) rowSlotOf[i] = -1;
+
     s.rowCount = 0;
     for (int i = 0; i < kMaxRows; i++) {
         WCHAR key[16];
@@ -1459,11 +1609,39 @@ static void ReadSettings(ModSettings &s) {
         PCWSTR value = Wh_GetStringSetting(key);
         if (value && value[0]) {
             // Keep only non-empty rows, preserving their relative order.
-            wcsncpy(s.rows[s.rowCount], value, 255);
-            s.rows[s.rowCount][255] = L'\0';
+            const int slot = s.rowCount;
+            rowSlotOf[i] = slot;
+
+            // The row's own metrics can be written at the start of its text. Parse them out
+            // and store what is left, so neither the painter nor the token expander has to
+            // know these tags exist.
+            int tagFontSize = 0, tagHeight = 0;
+            const WCHAR *text = ParseRowMetricTags(value, &tagFontSize, &tagHeight);
+            wcsncpy(s.rows[slot], text, 255);
+            s.rows[slot][255] = L'\0';
+
+            WCHAR sizeKey[24];
+            WCHAR heightKey[24];
+            swprintf(sizeKey, 24, L"Row%dFontSize", i + 1);
+            swprintf(heightKey, 24, L"Row%dHeight", i + 1);
+            const int settingSize = ClampInt((int)Wh_GetIntSetting(sizeKey), 0, kMaxRowFontSize);
+            const int settingHeight = ClampInt((int)Wh_GetIntSetting(heightKey), 0, kMaxRowHeight);
+
+            // A tag wins over the setting, and both are clamped to what the painter can draw.
+            s.rowFontSize[slot] = tagFontSize > 0
+                                      ? ClampInt(tagFontSize, kMinRowFontSize, kMaxRowFontSize)
+                                      : settingSize;
+            s.rowHeightPx[slot] = tagHeight > 0
+                                      ? ClampInt(tagHeight, kMinRowHeight, kMaxRowHeight)
+                                      : settingHeight;
             s.rowCount++;
         }
         Wh_FreeStringSetting(value);
+    }
+    for (int i = s.rowCount; i < kMaxRows; i++) {
+        s.rows[i][0] = L'\0';
+        s.rowFontSize[i] = 0;
+        s.rowHeightPx[i] = 0;
     }
 
     PCWSTR clickAction = Wh_GetStringSetting(L"ClickAction");
@@ -1552,12 +1730,21 @@ static void ReadSettings(ModSettings &s) {
     // one optional file that applies to every row (IconPath). An entry counts as
     // configured when it names a glyph (including None, which is a choice) or
     // supplies an image path.
+    //
+    // The keys are the settings row numbers, but the slots are the published rows
+    // (rowSlotOf). Pairing IconN with the Nth *drawn* row instead was a real bug: with Row2
+    // left empty, `Icon3` was handed to the second drawn row (which is Row3's) and every icon
+    // below a gap was off by one -- while the README promises "Row N icon goes with Row N".
     s.iconCount = 0;
     for (int i = 0; i < kMaxRows; i++) {
-        IconSpec &slot = s.icons[i];
-        slot.style = 0;
-        slot.styleSet = false;
-        slot.path[0] = L'\0';
+        s.icons[i].style = 0;
+        s.icons[i].styleSet = false;
+        s.icons[i].path[0] = L'\0';
+    }
+    for (int i = 0; i < kMaxRows; i++) {
+        const int published = rowSlotOf[i];
+        if (published < 0) continue;   // an empty row has no icon to describe
+        IconSpec &slot = s.icons[published];
 
         WCHAR key[32];
         swprintf(key, 32, L"Icon%d", i + 1);
@@ -4659,14 +4846,25 @@ static void PaintIconGlyph(GpGraphics *graphics, int style, float cx, float cy,
 // Returns the plate diameter for the current settings, or 0 when no icon is on.
 // A custom image counts as an icon even when no built-in glyph was chosen, so
 // setting only a path is enough to get a plate.
-// Diameter of the plate for one icon slot, or 0 when that slot has no icon. Every
-// plate is the same size: the diameter follows the font size, not the slot, so
-// there is no per-icon geometry to keep in sync.
+// Diameter of the plate for one row, or 0 when that row has no icon. The diameter follows
+// that row's font size, so a row drawn in a larger font gets a larger plate instead of a
+// small disc floating in a tall row.
 static float IconPlateDiameter(const ModSettings &settings, int slot) {
     if (ResolveIconStyle(settings, slot) <= 0 && !ResolveIconPath(settings, slot)[0]) {
         return 0.0f;
     }
-    return (float)settings.fontSize * (float)kIconPlateRatio;
+    return (float)RowFontSizePx(settings, slot) * (float)kIconPlateRatio;
+}
+
+// The widest plate any row will draw. The text column is shared by every row (one inset for
+// all of them), so it has to clear the largest plate, not the first row's.
+static float MaxIconPlateDiameter(const ModSettings &settings) {
+    float widest = 0.0f;
+    for (int i = 0; i < kMaxRows; i++) {
+        const float diameter = IconPlateDiameter(settings, i);
+        if (diameter > widest) widest = diameter;
+    }
+    return widest;
 }
 
 // True when at least one row will have a plate. Asked through the same function the
@@ -4715,7 +4913,9 @@ static IconGeometry ComputeIconGeometry(const ModSettings &settings, int slot,
     float diameter = IconPlateDiameter(settings, slot);
     if (diameter <= 0.0f) return g;
     g.present = true;
-    IconPlateCenterForRow(settings, slot, rowTop, (float)settings.rowHeight,
+    // The row's own height: a row with a taller font is a taller box, and the plate belongs
+    // in the middle of the box it is drawn in, not in the middle of the default one.
+    IconPlateCenterForRow(settings, slot, rowTop, (float)RowHeightPx(settings, slot),
                           &g.centerX, &g.centerY);
     g.plateRadius = diameter / 2.0f;
     // Rings are larger than the plate and measured from this radius (RingRadiusAt), so
@@ -5408,9 +5608,9 @@ static void PaintPanel(HWND hwnd) {
             g_gdiplus.CreateSolidFill(g_settings.background, &background);
             if (background && panelPath) g_gdiplus.FillPath(graphics, (GpBrush *)background, panelPath);
 
-            // Every plate is the same size (it follows the font size), so one
-            // diameter decides the left margin for all rows.
-            float iconDiameter = IconPlateDiameter(g_settings, 0);
+            // One inset for every row, so it has to clear the widest plate: rows may now be
+            // drawn at different font sizes, and a row with a larger font gets a larger plate.
+            float iconDiameter = MaxIconPlateDiameter(g_settings);
             bool iconsPresent = AnyIconConfigured(g_settings);
 
             // The border doubles as the state indicator: it dims while collapsed,
@@ -5499,9 +5699,24 @@ static void PaintPanel(HWND hwnd) {
                 for (int r = 0; r < rows; r++) {
                     const bool rowFontPath =
                         RowNeedsFontPath(r < kMaxRows && g_settings.rowFontTag[r], globalFontPath);
-                    float top = (float)(r * g_settings.rowHeight);
-                    float centerY = top + g_settings.rowHeight / 2.0f;
+                    // This row's own box: rows are not interchangeable any more, so the top
+                    // edge is the sum of the rows above it and everything inside the row --
+                    // the plate, the gauges, the text -- is placed against this height.
+                    const int rowFontSizePx = RowFontSizePx(g_settings, r);
+                    const int rowHeightPx = RowHeightPx(g_settings, r);
+                    const float rowHeight = (float)rowHeightPx;
+                    const float top = (float)RowTopPx(g_settings, r);
+                    const float centerY = top + rowHeight / 2.0f;
                     float cursor = leftInset;
+
+                    // The main font for this row. A row that inherits the global size keeps
+                    // using the one font built above, so the default configuration allocates
+                    // nothing extra and draws exactly as it did before rows had sizes.
+                    GpFont *rowMainFont = font;
+                    if (rowFontSizePx != g_settings.fontSize) {
+                        GpFont *sized = AcquireRowFont(graphics, g_settings.fontFamily, rowFontSizePx);
+                        if (sized) rowMainFont = sized;
+                    }
 
                     // One plate per row, at that row's vertical centre, drawn before
                     // the row's text so the text never sits under it. Each row uses
@@ -5586,7 +5801,7 @@ static void PaintPanel(HWND hwnd) {
                         // fit is computed with the font it will actually be drawn in. The choice
                         // is made from the whole run, not from whatever survives the trim: the row
                         // says which family it wants, not how much of it fits.
-                        GpFont *runFont = font;
+                        GpFont *runFont = rowMainFont;
                         if (rowFontPath) {
                             const FontChain &tagChain =
                                 seg.tagChain > 0 ? g_settings.tagFonts[seg.tagChain - 1].chain
@@ -5596,7 +5811,7 @@ static void PaintPanel(HWND hwnd) {
                                                g_settings.fallbackFonts, FontFamilyCovers);
                             if (picked && _wcsicmp(picked, g_settings.fontFamily) != 0) {
                                 GpFont *fallbackFont =
-                                    AcquireRowFont(graphics, picked, g_settings.fontSize);
+                                    AcquireRowFont(graphics, picked, rowFontSizePx);
                                 if (fallbackFont) runFont = fallbackFont;
                             }
                         }
@@ -5623,7 +5838,7 @@ static void PaintPanel(HWND hwnd) {
                         // drawn in its whole budget instead.
                         float advance = inlineFlow
                                             ? MeasureAdvance(graphics, runFont, format, slice,
-                                                             (float)g_settings.rowHeight)
+                                                             rowHeight)
                                             : budget;
 
                         // Trim to the space this segment is actually allowed to
@@ -5634,14 +5849,13 @@ static void PaintPanel(HWND hwnd) {
                         // what it reports.
                         bool fitted = FitTextToWidth(graphics, runFont, format, slice,
                                                      sizeof(slice) / sizeof(slice[0]),
-                                                     budget, (float)g_settings.rowHeight);
+                                                     budget, rowHeight);
                         if (fitted) {
-                            advance = MeasureAdvance(graphics, runFont, format, slice,
-                                                     (float)g_settings.rowHeight);
+                            advance = MeasureAdvance(graphics, runFont, format, slice, rowHeight);
                         }
 
                         float drawWidth = LayoutWidthFloor(advance);
-                        RectF layout(cursor, top, drawWidth, (float)g_settings.rowHeight);
+                        RectF layout(cursor, top, drawWidth, rowHeight);
                         if (logDraws) {
                             DBG(L"    draw row=%d seg=%d x=%.1f y=%.1f w=%.1f "
                                    L"adv=%.1f inline=%d fitted=%d \"%ls\"",
@@ -5674,6 +5888,11 @@ static void PaintPanel(HWND hwnd) {
                 // geometry to become a rectangle first (design 8).
                 if (cardUp && font && format && textBrush && background) {
                     const float pad = 10.0f;
+                    // The card is its own geometry, and deliberately the *global* row height:
+                    // it is not one of the rows, it covers them, and a card whose line height
+                    // changed with the rows underneath would resize while it was fading out.
+                    // Its own line height is what BuildIslandRegions and ComputeIslandCloseRect
+                    // are given as well, so the drawn card and the clickable card agree.
                     const float lineHeight = (float)g_settings.rowHeight;
                     // Cover with the panel's own background, inside the same rounded
                     // path, so nothing rectangular pokes out of the capsule corners. It
@@ -5833,7 +6052,9 @@ static void PaintPanel(HWND hwnd) {
 static void ComputeGeometry() {
     g_visibleRows = g_settings.rowCount;
     if (g_visibleRows < 1) g_visibleRows = 1;
-    g_panelHeight = g_visibleRows * g_settings.rowHeight;
+    // Rows are not all the same height any more, so the panel is the sum of theirs rather
+    // than a multiplication. The floor is still the collapsed tab: the panel never disappears.
+    g_panelHeight = PanelRowsHeight(g_settings, g_visibleRows);
     g_displayHeight = g_expanded ? g_panelHeight : kTabHeight;
 
     RefreshMonitors();

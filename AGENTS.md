@@ -291,6 +291,8 @@ python _preview.py
 `EvaluateIntro` · `FitCharacterCount` / `FitCharsWithEllipsis`（测量以函数指针注入） ·
 `ParseFontChainList` / `FontChainKey` / `RowNeedsFontPath` / `CollectRowFontTags` ·
 `PickFontFamily`（覆盖判定以函数指针注入） ·
+`ParseRowMetricTags` / `RowFontSizePx` / `RowHeightPx` / `RowTopPx` / `PanelRowsHeight` /
+`MinimumRowHeightForFont` / `MaxIconPlateDiameter` ·
 `ExtParseLine` · `ExtSanitize` · `ExtParseNumber` · `ExtLookup` · `ExtNextDeadline` ·
 `ExtEvictIndex` · `ExtProviderAllowed` · `IslandEnqueue` / `StepIsland` / `IslandHitTest` /
 `IslandClickActionFor` · `Select-StoreLineIndex` / `Select-SongTitle` / `Get-LeadMs`（脚本侧）
@@ -348,6 +350,25 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   比预算宽出这个差值（实测 24 px 字体下某个预算超 6.1 px）。现在每次量一次（旁边本来就有
   一次二分测量，多这一次可以忽略）。断言是**扫一遍预算**（40..200）而不是试一个：
   预留被低估时只有"刚好填满预留"的那些预算会越界。
+- **行不再是等高的**：每行有自己的字号与行高（`Row N font size` / `Row N height`，或行首的
+  `[[size:NN]]` / `[[h:NN]]`，标签优先）。三个派生量只有一处实现，谁都不许再自己乘一遍：
+  `RowFontSizePx`（0 = 继承全局）、`RowHeightPx`（**不小于 `MinimumRowHeightForFont`**）、
+  `RowTopPx` / `PanelRowsHeight`（前缀和）。`ComputeGeometry` 的 `g_panelHeight` **必须**来自
+  `PanelRowsHeight`——它同时是窗口高度、命中矩形高度与入场目标高度，**写成 `rowHeight × 行数`
+  就会让面板高度与画面不一致**（这一条有断言：`ComputeGeometry` 算出的高度必须等于各行之和）。
+- **行高下限是"字放得下"，不是美学选择**：`kRowHeightFontSlack = 15` 正是默认 `Row height 30`
+  与 `Font size 15` 之差。去掉它，30 px 字号的行会溢出到相邻行上（GDI+ 不裁剪字形）。
+  改这个常量会同时改变默认配置的外观，改前先看 §5.1 最后那条断言。
+- **行首标签只认行首，且前缀解析在 `ReadSettings` 里完成、标签已从 `rows[]` 剥掉**：
+  绘制侧与 `ExpandTokensAndRings` 都不知道 `[[size:]]` / `[[h:]]` 存在。写在文本中间的同名标签
+  因此是**普通文字**（不会半路改行高），写错的一律留下原文。
+- **`Row N` 系列设置按设置里的行号配对，但一切按发布行序索引**（`rowSlotOf[]` 是那层映射）。
+  留空的行会被跳过，所以 `Icon3` / `Row3Height` 属于**第三个设置行**，也就是**第二个显示出来的行**。
+  配对错位过一次：`Icon3` 曾落到第二个显示行上，README 的"Row N icon 配 Row N"当时并不是真的。
+- **图标盘直径跟随该行的字号**（`IconPlateDiameter` → `RowFontSizePx`），而文字列的左内缩用
+  **最宽**的那个盘（`MaxIconPlateDiameter`）——文字列是所有行共用的，不能按第一行算。
+- **岛上的卡片不受行高影响**：它有自己的行距，取的是全局 `Row height`。卡片不是"一行"，
+  它盖在行上面；如果它的行距跟着下面的行变，一个正在淡出的卡片会在中途改尺寸。
 
 ### 5.2 配色
 

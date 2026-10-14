@@ -459,4 +459,5 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 | 画不出来的 `[[ring:...]]` 被"消费掉但不产出" | 写错的环连同它周围的读数一起从屏幕上消失——而消失的那几个字符正是唯一能解释"为什么没有环"的线索（`ParseRing` 的注释一直写的是"调用方回退到原文"，代码却没有回退） | `T=[[ring:nonsense]]C` 必须原样显示（`expanded text, spaces preserved`） |
 | 未注册的 `[[font:...]]` 标签同样被消费掉 | 族名写错/没装的标签会把它包住的文字起点一起吞掉，屏幕上留下一段没有提示的错位文本 | 六个标签容错用例：`[[font:]]`、`[[fonts:…]]`、缺 `]]`、未安装族名各留下原文，且每行"可见字符都归属于某个段" |
 | `AcquireRowFont` 在有**空槽**时仍驱逐 LRU | 两个字号交替绘制时每帧重建字体对象——缓存等于没有，正是它要避免的开销（2026-10-14 由新断言 `a different size is a different, live object` 抓到，未发布） | `AcquireRowFont` 的空槽优先 + `releasing the caches really empties them` |
+| 留空的行让后面的**图标**整体错位 | `Row 2` 留空时 `Icon3` 落到第二个显示出来的行（= `Row 3`）上，`Row 3` 以下每个图标都取自上一行的设置；README 的"`Row N icon` 配 `Row N`"因此不是真的（2026-10-14 加 `rowSlotOf[]` 时发现，未发布） | `the second drawn row (settings Row3) gets Icon3, not Icon2`、`Row3's metrics land on the second drawn row` |
 

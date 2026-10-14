@@ -665,6 +665,11 @@ int main() {
         const WCHAR *row2File = L"C:\\pics\\row2.png";
 
         const StubSetting mixed[] = {
+            // Rows first: a per-row setting only reaches a row that is actually drawn, so these
+            // tables have to declare the rows they talk about. That is also the shape of the
+            // real configuration -- the icon of a row that does not exist is not read.
+            {L"Row1", L"CPU"},
+            {L"Row2", L"GPU"},
             {L"Icon1", L""},
             {L"Icon1Path", L"C:\\pics\\does-not-exist.png"},
             {L"Icon2", L"Network"},
@@ -678,6 +683,7 @@ int main() {
         Check(ResolveIconStyle(s, 1) == 4, "the row that chose it keeps its own");
 
         const StubSetting imageOnly[] = {
+            {L"Row1", L"CPU"},
             {L"Icon1", L""},
             {L"Icon1Path", L"C:\\pics\\does-not-exist.png"},
         };
@@ -693,6 +699,10 @@ int main() {
         // branch -- so README's "set it to None to leave a row without an icon" was
         // simply untrue.
         const StubSetting noneRow[] = {
+            {L"Row1", L"CPU"},
+            {L"Row2", L"GPU"},
+            {L"Row3", L"DISK"},
+            {L"Row4", L"MEM"},
             {L"IconPath", global},
             {L"Icon1", L"Memory"},
             {L"Icon3", L"None"},
@@ -707,7 +717,11 @@ int main() {
               "while the rows around it still inherit the chosen glyph");
 
         // ... and None must not become the glyph every other row inherits.
-        const StubSetting noneFirst[] = {{L"Icon1", L"None"}, {L"Icon2", L"Network"}};
+        const StubSetting noneFirst[] = {{L"Row1", L"CPU"},
+                                         {L"Row2", L"GPU"},
+                                         {L"Row3", L"DISK"},
+                                         {L"Icon1", L"None"},
+                                         {L"Icon2", L"Network"}};
         g_stubStrings = noneFirst;
         g_stubStringCount = (int)(sizeof(noneFirst) / sizeof(noneFirst[0]));
         ReadSettings(s);
@@ -718,7 +732,11 @@ int main() {
         // The global image: every row without a file of its own shows it, including the
         // default configuration where Icon1 chose a glyph, and all of them share one
         // cache slot so the file is decoded and resampled once.
-        const StubSetting globalOnly[] = {{L"IconPath", global}};
+        const StubSetting globalOnly[] = {{L"Row1", L"CPU"},
+                                          {L"Row2", L"GPU"},
+                                          {L"Row3", L"DISK"},
+                                          {L"Row4", L"MEM"},
+                                          {L"IconPath", global}};
         g_stubStrings = globalOnly;
         g_stubStringCount = (int)(sizeof(globalOnly) / sizeof(globalOnly[0]));
         ReadSettings(s);
@@ -733,6 +751,10 @@ int main() {
         // A row's own file wins over the global one, and a second row that names the same
         // file as the global shares the global's slot rather than loading it again.
         const StubSetting mixedPaths[] = {
+            {L"Row1", L"CPU"},
+            {L"Row2", L"GPU"},
+            {L"Row3", L"DISK"},
+            {L"Row4", L"MEM"},
             {L"IconPath", global},
             {L"Icon2Path", row2File},
             {L"Icon3Path", global},
@@ -752,7 +774,12 @@ int main() {
 
         // Without a global image, the documented per-row inheritance still holds: setting
         // only row 1's file means every row uses it, and they all share its slot.
-        const StubSetting inheritFile[] = {{L"Icon1Path", row2File}, {L"Icon2", L"Network"}};
+        const StubSetting inheritFile[] = {{L"Row1", L"CPU"},
+                                           {L"Row2", L"GPU"},
+                                           {L"Row3", L"DISK"},
+                                           {L"Row4", L"MEM"},
+                                           {L"Icon1Path", row2File},
+                                           {L"Icon2", L"Network"}};
         g_stubStrings = inheritFile;
         g_stubStringCount = (int)(sizeof(inheritFile) / sizeof(inheritFile[0]));
         ReadSettings(s);
@@ -760,12 +787,35 @@ int main() {
                   ResolveIconSlot(s, 3) == 0,
               "one row's file still covers the rows after it when there is no global image");
 
-        const StubSetting noIcons[] = {{L"Icon1", L"None"}};
+        const StubSetting noIcons[] = {{L"Row1", L"CPU"}, {L"Icon1", L"None"}};
         g_stubStrings = noIcons;
         g_stubStringCount = (int)(sizeof(noIcons) / sizeof(noIcons[0]));
         ReadSettings(s);
         Check(s.iconCount == 0 && ResolveIconStyle(s, 0) == 0 && !AnyIconConfigured(s),
               "with nothing configured at all no row gets a plate");
+
+        // A gap in the rows must not shift the icons: IconN belongs to RowN, and the row that
+        // is drawn second is Row3 here. Pairing icons with the Nth *drawn* row instead (which
+        // is what the code did before this was asserted) hands Icon2 -- an unconfigured slot
+        // -- to Row3 and shifts every icon below the gap by one.
+        {
+            const StubSetting gap[] = {
+                {L"Row1", L"CPU"},
+                {L"Row2", L""},          // left empty: skipped in the published order
+                {L"Row3", L"GPU"},
+                {L"Icon1", L"Memory"},
+                {L"Icon3", L"Disk"},
+            };
+            g_stubStrings = gap;
+            g_stubStringCount = (int)(sizeof(gap) / sizeof(gap[0]));
+            ReadSettings(s);
+            printf("  Row2 empty: rows=%d, published icons = %d, %d\n", s.rowCount,
+                   ResolveIconStyle(s, 0), ResolveIconStyle(s, 1));
+            Check(s.rowCount == 2, "the empty row is skipped");
+            Check(ResolveIconStyle(s, 0) == 2, "the first drawn row keeps Icon1");
+            Check(ResolveIconStyle(s, 1) == 3,
+                  "and the second drawn row (settings Row3) gets Icon3, not Icon2");
+        }
 
         g_stubStrings = savedStrings;
         g_stubStringCount = savedStringCount;
@@ -1533,6 +1583,252 @@ int main() {
                       "every visible character belongs to a segment");
             }
         }
+    }
+
+    printf("\n=== per-row font size and height ===\n");
+    {
+        // Rows stopped being interchangeable: each one can ask for its own font size and box
+        // height, from a setting or from a tag at the start of its text. The two things worth
+        // guarding are the inheritance rule (0 means "not set", and a tag beats a setting) and
+        // the fact that a row can never end up shorter than the font inside it.
+        g_stubStrings = nullptr;
+        g_stubStringCount = 0;
+        g_stubInts = nullptr;
+        g_stubIntCount = 0;
+
+        // --- the prefix parser ---
+        struct TagCase {
+            const WCHAR *row;
+            int expectFontSize;
+            int expectHeight;
+            const WCHAR *expectText;
+        };
+        const TagCase tagCases[] = {
+            {L"[[h:44]]CPU", 0, 44, L"CPU"},
+            {L"[[size:18]]CPU", 18, 0, L"CPU"},
+            {L"[[h:44]][[size:18]]CPU", 18, 44, L"CPU"},
+            {L"[[size:18]][[h:44]]CPU", 18, 44, L"CPU"},      // order cannot matter
+            {L"[[SIZE:18]][[H:44]]CPU", 18, 44, L"CPU"},      // case-insensitive
+            {L"[[size:18]][[size:22]]CPU", 22, 0, L"CPU"},    // a repeat overwrites
+            {L"[[h:0]]CPU", 0, 0, L"CPU"},                    // 0 means "not set", so it is
+                                                              // consumed but overrides nothing
+            {L"", 0, 0, L""},
+            // Anything that is not a well-formed prefix tag has to stay *text*: a row that
+            // loses characters to a typo is the failure this whole area keeps producing.
+            {L"CPU [[size:20]] RAM", 0, 0, L"CPU [[size:20]] RAM"},
+            {L"[[size:abc]]CPU", 0, 0, L"[[size:abc]]CPU"},
+            {L"[[size:]]CPU", 0, 0, L"[[size:]]CPU"},
+            {L"[[size:18]CPU", 0, 0, L"[[size:18]CPU"},
+            {L"[[ size:18 ]]CPU", 0, 0, L"[[ size:18 ]]CPU"},
+            {L"[[height:44]]CPU", 0, 0, L"[[height:44]]CPU"},
+            {L"[[size:1000]]CPU", 0, 0, L"[[size:1000]]CPU"},
+            // A font tag at the start is a different mechanism and must survive this one.
+            {L"[[font:Consolas]]CPU", 0, 0, L"[[font:Consolas]]CPU"},
+        };
+        for (const TagCase &c : tagCases) {
+            int fontSize = -1, height = -1;
+            const WCHAR *text = ParseRowMetricTags(c.row, &fontSize, &height);
+            wprintf(L"    \"%ls\" -> size=%d h=%d text=\"%ls\"\n", c.row, fontSize, height, text);
+            Check(fontSize == c.expectFontSize, "prefix tag: font size");
+            Check(height == c.expectHeight, "prefix tag: height");
+            Check(wcscmp(text, c.expectText) == 0, "prefix tag: remaining text");
+        }
+
+        // --- inheritance and the floor under a grown font ---
+        {
+            ModSettings d;
+            d.fontSize = 15;
+            d.rowHeight = 30;
+            printf("    defaults: floor=%d height=%d top1=%d\n",
+                   MinimumRowHeightForFont(d.fontSize), RowHeightPx(d, 0), RowTopPx(d, 1));
+            Check(MinimumRowHeightForFont(15) == 30,
+                  "the default row height is exactly what a 15 px font needs");
+            Check(RowFontSizePx(d, 0) == 15 && RowHeightPx(d, 0) == 30,
+                  "an unset row inherits both global values");
+            Check(RowFontSizePx(d, kMaxRows + 3) == 15, "an out-of-range row cannot read past the table");
+
+            d.rowFontSize[1] = 22;
+            Check(RowFontSizePx(d, 1) == 22, "a row with its own size uses it");
+            Check(RowHeightPx(d, 1) == 37,
+                  "and its box grows to fit that font (22 + the same 15 px of slack)");
+
+            d.rowHeightPx[2] = 20;
+            Check(RowHeightPx(d, 2) == 30,
+                  "an explicitly short row is still lifted to what its font needs");
+            d.rowFontSize[2] = 24;
+            Check(RowHeightPx(d, 2) == 39,
+                  "and the floor follows that row's font, not the global one");
+
+            d.rowHeightPx[3] = 52;
+            Check(RowHeightPx(d, 3) == 52,
+                  "a row taller than its font keeps its configured height");
+
+            ModSettings huge;
+            huge.fontSize = 15;
+            huge.rowHeight = 30;
+            huge.rowFontSize[0] = 999;
+            Check(RowFontSizePx(huge, 0) == kMaxRowFontSize, "a font size is clamped");
+        }
+
+        // --- the panel is the sum of the rows, and the rows do not overlap ---
+        {
+            ModSettings s;
+            s.fontSize = 15;
+            s.rowHeight = 30;
+
+            // The regression guard, first: with nothing configured the arithmetic has to give
+            // exactly what the old `rowHeight * count` gave, and the tops exactly `r * rowHeight`.
+            bool sameAsBefore = true;
+            bool topsAsBefore = true;
+            for (int count = 1; count <= kMaxRows; count++) {
+                if (PanelRowsHeight(s, count) != count * s.rowHeight) sameAsBefore = false;
+                for (int r = 0; r < count; r++) {
+                    if (RowTopPx(s, r) != r * s.rowHeight) topsAsBefore = false;
+                }
+            }
+            Check(sameAsBefore, "with no per-row metrics the panel height is rowHeight * rows");
+            Check(topsAsBefore, "and every row starts exactly where it used to");
+
+            s.rowHeightPx[1] = 44;
+            s.rowFontSize[1] = 20;
+            printf("    rows: heights %d %d %d %d, tops %d %d %d %d, panel %d\n",
+                   RowHeightPx(s, 0), RowHeightPx(s, 1), RowHeightPx(s, 2), RowHeightPx(s, 3),
+                   RowTopPx(s, 0), RowTopPx(s, 1), RowTopPx(s, 2), RowTopPx(s, 3),
+                   PanelRowsHeight(s, 4));
+            Check(RowHeightPx(s, 1) == 44, "the taller row keeps its height (44 > 20 + 15)");
+            Check(PanelRowsHeight(s, 4) == 30 + 44 + 30 + 30, "the panel is the sum of the rows");
+            Check(RowTopPx(s, 2) == 74, "and the row below starts after the taller one");
+            bool noOverlap = true;
+            for (int r = 0; r + 1 < kMaxRows; r++) {
+                if (RowTopPx(s, r) + RowHeightPx(s, r) > RowTopPx(s, r + 1)) noOverlap = false;
+            }
+            Check(noOverlap, "adjacent rows never overlap");
+            Check(PanelRowsHeight(s, 4) == RowTopPx(s, 4),
+                  "the panel height is the top of the row just past the last one");
+
+            // The plate follows the row's own font, so a taller row gets a bigger disc, and the
+            // text column has to clear the widest of them (there is one column for all rows).
+            ModSettings icons;
+            icons.fontSize = 15;
+            icons.rowHeight = 30;
+            icons.icons[0].style = 2;
+            icons.rowFontSize[1] = 24;
+            printf("    plate diameters: %f %f, widest %f\n", IconPlateDiameter(icons, 0),
+                   IconPlateDiameter(icons, 1), MaxIconPlateDiameter(icons));
+            Check(IconPlateDiameter(icons, 1) > IconPlateDiameter(icons, 0),
+                  "a row with a bigger font gets a bigger plate");
+            Check(MaxIconPlateDiameter(icons) == IconPlateDiameter(icons, 1),
+                  "and the shared text inset clears the widest plate");
+        }
+
+        // --- ReadSettings wiring ---
+        {
+            const StubSetting tagged[] = {
+                {L"Row1", L"[[size:22]][[h:44]]CPU"},
+                {L"Row2", L"GPU"},
+            };
+            g_stubStrings = tagged;
+            g_stubStringCount = (int)(sizeof(tagged) / sizeof(tagged[0]));
+            ModSettings s;
+            ReadSettings(s);
+            printf("    tagged row: text=\"%ls\" size=%d height=%d; row2 size=%d height=%d\n",
+                   s.rows[0], s.rowFontSize[0], s.rowHeightPx[0], s.rowFontSize[1],
+                   s.rowHeightPx[1]);
+            Check(wcscmp(s.rows[0], L"CPU") == 0, "the metric tags are stripped from the row text");
+            Check(s.rowFontSize[0] == 22 && s.rowHeightPx[0] == 44, "and reach the row's metrics");
+            Check(s.rowFontSize[1] == 0 && s.rowHeightPx[1] == 0, "a row without them stays unset");
+
+            const StubSetting settingsOnly[] = {
+                {L"Row1", L"CPU"},
+                {L"Row2", L"GPU"},
+            };
+            // Numeric settings come from the stub's int table, not its string table -- the two
+            // are separate on purpose, exactly as Wh_GetIntSetting and Wh_GetStringSetting are.
+            const StubSetting settingsOnlyInts[] = {
+                {L"Row1FontSize", L"20"},
+                {L"Row1Height", L"40"},
+                {L"Row2Height", L"500"},     // past the maximum: clamped, not honoured
+            };
+            g_stubStrings = settingsOnly;
+            g_stubStringCount = (int)(sizeof(settingsOnly) / sizeof(settingsOnly[0]));
+            g_stubInts = settingsOnlyInts;
+            g_stubIntCount = (int)(sizeof(settingsOnlyInts) / sizeof(settingsOnlyInts[0]));
+            ReadSettings(s);
+            printf("    settings only: row1 size=%d height=%d; row2 height=%d\n", s.rowFontSize[0],
+                   s.rowHeightPx[0], s.rowHeightPx[1]);
+            Check(s.rowFontSize[0] == 20 && s.rowHeightPx[0] == 40,
+                  "Row N font size / height reach that row");
+            Check(s.rowHeightPx[1] == kMaxRowHeight, "an out-of-range height is clamped");
+
+            const StubSetting both[] = {
+                {L"Row1", L"[[size:22]][[h:44]]CPU"},
+            };
+            const StubSetting bothInts[] = {
+                {L"Row1FontSize", L"20"},
+                {L"Row1Height", L"40"},
+            };
+            g_stubStrings = both;
+            g_stubStringCount = (int)(sizeof(both) / sizeof(both[0]));
+            g_stubInts = bothInts;
+            g_stubIntCount = (int)(sizeof(bothInts) / sizeof(bothInts[0]));
+            ReadSettings(s);
+            Check(s.rowFontSize[0] == 22 && s.rowHeightPx[0] == 44,
+                  "a tag wins over the setting for the same row");
+
+            // A gap in the rows: the settings are numbered from 1 while the rows are indexed in
+            // the order they are drawn, so `Row3`'s metrics belong to the *second* drawn row.
+            const StubSetting gap[] = {
+                {L"Row1", L"CPU"},
+                {L"Row3", L"[[size:26]]GPU"},
+            };
+            const StubSetting gapInts[] = {
+                {L"Row3Height", L"50"},
+            };
+            g_stubStrings = gap;
+            g_stubStringCount = (int)(sizeof(gap) / sizeof(gap[0]));
+            g_stubInts = gapInts;
+            g_stubIntCount = (int)(sizeof(gapInts) / sizeof(gapInts[0]));
+            ReadSettings(s);
+            printf("    Row2 empty: rows=%d, row2 metrics size=%d height=%d, panel=%d\n",
+                   s.rowCount, s.rowFontSize[1], s.rowHeightPx[1], PanelRowsHeight(s, s.rowCount));
+            Check(s.rowCount == 2, "the empty row is skipped");
+            Check(s.rowFontSize[1] == 26 && s.rowHeightPx[1] == 50,
+                  "Row3's metrics land on the second drawn row");
+            Check(s.rowFontSize[0] == 0, "and they do not leak onto the first");
+            Check(RowFontSizePx(s, 1) == 26 && RowHeightPx(s, 1) == 50,
+                  "the drawn row uses them");
+        }
+
+        // ComputeGeometry is where the window height, the hit-test height and the intro's
+        // target all come from, so the link between "the panel is the sum of its rows" and the
+        // height actually used has to be asserted. Without this the sums above could be perfect
+        // while the panel still sized itself with rowHeight * rows.
+        {
+            const ModSettings saved = g_settings;
+            ModSettings s;
+            s.fontSize = 15;
+            s.rowHeight = 30;
+            s.rowCount = 3;
+            wcscpy(s.rows[0], L"CPU");
+            wcscpy(s.rows[1], L"GPU");
+            wcscpy(s.rows[2], L"DISK");
+            s.rowHeightPx[1] = 48;
+            g_settings = s;
+            ComputeGeometry();
+            printf("    ComputeGeometry: rows=%d panelH=%d displayH=%d\n", g_visibleRows,
+                   g_panelHeight, g_displayHeight);
+            Check(g_visibleRows == 3, "every configured row is counted");
+            Check(g_panelHeight == 30 + 48 + 30,
+                  "the panel is as tall as its rows actually are, not rows x Row height");
+            Check(g_panelHeight == PanelRowsHeight(s, 3),
+                  "and that is the same sum the painter lays the rows out with");
+            g_settings = saved;
+        }
+
+        g_stubStrings = nullptr;
+        g_stubStringCount = 0;
+        g_stubInts = nullptr;
+        g_stubIntCount = 0;
     }
 
     printf("\n=== real GDI+ text fitting (skipped when GDI+ is unavailable) ===\n");
