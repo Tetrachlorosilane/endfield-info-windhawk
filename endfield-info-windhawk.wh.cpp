@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              endfield-info-windhawk
 // @name            Endfield Info Windhawk
-// @description     A configurable always-on-top status capsule: user-defined rows, on-demand collectors (CPU / memory / network / GPU), top-of-the-topmost-monitor anchoring, and proximity-or-always display with click-to-toggle.
-// @version         0.2.0
+// @description     A configurable always-on-top status capsule: user-defined rows with {variable} tokens, on-demand collectors (CPU / memory / network / GPU), ring gauges, per-row icons, an optional notification island fed by other programs over a named pipe, and proximity-or-always display with click-to-toggle.
+// @version         0.3.0
 // @author          Silicon Dioxide
 // @github          https://github.com/Tetrachlorosilane/endfield-info-windhawk
 // @include         windhawk.exe
@@ -15,7 +15,7 @@
 
 A lightweight always-on-top status capsule, built as a Windhawk **tool mod**: it
 runs in its own dedicated `windhawk.exe` process and never injects into, or hooks
-anything in, another process.
+anything in, another process. Nothing is collected until a row asks for it.
 
 ## Rows and variables
 
@@ -26,7 +26,7 @@ collectors for the groups you reference are the only ones that start.
 | :-- | :-- |
 | `{cpu}` | CPU total usage % |
 | `{cpu.user}` `{cpu.kernel}` | CPU split |
-| `{cpu.ghz}` `{cpu.ghz.max}` | Effective / base clock (GHz) |
+| `{cpu.ghz}` `{cpu.ghz.max}` | Effective / nominal clock (GHz) |
 | `{cpu.name}` `{cpu.cores}` `{cpu.threads}` | CPU identity |
 | `{mem}` | Memory usage % |
 | `{mem.used}` `{mem.total}` `{mem.free}` | Memory in GB |
@@ -40,9 +40,60 @@ collectors for the groups you reference are the only ones that start.
 | `{gpu.name}` `{gpu.fan}` `{gpu.power}` | GPU identity / fan % / watts |
 | `{time}` `{date}` `{uptime}` | Clock and uptime |
 | `{mod.ws}` `{mod.cpu}` | This mod's own footprint |
+| `{ext.provider.key}` | A value pushed by another program (see below) |
 
 A `{variable|spec}` suffix formats the value: `0` `1` `2` decimals, `gb`, `mb`,
-`pct`, `int`, `time`.
+`pct`, `int`, `time`. `[[ring:VALUE:MAX:THICK:COLOR]]` draws a gauge; one placed
+after text sits inline on that row. A variable that is known but unreadable on
+this machine (a GPU with no temperature sensor, say) renders as `--` rather than
+as a plausible-looking zero.
+
+## Rings, icons and themes
+
+* Ring gauges are drawn where you write them: right-docked by default, or inline
+  after text.
+* Every row can carry a disc icon: a built-in glyph (`CPU`, `Memory`, `Disk`,
+  `Network`, `GPU`), your own image file, or nothing. One image can be set for
+  all rows at once.
+* Three colour presets plus a `Custom` theme that unlocks the colour fields.
+* An intro animation (slide / fade / none) with a ripple, and a speed you set per
+  the machine.
+
+## Display
+
+* Anchored to the **top-centre of the topmost monitor** (the one highest in the
+  virtual desktop, not necessarily the primary one).
+* Always topmost, and it never takes focus.
+* **Mouse proximity** - hidden until the pointer reaches the top edge, then it
+  slides in and hides again shortly after the pointer leaves.
+* **Always shown** - stays up; clicking the capsule toggles it, and the collapsed
+  state is visible at a glance.
+* The panel is never hidden completely: collapsed it is an 8 px tab that can
+  always be clicked back.
+
+## The island (optional notifications)
+
+Set `Island` to on and a card can appear under the capsule for an event pushed by
+another program: a title, a body line, a severity (`info` / `warn` / `critical`,
+which picks the colour) and a lifetime. It fades out on its own, and the card's
+close button dismisses it early. Nothing shows a card unless a program pushes one.
+
+## External data (`{ext.provider.key}`)
+
+Turn on `External data` and the mod serves a **named pipe**; another program can
+`HELLO`, then `SET provider key ttl text`, and rows that reference
+`{ext.provider.key}` show that text (values expire on their own, and the row falls
+back to `--`). The optional `External publisher command` setting lets the mod
+start your publisher for you *while a row actually references `{ext.*}`*, and it
+is stopped again when nothing consumes it; the mod never starts or restarts your
+other software by itself.
+
+**This is a trust boundary, not a security channel.** The pipe is local-only and
+its DACL admits the user running the mod (plus SYSTEM and Administrators), so any
+program running as you can push text. The mod prints that text and nothing else:
+it executes nothing and accepts no image bytes - icons are built-in glyphs or
+files you chose yourself. Treat the values as untrusted input if you display them
+next to anything you trust.
 
 ## Collectors start on demand
 
@@ -58,23 +109,8 @@ because those two are by far the most expensive things this mod can do:
 
 Measured on the development machine. `PdhCloseQuery` does not give the memory
 back, so a collector that has started stays started until the mod is reloaded.
-
-## Display
-
-* Anchored to the **top-centre of the topmost monitor** (the one highest in the
-  virtual desktop, not necessarily the primary one).
-* Always topmost.
-* **Mouse proximity** - hidden until the pointer reaches the top edge, then it
-  slides in and hides again shortly after the pointer leaves.
-* **Always shown** - stays up; clicking the capsule toggles it, and the border
-  colour dims when collapsed so the current state is visible at a glance.
-
-## A note on the cost of GPU collectors
-
-`{gpu.temp}` and `{gpu}` read a real sensor, and reading one is not free: on the
-development machine NVML costs ~1.9 ms per sample and ~22 MB resident. That is a
-deliberate trade - it is still far cheaper, and far more accurate, than going
-through WMI.
+Reading a real GPU sensor is not free (~1.9 ms per sample with NVML); that is a
+deliberate trade for accuracy, and it only happens when you asked for it.
 */
 // ==/WindhawkModReadme==
 
@@ -227,7 +263,7 @@ through WMI.
   $description: '0-3. Concentric rings expanding from the icon while the panel arrives, as in the original.'
 - IconPath: ""
   $name: 'Custom icon file'
-  $description: 'Full path to a PNG, JPEG, BMP, GIF or TIFF. Overrides the built-in glyph above and is drawn centred on the plate. SVG is not supported because GDI+ has no SVG decoder. Leave empty to use the built-in glyph.'
+  $description: 'Full path to a PNG, JPEG, BMP, GIF or TIFF. Used on every row that has no icon file of its own, and it takes precedence over the built-in glyphs. A row set to None still draws no icon at all. SVG is not supported because GDI+ has no SVG decoder.'
 - UpdateMs: 1000
   $name: 'Update interval (ms)'
   $description: '200-10000. Clocks refresh every second regardless.'
@@ -345,6 +381,15 @@ static const INT kPixelFormat32bppPARGB = 0x000E200B;
 #define PDH_CSTATUS_NEW_DATA ((PDH_STATUS)0x00000001L)
 #endif
 
+// A formatted PDH counter value is usable when its status says either "valid data" or
+// "new data". The CPU clock path accepted both; the GPU array readers accepted only
+// ERROR_SUCCESS (the value of VALID_DATA) and therefore threw away counters that had just
+// been created -- the first sample after PdhAddCounter reports NEW_DATA. One rule, asked
+// by all of them.
+static bool PdhValueUsable(PDH_STATUS status) {
+    return status == PDH_CSTATUS_VALID_DATA || status == PDH_CSTATUS_NEW_DATA;
+}
+
 // ---------------------------------------------------------------------------
 // Small helpers. min/max macros are an MSVC convenience that this toolchain does
 // not provide, so they are spelled out here.
@@ -392,6 +437,10 @@ static bool ExtIsExtToken(const WCHAR *name, int len);
 static void ExtStart(const ModSettings &snap);
 static void ExtStop();
 static void ExtPublisherTick();
+// The sampler reaps the publisher when nothing consumes {ext.*} any more, so it needs
+// these two before their definitions.
+static bool ExtPublisherAlive();
+static void ExtPublisherStop();
 
 // ---------------------------------------------------------------------------
 // Minimal GDI+ surface, resolved at runtime.
@@ -769,7 +818,8 @@ static const double kIconContentGap = 8.0;
 // and the host's downward offset are the original's numbers.
 static const double kRippleScaleEnd[3] = {1.5, 2.0, 2.5};
 static const double kRipplePeakOpacity[3] = {0.50, 0.50, 0.60};
-static const double kRippleOffsetY = 16.0;    // RippleRise start
+// (The original's RippleRise offset lived here. It is not applied -- see PaintRipples --
+// so the constant and the frame field it fed are gone rather than kept unused.)
 
 // The icon plate: a light disc with a dark glyph, from HudTheme.axaml
 // (Hud.IconPlate #E9E7E4 / Hud.BoltDark #141313).
@@ -787,6 +837,11 @@ static const DWORD kGlyphDark = 0xFF141313;
 // ---------------------------------------------------------------------------
 struct IconSpec {
     int style = 0;                  // 0 none, 1 cpu, 2 memory, 3 disk, 4 network, 5 gpu
+    // True when the settings key held a value. Without it an explicit `None` cannot be
+    // told apart from "this row was never configured", so it fell through to the
+    // inherited glyph and README's "set it to None to leave a row without an icon" was
+    // simply untrue (measured: Icon1=Memory + Icon3=None gave row 3 the Memory glyph).
+    bool styleSet = false;
     WCHAR path[MAX_PATH] = L"";     // empty = use the built-in glyph
 };
 
@@ -834,6 +889,7 @@ static int IconStyleFromName(const WCHAR *name) {
 // so setting only Icon1 still produces a plate on every row.
 static int ResolveIconStyle(const ModSettings &settings, int index);
 static const WCHAR *ResolveIconPath(const ModSettings &settings, int index);
+static int ResolveIconSlot(const ModSettings &settings, int index);
 
 
 // Colour presets. The alpha on the background matches the mod's 90% default.
@@ -878,19 +934,6 @@ static const double kPanelBounceStrength = 0.04;
 
 static double Lerp(double a, double b, double t) { return a + (b - a) * t; }
 
-// Evaluates a two-keyframe segment: holds `from` until cue1, eases to `to` by
-// cue2 using the given spline, then keeps `to`. This mirrors how the Avalonia
-// KeyFrames behave with FillMode.Forward, so the original cues map over directly.
-static double Segment(double cue, double cue1, double cue2,
-                      double from, double to,
-                      double (*ease)(double)) {
-    if (cue <= cue1) return from;
-    if (cue2 <= cue1) return to;
-    double t = (cue - cue1) / (cue2 - cue1);
-    if (t > 1.0) t = 1.0;
-    return Lerp(from, to, ease(t));
-}
-
 // One edge in a keyframe chain: reach `value` at `cue`, easing into it.
 struct IntroKey { double cue; double value; double (*ease)(double); };
 
@@ -909,7 +952,9 @@ static double EvaluateKeys(double cue, const IntroKey *keys, int count) {
     return keys[count - 1].value;
 }
 
-// The four KeySplines, plus the curves the panel needs that are plain names.
+// The KeySplines this panel actually uses. The original also had KS_Smooth, which only
+// drove RippleRise -- the rise this port deliberately does not apply -- so it is gone
+// with it rather than kept as an unused helper.
 static double Clamp01(double x) { return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x); }
 
 static double CubicBezierY(double x, double x1, double y1, double x2, double y2) {
@@ -932,7 +977,6 @@ static double CubicBezierY(double x, double x1, double y1, double x2, double y2)
 static double EaseIn(double t) { return CubicBezierY(t, 0.42, 0.0, 1.0, 1.0); }
 static double EaseOut(double t) { return CubicBezierY(t, 0.0, 0.0, 0.58, 1.0); }
 static double EaseInOut(double t) { return CubicBezierY(t, 0.42, 0.0, 0.58, 1.0); }
-static double EaseSmooth(double t) { return CubicBezierY(t, 0.65, 0.0, 0.35, 1.0); }
 static double EaseBackOut(double t) {
     return CubicBezierY(t, 0.175, 0.885, 0.32, 1.0 + kPanelBounceStrength);
 }
@@ -961,7 +1005,6 @@ struct IntroFrame {
     double iconAlpha;
     bool expanding;       // true = arriving, false = collapsing
     double rippleProgress;  // 0 until the ripples start, then 0..1
-    double rippleRise;      // host vertical offset
 };
 
 // Note: this deliberately does not consult g_displayHeight. That variable holds
@@ -1029,12 +1072,18 @@ static IntroFrame EvaluateIntro() {
         };
         f.height = EvaluateKeys(cue, growKeys, 2);
     } else {
-        // The shrink finishes at kCollapseDurationRatio, which on a collapse is
-        // cue 1.0 by construction (IntroCue measures against the halved duration).
-        // The content fade is keyed to the same point.
+        // The shrink runs the whole collapse, ending exactly on the end of the
+        // (already halved) timeline. It used to stop at kCollapseDurationRatio -- the
+        // duration ratio used as a *cue* -- which is cue 0.5 of a timeline that had
+        // already been halved: the panel sat at tab height for the second half while
+        // the frame clock kept repainting it at 16 ms, and the visible collapse was
+        // IntroMs/4 rather than the half the README promises. The content fade and the
+        // scale shrink below are still keyed to kCueSettle; nothing draws content while
+        // collapsed (PaintPanel takes the tab branch), so they only have to be over by
+        // the time the tab is all that is left.
         const IntroKey shrinkKeys[] = {
             {0.0, start, nullptr},
-            {kCollapseDurationRatio, end, EaseInOut},
+            {1.0, end, EaseInOut},
         };
         f.height = EvaluateKeys(cue, shrinkKeys, 2);
     }
@@ -1101,11 +1150,11 @@ static IntroFrame EvaluateIntro() {
         f.contentAlpha = 1.0 - EaseIn(Clamp01(cue / kCueSettle));
     }
 
-    // Ripples run from the grow cue to the settle cue, rising meanwhile. The
-    // rise uses KS_Smooth, matching RippleRise in the original.
+    // Ripples run from the grow cue to the settle cue. The original's RippleRise
+    // (lifting the host by 16 px while they expand) is deliberately not applied -- see
+    // PaintRipples -- so there is no rise term to compute here.
     if (expanding && g_intro.rippleCount > 0 && cue > kCueGrow) {
         f.rippleProgress = EaseOut(Clamp01((cue - kCueGrow) / (kCueSettle - kCueGrow)));
-        f.rippleRise = Segment(cue, kCueGrow, kCueSettle, kRippleOffsetY, 0.0, EaseSmooth);
     }
     return f;
 }
@@ -1151,7 +1200,13 @@ struct ModSettings {
     // Left icon plates and intro animation. One icon per row, row-aligned with the
     // RowN settings.
     IconSpec icons[kMaxRows] = {};
-    int iconCount = 0;             // entries actually configured
+    int iconCount = 0;             // slots that will draw a plate
+    // A custom icon file that applies to every row ("Custom icon file"). A row's own
+    // IconN path wins over it; a row that says None gets no icon at all.
+    WCHAR iconPath[MAX_PATH] = L"";
+    // The glyph an image falls back to when it cannot be decoded: the first glyph the
+    // user chose, or Memory when the icons are images only, or 0 when there are none.
+    int iconFallbackStyle = 0;
     int introStyle = 0;            // 0 slide, 1 fade, 2 none
     int introMs = 1200;
     int rippleCount = 2;
@@ -1228,19 +1283,24 @@ static void ReadSettings(ModSettings &s) {
     }
     Wh_FreeStringSetting(introStyle);
 
-    // Icons are read as a row-aligned list: Icon1/Icon1Path .. Icon{kMaxRows}.
-    // An entry counts as configured when it names a glyph other than None or
+    // Icons are read as a row-aligned list: Icon1/Icon1Path .. Icon{kMaxRows}, plus
+    // one optional file that applies to every row (IconPath). An entry counts as
+    // configured when it names a glyph (including None, which is a choice) or
     // supplies an image path.
     s.iconCount = 0;
     for (int i = 0; i < kMaxRows; i++) {
         IconSpec &slot = s.icons[i];
         slot.style = 0;
+        slot.styleSet = false;
         slot.path[0] = L'\0';
 
         WCHAR key[32];
         swprintf(key, 32, L"Icon%d", i + 1);
         PCWSTR styleName = Wh_GetStringSetting(key);
-        slot.style = IconStyleFromName(styleName);
+        if (styleName && styleName[0]) {
+            slot.styleSet = true;
+            slot.style = IconStyleFromName(styleName);
+        }
         Wh_FreeStringSetting(styleName);
 
         swprintf(key, 32, L"Icon%dPath", i + 1);
@@ -1258,20 +1318,37 @@ static void ReadSettings(ModSettings &s) {
         if (slot.style > 0 || slot.path[0]) s.iconCount++;
     }
 
-    // A slot that supplies only an image needs a glyph to fall back on when that
-    // image cannot be decoded, otherwise the row shows an empty plate. Borrow the
-    // first configured glyph; if there is none, use Memory so a failed load is still
-    // visibly "an icon that did not load" rather than a blank disc.
-    bool anyGlyph = false;
-    for (int i = 0; i < kMaxRows; i++) {
-        if (s.icons[i].style > 0) { anyGlyph = true; break; }
-    }
-    if (!anyGlyph && s.iconCount > 0) {
-        for (int i = 0; i < kMaxRows; i++) {
-            if (s.icons[i].path[0]) s.icons[i].style = 2;   // Memory
+    // The global icon file, if any. Read after the slots so the fallback below can tell
+    // whether there is a glyph anywhere to fall back on.
+    {
+        PCWSTR global = Wh_GetStringSetting(L"IconPath");
+        s.iconPath[0] = L'\0';
+        if (global && global[0]) {
+            CopyUserPath(s.iconPath, MAX_PATH, global);
+            if (s.iconPath[0] == L'\0') {
+                Wh_Log(L"Icons: the global icon path is empty after trimming quotes and "
+                       L"spaces; ignoring it");
+            }
         }
-        Wh_Log(L"Icons: no built-in glyph was chosen, so image-only slots fall back "
-               L"to the Memory glyph if their file cannot be loaded");
+        Wh_FreeStringSetting(global);
+    }
+
+    // The glyph an image falls back on when it cannot be decoded, otherwise the row shows
+    // an empty plate -- which reads as "the icon turned white" and sends the reader off in
+    // the wrong direction. Resolved here, once, rather than by writing a style into the
+    // image-only slots: the global image does not belong to any slot, so the rule has to
+    // live where both cases can see it.
+    s.iconFallbackStyle = 0;
+    for (int i = 0; i < kMaxRows; i++) {
+        if (s.icons[i].style > 0) {
+            s.iconFallbackStyle = s.icons[i].style;
+            break;
+        }
+    }
+    if (!s.iconFallbackStyle && (s.iconCount > 0 || s.iconPath[0])) {
+        s.iconFallbackStyle = 2;   // Memory
+        Wh_Log(L"Icons: no built-in glyph was chosen, so an image that cannot be loaded "
+               L"falls back to the Memory glyph");
     }
 
     // Palette resolution. The two sources are mutually exclusive on purpose:
@@ -1377,33 +1454,72 @@ static void ReadSettings(ModSettings &s) {
 
 // Per-row icon resolution.
 //
-// A row with no icon of its own inherits the first configured one. That makes
-// "set Icon1 only" mean "this glyph on every row", which is the obvious reading,
-// while still allowing Icon2..Icon4 to override individual rows.
-static bool SlotIsConfigured(const IconSpec &slot) {
-    return slot.style > 0 || slot.path[0] != L'\0';
-}
+// A row with no icon of its own inherits the first configured one, which makes "set
+// Icon1 only" mean "this glyph on every row", while Icon2..Icon4 override individual
+// rows. On top of that there is one optional global image (`IconPath`) that applies to
+// every row. The rules for the two live in the three functions below, in one place,
+// because they interlock (see ResolveIconPath).
+//
+// "Configured" is deliberately not one predicate: a row can choose a glyph (including
+// `None`, which is a choice -- "this row has no icon" -- and not an absence) and/or name
+// a file, and the two are consulted separately. `IconSpec::styleSet` is what separates an
+// explicit `None` from "never set".
 
+// The glyph a row falls back on when it has no (working) image. Highest first:
+//
+//   1. the glyph the row chose itself (`None` means none, and must not inherit)
+//   2. the shared fallback for an image-only row: the first glyph anywhere, else Memory
+//   3. otherwise the first glyph anywhere, for rows that said nothing at all
+//
+// Resolved rather than written into the slots, so the global image -- which belongs to
+// no slot -- gets the same fallback as a row's own file.
 static int ResolveIconStyle(const ModSettings &settings, int index) {
-    if (index >= 0 && index < kMaxRows && SlotIsConfigured(settings.icons[index])) {
-        // A slot that supplies only an image still needs a style for its glyph
-        // fallback if the image fails to load.
-        return settings.icons[index].style;
+    if (index >= 0 && index < kMaxRows) {
+        const IconSpec &slot = settings.icons[index];
+        if (slot.style > 0 || slot.styleSet) return slot.style;
+        if (slot.path[0]) return settings.iconFallbackStyle;
     }
     for (int i = 0; i < kMaxRows; i++) {
-        if (SlotIsConfigured(settings.icons[i])) return settings.icons[i].style;
+        if (settings.icons[i].style > 0) return settings.icons[i].style;
     }
-    return 0;
+    return settings.iconFallbackStyle;
 }
 
+// The image file a row shows, or "" when it shows a glyph. Highest first:
+//
+//   1. the row's own `Row N icon file`
+//   2. nothing, when the row says `None`: no icon at all, not even the global one
+//   3. the global `IconPath`, which is the panel-wide default for every row
+//   4. a file another row set -- the documented "set Icon1 only and every row uses it"
+//      inheritance, which only comes into play when there is no global image (with one,
+//      the per-row file is the exception, so it must not leak to the other rows)
 static const WCHAR *ResolveIconPath(const ModSettings &settings, int index) {
-    if (index >= 0 && index < kMaxRows && SlotIsConfigured(settings.icons[index])) {
-        return settings.icons[index].path[0] ? settings.icons[index].path : L"";
+    if (index >= 0 && index < kMaxRows) {
+        const IconSpec &slot = settings.icons[index];
+        if (slot.path[0]) return slot.path;
+        if (slot.styleSet && slot.style <= 0) return L"";
     }
+    if (settings.iconPath[0]) return settings.iconPath;
     for (int i = 0; i < kMaxRows; i++) {
-        if (SlotIsConfigured(settings.icons[i])) return settings.icons[i].path;
+        if (settings.icons[i].path[0]) return settings.icons[i].path;
     }
     return L"";
+}
+
+// Which cache slot holds the image for a row. Rows that resolve to the same file share
+// one slot -- the lowest row that wants it -- so a file is decoded and resampled once
+// however many rows show it, which is the normal case for the global icon. The sharing
+// is done at resolution time instead of by adding a slot or by reference counting, so
+// every file still has exactly one owner and the per-slot dispose path is unchanged.
+// Returns -1 when the row shows no image at all.
+static int ResolveIconSlot(const ModSettings &settings, int index) {
+    const WCHAR *path = ResolveIconPath(settings, index);
+    if (!path || !path[0]) return -1;
+    for (int i = 0; i < index && i < kMaxRows; i++) {
+        const WCHAR *earlier = ResolveIconPath(settings, i);
+        if (earlier && earlier[0] && _wcsicmp(earlier, path) == 0) return i;
+    }
+    return index;
 }
 
 // ---------------------------------------------------------------------------
@@ -1494,6 +1610,12 @@ struct Values {
     // counter path has no equivalent. Without this flag a PDH-only machine
     // reported "0C", which looks like a real (and alarming) reading.
     bool gpuTempValid = false;
+    // Fan, power and the VRAM counters are read one by one, and the PDH fallback has no
+    // equivalent for the first two or for the total. They carried no flag, so "this
+    // machine cannot read it" was rendered as a very real-looking 0 -- the same failure
+    // gpuTempValid exists to prevent, one field over.
+    bool gpuFanValid = false, gpuPowerValid = false;
+    bool vramUsedValid = false, vramTotalValid = false;
     double vramUsedGb = 0, vramTotalGb = 0, gpuFan = 0, gpuPower = 0;
     WCHAR gpuName[64] = L"GPU";
 
@@ -1502,10 +1624,12 @@ struct Values {
     WCHAR uptimeText[24] = L"";
 
     double modWsMb = 0, modCpuMs = 0;
-    bool valid = false;
 };
 
 static CRITICAL_SECTION g_valuesLock;       // guards g_rowState and g_publishedRows
+// Cleared when the sampler could not be joined at unload, in which case the lock is left
+// to the process exit instead of being deleted under a thread that may still hold it.
+static bool g_valuesLockUsable = true;
 static Values g_values;                     // published snapshot
 static unsigned g_activeGroups = 0;
 
@@ -1536,7 +1660,6 @@ struct ExtProvider {
     WCHAR    name[kExtProviderChars + 1];
     ExtEntry entries[kMaxExtKeys];
     int      count;
-    DWORD    lastSeenAt;
     unsigned drops;                       // bounded counter for the log
 };
 
@@ -1720,8 +1843,7 @@ static int ExtFindProvider(const WCHAR *name, int len, bool create, int maxProvi
             g_ext[i].name[copy] = L'\0';
             g_ext[i].count = 0;
             g_ext[i].drops = 0;
-            g_ext[i].lastSeenAt = GetTickCount();
-            return i;
+                    return i;
         }
     }
     return -1;
@@ -1902,6 +2024,16 @@ static int IslandEnqueue(IslandEvent *queue, int count, int cap, const IslandEve
         if (_wcsicmp(queue[i].title, ev.title) == 0 &&
             (DWORD)(ev.queuedAt - queue[i].queuedAt) <= kIslandMergeWindowMs) {
             // The same thing again: bump the badge instead of queueing a twin.
+            //
+            // Severity is the one field that must not be inherited from the first
+            // sighting. "The same title, but now critical" is exactly the escalation this
+            // window would otherwise swallow: the entry kept its old level, so the state
+            // machine never saw a critical waiting and the card stayed at warn. Take the
+            // higher of the two -- a repeat can raise the level, never lower it.
+            if (ev.severity > queue[i].severity) queue[i].severity = ev.severity;
+            // The newest text describes the same thing most accurately.
+            wcsncpy(queue[i].body, ev.body, kIslandBodyChars - 1);
+            queue[i].body[kIslandBodyChars - 1] = L'\0';
             queue[i].repeat++;
             queue[i].queuedAt = ev.queuedAt;
             queue[i].ttlMs = ev.ttlMs;
@@ -2105,7 +2237,6 @@ static void ExtStoreValue(int slot, const WCHAR *key, const WCHAR *text, DWORD t
     ExtSanitize(text, e.text, cap);
     e.updatedAt = GetTickCount();
     e.ttlMs = ttlMs;
-    p.lastSeenAt = e.updatedAt;
     LeaveCriticalSection(&g_extLock);
 }
 
@@ -2127,11 +2258,18 @@ static void ExtInvalidate(int slot, const WCHAR *key) {
 static bool g_cpuPrimed = false;
 static ULONGLONG g_prevIdle = 0, g_prevKernel = 0, g_prevUser = 0;
 
-// CPU identity is static for the process lifetime and is read on the loader
-// thread, so it lives in globals rather than in the published Values snapshot
-// (writing into that snapshot from two threads would be a data race).
+// CPU identity is static for the process lifetime, so it lives in globals rather
+// than in the published Values snapshot (writing into that snapshot from two
+// threads would be a data race). ReadCpuStatic() runs on the sampler thread, and
+// again on every settings-version change, so everything it writes must be safe to
+// write a second time -- see g_cpuGhzFromApi.
 static WCHAR g_cpuName[64] = L"CPU";
 static double g_cpuGhzMax = 1.0;
+// >0 once the power API has supplied the nominal. From that point the registry's
+// "~MHz" must never win again: ReadCpuStatic() re-reads the registry whenever the
+// settings change, which used to revert a 2.20 GHz nominal to the registry's 2.42
+// for the rest of the session, because CpuNominalEnsure only tries the API once.
+static double g_cpuGhzFromApi = 0.0;
 static int g_cpuCores = 0, g_cpuThreads = 0;
 
 static void ReadCpuStatic() {
@@ -2155,7 +2293,10 @@ static void ReadCpuStatic() {
         size = sizeof(mhz);
         if (RegQueryValueExW(key, L"~MHz", nullptr, &type, (LPBYTE)&mhz, &size) == ERROR_SUCCESS &&
             mhz > 0) {
-            g_cpuGhzMax = mhz / 1000.0;
+            // Fallback only: the power API's value outranks the registry's, and this
+            // function re-runs on every settings change, so writing unconditionally
+            // here silently reverted the nominal once the API had already answered.
+            if (g_cpuGhzFromApi <= 0.0) g_cpuGhzMax = mhz / 1000.0;
         }
         RegCloseKey(key);
     }
@@ -2192,8 +2333,11 @@ static void ReadCpuStatic() {
 // The registry's "~MHz" is what ACPI/BIOS reports and is not always the nominal clock
 // (measured: 2.42 GHz on a CPU whose nominal is 2.20 GHz). The power manager knows the
 // real one: PROCESSOR_POWER_INFORMATION.MaxMhz. So the API wins and the registry value
-// stays as the fallback. powrprof is loaded on demand through GetProcAddress, the same
-// way iphlpapi and nvml are, so the import table does not change.
+// stays as the fallback -- which is why the two are told apart by separate globals:
+// ReadCpuStatic() re-reads the registry on every settings change, so without
+// g_cpuGhzFromApi a later registry read would undo the API's answer for good (the API
+// is only ever tried once). powrprof is loaded on demand through GetProcAddress, the
+// same way iphlpapi and nvml are, so the import table does not change.
 struct ProcPowerInfo {
     ULONG number;
     ULONG maxMhz;
@@ -2254,6 +2398,9 @@ static void CpuNominalEnsure() {
     Wh_Log(L"CPU clock: nominal %.2f GHz from the power API (registry said %.2f)", nominal,
            fallback);
     g_cpuGhzMax = nominal;
+    // Latch the source: from here on the registry value is only a fallback, even
+    // though ReadCpuStatic() will read it again on the next settings change.
+    g_cpuGhzFromApi = nominal;
 }
 
 // ---------------------------------------------------------------------------
@@ -2350,7 +2497,7 @@ static bool CpuClockRead(double baseGhz, double *outGhz) {
         CpuClockLog(L"PdhGetFormattedCounterValue failed status=0x%08X", (unsigned)status);
         return false;
     }
-    if (value.CStatus != PDH_CSTATUS_VALID_DATA && value.CStatus != PDH_CSTATUS_NEW_DATA) {
+    if (!PdhValueUsable(value.CStatus)) {
         CpuClockLog(L"counter status=0x%08X is not valid data", (unsigned)value.CStatus);
         return false;
     }
@@ -2699,7 +2846,7 @@ static double PdhReadMaxEngine(PDH_HQUERY query, PDH_HCOUNTER counter) {
                                      (PPDH_FMT_COUNTERVALUE_ITEM_W)buffer) == ERROR_SUCCESS) {
         auto *items = (PPDH_FMT_COUNTERVALUE_ITEM_W)buffer;
         for (DWORD i = 0; i < itemCount; i++) {
-            if (items[i].FmtValue.CStatus != ERROR_SUCCESS) continue;
+            if (!PdhValueUsable(items[i].FmtValue.CStatus)) continue;
             double value = items[i].FmtValue.doubleValue;
             if (value > best) best = value;
         }
@@ -2728,15 +2875,23 @@ void GpuBackend::Sample(Values &v) {
             if (getMemory(device, &mem) == 0) {
                 v.vramUsedGb = mem.used / 1073741824.0;
                 v.vramTotalGb = mem.total / 1073741824.0;
+                v.vramUsedValid = true;
+                v.vramTotalValid = true;
             }
         }
         if (getFan) {
             unsigned int fan = 0;
-            if (getFan(device, &fan) == 0) v.gpuFan = fan;
+            if (getFan(device, &fan) == 0) {
+                v.gpuFan = fan;
+                v.gpuFanValid = true;
+            }
         }
         if (getPower) {
             unsigned int mw = 0;
-            if (getPower(device, &mw) == 0) v.gpuPower = mw / 1000.0;
+            if (getPower(device, &mw) == 0) {
+                v.gpuPower = mw / 1000.0;
+                v.gpuPowerValid = true;
+            }
         }
     } else if (kind == Pdh) {
         if (PdhCollectQueryData(query) == ERROR_SUCCESS) {
@@ -2754,11 +2909,12 @@ void GpuBackend::Sample(Values &v) {
                             auto *items = (PPDH_FMT_COUNTERVALUE_ITEM_W)buffer;
                             ULONGLONG best = 0;
                             for (DWORD i = 0; i < itemCount; i++) {
-                                if (items[i].FmtValue.CStatus != ERROR_SUCCESS) continue;
+                                if (!PdhValueUsable(items[i].FmtValue.CStatus)) continue;
                                 ULONGLONG value = (ULONGLONG)items[i].FmtValue.largeValue;
                                 if (value > best) best = value;
                             }
                             v.vramUsedGb = best / 1073741824.0;
+                            v.vramUsedValid = true;
                         }
                         free(buffer);
                     }
@@ -2799,7 +2955,14 @@ static const WCHAR *LookupRaw(const WCHAR *name, int len, const Values &v, WCHAR
     if (MATCH(L"time")) return v.timeText;
     if (MATCH(L"date")) return v.dateText;
     if (MATCH(L"uptime")) return v.uptimeText;
-    if (MATCH(L"gpu.vram.total")) { swprintf(scratch, scratchCount, L"%.1f", v.vramTotalGb); return scratch; }
+    if (MATCH(L"gpu.vram.total")) {
+        // No VRAM total on this machine (the PDH fallback cannot read it): the row must
+        // show "--", not "0.0". Returning nullptr lets ResolveToken fall through to
+        // LookupNumber, which answers with the same validity flag.
+        if (!v.vramTotalValid) return nullptr;
+        swprintf(scratch, scratchCount, L"%.1f", v.vramTotalGb);
+        return scratch;
+    }
     if (MATCH(L"cpu.cores")) { swprintf(scratch, scratchCount, L"%d", v.cores); return scratch; }
     if (MATCH(L"cpu.threads")) { swprintf(scratch, scratchCount, L"%d", v.threads); return scratch; }
     if (MATCH(L"net.nics")) { swprintf(scratch, scratchCount, L"%d", v.netNics); return scratch; }
@@ -2836,10 +2999,10 @@ static bool LookupNumber(const WCHAR *name, int len, const Values &v, double &ou
     if (MATCH(L"gpu")) { out = v.gpuValid ? v.gpu : 0; return v.gpuValid; }
     if (MATCH(L"gpu.mem")) { out = v.gpuValid ? v.gpuMem : 0; return v.gpuValid; }
     if (MATCH(L"gpu.temp")) { out = v.gpuTemp; return v.gpuTempValid; }
-    if (MATCH(L"gpu.fan")) { out = v.gpuFan; return true; }
-    if (MATCH(L"gpu.power")) { out = v.gpuPower; return true; }
-    if (MATCH(L"gpu.vram.used")) { out = v.vramUsedGb; return true; }
-    if (MATCH(L"gpu.vram.total")) { out = v.vramTotalGb; return true; }
+    if (MATCH(L"gpu.fan")) { out = v.gpuFan; return v.gpuFanValid; }
+    if (MATCH(L"gpu.power")) { out = v.gpuPower; return v.gpuPowerValid; }
+    if (MATCH(L"gpu.vram.used")) { out = v.vramUsedGb; return v.vramUsedValid; }
+    if (MATCH(L"gpu.vram.total")) { out = v.vramTotalGb; return v.vramTotalValid; }
 #undef MATCH
     return false;
 }
@@ -2988,13 +3151,6 @@ static PanelTransform ComputePanelTransform(float width, float height, double in
     return t;
 }
 
-// Maps a point from local (untransformed) panel space to rendered space.
-static void ApplyPanelTransform(const PanelTransform &t, float x, float y,
-                                float *outX, float *outY) {
-    *outX = t.scale * x + t.dx;
-    *outY = t.scale * y + t.dy;
-}
-
 // Right edge available to text on one row, and the width the text should occupy.
 //
 // This is factored out because getting it wrong is invisible in a compile and
@@ -3018,6 +3174,35 @@ static RowTextMetrics ComputeRowTextMetrics(float panelWidth, int ringCount, int
     m.textWidth = m.textRight - inset;
     if (m.textWidth < 0.0f) m.textWidth = 0.0f;
     return m;
+}
+
+// How much room an *inline* text run may use, measured from where it starts.
+//
+// A right-parked row hands the text whatever is left after the gauges; an inline
+// row has to work out its own limit, and it used to work it out by measuring the
+// run and then passing that same number as the budget -- so FitTextToWidth could
+// never shorten anything (its first test is "does it already fit?"), which meant a
+// row using [[ring:...]] was never truncated: the text ran to the bitmap edge with
+// no ellipsis and pushed its own gauge off the panel. The README promises the
+// opposite ("the part that does not fit is cut and marked with ...").
+//
+// The rule is "the run plus the gauges still to come must fit the row", which is
+// the same relation the parked path gets from ComputeRowTextMetrics; the gauges
+// keep their width so they stay on screen, and the text is what gives way.
+// Factored out so that relation is assertable instead of implied by the paint loop.
+static float ComputeInlineTextLimit(float textRight, float cursor, int ringsAfter, int ringSize) {
+    if (ringsAfter < 0) ringsAfter = 0;
+    const float limit = textRight - cursor - (float)ringsAfter * ((float)ringSize + 4.0f);
+    return limit > 0.0f ? limit : 0.0f;
+}
+
+// The floor both the trim budget and the DrawString box use. A zero-width box makes GDI+
+// drop the whole run -- that is the other half of the "every row after the first
+// disappeared" bug -- so the floor lives in one function that both call sites ask,
+// instead of the same expression being written out twice (the regression test used to
+// copy the expression, which meant it tested its own copy; see AGENTS 7.8).
+static float LayoutWidthFloor(float width) {
+    return width > kMinLayoutWidth ? width : kMinLayoutWidth;
 }
 
 // Colour of a ring gauge. Precedence, highest first:
@@ -3138,12 +3323,15 @@ static bool FitTextToWidth(GpGraphics *graphics, GpFont *font, GpStringFormat *f
     if (length <= 0) return false;
     if (MeasureAdvance(graphics, font, format, text, boxHeight) <= available) return false;
 
-    // Width of the ellipsis on its own, measured once per process. The font is fixed
-    // for the lifetime of the panel, so this cannot go stale.
-    static float ellipsisWidth = -1.0f;
-    if (ellipsisWidth < 0.0f) {
-        ellipsisWidth = MeasureAdvance(graphics, font, format, L"\x2026", boxHeight);
-    }
+    // Width of the ellipsis on its own.
+    //
+    // This used to be cached "once per process", on the claim that "the font is fixed for
+    // the lifetime of the panel". It is not: the painter rebuilds the font from the
+    // settings on every frame, so after a font-size change the cache still held the width
+    // for the *old* size and every trimmed run overshot its budget by the difference.
+    // Measuring it here costs one extra MeasureString next to the binary search below,
+    // which is not a price worth a stale global.
+    const float ellipsisWidth = MeasureAdvance(graphics, font, format, L"\x2026", boxHeight);
 
     // A lambda captures nothing it could pass as a C callback, so the measurement is
     // reached through a small context struct instead.
@@ -3265,8 +3453,15 @@ static void ExpandTokens(const WCHAR *source, const Values &v, WCHAR *out, size_
         int nameLen = (int)(pipe - (p + 1));
         int specLen = (*pipe == L'|') ? (int)(end - pipe - 1) : 0;
 
-        WCHAR value[128];
-        LookupResult result = ResolveToken(p + 1, nameLen, pipe + 1, specLen, v, value, 128);
+        // Sized for the longest external value the settings allow, not 128: a pushed
+        // value used to be silently cut to 127 characters on its way into a row, so a
+        // long value lost its tail with no ellipsis at all, even though "External value
+        // length" can be set to 512. ExtSanitize marks the *stored* value with an
+        // ellipsis when the provider exceeds that setting; this buffer must not add a
+        // second, invisible cap on top of it.
+        WCHAR value[kExtMaxValueChars + 1];
+        LookupResult result = ResolveToken(p + 1, nameLen, pipe + 1, specLen, v, value,
+                                           kExtMaxValueChars + 1);
         if (result == LR_UNKNOWN) {
             // Not a variable at all: keep it visible so a typo is obvious.
             size_t span = (size_t)(end - p + 1);
@@ -3366,8 +3561,8 @@ static void ExpandTokensAndRings(const WCHAR *source, const Values &v,
                 int span = MinInt((int)(end - p) + 1, 319);
                 wcsncpy(token, p, span);
                 token[span] = L'\0';
-                WCHAR expanded[384];
-                ExpandTokens(token, v, expanded, 384);
+                WCHAR expanded[kExtMaxValueChars + 1];
+                ExpandTokens(token, v, expanded, kExtMaxValueChars + 1);
                 // Copy with a per-character bounds check, mirroring ExpandTokens.
                 // A single "written + 1 < outCount" guard before the whole run
                 // would let a long expansion overrun the destination.
@@ -3745,26 +3940,21 @@ static DownscalePlan PlanDownscale(int srcW, int srcH, int target) {
     int guard = 0;
     while (guard++ < 12) {
         if (w <= target * 2 && h <= target * 2) break;
+        // Halve both axes. That alone keeps the aspect ratio -- what distorted a 2:1
+        // source into 23x17 was clamping the two axes *independently*, and the
+        // proportional repair that replaced it had a fixed point: whenever the short
+        // axis was already at or below the target, the repair scaled it back up to the
+        // target, the "never grow" clamp below put it straight back, and the step
+        // changed nothing. A 200x20 banner therefore did twelve 1:1 resamples and then
+        // one 173x reduction -- the aliasing this plan exists to prevent.
+        //
+        // The short axis is allowed to fall below the target here: it is an
+        // intermediate, and for a 200:1 source no chain of half-steps keeps both axes
+        // at or above 23. Only the long axis is what the final fit lands on the box.
         int nw = w / 2, nh = h / 2;
-        // Clamp proportionally. Clamping the two axes independently stretches the
-        // image: a 2:1 source reduced toward a 23 px box would land on 23x17
-        // (1.35:1) instead of keeping its shape.
-        if (nw < target) {
-            // Scale the other axis by the same factor so the aspect ratio survives.
-            double factor = (double)target / (double)nw;
-            nw = target;
-            nh = (int)((double)nh * factor + 0.5);
-        }
-        if (nh < target) {
-            double factor = (double)target / (double)nh;
-            nh = target;
-            nw = (int)((double)nw * factor + 0.5);
-        }
         if (nw < 1) nw = 1;
         if (nh < 1) nh = 1;
-        // Never allow a step to grow a dimension.
-        if (nw > w) nw = w;
-        if (nh > h) nh = h;
+        if (nw == w && nh == h) break;   // a 1 px axis: nothing left to halve
         w = nw;
         h = nh;
         if (plan.count < 15) {
@@ -4086,10 +4276,13 @@ static float IconPlateDiameter(const ModSettings &settings, int slot) {
     return (float)settings.fontSize * (float)kIconPlateRatio;
 }
 
-// True when at least one slot has an icon.
+// True when at least one row will have a plate. Asked through the same function the
+// painter uses for each row, so "is the plate margin needed" and "does this row get a
+// plate" cannot answer differently -- and an explicit `None` on every row is not a
+// configuration that wants a margin.
 static bool AnyIconConfigured(const ModSettings &settings) {
     for (int i = 0; i < kMaxRows; i++) {
-        if (SlotIsConfigured(settings.icons[i])) return true;
+        if (IconPlateDiameter(settings, i) > 0.0f) return true;
     }
     return false;
 }
@@ -4117,8 +4310,7 @@ struct IconGeometry {
     bool present = false;
     float centerX = 0.0f;
     float centerY = 0.0f;
-    float plateRadius = 0.0f;   // the icon disc
-    float ringInner = 0.0f;     // radius a ring has at the start of its expansion
+    float plateRadius = 0.0f;   // the icon disc; the rings start from this radius
 };
 
 // rowTop is the row's own offset, so one call describes exactly one plate and its
@@ -4133,9 +4325,8 @@ static IconGeometry ComputeIconGeometry(const ModSettings &settings, int slot,
     IconPlateCenterForRow(settings, slot, rowTop, (float)settings.rowHeight,
                           &g.centerX, &g.centerY);
     g.plateRadius = diameter / 2.0f;
-    // Rings are larger than the plate and measured from its radius, so the
-    // innermost ring starts at the plate's edge rather than on top of the glyph.
-    g.ringInner = diameter / 2.0f;
+    // Rings are larger than the plate and measured from this radius (RingRadiusAt), so
+    // the innermost ring starts at the plate's edge rather than on top of the glyph.
     return g;
 }
 
@@ -4149,6 +4340,28 @@ static float RingRadiusAt(const IconGeometry &geometry, int ringIndex, double pr
     double endScale = kRippleScaleEnd[ringIndex < 3 ? ringIndex : 2];
     double outer = geometry.plateRadius * endScale;
     return (float)Lerp(geometry.plateRadius, outer, progress);
+}
+
+// The size a cached icon image is drawn at.
+//
+// The intro scales the whole plate in, so the image has to follow it. It did not: the
+// scale was applied only inside the branch for images *larger* than the plate, and a
+// cached image is already exactly plate-sized, so a custom icon merely faded in while its
+// plate grew. The "never upsample past the natural size" rule caps the base size; the
+// animation multiplies that cap, it is not a second cap.
+static void ComputeIconImageDrawSize(int imageW, int imageH, float plateRadius,
+                                     float iconScale, float *outW, float *outH) {
+    float w = (float)imageW;
+    float h = (float)imageH;
+    const float cap = plateRadius * 2.0f;
+    if (w > cap && w > 0.0f) {
+        const float k = cap / w;
+        w = cap;
+        h *= k;
+    }
+    const float scale = iconScale > 0.0f ? iconScale : 0.0f;
+    if (outW) *outW = w * scale;
+    if (outH) *outH = h * scale;
 }
 
 // Draws one plate, at the centre and radius the shared geometry reports.
@@ -4190,29 +4403,29 @@ static void PaintIconPlate(GpGraphics *graphics, const ModSettings &settings,
     // hold the source unchanged, the source is used and this never upsamples it
     // past its natural size.
     bool imageFailed = false;
-    const WCHAR *iconPath = ResolveIconPath(settings, slot);
+    // The image may belong to a different cache slot than this row: rows that resolve to
+    // the same file share one slot, so it is decoded once (see ResolveIconSlot). The
+    // glyph fallback is still this row's own, so a row that said `None` draws nothing.
+    const int imageSlot = ResolveIconSlot(settings, slot);
+    const WCHAR *iconPath = imageSlot >= 0 ? ResolveIconPath(settings, slot) : L"";
     int target = (int)(geometry.plateRadius * 2.0f + 0.5f);
-    GpImage *image = iconPath[0] ? IconImageFor(slot, iconPath, target, &imageFailed) : nullptr;
+    GpImage *image = imageSlot >= 0 ? IconImageFor(imageSlot, iconPath, target, &imageFailed)
+                                    : nullptr;
     if (g_iconDrawLogs < 8) {
         g_iconDrawLogs++;
-        DBG(L"Icon%d draw: plate diameter target=%d  image=%s  built-in glyph=%d",
-               slot + 1, target, image ? L"custom" : L"none", ResolveIconStyle(settings, slot));
+        DBG(L"Icon%d draw: plate diameter target=%d  image=%s  cache slot=%d  built-in glyph=%d",
+               slot + 1, target, image ? L"custom" : L"none", imageSlot,
+               ResolveIconStyle(settings, slot));
     }
     if (image) {
         UINT iw = 0, ih = 0;
         if (g_gdiplus.GetImageWidth) g_gdiplus.GetImageWidth(image, &iw);
         if (g_gdiplus.GetImageHeight) g_gdiplus.GetImageHeight(image, &ih);
         if (iw > 0 && ih > 0) {
-            // Cached images are already at plate size, so `scale` carries only the
-            // intro animation. A source smaller than the plate is drawn at its own
-            // size rather than blown up, which is the "never upsample past natural
-            // size" rule.
-            float dw = (float)iw;
-            float dh = (float)ih;
-            if (dw > geometry.plateRadius * 2.0f * 1.01f) {
-                dw = geometry.plateRadius * 2.0f * scale;
-                dh = dw * (float)ih / (float)iw;
-            }
+            // Same size rule as the glyph path below: base size capped at the plate, then
+            // the intro's scale on top of it (see ComputeIconImageDrawSize).
+            float dw = 0.0f, dh = 0.0f;
+            ComputeIconImageDrawSize((int)iw, (int)ih, geometry.plateRadius, scale, &dw, &dh);
             g_gdiplus.DrawImageRect(graphics, image, centerX - dw / 2.0f,
                                     centerY - dh / 2.0f, dw, dh);
         }
@@ -4308,16 +4521,25 @@ static PanelRect ComputeIslandRect(const IslandMetrics &m, const ModSettings &cf
 }
 
 // The close affordance: a square at the card's right edge, centred on its first line.
-// The clamps win over the padding, so on a very narrow card it stays inside the card
-// rather than poking out of it -- which would be a click target outside the panel.
+//
+// The button may not be larger than the card it belongs to. The clamps below are what
+// keeps it inside, but when the button is *taller* than the card no position satisfies
+// both clamps at once: the old fixed 22 px square against a single 18 px row landed at
+// y = -2, the top clamp lifted it to the card's edge, and the bottom clamp then pushed it
+// straight back out of the card (measured: y = card.y - 4) -- a click target outside the
+// panel, over whatever is behind it. Shrinking is the only way both clamps can hold.
 static const int kIslandCloseSize = 22;
 
 static PanelRect ComputeIslandCloseRect(const PanelRect &card, int rowHeight) {
     PanelRect out = {};
-    out.w = kIslandCloseSize;
-    out.h = kIslandCloseSize;
-    out.x = card.x + card.w - kIslandCloseSize - 8;
-    out.y = card.y + (rowHeight - kIslandCloseSize) / 2;
+    int size = kIslandCloseSize;
+    if (size > card.w) size = card.w;
+    if (size > card.h) size = card.h;
+    if (size < 1) size = 1;
+    out.w = size;
+    out.h = size;
+    out.x = card.x + card.w - size - 8;
+    out.y = card.y + (rowHeight - size) / 2;
     if (out.x + out.w > card.x + card.w) out.x = card.x + card.w - out.w;
     if (out.x < card.x) out.x = card.x;
     if (out.y < card.y) out.y = card.y;
@@ -4360,11 +4582,32 @@ static IslandRegion IslandHitTest(const IslandHitRegion *regions, int count, int
 // Closing a card early takes the same road the ttl expiry takes, so the fade and the
 // state machine cannot diverge. Idempotent on purpose: a second click on the button must
 // not restart the fade.
+static bool IslandDismissable(const IslandView &v) {
+    return v.state == IS_POPPING || v.state == IS_CARD;
+}
+
 static bool IslandDismiss(IslandView *v, DWORD now) {
-    if (v->state != IS_POPPING && v->state != IS_CARD) return false;
+    if (!IslandDismissable(*v)) return false;
     v->state = IS_COLLAPSING;
     v->phaseStarted = now;
     return true;
+}
+
+// What a click does while a card is up. Pure, so the rule is assertable rather than
+// buried in WindowProc.
+//
+// The button consumes the click whether or not there is still a fade to start: the old
+// code demanded IslandDismiss() == true, so a *second* click on the × during the fade
+// fell straight through to the panel's own click behaviour and toggled the panel -- which
+// reads as "the × closed the panel". The card body consumes as well, for the same reason:
+// clicking the card to read it must not toggle the panel either. Only a click outside the
+// card belongs to the panel.
+enum IslandClickAction { ICA_PANEL = 0, ICA_CONSUMED, ICA_DISMISS };
+
+static IslandClickAction IslandClickActionFor(IslandRegion hit, bool dismissable) {
+    if (hit == IR_CLOSE) return dismissable ? ICA_DISMISS : ICA_CONSUMED;
+    if (hit == IR_CARD) return ICA_CONSUMED;
+    return ICA_PANEL;
 }
 
 // ---------------------------------------------------------------------------
@@ -4710,20 +4953,30 @@ static void PaintPanel(HWND hwnd) {
                         wcsncpy(slice, g_rowState.text[r] + seg.offset, length);
                         slice[length] = L'\0';
 
-                        float advance = 0.0f;
+                        // How much room this run may use. Right-parked gauges leave the
+                        // text whatever they do not need; an inline run has to count the
+                        // gauges that still follow it, or a long run pushes them off the
+                        // panel (and FitTextToWidth gets a budget it can never exceed,
+                        // so the run was never trimmed at all -- see
+                        // ComputeInlineTextLimit).
+                        float limit = metrics.textWidth;
                         if (inlineFlow) {
-                            // Measure so an inline gauge lands right after the text,
-                            // including any spaces written before it.
-                            advance = MeasureAdvance(graphics, font, format, slice,
-                                                     (float)g_settings.rowHeight);
-                        } else {
-                            // Right-parked gauges: the text gets the width that is
-                            // left over, so a run that does not fit is trimmed
-                            // rather than overrunning the gauges. With no gauges
-                            // this is the full inner width, which a plain text row
-                            // needs in order to be visible at all.
-                            advance = metrics.textWidth;
+                            int ringsAfter = 0;
+                            for (int k = s + 1; k < g_rowState.segmentCount[r]; k++) {
+                                if (g_rowState.segments[r][k].offset < 0) ringsAfter++;
+                            }
+                            limit = ComputeInlineTextLimit(metrics.textRight, cursor, ringsAfter,
+                                                           g_settings.ringSize);
                         }
+                        float budget = LayoutWidthFloor(limit);
+
+                        // The run's own width is what an inline gauge is placed after
+                        // (including the spaces written before it); a parked run is
+                        // drawn in its whole budget instead.
+                        float advance = inlineFlow
+                                            ? MeasureAdvance(graphics, font, format, slice,
+                                                             (float)g_settings.rowHeight)
+                                            : budget;
 
                         // Trim to the space this segment is actually allowed to
                         // occupy. GDI+ does not clip text to the layout box, so
@@ -4731,7 +4984,6 @@ static void PaintPanel(HWND hwnd) {
                         // gauge that follows it. The fit is measured through the same
                         // helper used for the advance, so a fitted run costs exactly
                         // what it reports.
-                        float budget = advance > kMinLayoutWidth ? advance : kMinLayoutWidth;
                         bool fitted = FitTextToWidth(graphics, font, format, slice,
                                                      sizeof(slice) / sizeof(slice[0]),
                                                      budget, (float)g_settings.rowHeight);
@@ -4740,7 +4992,7 @@ static void PaintPanel(HWND hwnd) {
                                                      (float)g_settings.rowHeight);
                         }
 
-                        float drawWidth = advance > kMinLayoutWidth ? advance : kMinLayoutWidth;
+                        float drawWidth = LayoutWidthFloor(advance);
                         RectF layout(cursor, top, drawWidth, (float)g_settings.rowHeight);
                         if (logDraws) {
                             DBG(L"    draw row=%d seg=%d x=%.1f y=%.1f w=%.1f "
@@ -5163,7 +5415,25 @@ static void UpdateIntro(HWND hwnd) {
 // step; the machine itself already runs, so its transitions are real and logged
 // rather than waiting for the drawing to exist.
 static void UpdateIsland() {
-    if (!g_settings.islandEnabled || !g_islandLockReady) return;
+    if (!g_settings.islandEnabled) {
+        // Turning the island off has to stop its phase too. Nothing drives the machine
+        // while the feature is off, so a phase caught mid-flight stayed POPPING or
+        // COLLAPSING for the rest of the session: IslandPhaseAnimating() stayed true,
+        // ApplyTickRate pinned the tick at 16 ms, and the stale card could not even be
+        // dismissed (the click path is gated on the same switch).
+        if (g_islandView.state != IS_IDLE) {
+            if (g_islandLogs < 8) {
+                Wh_Log(L"EXT island: disabled mid-phase (%s); dropping it",
+                       IslandStateName(g_islandView.state));
+                g_islandLogs++;
+            }
+            g_islandView.state = IS_IDLE;
+            g_islandView.showing = ES_INFO;
+            g_islandCardValid = false;
+        }
+        return;
+    }
+    if (!g_islandLockReady) return;
 
     IslandEvent local[kIslandQueueMax];
     int count = 0;
@@ -5331,10 +5601,17 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 BuildIslandRegions(card, g_settings.rowHeight, regions, 2);
             const int screenX = wr.left + (int)(short)LOWORD(lParam);
             const int screenY = wr.top + (int)(short)HIWORD(lParam);
-            if (IslandHitTest(regions, regionCount, screenX, screenY) == IR_CLOSE &&
-                IslandDismiss(&g_islandView, GetTickCount())) {
+            const IslandRegion hit = IslandHitTest(regions, regionCount, screenX, screenY);
+            switch (IslandClickActionFor(hit, IslandDismissable(g_islandView))) {
+            case ICA_DISMISS:
+                IslandDismiss(&g_islandView, GetTickCount());
                 PaintPanel(hwnd);
                 return 0;
+            case ICA_CONSUMED:
+                // The card swallows the click; the panel's own behaviour must not run.
+                return 0;
+            default:
+                break;
             }
         }
         if (g_settings.clickToggle) {
@@ -5569,14 +5846,29 @@ static void SamplerIteration() {
     // External providers start lazily, and only when a row actually references
     // {ext.*}: the same shape as the GPU backends below, and it is what keeps
     // "off" free of cost.
-    if ((groups & G_EXT) && settings.externalData && !g_extStartAttempted) {
+    const bool extConsumed = (groups & G_EXT) != 0 && settings.externalData;
+    if (extConsumed && !g_extStartAttempted) {
         g_extStartAttempted = true;
         ExtStart(settings);
     }
-    if ((groups & G_EXT) && settings.externalData) {
+    if (extConsumed) {
         // Cheap every-pass call: starts the configured publisher, supervises it with a
         // bounded restart policy, and stops it the moment the command is cleared.
         ExtPublisherTick();
+    } else {
+        // Nothing consumes {ext.*} any more -- the switch is off, or the last row that
+        // referenced it is gone -- so the publisher this mod started has to go with it.
+        // It used to keep running (the tick was simply not called any more), which means
+        // a bridge doing memory reads or network calls kept doing them after the user
+        // turned the feature off, until the mod was unloaded. Stop() is idempotent and
+        // also closes the job object, so it runs on every pass either way; the log line
+        // is emitted only when there really was a process. No assertion can cover this
+        // (it is a real CreateProcess), so the log is the defence -- same as the
+        // nMaxInstances case in AGENTS §6.
+        if (ExtPublisherAlive()) {
+            Wh_Log(L"EXT publisher: nothing consumes {ext.*} any more; stopping it");
+        }
+        ExtPublisherStop();
     }
 
     Values v;
@@ -5601,7 +5893,6 @@ static void SamplerIteration() {
         }
         g_gpu.Sample(v);
     }
-    v.valid = true;
     g_activeGroups = groups;
     g_sampleCount++;
     PublishRows(v, settings);
@@ -6666,8 +6957,9 @@ static void ExtStop() {
 static void PushSettings(int updateMs) {
     // No allocation: the HUD thread reads g_settings under the same lock the
     // loader thread writes it with. That keeps this DLL free of any C++ runtime
-    // import (new/delete is what pulls in libc++.dll), so it stays a ~125 KB
-    // self-contained mod instead of a ~590 KB statically-linked one.
+    // import (new/delete is what pulls in libc++.dll), so it stays a ~176 KB
+    // self-contained mod (measured 180736 B on 2026-10-14) instead of a ~590 KB
+    // statically-linked one.
     // The refresh interval comes from the caller's copy rather than from the
     // global, so it cannot disagree with the settings that were just swapped in.
     InterlockedExchange(&g_refreshMs, updateMs);
@@ -6774,6 +7066,15 @@ void WhTool_ModSettingsChanged() {
            fresh.clickToggle ? L"toggle" : L"proximity");
 }
 
+// True when the values critical section may be deleted: only once the sampler thread is
+// really gone. The wait used to be fire-and-forget -- its result was thrown away and the
+// lock was deleted anyway, which is undefined behaviour (freeing a lock another thread can
+// still be inside) in exactly the case the wait exists to catch. This runs on the way out
+// of the process, so leaving the lock alone is the safe answer.
+static bool ValuesLockCanBeReleased(DWORD waitResult) {
+    return waitResult == WAIT_OBJECT_0;
+}
+
 void WhTool_ModUninit() {
     InterlockedExchange(&g_stopSampler, 1);
     // Stop the pipe server first: it writes the external value table and the
@@ -6782,9 +7083,14 @@ void WhTool_ModUninit() {
     // (docs/external-data-island-design.md 5.6.4).
     ExtStop();
     if (g_samplerThread) {
-        WaitForSingleObject(g_samplerThread, 2000);
+        const DWORD samplerWait = WaitForSingleObject(g_samplerThread, 2000);
         CloseHandle(g_samplerThread);
         g_samplerThread = nullptr;
+        if (!ValuesLockCanBeReleased(samplerWait)) {
+            Wh_Log(L"sampler thread did not stop within 2s (wait=%lu); leaving the values "
+                   L"lock to the process exit", (unsigned long)samplerWait);
+            g_valuesLockUsable = false;
+        }
     }
     if (g_hudThreadId) PostThreadMessageW(g_hudThreadId, kMsgQuit, 0, 0);
     if (g_hudThread) {
@@ -6809,7 +7115,7 @@ void WhTool_ModUninit() {
         g_gdiplus.Shutdown(g_gdiplusToken);
         g_gdiplusToken = 0;
     }
-    DeleteCriticalSection(&g_valuesLock);
+    if (g_valuesLockUsable) DeleteCriticalSection(&g_valuesLock);
     DeleteCriticalSection(&g_settingsLock);
     // Only now: the pipe threads and the sampler are both joined, so nothing can
     // be inside the external lock any more.

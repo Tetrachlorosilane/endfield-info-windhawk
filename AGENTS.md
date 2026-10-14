@@ -25,27 +25,37 @@
 
 ```
 endfield-info-windhawk/
-├── endfield-info-windhawk.wh.cpp      唯一的交付物（约 226 KB）
-├── README.md                          用户文档
-├── AGENTS.md                          本文
-├── docs/                              规划与设计文档（不是实现说明）
-│   └── external-data-island-design.md 设计：外部数据（M1 数据面、M2 事件面均已实现）
+├── endfield-info-windhawk.wh.cpp      唯一的交付物（含 Windhawk 元数据与注释内 Readme）
+├── README.md                          用户文档（安装、设置、变量、排查）
+├── AGENTS.md                          本文（实现与不变量）
+├── CHANGELOG.md                       版本与变更（发布说明的来源）
+├── LICENSE                            MIT
+├── docs/                              规划、设计与交接文档
+│   ├── external-data-island-design.md 设计：外部数据（M1 数据面、M2 事件面均已实现）
+│   └── state-and-handover.md          验证状态、真机更正、犯错档案、待办
 │
-├── 开发工具（不随 mod 交付）
-├── build.ps1                          本地编译，不用开 Windhawk GUI
-├── test-layout.cpp                    回归测试宿主（打桩 Windhawk API）
-├── test-gdiplus-scale.cpp             GDI+ 缩放探针（独立 exe）
-├── _settings.py                       校验 mod 头部的设置块结构
-├── _preview.py                        渲染 assets/panel-preview.png
-├── _extclient.py                      外部数据管道的冒烟客户端（Python）
-├── _extclient.ps1                     第二客户端（.NET）——**真机验证过的是这一个**
-├── _netease-bridge.ps1                示例发布器：网易云正在播放的曲名 + 当前歌词行
-├── _netease-position.ps1              位置助手（SMTC，必须由 Windows PowerShell 5.1 运行）
+├── 开发工具（不随 mod 交付）——**每个都有自己的 .md，讲怎么跑/要什么/输出什么/坑在哪**
+├── build.ps1                  + build.md
+├── test-layout.cpp            + test-layout.md
+├── test-gdiplus-scale.cpp     + test-gdiplus-scale.md
+├── _settings.py               + _settings.md
+├── _logfmt.py                 + _logfmt.md
+├── _deadcode.py               + _deadcode.md
+├── _preview.py                + _preview.md
+├── _extclient.py              + _extclient.md
+├── _extclient.ps1             + _extclient.md（与上面同一个文件：两个客户端一起讲）
+├── _netease-bridge.ps1        + _netease-bridge.md
+├── _netease-position.ps1      + _netease-position.md
+├── _netease-lyric-scan.ps1    + _netease-lyric-scan.md
+├── _netease-lyric-probe.ps1   + _netease-lyric-probe.md
 └── assets/panel-preview.png           版面预览（README 引用）
 ```
 
+分工：**README 讲用户怎么用**，**脚本的 `.md` 讲这个脚本怎么跑**，**AGENTS（本文）讲实现、
+不变量与踩过的坑**。同一个事实不要在三处各写一遍——写在你改代码时需要看到的那一处。
+
 `test-layout.cpp` 与 `test-gdiplus-scale.cpp` 是**开发工具**，不随 mod 交付。
-`_settings.py` / `_preview.py` 需要 Pillow 与 Python。
+`_settings.py` 需要 Pillow 与 Python；`_logfmt.py` 只需要 Python。
 
 > 本机 `python` 解析到的是 Windows Store 的占位程序，不一定真的能执行。
 > 如果 `python` 打开的是应用商店，用 DSH 运行时自带的解释器：
@@ -66,7 +76,7 @@ endfield-info-windhawk/
   `// ==WindhawkModSettings==` 块里的静态 YAML。字体、图标路径这类只能手输 + 校验。
 
 **约束**：不使用 `new` / `delete` / `std::*` / 异常。原因是**体积**
-（去掉堆分配后约 158 KB，静态链接 libc++ 会涨到约 590 KB），
+（去掉堆分配后 DLL 约 178 KB，2026-10-14 实测 182272 B；静态链接 libc++ 会涨到约 590 KB），
 **不是**因为运行时不可用——Windhawk 会自带并注入 `libc++.whl`，堆分配其实能用。
 早先 AGENTS 里"堆分配不可用"的说法是错的，已更正。
 
@@ -83,14 +93,17 @@ pwsh -File build.ps1
 脚本读取 Windhawk 自己的 `compile_flags.txt`，用它的 clang 20 工具链（MinGW x86_64 +
 libc++）编译，并打印导出符号表。
 
-**允许出现的两个警告**：
+**允许出现的唯一警告**：
 
 1. `winsock2.h:15:2: warning: Please include winsock2.h before windows.h` —
    **无法消除**：Windhawk 用 `-include windhawk_api.h` 强制先包含 `windows.h`，
    而该文件第一行就是 `#include <windows.h>`。这是头顺序问题，不是代码问题。
-2. `unused function 'ApplyPanelTransform'` — 已知残留：该函数在主 mod 中未被调用，
-   只服务于回归测试。可以消除（加 `__attribute__((unused))` 或挪进测试文件），
-   见 §10。
+
+> 2026-10-14 之前还有第二条（`unused function 'ApplyPanelTransform'`）。它不是"可以消除的噪声"，
+> 而是**为测试而存在的产品函数**：主 mod 里没人调用它，只有 `test-layout.cpp` 调。
+> 现已删除，断言改成直接打在产品**真正交给 GDI+ 的字段**上（`ComputePanelTransform` 的
+> `active` / `scale` / `dx` / `dy`，以及"面板中心是不动点"这个由两个函数共同保证的关系）。
+> **"只有测试在用"就是死代码**——它会让下一个人以为产品里有这么一条路径。见 §7.7。
 
 **如果出现别的警告，要处理掉。**
 
@@ -100,7 +113,8 @@ libc++）编译，并打印导出符号表。
 > 日志调用连同它们的格式串在本地被编译掉，DLL 里搜不到任何日志字符串——我为此白排查过一轮
 > （"DLL 里没有新日志"其实什么也没证明）。去掉 `-DWH_EDITING` 也救不了：那会引用
 > `InternalWh_*`，而它们由 Windhawk 自己提供，本地链接不过。
-> **要检查日志格式串，用测试宿主**（它打桩了一个真的 `Wh_Log`，会走 `-Wformat`）。
+> **要检查日志格式串，别指望编译器**——宽格式它一条都查不了（原因与实测见下面的方框），
+> 用 `python _logfmt.py`。
 
 ### 设置块校验（改过设置项就跑）
 
@@ -111,9 +125,19 @@ python _settings.py
 检查设置块结构并统一 `$name` / `$description` 的引号。期望输出含
 `no structural problems found`。
 
+它查的结构项是**被 Windhawk 的解析器拒绝过、而它当时却说没事**的那些：
+
+- **序列项的缩进**：顶层条目必须在第 0 列，`$options` 下的选项项必须正好 4 空格
+  （5 空格 → js-yaml `bad indentation of a sequence entry`）；
+- **每条目恰好一个 `$name` / 一个 `$description`**（把新条目插到上一条目的键与它自己的
+  `$name` 之间 → `duplicated mapping key`）；
+- **顶层键不重复**、**同一 `$options` 组内选项不重复**（YAML 会静默保留最后一个）；
+- 选项项必须出现在它那条目的 `$options:` 之后。
+
 注意：`$name` / `$description` 必须**单引号包裹**（裸的 `-` 会被 YAML 解析成序列，
 导致 `bad indentation of a mapping entry`）；数值设置项**不要加引号**，否则
 `Wh_GetIntSetting` 取不到。
+`--write` 只重写这两种显示串，且是幂等的（实测字节不变）。
 
 ### 回归测试（改过任何绘制/布局/配色/动画逻辑就跑）
 
@@ -132,20 +156,62 @@ $wc = 'D:\Program Files\Windhawk\Compiler'
 & "$env:TEMP\layouttest.exe"
 ```
 
-期望最后一行 `PASSED (0 failure(s))`。
+期望最后一行 `PASSED (0 failure(s))`，或者——在这个受限沙箱里**就是**——
+`PASSED (0 failure(s), 1 skipped)`。**skipped 不为 0 时必须逐条解释**：每条跑不起来的检查
+都打印成 `SKIP` 并计入这个数字，就是为了让"通过"和"根本没跑"不再长得一样
+（宿主自己打印 `SKIPPED: n check(s) ...` 那行也在）。
 
-> **受限沙箱会跳过一条断言**：命名管道客户端在 DSH 的受限模式下被拒绝
-> （连"完全不给安全描述符"的对照管道也打不开，`err=5`），所以 DACL 那条会打印
-> `this environment refuses pipe clients ... the DACL check is skipped here`。
-> **跳过不等于通过**——要验证 DACL 得在普通终端里跑一次。
-> 实测边界：**只读**打开可以（`GENERIC_READ` → `opened=1`），而 `GENERIC_WRITE`、
-> `FILE_WRITE_DATA`、`GENERIC_ALL` 全部 `err=5`。因此宿主**没法**做管道端到端测试
-> （客户端要写），管道读写路径只能靠真机日志——§10 的"未验证"里也记着这条。
+> **受限沙箱会跳过管道 DACL 那条**：命名管道客户端在 DSH 的受限模式下被拒绝
+> （连"完全不给安全描述符"的对照管道也打不开，`err=5`），于是那条打印
+> `the pipe DACL admits the user running the mod (no pipe clients here)  SKIP`，
+> 末行变成 `PASSED (0 failure(s), 1 skipped)`。**跳过不等于通过**——要验证 DACL 得在普通
+> 终端里跑一次。实测边界：**只读**打开可以（`GENERIC_READ` → `opened=1`），而
+> `GENERIC_WRITE`、`FILE_WRITE_DATA`、`GENERIC_ALL` 全部 `err=5`。因此宿主**没法**做管道
+> 端到端测试（客户端要写），管道读写路径只能靠真机日志——§10 的"未验证"里也记着这条。
 
-> **mod 的日志格式串是在这里被检查的**：宿主打桩了一个真的 `Wh_Log`，所以 mod 里每个
-> `Wh_Log(L"...%s", ...)` 都会被真的编译并走 `-Wformat`。**不要给这条命令加
-> `-Wno-format`**，那会把这项检查一起关掉（加过一次，等于把唯一的日志类型检查关了）。
-> 宿主自己那 15 条 `%08X` 收 `DWORD` 的警告是它自己的 printf，与 mod 无关。
+> 宿主还替产品守了三件它自己容易犯的事：**设置字符串的所有权**（桩按真实 API 每次发放新内存，
+> 漏 free / double free / 泄漏都会在末段 `=== settings string ownership ===` 里报出来）、
+> **变量注册表**（token 覆盖直接遍历 `kVariables[]`，注册了却不实现会被抓）、
+> **宽度下限**（`LayoutWidthFloor` 由产品提供，测试不再抄一遍表达式）。
+> 这三条原来都属于"看着有、其实没有"。
+
+> **mod 的日志格式串不在这里检查——而且编译器根本查不了宽格式。** 这一段曾经写着
+> "宿主打桩了真的 `Wh_Log`，所以每个 `Wh_Log(L"...%s", ...)` 都会走 `-Wformat`"，
+> 那是**错的**：`Wh_Log` 是自造的变参函数，clang 只对带 format 属性的函数或 printf 家族
+> 做检查。2026-10-14 实测（Windhawk clang 20）四条路全堵：
+> `format(printf,1,2)` 挂在 `wchar_t*` 格式参数上是**硬错误**（`format argument not a string type`）；
+> `ms_printf` / `wprintf` 不被这个 target 支持（`-Wignored-attributes`）；
+> `-fms-compatibility` 会把编译器自己的头文件打崩；连 MinGW 的 `swprintf` 也不查
+> （`swprintf(b,0,L"%s",1)` 无任何诊断，所以 mod 自己的缓冲格式化同样无人检查）。
+> 那次实测还证明：同一文件里 `printf` 的两处错型各报 1 条，而自造桩的错型 **0 条**。
+> **替代检查**：`python _logfmt.py`（105 个调用点/元数 + 可判定的错型；负对照实测会红）。
+> 宿主**自己的** printf 现在也是干净的：那 15 条 `%08X` 收 `DWORD` 的警告（它在 MinGW 上是
+> `unsigned long`）已经改成 `%08lX`，所以宿主可以在 `-Wformat=2` 下零警告编译——多一条守得住的线。
+
+### 死代码检查（改过结构体或脚本就跑）
+
+```powershell
+python _deadcode.py
+```
+
+编译器只管**符号**（`-Wunused-function` / `-Wunused-variable` / `-Wunused-macros` 都在 build.ps1 里，
+mod 现在只剩 1 条已知警告）。它管不了的三类是：
+
+- **只写不读的结构体字段**（每帧算一遍然后扔掉的量、重构留下的字段），以及**完全没被碰过**的字段；
+- **`#if 0`**；
+- **注释掉的代码**（要求注释以 `;` / `{` / `}` 结尾，否则散文会被误报）；
+- **脚本里定义了却没人引用的函数**（PowerShell / Python 都没有编译器看它们）。
+
+三条刻意的限制，否则一次"干净"没有意义：读计数**跨所有 C++ 文件**（宿主 `#include` 了 mod，
+会读 mod 只写的字段——按单文件扫会误报 `DownscalePlan.steps`）；**先剥注释再统计**（只在注释里
+出现的字段等于没人用）；少量**豁免清单**（`EXTERNAL_READERS` / `EXTERNAL_STRUCTS`）覆盖
+"由 Windows / GDI+ 读，不是由我们读"的结构体镜像，另有"体里有 `{` 的结构体跳过"这条
+（成员函数里的字段可以不带 `this->` 引用，文本扫描看不见）。
+
+2026-10-14 第一次跑就是它找出我们自己的 5 处：`Values.valid`、`IntroFrame.rippleRise`、
+`ExtProvider.lastSeenAt`、`IconGeometry.ringInner`（都只写不读），以及随之失去唯一调用者的
+`Segment` / `EaseSmooth` / `kRippleOffsetY`（这几处编译器也报了）。**每次的判据都一样：
+先看它报什么，再决定是删还是加豁免——豁免要写理由。**
 
 **宿主原理**：`test-layout.cpp` 把 Windhawk API（`Wh_GetIntSetting` / `Wh_GetStringSetting` /
 `Wh_Log` / `Wh_SetFunctionHook`）打桩，然后 `#include "endfield-info-windhawk.wh.cpp"`。
@@ -157,8 +223,9 @@ $wc = 'D:\Program Files\Windhawk\Compiler'
 
 测试**最后一段会真启动 GDI+**（`g_gdiplus.Load()` + `Startup`），用真字体量
 "这段文字会不会折行、会不会冲出预算"。这是唯一能守住 §5.1 那条
-"文字不得折行"的办法：纯函数测不了 GDI+ 的排版行为。GDI+ 起不来时该段会打印
-`GDI+ did not start; section skipped` 而不是失败，所以在没有 GDI+ 的环境里测试仍可用。
+"文字不得折行"的办法：纯函数测不了 GDI+ 的排版行为。GDI+ 起不来时该段打印一行
+`SKIP` 并计入末行的 `skipped` 数（不再是一句容易被忽略的 "section skipped"），
+所以没有 GDI+ 的环境里测试仍可用，但**不会被误读成全绿**。
 
 > **踩过的坑**：脚本里要加 `if (-not (Test-Path $out)) { exit 1 }` 守卫。
 > 曾出现编译失败但脚本仍执行了**上一次的旧 exe**，得出"改了没效果"的错误结论。
@@ -215,12 +282,14 @@ python _preview.py
 都抽成一个不依赖 GDI+ 状态的纯函数，然后由回归测试直接调用。已有：
 
 `ComputeRowTextMetrics` · `ComputeRowVariables` · `ResolveRingColor` ·
-`ComputePanelTransform` · `ApplyPanelTransform` · `IconPlateDiameter` ·
+`ComputePanelTransform` · `IconPlateDiameter` ·
 `IconPlateCenterForRow` · `ComputeIconGeometry` · `RingRadiusAt` ·
 `PlanDownscale` · `CopyUserPath` · `ResolveIconStyle` / `ResolveIconPath` ·
+`ComputeIconImageDrawSize` · `LayoutWidthFloor` · `PdhValueUsable` ·
 `EvaluateIntro` · `FitCharacterCount` / `FitCharsWithEllipsis`（测量以函数指针注入） ·
 `ExtParseLine` · `ExtSanitize` · `ExtParseNumber` · `ExtLookup` · `ExtNextDeadline` ·
-`ExtEvictIndex` · `ExtProviderAllowed`
+`ExtEvictIndex` · `ExtProviderAllowed` · `IslandEnqueue` / `StepIsland` / `IslandHitTest` /
+`IslandClickActionFor` · `Select-StoreLineIndex` / `Select-SongTitle` / `Get-LeadMs`（脚本侧）
 
 **新增绘制逻辑时照此办理。** 如果一段逻辑无法在测试里调用，它就无法被守住。
 反过来，**测试不应该自己复刻一份产品逻辑**（复刻出来的那份测不到产品）；
@@ -261,13 +330,20 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   **不要把这个函数拆回内联**：测试必须和绘制走同一个函数，
   否则测的是测试自己那份副本（这一点已实测踩到，见 §7 第 8 条）。
 - **GDI+ 不按 layout 框裁剪文本。** 关掉换行后，超宽的文本会**直接画到框外**、
-  压在后面的环上。所以每段在 `DrawString` 前要按自己的预算
-  （内联段 = 实测 advance，右停靠段 = `metrics.textWidth`）调用
-  `FitTextToWidth()` 截断。`FitTextToWidth` / `FitCharacterCount` /
-  `FitCharsWithEllipsis` 是纯函数或注入测量的函数，都有断言。
+  压在后面的环上。所以每段在 `DrawString` 前要按自己的预算调用 `FitTextToWidth()` 截断：
+  右停靠段 = `metrics.textWidth`，**内联段 = `ComputeInlineTextLimit(textRight, cursor,
+  跟在它后面的环数, ringSize)`**。内联段曾经写成"实测 advance"，那是个**恒真的预算**
+  （该函数第一句就是"已经放得下吗"），于是用了 `[[ring:…]]` 的行**从不截断**：文字切在
+  位图外缘且没有 `…`，它自己的环被挤出面板。`FitTextToWidth` / `FitCharacterCount` /
+  `FitCharsWithEllipsis` / `ComputeInlineTextLimit` 是纯函数或注入测量的函数，都有断言。
 - **`DrawString` 的框宽下限是 `kMinLayoutWidth`（1.0）**，不能是 0：
   0 宽会让 GDI+ 把整段裁掉，这与第一条是同一个坑的另一面。
-  截断与框用的是同一个下限，两者不能各写一个数字。
+  截断与框用的是同一个下限（`LayoutWidthFloor`），两者不能各写一个数字。
+- **`FitTextToWidth` 不缓存省略号宽度。** 它曾经"按进程缓存一次"，理由写着"字体终生固定"——
+  **不成立**：绘制每帧按设置重建字体。于是改字号后缓存还是旧字号的宽度，被截断的行可以
+  比预算宽出这个差值（实测 24 px 字体下某个预算超 6.1 px）。现在每次量一次（旁边本来就有
+  一次二分测量，多这一次可以忽略）。断言是**扫一遍预算**（40..200）而不是试一个：
+  预留被低估时只有"刚好填满预留"的那些预算会越界。
 
 ### 5.2 配色
 
@@ -277,7 +353,14 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   否则残留字段可能从某条路径泄漏进预设配色。
 - **环色优先级**：`:COLOR` > `Ring colour`（仅 Custom）> 主题边框色。
 - **`{gpu.temp}` 等"已知但取不到"的变量渲染为 `--`**，未知变量保持字面文本。
-  二者必须区分（见 §6 第 3 条）。
+  二者必须区分（见 §6 第 3 条）。**每个 NVML-only 读数都要有自己的有效性标志**
+  （`gpuTempValid` / `gpuFanValid` / `gpuPowerValid` / `vramUsedValid` / `vramTotalValid`）：
+  少一个标志，"这台机器读不到"就会被画成一个看着很像真读数的 `0`——温度、风扇、功耗、
+  显存总量各栽过一次。
+- **PDH 的"这个值能不能用"只有一个判据**：`PdhValueUsable()` 接受 `PDH_CSTATUS_VALID_DATA`
+  **和** `PDH_CSTATUS_NEW_DATA`。CPU 时钟路径一直接受两者，而 GPU 的数组读取只接受
+  `ERROR_SUCCESS`（即 VALID_DATA）——于是**计数器刚建好时的第一个采样被丢掉**，
+  表现为 GPU 读数晚一拍才出现。三条路径现在问同一个函数。
 
 ### 5.3 图标
 
@@ -292,15 +375,39 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 - **用户路径必须裁剪引号与前后空白**（`CopyUserPath`）。
   曾把 `"C:\...\img.png"` 的引号一起传给文件 API → "文件明明在却 could not load"。
 - **图片载入失败必须回退到内置字形。** 否则只剩空盘，看起来像"图标变纯白"，
-  会把人引向完全错误的排查方向。
+  会把人引向完全错误的排查方向。回退值在 `ReadSettings` 里解析一次
+  （`iconFallbackStyle`：第一个显式字形 → 没有任何字形但有图片时用 `Memory` → 否则 0），
+  由 `ResolveIconStyle` 统一取用——**不是**把字形写进槽位：全局图片不属于任何槽位，
+  规则必须放在两者都看得见的地方。
+- **`Row N icon = None` 是"这一行不要图标"，与"没设置"必须可区分。** `IconSpec::styleSet`
+  记录该键是否给了值；没有它，`None` 会落到继承分支，README 的"设成 None 就不要图标"
+  曾**不是真的**（实测：`Icon1=Memory` + `Icon3=None` → 第 3 行拿到 Memory 字形）。
+  `None` 连全局图片一起挡住。
+- **一张图给所有行**（`Custom icon file` → `ModSettings::iconPath`）。每行的优先级：
+  `Row N icon file` > 显式 `None`（不画）> 全局图片 > 内置字形（自己的 → 第一个显式字形）。
+  全局图片排在"继承别的行的文件"**之前**：有全局图时，单行的文件是例外，不该扩散到其余行；
+  没有全局图时，"只设 `Row 1 icon file` 就等于所有行都用它"这条继承照旧。
+- **相同路径的图片只解码/缩放一次**：`ResolveIconSlot` 让解析到同一文件的行**共用最低那个
+  槽位的缓存**（全局图片因此天然只解码一次）。**刻意不加第五个槽、也不做引用计数**——
+  每个文件仍然只有一个所有者，`ReleaseSlotImage` / `DisposeIconImage` 的按槽释放逻辑不变。
 - **自定义图片在载入时按盘径重采样一次**，不在每帧缩放。大图一步压到 23px 会有锯齿，
-  且每帧重采样很贵。
+  且每帧重采样很贵。**逐级折半对"短边已经小于目标箱"的横幅同样成立**：
+  `PlanDownscale` 只按比例折半，不把短边钳回目标（那个钳位有不动点，会让宽扁图做十几次
+  1:1 空转、然后一次性压 173 倍）；短边在中间步骤允许降到 1px，末级仍由长边定尺。
+- **图片的绘制尺寸 = min(自然尺寸, 盘径) × 入场缩放**（`ComputeIconImageDrawSize`）。
+  "不放大超过自然尺寸"是给**基准**尺寸的天花板，不是第二次钳位。它曾经被写成
+  "只有比盘还大的图才乘缩放"，而缓存图恰好**等于**盘径，于是自定义图片只会淡入、
+  不随盘子长大（内置字形那条路径一直是乘缩放的）。
 
 ### 5.4 动画
 
 - **`g_displayHeight` 是静止几何**（`PlaceWindow` 与 `WM_NCHITTEST` 都用它），
-  **`g_paintedHeight` 是当前帧绘制高度**。动画**不得**写回前者。
-  曾混用 → 窗口与命中矩形在动画中途缩到标签尺寸 → "弹出后立刻收起"。
+  **`g_paintedHeight` 是当前帧绘制高度**。**展开**方向动画不得写回前者
+  （曾混用 → 窗口与命中矩形在动画中途缩到标签尺寸 → "弹出后立刻收起"）。
+  **例外是收起方向**：`PaintPanel` 的收缩分支逐帧把 `g_displayHeight` 跟到绘制高度并
+  `PlaceWindow`——这正是修掉收起闪烁的手段（见下一条），此刻窗口与位图同高、命中矩形
+  跟着窗口，仍然自洽；动画结束时 `UpdateIntro` 把静止值写回。**不要"恢复"成展开时那样
+  不写它**，那会让展开高度的位图被裁进 8px 窗口——这一条与下一条是一体的。
 - **热区起点用 `kPanelTopOffset`（窗口实际顶部）**，不是显示器顶边。
   曾用显示器顶边 → 面板最上面 6px 落在自己的热区之外。
 - **动画进度每帧只采样一次。** `IntroCue()` 每次都重算 `GetTickCount()`，
@@ -317,6 +424,10 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   to the resting (tab) height, so the frame has to grow it back"* 正是这个往返的补偿——
   **补偿存在，说明顺序错了**。
 - **展开与收回刻意不对称**：展开先生长定型、再让内容分层浮现；收回贯穿整段、时长为一半。
+- **收回的关键帧 cue 是 `1.0`，不是 `kCollapseDurationRatio`。** 那个常量是**时长比例**；
+  把它当 cue 用（`{kCollapseDurationRatio, end}`）会让收缩在半程就结束，剩下半程窗口停在
+  标签高度、而帧时钟仍以 16 ms 重绘它——可见收回只有 `IntroMs/4`（README 写的是"一半"）。
+  断言：`the shrink still has work left at the midpoint`。
 - **方向判定用 `start = fromHeight`、`end = toHeight`**，方向由两者大小自然决定。
   曾按方向重排 start/end → 收回时高度反而在增长。
 - **过冲强度 `kPanelBounceStrength = 0.04`**（原项目 0.275）。0.275 在 250px 面板上是
@@ -345,6 +456,9 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   替换出来的文本不会被重新扫描——并且有断言钉住：把展开改成递归，
   `test-layout.cpp` 里 "a pushed value that looks like a token stays literal" 必须变红（已实测）。
 - **停机顺序：IPC 先于 sampler**（写者先于读者），最后才 `DeleteCriticalSection(&g_extLock)`。
+  同理，**删 `g_valuesLock` 之前必须确认 sampler 真的停了**：等待结果不能丢
+  （`ValuesLockCanBeReleased` 只认 `WAIT_OBJECT_0`）。超时就把锁留给进程退出——
+  在"另一条线程可能还握着它"的时候删锁是未定义行为，而超时正是这个等待要防的情形。
 - **`CreateNamedPipe` 的 `nMaxInstances` 必须等于实例线程数**（每线程建一个实例）。
   传 1 会让第一个线程占满额度、其余线程以 `ERROR_PIPE_BUSY (231)` 退出——表面上"serving 4
   instances"，实际只有一个客户端能连。**231 是瞬态**（实例都被占着），要等一会儿重试，
@@ -392,6 +506,18 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   16 ms），所以淡出只有两三帧；现在相位与高度动画共用同一个决策点。
 - **关闭卡片与 ttl 到期走同一条路**（`IslandDismiss` → `COLLAPSING`），所以淡出与状态机不会分叉；
   它**幂等**，第二次点击不会重启淡出。
+- **合并窗口内"同一件事又来了"只加计数，但 `severity` 必须取两者中更高的那个。** 否则
+  "同一个标题，现在变成 critical"这条**升级会被窗口整个吞掉**：条目留在原级别 → 状态机看不到
+  `criticalWaiting` → 卡片一直停在 warn。文本取最新的一条（同标题的最新读数是更准的），
+  而**窗口从最后一次出现算起**（每次重复都刷新它，断了两倍窗口才算新事件）。
+  断言不只查队列字段，还直接驱动 `StepIsland`：屏幕上正显示的 warn 卡必须为它让位。
+- **关闭按钮不得比卡片大。** 卡片可以只有一行（`rowHeight` 下限 18）而按钮默认 22 px，
+  这时**没有任何位置能同时满足上下两个钳位**：旧代码先把 y 抬到卡片上沿、再被下钳位推出卡片
+  （实测 y = card.y − 4），于是卡片之外多出一个可点区域。按钮按卡片尺寸收缩是唯一解。
+- **卡片在时，点击要么关卡片、要么被卡片吃掉，绝不落到面板行为上。** 规则抽成纯函数
+  `IslandClickActionFor(hit, dismissable)`：按钮命中 → 可淡出就淡出，**正在淡出也要吃掉**
+  （旧代码要求 `IslandDismiss()` 返回 true 才算处理，于是淡出期间再点 × 会切换面板——
+  看起来像"× 把面板关掉了"）；卡片命中 → 吃掉（点卡片读它不该切换面板）；只有卡片之外才归面板。
 - **"动画期间取两态并集"这条规则仍然不在代码里**：它服务于已移除的宽度动画。现在没有动画窗口期，
   区域表本身就是完整的可点范围；等 M3 的悬停态落地时再回来看是否需要它。
 
@@ -424,6 +550,26 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 | `CreateNamedPipe` 的 `nMaxInstances` 传 1 而线程数是 4 | 日志写着 `serving 4 pipe instance(s)`，实际 3 个线程以 `CreateNamedPipe failed: 231` 当场退出，只支持 1 个并发客户端 | **没有断言能覆盖**（这是 API 调用点的常量错，宿主里没有真管道）；判别依据是错误码语义——**断言覆盖不到的地方，日志就是防线** |
 | 读用 `INFINITE` 等完成事件，完成事件一旦丢失线程就永久停住 | 客户端**连上了**（`ExtLogClient` 有），之后日志**完全静默**——连 `client done` 都没有，行永远 `--` | 等待加 500 ms 上界 + `PeekNamedPipe` 判定；缓冲有数据却没完成就重投。判别日志：`EXT read#1 result=… got=…`、`read completion never arrived with N bytes queued`、`no frame for 2s and the pipe buffer is empty` |
 | 收起时先把窗口缩到标签高度、再长回来画（`SetExpanded` 里那次 `PlaceWindow`） | 收起瞬间闪出一条"切片"，极短、难复现；鼠标离开检测区延迟后触发 | **无法断言**（这是分层窗口的帧内顺序，不是数值）。判据是流程：窗口尺寸必须与**同一帧提交的位图**一致；收起方向由绘制侧逐帧跟随内容（`if (expanded) PlaceWindow(hwnd);`） |
+| 内联环行的截断预算写成"实测 advance" | 用了 `[[ring:…]]` 的行**永不截断**：文字切在位图外缘（没有 `…`），它自己的环被挤出面板 | `ComputeInlineTextLimit` 的关系断言（run + 后面的环 = 整行） |
+| 收回关键帧把**时长比例**当 **cue** 用 | 收缩在半程就完成、后半个时间轴是死区：可见收回只有 `IntroMs/4`（README 写"一半"），且那半程仍以 16 ms 重绘空转 | `the shrink still has work left at the midpoint` |
+| GPU 的风扇/功耗/显存总量没有有效性标志 | 非 NVIDIA（PDH 回退）机器上 `{gpu.fan}`=0、`{gpu.power}`=0、`{gpu.vram.total}`=0.0——看着像真读数 | `{gpu.fan}` → `--` 等 5 条 unavailable 断言 |
+| 行内展开用 128 字符暂存缓冲 | `{ext.*}` 的值被静默截到 127 字符（设置允许 512，且不带 `…`） | 399 字符的值整段到达行里 |
+| 关掉岛不丢相位 | `POPPING`/`COLLAPSING` 冻结 → `IslandPhaseAnimating` 恒真 → tick 永久钉在 16 ms，卡片也关不掉 | `turning the island off drops a phase that was in flight` |
+| 发布器没有回收路径 | 关掉 `External data`、或删掉最后一行 `{ext.*}` 后，mod 启动的发布器继续跑（读内存/联网）直到卸载 | **没有断言**（真 `CreateProcess`）；判据是日志 `nothing consumes {ext.*} any more; stopping it` |
+| `PlanDownscale` 的比例钳位有不动点 | 短边已小于目标箱的宽扁图（横幅）**一次都不折半**：十几次 1:1 空转之后一次性压 173 倍——正是要修的锯齿形态 | `no stage reduces the long edge by more than 2x`、`the short side is the exact fit, rounded up by at most a pixel` |
+| 图片-only 槽只在"全工程都没有字形"时才借字形 | 混合配置（第 1 行图片、第 2 行 Network）里图片载入失败仍是**空盘**，看着像"图标变纯白" | `an image-only row falls back to the configured glyph`、`with no glyph anywhere an image-only row falls back to Memory` |
+| `Row N icon = None` 与"没设置"无法区分 | 设了 `None` 的行**照样得到继承来的字形**（实测 `Icon1=Memory`+`Icon3=None` → 第 3 行是 Memory），README 的"设成 None 就不要图标"不成立 | `an explicit None leaves that row without a glyph`、`an unconfigured row inherits the first real glyph, not a None` |
+| 全局 `IconPath` 从未被读取（死设置项） | 界面上有"Custom icon file"，填了没有任何效果 | `the global icon applies to a row that has no file of its own`、`a global icon on its own still means plates are drawn` |
+| 多行用同一张图时逐行解码 | 全局图片在大图上会被解码 N 次（峰值内存按行数翻倍） | `every row shares one cache slot, so the file is decoded once`、`a row that names the global file shares row 1's slot` |
+| 合并窗口吞掉同一标题的升级 | 同标题从 warn 变 critical 时卡片仍停在 warn，升级永远看不见 | `an escalation inside the merge window raises the queued level`、`so a card already on screen stands down for it` |
+| 关闭按钮比卡片还高 | 单行卡片（18 px）下按钮被下钳位顶出卡片上沿（y = card.y − 4）→ 卡片外多出一个可点区域 | `the close button fits inside a card of any height`、`and it shrinks to the card when the card is smaller` |
+| 淡出期间点击 × 落到面板行为上 | 卡片正在淡出时再点 × → 面板被切换（看着像"× 关掉了面板"）；点卡片本身同样如此 | `and during the fade it is still swallowed, not handed to the panel`、`a click on the card is swallowed, never the panel's` |
+| `FitTextToWidth` 按进程缓存省略号宽度 | 改字号后被截断的行比预算宽出省略号的差值（实测 24 px 下某个预算超 6.1 px），文字压到后面的环上 | `a trimmed run fits its budget under any second font size`（扫 40..200 全部预算） |
+| sampler 的 join 超时被忽略 | 超时后仍 `DeleteCriticalSection(&g_valuesLock)`：另一条线程可能还握着它，未定义行为 | `a sampler that did not stop leaves its lock alone`、`and so does a failed wait` |
+| 自定义图片不参与入场缩放 | 图片只淡入、不随盘子长大（内置字形那条路径一直会） | `and follows the intro as it scales the plate in`、`while the intro still scales it down` |
+| PDH 的 GPU 数组读只认 `ERROR_SUCCESS` | 计数器刚建好时的第一个采样（`NEW_DATA`）被丢掉 → GPU 读数晚一拍 | `and so is a counter's first sample (new data)` |
+| bridge 的 `$client.Connect(3000)` 无保护 | 瞬时连不上变成未处理异常、脚本当场死掉，mod 看门狗再拉起它——重启预算烧在"再等一秒就能连上"上 | 自检 `连不上管道时返回空值（不抛异常）`；对照（裸 Connect）实测未捕获异常 + exit 1 |
+| bridge 用 `Process.MainWindowTitle` 取曲名 | **开着「桌面歌词」时 `MainWindowTitle` 就是「桌面歌词」**（真机实测 2026-10-14：`Get-Process -Id 15824` → `cloudmusic / 桌面歌词`，而同一 pid 另一个顶层窗口才是「下等马 - 洛天依…」）→ 标题里永远没有「 - 」→ 桥一直停在"没有可用窗口"的等待循环里、**从不连接**，面板 title/lyric 两行永远 `--` | 自检 `曲目标题：桌面歌词窗口不算曲目`、`曲目标题：从多窗口里挑出带「 - 」的那个`、`曲目标题：多个候选取最长的`、`窗口枚举：网易云在跑时能看到它的顶层窗口`；活体输出 `网易云顶层窗口（2 个）：[桌面歌词] [下等马 - …]` |
 
 ### 排查心法：先分类，再定位
 
@@ -450,9 +596,12 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
    GDI+ 管线、测四种 PNG 编码……最后一行日志显示
    `could not load ""C:\...\image.png""` ——**是路径里的引号**。
    一行日志能省掉全部弯路。
-2. **`ApplyPanelTransform` / 变换类断言要避开不动点。** 我第一版断言比较的是
+2. **变换类断言要避开不动点。** 我第一版断言比较的是
    缩放变换的**不动点**（面板中心），映射前后必然相同，断言恒真、什么也证明不了。
-   要用**偏离中心的点**，并给出"错误做法"的对照数值。
+   要用**偏离中心的点**，并给出"错误做法"的对照数值。现在的写法是断言产品**交给 GDI+ 的字段**：
+   `active` / `scale` / `dx = (1-scale)*W/2`，以及"面板中心在映射下不动"这条把
+   `ComputePanelTransform` 与"GDI+ 怎么映射一个点"绑在一起的关系——它仍然会红
+   （`dx` 少一个 `/2`，或符号反了，都会被它抓住），但不再依赖一个只有测试在用的函数。
 3. **PARGB 下透明像素的 RGB 是 0。** 因此"彩色图案偏淡"与"整片纯白"在浅色盘上
    肉眼无法区分。要区分就必须**测量像素**（`GdipBitmapGetPixel` 采样）。
 4. **测试脚本要防旧产物。** 编译失败时若仍执行上一次的 exe，会得出"改了没效果"的
@@ -463,6 +612,11 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
    而非硬编码 600ms，这样改默认时长后断言依然成立。
 7. **删掉"为文档而存在但未使用"的声明。** 曾声明一组设计令牌常量却全部未使用，
    编译器报 9 个 `unused-variable`。能用的接进渲染路径，不能用的写进注释。
+   **同样适用于"只有测试在用"的函数**：`ApplyPanelTransform` 在主 mod 里没有调用者，
+   只为让宿主能断言变换而存在——它让下一个人以为产品里有这条路径。删掉之后，
+   断言改打在产品真正交给 GDI+ 的字段上（见 §3 的方框），mod 的已知警告从 2 条降到 1 条。
+   **字段级的同类问题编译器看不见**（只写不读、从没被碰过），那是 `python _deadcode.py`
+   的活；2026-10-14 它一次找出 5 处，其中 4 处是纯粹的"算完就扔"。
 8. **断言必须打在"产品代码"上，不是打在测试自己复刻的那份上。** 修"第一行不在一条直线"
    时，我第一版断言在测试里自己调 `CreateStringFormat(kStringFormatNoWrap, …)` 建格式，
    于是把 mod 的 flag 改回 `0` 做负对照时，测试**照样全绿**——它测的是自己。
@@ -496,6 +650,18 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
     定位方法也不是按层猜，而是**把事件流程读出来**：谁在什么时候调 `PlaceWindow`、谁调
     `PaintPanel`、一拍之内两者的先后。用户一句"检查鼠标离开检测区后的渲染事件流程"比我自己
     猜四轮都有效——**症状说不清层的时候，去读调用顺序，而不是继续调参数**。
+13. **恒真断言、"抄一份表达式"和"静默跳过"是同一类失效：看着在守，其实没有。**
+    2026-10-14 一次清掉四处，每一处都用"把它要防的改动回去、必须变红"验证过：
+    — `if (firstY == panelH / 2.0f) Check(rowCount == 1, …)`：条件与结论代数等价；
+    — "盘心 = 环心"：拿同一个结构体的字段和自己比；
+    — 测试里又抄一遍 `width > kMinLayoutWidth ? … : …`：测的是那份副本
+      （产品现在提供 `LayoutWidthFloor`，绘制与测试都调它）；
+    — 三处 `printf("… section skipped")`：**"跑不起来"和"通过"长得一模一样**——
+      `CreateRowStringFormat` 一旦返回 null，GDI+ 段那些 NoWrap/预算断言全部消失，
+      而末行照样写 `PASSED`。
+    现在的规矩：跑不起来的检查打印 `SKIP` 并**计入末行的 skipped 数**；产品自身的前置条件
+    （格式建不出来）算**失败**；字符串所有权、变量注册表这类"桩替产品守"的东西要真的能报错。
+    判据与第 8、9 条相同——**断言的价值只等于"改坏它会不会红"**，与字数无关。
 
 ---
 
@@ -571,8 +737,9 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 2. 在 `LookupRaw`（格式化字符串）或 `LookupNumber`（数值）里实现。
 3. 若是数值变量，加进 `IsKnownNumberVariable`，这样"本机取不到"时会渲染 `--`
    而不是字面文本。
-4. 在 `test-layout.cpp` 的 token 覆盖列表里加一行——
-   **有测试保证"32 个变量全部能解析"**，漏了会被测出来。
+4. 更新 `test-layout.cpp` 时**不需要**再维护第二份 token 列表：那一节现在直接遍历
+   `kVariables[]`，注册了却不实现（或没给采集组）会当场变红。README 的「变量速查」表
+   仍要手改——它是给用户看的，没有任何东西比对它。
 5. 更新 README 的「变量速查」表。
 
 > `{ext.*}` 是**运行期**变量，**不要**注册进 `kVariables[]`：那张表是编译期的采集通路清单，
@@ -587,6 +754,19 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 3. 改实现，跑到 `PASSED (0 failure(s))`。
 4. 同步 `_preview.py`（若涉及版面）。
 5. 若偏离了原项目，把偏离与理由写进注释。
+
+### 收尾检查（任何改动之后）
+
+改完跑这三条，它们各自守一类编译器看不见的东西：
+
+```powershell
+python _settings.py     # 设置块结构（改了设置项就必须跑）
+python _logfmt.py       # 宽格式日志的元数与错型（编译器一条都查不了）
+python _deadcode.py     # 死代码：只写不读的字段、#if 0、注释掉的代码、脚本死函数
+```
+
+**改了结构体字段尤其要跑第三条**：删掉一个字段的写者之后，它可能变成"从没被碰过"，
+而那正是它该被删掉的证据（`Values.valid` 就是这么走完最后一步的）。
 
 ### 报告与调试
 

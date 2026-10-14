@@ -16,11 +16,11 @@
 #include <psapi.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
 
 #define WH_MOD_ID L"test"
-#define WH_EDITING 1
 
 // ---- Windhawk API stubs ---------------------------------------------------
 // These honour the name they are asked for, so ReadSettings can be driven from
@@ -45,10 +45,47 @@ static int Wh_GetIntSetting(PCWSTR name, ...) {
     const WCHAR *v = StubLookup(g_stubInts, g_stubIntCount, name);
     return v[0] ? _wtoi(v) : 0;
 }
-static PCWSTR Wh_GetStringSetting(PCWSTR name, ...) {
-    return StubLookup(g_stubStrings, g_stubStringCount, name);
+
+// The real Wh_GetStringSetting hands back a freshly allocated copy that the caller must
+// release with Wh_FreeStringSetting (windhawk_api.h:230-245). A stub that returned a
+// pointer into its own table could not tell a leak from a double free -- both were
+// invisible, and both are easy to introduce. Every handout is recorded here, every free
+// has to match one, and whatever is still outstanding at the end of main is a leak.
+static const WCHAR *g_handedOut[64];
+static int g_handedOutCount = 0;
+static bool g_stringLedgerBroken = false;
+static int g_stringsHandedOut = 0;
+
+static WCHAR *StubDupString(const WCHAR *value) {
+    const size_t chars = wcslen(value) + 1;
+    WCHAR *copy = (WCHAR *)malloc(chars * sizeof(WCHAR));
+    if (!copy) return nullptr;
+    wcscpy(copy, value);
+    if (g_handedOutCount < (int)(sizeof(g_handedOut) / sizeof(g_handedOut[0]))) {
+        g_handedOut[g_handedOutCount++] = copy;
+    } else {
+        g_stringLedgerBroken = true;   // more outstanding strings than the ledger holds
+    }
+    g_stringsHandedOut++;
+    return copy;
 }
-static void Wh_FreeStringSetting(PCWSTR) {}
+
+static PCWSTR Wh_GetStringSetting(PCWSTR name, ...) {
+    return StubDupString(StubLookup(g_stubStrings, g_stubStringCount, name));
+}
+
+static void Wh_FreeStringSetting(PCWSTR value) {
+    if (!value) return;                 // the real API tolerates a null release
+    for (int i = 0; i < g_handedOutCount; i++) {
+        if (g_handedOut[i] != value) continue;
+        g_handedOut[i] = g_handedOut[--g_handedOutCount];
+        free((void *)value);
+        return;
+    }
+    printf("  Wh_FreeStringSetting on a pointer that was never handed out "
+           "(double free, or a free of something else)\n");
+    g_stringLedgerBroken = true;
+}
 static void Wh_Log(const WCHAR *fmt, ...) {
     va_list args;
     va_start(args, fmt);
@@ -61,10 +98,19 @@ static bool Wh_SetFunctionHook(void *, void *, void **) { return true; }
 #include "endfield-info-windhawk.wh.cpp"
 
 static int g_failures = 0;
+static int g_skips = 0;
 
 static void Check(bool ok, const char *label) {
     printf("  %-58s %s\n", label, ok ? "OK" : "FAIL");
     if (!ok) g_failures++;
+}
+
+// A check that cannot run in this environment. It is counted and printed, never silently
+// skipped: "the check passed" and "the check never ran" used to look identical in the
+// output, which is the trap AGENTS 3 warns about.
+static void Skip(const char *label) {
+    printf("  %-58s SKIP\n", label);
+    g_skips++;
 }
 
 int main() {
@@ -88,7 +134,7 @@ int main() {
         ModSettings s;
         ReadSettings(s);
         printf("  Theme=Midnight with custom colours set:\n");
-        printf("    themeIndex=%d bg=%08X border=%08X text=%08X accent=%08X\n",
+        printf("    themeIndex=%d bg=%08lX border=%08lX text=%08lX accent=%08lX\n",
                s.themeIndex, s.background, s.border, s.text, s.accent);
         Check(s.themeIndex == 1, "named theme resolved");
         Check(s.background == kThemes[1].background, "named theme wins for background");
@@ -108,7 +154,7 @@ int main() {
         g_stubStringCount = (int)(sizeof(custom) / sizeof(custom[0]));
         ReadSettings(s);
         printf("  Theme=Custom with the same colours:\n");
-        printf("    themeIndex=%d bg=%08X border=%08X text=%08X accent=%08X\n",
+        printf("    themeIndex=%d bg=%08lX border=%08lX text=%08lX accent=%08lX\n",
                s.themeIndex, s.background, s.border, s.text, s.accent);
         Check(s.themeIndex == -1, "Custom theme resolved");
         Check(s.background == 0xAA111111, "custom background takes effect");
@@ -123,7 +169,7 @@ int main() {
         g_stubStringCount = (int)(sizeof(blank) / sizeof(blank[0]));
         ReadSettings(s);
         printf("  Theme=Custom, all colour fields empty:\n");
-        printf("    bg=%08X border=%08X text=%08X\n", s.background, s.border, s.text);
+        printf("    bg=%08lX border=%08lX text=%08lX\n", s.background, s.border, s.text);
         Check(s.background == kThemes[0].background, "empty custom falls back to Endfield bg");
         Check(s.text == kThemes[0].text, "empty custom falls back to Endfield text");
 
@@ -148,19 +194,19 @@ int main() {
         explicitColor.hasColor = true;
         explicitColor.color = 0xFF00FF00;
 
-        printf("  per-ring colour wins:      %08X (expect FF00FF00)\n",
+        printf("  per-ring colour wins:      %08lX (expect FF00FF00)\n",
                ResolveRingColor(explicitColor, preset));
         Check(ResolveRingColor(explicitColor, preset) == 0xFF00FF00,
               "per-ring :COLOR beats the theme");
         Check(ResolveRingColor(explicitColor, custom) == 0xFF00FF00,
               "per-ring :COLOR beats the Custom ring colour");
 
-        printf("  RingColor under Custom:    %08X (expect FFAB12CD)\n",
+        printf("  RingColor under Custom:    %08lX (expect FFAB12CD)\n",
                ResolveRingColor(plain, custom));
         Check(ResolveRingColor(plain, custom) == 0xFFAB12CD,
               "RingColor applies when Theme is Custom");
 
-        printf("  no RingColor -> border:    %08X (expect %08X)\n",
+        printf("  no RingColor -> border:    %08lX (expect %08lX)\n",
                ResolveRingColor(plain, preset), preset.border);
         Check(ResolveRingColor(plain, preset) == preset.border,
               "falls back to the border colour");
@@ -242,18 +288,20 @@ int main() {
             printf("  %4d  %7.0f  ", rowCount, panelH);
             for (int r = 0; r < rowCount; r++) {
                 float px = 0.0f, py = 0.0f;
-                IconPlateCenterForRow(s, r, (float)(r * s.rowHeight), (float)s.rowHeight,
-                                      &px, &py);
+                const float rowTop = (float)(r * s.rowHeight);
+                IconPlateCenterForRow(s, r, rowTop, (float)s.rowHeight, &px, &py);
                 printf("%.0f ", py);
+                // The centre has to be the middle of *that* row, and the plate has to
+                // fit inside it. A "panel centre only coincides with a plate on one row"
+                // check used to sit here whose condition was algebraically identical to
+                // its conclusion -- it could not fail, and so proved nothing.
+                Check(py == rowTop + s.rowHeight / 2.0f,
+                      "each plate is centred in its own row");
+                Check(py - IconPlateDiameter(s, r) / 2.0f >= rowTop - 0.01f &&
+                          py + IconPlateDiameter(s, r) / 2.0f <= rowTop + s.rowHeight + 0.01f,
+                      "and the whole plate fits inside that row");
             }
             printf("\n");
-
-            float px = 0.0f, firstY = 0.0f;
-            IconPlateCenterForRow(s, 0, 0.0f, (float)s.rowHeight, &px, &firstY);
-            Check(firstY == s.rowHeight / 2.0f, "first row plate sits at half a row");
-            if (firstY == panelH / 2.0f) {
-                Check(rowCount == 1, "panel centre only coincides with a plate on one row");
-            }
         }
 
         // Ripples must be emitted per plate, each from its own centre. Two icons
@@ -279,40 +327,31 @@ int main() {
         // The plate and its rings are different sizes but must share one centre.
         // This is the assertion that pins the reported symptom: the rings have to
         // come out of the plate, not from somewhere near it.
-        printf("\n  row  plate centre      ring centre       plate r  ring r(0)  r(0.5)  r(1)\n");
-        double worstCenterError = 0.0;
+        // The plate and its rings are different sizes but share one centre. Both painters
+        // take that centre from this geometry value, so a check that reads the centre out
+        // of the struct twice ("ring centre == plate centre") is algebraically true and
+        // cannot fail -- there was one here, and it proved nothing. What is worth
+        // asserting is that the value itself is sane: the plate has to fit the panel.
+        printf("\n  row  plate centre      plate r  ring r(0)  r(0.5)  r(1)\n");
         for (int r = 0; r < 4; r++) {
             IconGeometry g = ComputeIconGeometry(s, r, (float)(r * s.rowHeight));
             if (!g.present) continue;
 
-            // The plate is drawn at (g.centerX, g.centerY); the rings are drawn at
-            // the same two values. Recompute what the ring painter uses so the test
-            // fails if a future edit offsets one of them again.
-            float ringCenterX = g.centerX;
-            float ringCenterY = g.centerY;   // no vertical offset of any kind
-            double errX = (double)(ringCenterX - g.centerX);
-            double errY = (double)(ringCenterY - g.centerY);
-            double err = errX < 0 ? -errX : errX;
-            double errYAbs = errY < 0 ? -errY : errY;
-            if (errYAbs > err) err = errYAbs;
-            if (err > worstCenterError) worstCenterError = err;
-
             float r0 = RingRadiusAt(g, 0, 0.0);
             float rMid = RingRadiusAt(g, 0, 0.5);
             float rEnd = RingRadiusAt(g, 0, 1.0);
-            printf("  %3d  (%6.1f,%6.1f)  (%6.1f,%6.1f)  %7.1f  %7.1f  %6.1f  %5.1f\n",
-                   r + 1, g.centerX, g.centerY, ringCenterX, ringCenterY,
-                   g.plateRadius, r0, rMid, rEnd);
-            Check(worstCenterError == 0.0, "ring centre equals plate centre exactly");
+            printf("  %3d  (%6.1f,%6.1f)  %7.1f  %7.1f  %6.1f  %5.1f\n",
+                   r + 1, g.centerX, g.centerY, g.plateRadius, r0, rMid, rEnd);
+            Check(g.centerX - g.plateRadius >= 0.0f,
+                  "the plate stays inside the panel's left edge");
 
             // Sizes differ on purpose, and the rings must always be the larger of
             // the two: a ring smaller than the plate would sit on the glyph.
             Check(g.plateRadius != rEnd, "rings and plate have different sizes");
             Check(r0 >= g.plateRadius - 0.01f, "the innermost ring starts at the plate edge");
             Check(rEnd > g.plateRadius, "rings expand outward past the plate");
-            Check(rMid > r0 && rEnd > rMid, "ring radius grows with progress");        }
-        printf("  worst plate/ring centre mismatch = %.1f px\n", worstCenterError);
-        Check(worstCenterError == 0.0, "plate and ring centres never drift apart");
+            Check(rMid > r0 && rEnd > rMid, "ring radius grows with progress");
+        }
 
         // 2. The ripple's anchor must be the first row's plate, and the plate must
         //    be drawn under the same transform as the ripple.
@@ -327,14 +366,29 @@ int main() {
             Check(anchorY != panelCentreY, "first origin is not the panel centre");
             Check(anchorY < panelCentreY, "first origin is on the first row");
 
+            // The intro scales the capsule **about its centre**, and the painter hands
+            // these three fields straight to the GDI+ matrix, so the fields are what is
+            // asserted here. (An ApplyPanelTransform() used to live in the mod for this
+            // arithmetic; nothing but this test called it, so it is gone and the
+            // properties are stated the way GDI+ maps a point: x*scale + dx.)
             PanelTransform t = ComputePanelTransform(W, H, 0.94, true);
-            float mappedX = 0.0f, mappedY = 0.0f;
-            ApplyPanelTransform(t, anchorX, anchorY, &mappedX, &mappedY);
-            printf("  transformed origin = (%.1f, %.1f), panel centre = %.1f\n",
-                   mappedX, mappedY, panelCentreY);
-            Check(mappedY != anchorY, "the transform displaces the origin");
-            Check(mappedY > anchorY, "a 0.94 scale pushes the first row toward the top");
-            printf("  origin shifts by %.1f px during the intro scale\n", mappedY - anchorY);
+            Check(t.active && t.scale > 0.93f && t.scale < 0.95f,
+                  "a mid-intro frame is an active 0.94 transform");
+            Check(t.dx == (1.0f - t.scale) * W / 2.0f && t.dy == (1.0f - t.scale) * H / 2.0f,
+                  "and its offset is built from the panel centre");
+            Check(t.scale * (W / 2.0f) + t.dx == W / 2.0f &&
+                      t.scale * (H / 2.0f) + t.dy == H / 2.0f,
+                  "so the panel centre is the fixed point of the mapping");
+            // Two frames that must not be transformed at all: a finished intro, and the
+            // very first frame (scale 0, where GDI+ would collapse everything to a point).
+            Check(!ComputePanelTransform(W, H, 1.0, true).active,
+                  "a finished intro is not a transform");
+            Check(!ComputePanelTransform(W, H, 0.0, true).active,
+                  "and neither is the first frame");
+            Check(!ComputePanelTransform(W, H, 0.94, false).active,
+                  "nor is any frame once the intro is inactive");
+            printf("  mid-intro transform: scale=%.3f dx=%.1f dy=%.1f (centre %.1f,%.1f)\n",
+                   t.scale, t.dx, t.dy, W / 2.0f, H / 2.0f);
         }
 
         // With no icon anywhere there is no plate, so there must be no ripple.
@@ -467,7 +521,7 @@ int main() {
         printf("   cue   height  scale  content\n");
         double lastShrink = to * 2;
         bool shrinkMonotonic = true;
-        double atQuarter = 0.0, atShrinkEnd = 0.0;
+        double atQuarter = 0.0, atMid = 0.0, atLate = 0.0;
         for (int step = 0; step <= 10; step++) {
             double cue = step / 10.0;
             g_intro.startedAt = GetTickCount() - (DWORD)(cue * g_intro.durationMs);
@@ -477,16 +531,24 @@ int main() {
             if (f.height > lastShrink + 0.01) shrinkMonotonic = false;
             lastShrink = f.height;
             if (step == 2) atQuarter = f.height;
-            if (step == 5) atShrinkEnd = f.height;
+            if (step == 5) atMid = f.height;
+            if (step == 9) atLate = f.height;
         }
-        printf("  height at cue 0.25 = %.1f, at cue 0.50 = %.1f "
-               "(tab is %.0f, expanded is %.0f)\n", atQuarter, atShrinkEnd, from, to);
+        printf("  height at cue 0.25 = %.1f, 0.50 = %.1f, 0.90 = %.1f "
+               "(tab is %.0f, expanded is %.0f)\n", atQuarter, atMid, atLate, from, to);
         Check(shrinkMonotonic, "collapse height only ever shrinks");
         // At the quarter point it must be genuinely between the two, proving the
         // shrink is spread over the duration rather than completed up front.
-        // (A quarter, not a half: the shrink completes at kCollapseDurationRatio.)
         Check(atQuarter < to && atQuarter > from, "collapse is still shrinking at the quarter point");
-        Check(atShrinkEnd <= from + 0.01, "collapse has reached the tab by the duration end");
+        // ... and it must still have work left at the midpoint. It used to be finished
+        // there, because kCollapseDurationRatio (a *duration* ratio) was used as a *cue*
+        // on a timeline that had already been halved: the panel then sat at tab height
+        // for the whole second half while the frame clock kept repainting it, and the
+        // visible collapse was IntroMs/4 instead of the half the README documents.
+        Check(atMid < to - 1.0 && atMid > from,
+              "the shrink still has work left at the midpoint");
+        Check(atLate < atMid && atLate > from - 0.01,
+              "and it keeps shrinking past the midpoint without passing the tab");
 
         g_intro.active = true;
         g_intro.fromHeight = to;
@@ -561,6 +623,124 @@ int main() {
         Check(wcslen(tiny) < 8, "a short destination is still terminated");
     }
 
+    printf("\n=== icon resolution: glyph fallback, explicit None, global image ===\n");
+    {
+        // The failure mode behind the fallback: the image cannot be decoded, the painter
+        // asks for that row's glyph and gets 0, and the row shows an empty plate -- which
+        // reads as "the icon turned white", not as "that path did not load".
+        const StubSetting *savedStrings = g_stubStrings;
+        const int savedStringCount = g_stubStringCount;
+        ModSettings s;
+        const WCHAR *global = L"C:\\pics\\global.png";
+        const WCHAR *row2File = L"C:\\pics\\row2.png";
+
+        const StubSetting mixed[] = {
+            {L"Icon1", L""},
+            {L"Icon1Path", L"C:\\pics\\does-not-exist.png"},
+            {L"Icon2", L"Network"},
+        };
+        g_stubStrings = mixed;
+        g_stubStringCount = (int)(sizeof(mixed) / sizeof(mixed[0]));
+        ReadSettings(s);
+        Check(ResolveIconStyle(s, 0) == 4, "an image-only row falls back to the configured glyph");
+        Check(s.icons[0].style == 0,
+              "and that fallback is resolved, not written into the slot");
+        Check(ResolveIconStyle(s, 1) == 4, "the row that chose it keeps its own");
+
+        const StubSetting imageOnly[] = {
+            {L"Icon1", L""},
+            {L"Icon1Path", L"C:\\pics\\does-not-exist.png"},
+        };
+        g_stubStrings = imageOnly;
+        g_stubStringCount = (int)(sizeof(imageOnly) / sizeof(imageOnly[0]));
+        ReadSettings(s);
+        Check(ResolveIconStyle(s, 0) == 2,
+              "with no glyph anywhere an image-only row falls back to Memory");
+
+        // An explicit None means "this row has no icon". Measured before the fix:
+        // Icon1=Memory + Icon3=None handed row 3 the Memory glyph, because None was
+        // indistinguishable from "never configured" and fell through to the inherit
+        // branch -- so README's "set it to None to leave a row without an icon" was
+        // simply untrue.
+        const StubSetting noneRow[] = {
+            {L"IconPath", global},
+            {L"Icon1", L"Memory"},
+            {L"Icon3", L"None"},
+        };
+        g_stubStrings = noneRow;
+        g_stubStringCount = (int)(sizeof(noneRow) / sizeof(noneRow[0]));
+        ReadSettings(s);
+        Check(ResolveIconStyle(s, 2) == 0, "an explicit None leaves that row without a glyph");
+        Check(ResolveIconPath(s, 2)[0] == 0, "and without the global image either");
+        Check(ResolveIconSlot(s, 2) == -1, "so it takes no image cache slot");
+        Check(ResolveIconStyle(s, 1) == 2 && ResolveIconStyle(s, 3) == 2,
+              "while the rows around it still inherit the chosen glyph");
+
+        // ... and None must not become the glyph every other row inherits.
+        const StubSetting noneFirst[] = {{L"Icon1", L"None"}, {L"Icon2", L"Network"}};
+        g_stubStrings = noneFirst;
+        g_stubStringCount = (int)(sizeof(noneFirst) / sizeof(noneFirst[0]));
+        ReadSettings(s);
+        Check(ResolveIconStyle(s, 2) == 4,
+              "an unconfigured row inherits the first real glyph, not a None");
+        Check(ResolveIconStyle(s, 0) == 0, "and the row that said None has none");
+
+        // The global image: every row without a file of its own shows it, including the
+        // default configuration where Icon1 chose a glyph, and all of them share one
+        // cache slot so the file is decoded and resampled once.
+        const StubSetting globalOnly[] = {{L"IconPath", global}};
+        g_stubStrings = globalOnly;
+        g_stubStringCount = (int)(sizeof(globalOnly) / sizeof(globalOnly[0]));
+        ReadSettings(s);
+        printf("  global image only -> row1 path=%ls slot=%d, row4 slot=%d\n",
+               ResolveIconPath(s, 0), ResolveIconSlot(s, 0), ResolveIconSlot(s, 3));
+        Check(wcscmp(ResolveIconPath(s, 0), global) == 0,
+              "the global icon applies to a row that has no file of its own");
+        Check(ResolveIconSlot(s, 0) == 0 && ResolveIconSlot(s, 3) == 0,
+              "every row shares one cache slot, so the file is decoded once");
+        Check(AnyIconConfigured(s), "a global icon on its own still means plates are drawn");
+
+        // A row's own file wins over the global one, and a second row that names the same
+        // file as the global shares the global's slot rather than loading it again.
+        const StubSetting mixedPaths[] = {
+            {L"IconPath", global},
+            {L"Icon2Path", row2File},
+            {L"Icon3Path", global},
+        };
+        g_stubStrings = mixedPaths;
+        g_stubStringCount = (int)(sizeof(mixedPaths) / sizeof(mixedPaths[0]));
+        ReadSettings(s);
+        printf("  global + row2 file + row3 repeats global -> slots: %d %d %d %d\n",
+               ResolveIconSlot(s, 0), ResolveIconSlot(s, 1), ResolveIconSlot(s, 2),
+               ResolveIconSlot(s, 3));
+        Check(ResolveIconSlot(s, 1) == 1, "a row's own file gets its own cache slot");
+        Check(ResolveIconSlot(s, 2) == 0, "a row that names the global file shares row 1's slot");
+        Check(ResolveIconSlot(s, 3) == 0,
+              "and so does a row that inherits the global image");
+        Check(wcscmp(ResolveIconPath(s, 0), global) == 0,
+              "the per-row file does not leak to the rows the global covers");
+
+        // Without a global image, the documented per-row inheritance still holds: setting
+        // only row 1's file means every row uses it, and they all share its slot.
+        const StubSetting inheritFile[] = {{L"Icon1Path", row2File}, {L"Icon2", L"Network"}};
+        g_stubStrings = inheritFile;
+        g_stubStringCount = (int)(sizeof(inheritFile) / sizeof(inheritFile[0]));
+        ReadSettings(s);
+        Check(wcscmp(ResolveIconPath(s, 3), row2File) == 0 &&
+                  ResolveIconSlot(s, 3) == 0,
+              "one row's file still covers the rows after it when there is no global image");
+
+        const StubSetting noIcons[] = {{L"Icon1", L"None"}};
+        g_stubStrings = noIcons;
+        g_stubStringCount = (int)(sizeof(noIcons) / sizeof(noIcons[0]));
+        ReadSettings(s);
+        Check(s.iconCount == 0 && ResolveIconStyle(s, 0) == 0 && !AnyIconConfigured(s),
+              "with nothing configured at all no row gets a plate");
+
+        g_stubStrings = savedStrings;
+        g_stubStringCount = savedStringCount;
+    }
+
     printf("\n=== custom icon resampling plan ===\n");
     {
         // The plate diameter follows FontSize, so a loaded file has to be brought
@@ -574,6 +754,7 @@ int main() {
             {4000, 4000, 23},    // extreme: a photo used as an icon
             {512,  512,  23},
             {256,  128,  23},    // non-square
+            {200,  20,   23},    // a banner: the short axis is already under the plate
             {64,   64,   23},
             {32,   32,   23},    // smaller than the plate
             {23,   23,   23},    // exactly plate size
@@ -606,12 +787,25 @@ int main() {
                 int longest = lastW > lastH ? lastW : lastH;
                 Check(longest >= c.target - 1 && longest <= c.target,
                       "the long side is fitted exactly to the plate box");
-                // Aspect ratio preserved within rounding.
-                double srcAspect = (double)c.w / c.h;
-                double dstAspect = (double)lastW / lastH;
-                double drift = srcAspect > dstAspect ? srcAspect / dstAspect
-                                                     : dstAspect / srcAspect;
-                Check(drift < 1.12, "aspect ratio is preserved");
+                // The short side must be what the fit gives, rounded by at most a pixel.
+                // A percentage drift cannot say that for a 200:1 banner, whose short side
+                // is 1 or 2 px either way (the previous 12%-drift check failed on it).
+                const int srcLong = c.w > c.h ? c.w : c.h;
+                const int srcShort = c.w > c.h ? c.h : c.w;
+                const int lastShort = lastW < lastH ? lastW : lastH;
+                const double exactShort = (double)srcShort * (double)c.target / (double)srcLong;
+                printf("    short side %d, exact fit %.2f\n", lastShort, exactShort);
+                Check(lastShort >= 1 && (double)lastShort <= exactShort + 1.0,
+                      "the short side is the exact fit, rounded up by at most a pixel");
+                if (exactShort >= 4.0) {
+                    // Where the short side is several pixels, the ratio has to hold to
+                    // within rounding too.
+                    double srcAspect = (double)c.w / c.h;
+                    double dstAspect = (double)lastW / lastH;
+                    double drift = srcAspect > dstAspect ? srcAspect / dstAspect
+                                                         : dstAspect / srcAspect;
+                    Check(drift < 1.12, "aspect ratio is preserved where rounding cannot dominate");
+                }
             }
         }
 
@@ -630,6 +824,37 @@ int main() {
             ph = big.sizes[i].h;
         }
         Check(allShrink, "no resampling stage enlarges the image");
+
+        // The plan's whole point is that no single stage is a large reduction: with one
+        // big step GDI+ samples only a few source pixels, which is the aliasing this
+        // exists to prevent. The banner is where that used to fail -- the proportional
+        // clamp had a fixed point, so 200x20 spent twelve stages resampling itself 1:1
+        // and then one 8.7x squash (4000x20 ended in a single 173x step).
+        for (const Case &c : cases) {
+            if (c.w <= c.target && c.h <= c.target) continue;
+            DownscalePlan plan = PlanDownscale(c.w, c.h, c.target);
+            const bool landscape = c.w >= c.h;
+            double worstLong = 1.0, worstShort = 1.0;
+            int pw = c.w, ph = c.h;
+            for (int i = 0; i < plan.count; i++) {
+                double rw = (double)pw / plan.sizes[i].w;
+                double rh = (double)ph / plan.sizes[i].h;
+                double rl = landscape ? rw : rh;
+                double rs = landscape ? rh : rw;
+                if (rl > worstLong) worstLong = rl;
+                if (rs > worstShort) worstShort = rs;
+                pw = plan.sizes[i].w;
+                ph = plan.sizes[i].h;
+            }
+            printf("  %4dx%-4d worst step: long %.2fx, short %.2fx\n", c.w, c.h, worstLong,
+                   worstShort);
+            Check(worstLong <= 2.05, "no stage reduces the long edge by more than 2x");
+            // Integer halving truncates: an odd 125 px edge goes to 62, which is a
+            // 2.016x step rather than 2.0x, so the bar is 2.05x and not 2.0x.
+            // The short edge is floored at 1 px on a very wide source, so it may round
+            // its way down a little faster; it must still never be squashed in one go.
+            Check(worstShort <= 2.51, "and the short edge is floored, never squashed");
+        }
 
         // Degenerate inputs must not produce a plan that allocates nonsense.
         DownscalePlan zero = PlanDownscale(0, 0, 23);
@@ -665,7 +890,6 @@ int main() {
             if (count > l->length) count = l->length;
             return (float)count * l->perChar;
         };
-        Layout layout = {40, 10.0f};          // 400 px of text in total
         const float ellipsis = 10.0f;         // one character wide
 
         printf("  400 px of text (10 px/char) into these budgets, ellipsis = %.0f px\n",
@@ -731,9 +955,65 @@ int main() {
         Check(FitCharsWithEllipsis(40, 400.0f, 0.0f, widthOfChars, &l) == 0,
               "an unmeasurable ellipsis falls back to a plain trim");
 
-        // The box handed to DrawString follows the same floor, so the fit and the box
-        // cannot disagree about how little room is too little.
-        Check(kMinLayoutWidth >= 1.0f, "the layout box floor is never degenerate");
+        // The box handed to DrawString and the trim budget share one floor, so the two
+        // cannot disagree about how little room is too little. Asked through the product
+        // function rather than by copying the expression (the old assertion here only
+        // checked the constant, and the GDI+ section copied the expression itself).
+        Check(LayoutWidthFloor(0.0f) == kMinLayoutWidth, "a zero-width box is raised to the floor");
+        Check(LayoutWidthFloor(-5.0f) == kMinLayoutWidth, "so is a negative one");
+        Check(LayoutWidthFloor(kMinLayoutWidth / 2.0f) == kMinLayoutWidth,
+              "and anything under the floor");
+        Check(LayoutWidthFloor(120.0f) == 120.0f, "a usable width is left alone");
+        Check(LayoutWidthFloor(kMinLayoutWidth) == kMinLayoutWidth,
+              "the floor itself passes through unchanged");
+
+        // The PDH rule the CPU path and the GPU array readers now share. Accepting only
+        // ERROR_SUCCESS (as the GPU readers did) drops a counter that has just been
+        // created: its first sample is NEW_DATA, not VALID_DATA.
+        Check(PdhValueUsable(PDH_CSTATUS_VALID_DATA), "a PDH value with valid data is used");
+        Check(PdhValueUsable(PDH_CSTATUS_NEW_DATA),
+              "and so is a counter's first sample (new data)");
+        Check(!PdhValueUsable((PDH_STATUS)0x800007D2), "more-data is not a value");
+        Check(!PdhValueUsable((PDH_STATUS)0xC0000BBA), "an invalid-data status is rejected");
+        Check(!PdhValueUsable((PDH_STATUS)0xC0000BC6), "and so is a missing instance");
+    }
+
+    printf("\n=== icon image size follows the intro scale ===\n");
+    {
+        // A cached image is already exactly plate-sized, so the old branch (which only
+        // applied the intro scale to images *larger* than the plate) never scaled it: a
+        // custom icon faded in while its plate grew.
+        float w = 0.0f, h = 0.0f;
+        const float plateRadius = 11.5f;     // a 23 px plate, the default font's size
+        ComputeIconImageDrawSize(23, 23, plateRadius, 1.0f, &w, &h);
+        Check(w == 23.0f && h == 23.0f, "a plate-sized image draws at plate size");
+        ComputeIconImageDrawSize(23, 23, plateRadius, 0.5f, &w, &h);
+        Check(w == 11.5f && h == 11.5f, "and follows the intro as it scales the plate in");
+        ComputeIconImageDrawSize(23, 23, plateRadius, 0.0f, &w, &h);
+        Check(w == 0.0f && h == 0.0f, "at zero scale it draws at zero size");
+
+        // A source larger than the plate is capped by the plate, keeping its aspect, and
+        // the animation multiplies that cap.
+        ComputeIconImageDrawSize(400, 200, plateRadius, 1.0f, &w, &h);
+        Check(w == 23.0f && h == 11.5f, "a large source is capped at the plate, aspect kept");
+        ComputeIconImageDrawSize(400, 200, plateRadius, 0.25f, &w, &h);
+        Check(w == 5.75f && h == 2.875f, "and the intro scales the capped size too");
+
+        // Smaller than the plate: never upsampled to fill it, but the animation still
+        // shrinks it -- the cap is a ceiling, not a fixed size.
+        ComputeIconImageDrawSize(10, 10, plateRadius, 1.0f, &w, &h);
+        Check(w == 10.0f && h == 10.0f, "a source smaller than the plate is not blown up");
+        ComputeIconImageDrawSize(10, 10, plateRadius, 0.5f, &w, &h);
+        Check(w == 5.0f && h == 5.0f, "while the intro still scales it down");
+
+        // The sampler join decides whether the values lock may be deleted. Only a real
+        // join counts: deleting a critical section a live thread can still be inside is
+        // undefined behaviour, which is exactly what the ignored timeout did.
+        Check(ValuesLockCanBeReleased(WAIT_OBJECT_0),
+              "the values lock is released once the sampler is joined");
+        Check(!ValuesLockCanBeReleased(WAIT_TIMEOUT),
+              "a sampler that did not stop leaves its lock alone");
+        Check(!ValuesLockCanBeReleased(WAIT_FAILED), "and so does a failed wait");
     }
 
     printf("\n=== ComputeRowTextMetrics ===\n");
@@ -762,6 +1042,30 @@ int main() {
     RowTextMetrics inl = ComputeRowTextMetrics(W, 2, 26, 12, true);
     Check(inl.textWidth == none.textWidth, "inline gauges do not reserve width");
 
+    // The budget an inline run is trimmed against is a different question: the run
+    // starts where it starts, so its limit has to count the gauges that still follow
+    // it. It used to be handed the run's own measured width as its budget, and
+    // FitTextToWidth can never exceed that (its first test is "does it already fit?"),
+    // so a row using [[ring:...]] was never truncated at all: the text ran to the bitmap
+    // edge with no ellipsis and pushed its own gauge off the panel.
+    {
+        const float right = inl.textRight;      // the row's right inset
+        const float cursor = 12.0f;             // where a run at the left edge starts
+        Check(ComputeInlineTextLimit(right, cursor, 0, 26) == right - cursor,
+              "an inline run with no gauge after it may use the whole row");
+        Check(ComputeInlineTextLimit(right, cursor, 1, 26) == right - cursor - (26.0f + 4.0f),
+              "one gauge after the run is reserved out of its budget");
+        Check(ComputeInlineTextLimit(right, cursor, 2, 26) <
+                  ComputeInlineTextLimit(right, cursor, 1, 26),
+              "each further gauge costs the run more");
+        // The relation, not the arithmetic: run + the gauges that follow it = the row.
+        Check(ComputeInlineTextLimit(right, cursor, 2, 26) + cursor + 2.0f * (26.0f + 4.0f) ==
+                  right,
+              "the run plus the gauges after it exactly fill the row");
+        Check(ComputeInlineTextLimit(right, 500.0f, 1, 26) == 0.0f,
+              "a run already past the right inset gets nothing, never a negative budget");
+    }
+
     // A pathological configuration must clamp at zero rather than go negative.
     RowTextMetrics tiny = ComputeRowTextMetrics(200.0f, 4, 64, 40, false);
     printf("  tiny panel    : right=%.1f width=%.1f\n", tiny.textRight, tiny.textWidth);
@@ -786,16 +1090,13 @@ int main() {
         wcscpy(t.uptimeText, L"1d 02:03");
         t.modWsMb = 7.5; t.modCpuMs = 123;
 
-        const WCHAR *tokens[] = {
-            L"cpu", L"cpu.user", L"cpu.kernel", L"cpu.ghz", L"cpu.ghz.max",
-            L"cpu.name", L"cpu.cores", L"cpu.threads",
-            L"mem", L"mem.used", L"mem.total", L"mem.free", L"mem.commit",
-            L"net.down", L"net.up", L"net.down.bps", L"net.up.bps", L"net.total", L"net.nics",
-            L"gpu", L"gpu.mem", L"gpu.temp", L"gpu.name", L"gpu.vram.used",
-            L"gpu.vram.total", L"gpu.fan", L"gpu.power",
-            L"time", L"date", L"uptime", L"mod.ws", L"mod.cpu",
-        };
-        for (const WCHAR *token : tokens) {
+        // Iterate the product's own registry rather than a hand-written copy of it. A
+        // variable added to kVariables[] used to be invisible here -- the list below was
+        // a second copy that nothing compared against the first, so registering a
+        // variable without implementing it left every assertion green, which is the
+        // opposite of what AGENTS 9 claims.
+        for (int i = 0; i < kVariableCount; i++) {
+            const WCHAR *token = kVariables[i].name;
             WCHAR row[128];
             swprintf(row, 128, L"[{%ls}]", token);
             WCHAR marked[640];
@@ -806,7 +1107,10 @@ int main() {
             // The expansion must not still contain a brace.
             bool resolved = wcschr(marked, L'{') == nullptr;
             if (!resolved) printf("    {%ls} -> \"%ls\"\n", token, marked);
-            Check(resolved, "token resolves (no leftover braces)");
+            Check(resolved, "every registered variable resolves (no leftover braces)");
+            // A registration with no group would never be collected, so the token would
+            // render a value that is always zero.
+            Check(kVariables[i].group != G_NONE, "every registered variable names a collector");
         }
     }
 
@@ -828,6 +1132,15 @@ int main() {
             {L"{gpu.temp|0}", L"--"},
             {L"T={gpu.temp}C", L"T=--C"},
             {L"{gpu.thermal}", L"{gpu.thermal}"},   // unknown token stays visible
+            // The same rule for the fields the PDH fallback cannot read at all. They had
+            // no validity flag, so the panel invented a reading: "0 %" of fan, "0.0" GB
+            // of VRAM. The whole point of gpuTempValid is that "cannot read it" and
+            // "reads zero" are different things.
+            {L"{gpu.fan}", L"--"},
+            {L"{gpu.power}", L"--"},
+            {L"{gpu.vram.used}", L"--"},
+            {L"{gpu.vram.total}", L"--"},
+            {L"F={gpu.fan}rpm", L"F=--rpm"},
         };
         for (const Expect &e : expects) {
             WCHAR marked[640];
@@ -906,7 +1219,7 @@ int main() {
             }
         }
         if (!gdiplusReady) {
-            printf("  GDI+ did not start on this machine; section skipped\n");
+            Skip("GDI+ starts on this machine (real-text checks)");
         } else {
             const int width = 420, height = 30;
             BITMAPINFO bmi = {};
@@ -933,7 +1246,11 @@ int main() {
                 GpFont *font = nullptr;
                 if (family) g_gdiplus.CreateFont(family, 15.0f, 0, 0, &font);
                 GpStringFormat *format = CreateRowStringFormat();
-                if (!format) printf("  CreateRowStringFormat failed; section skipped\n");
+                // Product code: a null here is a failure, not a reason to skip. The
+                // NoWrap/fitting checks below are the only automatic defence for the
+                // "text wraps and the first line rides up" regression, and they used to
+                // disappear from the output without a trace.
+                Check(format != nullptr, "CreateRowStringFormat builds the row format");
 
                 if (font && format) {
                     const float boxHeight = 30.0f;
@@ -970,7 +1287,7 @@ int main() {
                         wcsncpy(buffer, seg.text, 639);
                         buffer[639] = L'\0';
 
-                        float budget = seg.budget > kMinLayoutWidth ? seg.budget : kMinLayoutWidth;
+                        float budget = LayoutWidthFloor(seg.budget);
                         float natural = MeasureAdvance(graphics, font, format, buffer, boxHeight);
 
                         bool fitted = FitTextToWidth(graphics, font, format, buffer,
@@ -1002,6 +1319,76 @@ int main() {
                     Check(fitAllSingle, "a fitted run is drawn on one line");
                     Check(allInsideBudget, "every fitted run stays inside its budget");
                     Check(allFitted, "a run wider than its budget is actually trimmed");
+
+                    // The trailing-space sentinel: GDI+ MeasureString deliberately ignores
+                    // trailing spaces, so "9%  " would advance no further than "9%" and an
+                    // inline gauge would land on top of the '%'. Measured here with the
+                    // real font; remove the sentinel from MeasureAdvance and this goes red.
+                    {
+                        const float bare =
+                            MeasureAdvance(graphics, font, format, L"CPU 12%", boxHeight);
+                        const float padded =
+                            MeasureAdvance(graphics, font, format, L"CPU 12%   ", boxHeight);
+                        printf("  trailing spaces: \"CPU 12%%\" = %.1f px, with 3 spaces = %.1f px\n",
+                               bare, padded);
+                        Check(padded > bare + 1.0f,
+                              "trailing spaces advance the run (that is what the sentinel buys)");
+                    }
+
+                    // The ellipsis width used to be cached "once per process" on the claim
+                    // that the font never changes. The painter rebuilds the font from the
+                    // settings on every frame, so after a font-size change the cache held
+                    // the old width and a trimmed run could overshoot its budget by the
+                    // difference -- but only for the budgets where the kept prefix happens
+                    // to fill the (underestimated) reservation, which is why this sweeps
+                    // budgets instead of testing one. The small-font primer is what fills
+                    // the old cache; it is the point of the check, not decoration.
+                    {
+                        GpFont *bigFont = nullptr;
+                        if (family) g_gdiplus.CreateFont(family, 24.0f, 0, 0, &bigFont);
+                        if (bigFont) {
+                            WCHAR primer[640];
+                            wcsncpy(primer, L"Memory utilization is climbing steadily", 639);
+                            primer[639] = L'\0';
+                            const bool primerTrimmed =
+                                FitTextToWidth(graphics, font, format, primer,
+                                               sizeof(primer) / sizeof(primer[0]), 90.0f,
+                                               boxHeight);
+
+                            float worstOver = 0.0f, worstBudget = 0.0f;
+                            int trimmedCount = 0;
+                            for (int budget = 40; budget <= 200; budget++) {
+                                WCHAR run[640];
+                                wcsncpy(run, L"Memory utilization is climbing steadily", 639);
+                                run[639] = L'\0';
+                                if (FitTextToWidth(graphics, bigFont, format, run,
+                                                   sizeof(run) / sizeof(run[0]),
+                                                   (float)budget, boxHeight)) {
+                                    trimmedCount++;
+                                }
+                                const float drawn =
+                                    MeasureAdvance(graphics, bigFont, format, run, boxHeight);
+                                const float over = drawn - ((float)budget + 0.6f);
+                                if (over > worstOver) {
+                                    worstOver = over;
+                                    worstBudget = (float)budget;
+                                }
+                            }
+                            printf("  primer(15 px) trimmed=%d; 24 px font over %d budgets "
+                                   "(40..200): %d trimmed, worst overshoot %.1f px at %.0f\n",
+                                   primerTrimmed ? 1 : 0, 161, trimmedCount, worstOver,
+                                   worstBudget);
+                            Check(primerTrimmed,
+                                  "the small font trims too (this is what primes the cache)");
+                            Check(worstOver <= 0.0f,
+                                  "a trimmed run fits its budget under any second font size");
+                            Check(trimmedCount > 100,
+                                  "and it really is being trimmed at most of those budgets");
+                            g_gdiplus.DeleteFont(bigFont);
+                        } else {
+                            Skip("a second font size can be created (ellipsis cache check)");
+                        }
+                    }
                     if (!allInsideBudget)
                         printf("  worst overflow = %.1f px\n", worstOverflow);
 
@@ -1020,14 +1407,14 @@ int main() {
                                "without NoWrap this was 2+\n", naturalWide, lines);
                     }
                 } else {
-                    printf("  Segoe UI could not be created; section skipped\n");
+                    Skip("Segoe UI is installed (real-text checks)");
                 }
                 if (format) g_gdiplus.DeleteStringFormat(format);
                 if (font) g_gdiplus.DeleteFont(font);
                 if (family) g_gdiplus.DeleteFontFamily(family);
                 g_gdiplus.DeleteGraphics(graphics);
             } else {
-                printf("  could not build the probe surface; section skipped\n");
+                Skip("the probe surface could be built (real-text checks)");
             }
             if (bitmap) g_gdiplus.DisposeImage((GpImage *)bitmap);
             if (dib) DeleteObject(dib);
@@ -1092,6 +1479,28 @@ int main() {
               "a stored value resolves");
         Check(text && wcscmp(text, L"Now Playing: Blue Hour") == 0,
               "the stored value is trimmed before it is shown");
+
+        // A value the settings allow has to survive the trip into a row. It used to be
+        // cut at 127 characters by a 128-char scratch buffer on the way, so
+        // "External value length = 512" bought 127 visible characters and never said so.
+        {
+            WCHAR stored[400];
+            for (int i = 0; i < 399; i++) stored[i] = (WCHAR)(L'a' + (i % 26));
+            stored[399] = L'\0';
+            ExtStoreValue(slot, L"long", stored, 60000, kExtMaxValueChars);
+            Values none = {};
+            WCHAR marked[640];
+            RingSpec rings[kMaxRingsPerRow];
+            int ringCount = 0;
+            ExpandTokensAndRings(L"{ext.music.long}", none, g_settings, marked, 640, rings,
+                                 &ringCount, kMaxRingsPerRow);
+            printf("  399-char value -> %d chars in the row\n", (int)wcslen(marked));
+            Check(wcscmp(marked, stored) == 0,
+                  "a long pushed value reaches the row whole, not cut at 127");
+            // Do not leave a live value behind: the deadline assertions below check that
+            // nothing live means no deadline.
+            ExtInvalidate(slot, L"long");
+        }
         Check(ExtLookup(L"ext.MUSIC.Title", (int)wcslen(L"ext.MUSIC.Title"), &text) == ER_VALUE,
               "provider and key match case-insensitively");
         Check(ExtLookup(L"ext.music.nope", (int)wcslen(L"ext.music.nope"), &text) == ER_EXPIRED,
@@ -1377,6 +1786,63 @@ int main() {
             n = IslandEnqueue(q, n, 3, alarm, &drops);
             Check(n == 3 && q[IslandPick(q, n)].severity == ES_CRITICAL,
                   "a critical displaces an info rather than being dropped");
+
+            // A repeat that arrives at a *higher* level is an escalation, not a repeat:
+            // the merge window used to keep the first sighting's severity, so "same
+            // title, now critical" never reached the screen (the card stayed at warn).
+            {
+                IslandEvent esc[kIslandQueueMax] = {};
+                unsigned escDrops = 0;
+                IslandEvent warn = {};
+                wcsncpy(warn.provider, L"music", kExtProviderChars);
+                wcsncpy(warn.title, L"Now playing", kIslandTitleChars - 1);
+                wcsncpy(warn.body, L"battery 15%", kIslandBodyChars - 1);
+                warn.severity = ES_WARN; warn.ttlMs = 6000; warn.repeat = 1;
+                warn.queuedAt = 1000;
+
+                IslandEvent hot = warn;
+                wcsncpy(hot.body, L"battery 4%, plug in now", kIslandBodyChars - 1);
+                hot.severity = ES_CRITICAL; hot.queuedAt = 1500;   // inside the window
+
+                int m = IslandEnqueue(esc, 0, 4, warn, &escDrops);
+                m = IslandEnqueue(esc, m, 4, hot, &escDrops);
+                Check(m == 1 && esc[0].severity == ES_CRITICAL,
+                      "an escalation inside the merge window raises the queued level");
+                Check(esc[0].repeat == 2 && wcscmp(esc[0].body, hot.body) == 0,
+                      "and it still counts as the same thing, with the newest text");
+
+                // The symptom, driven through the real state machine: a warn card on
+                // screen must give way when the queue now holds a critical.
+                IslandView escView = {};
+                escView.state = IS_CARD;
+                escView.showing = ES_WARN;
+                escView.cardDeadline = 9999;
+                Check(StepIsland(&escView, esc, m, 2000, false, nullptr) == IS_COLLAPSING,
+                      "so a card already on screen stands down for it");
+
+                // A repeat at a lower level must not lower the queued one either.
+                IslandEvent cool = hot;
+                cool.severity = ES_INFO; cool.queuedAt = 2000;
+                m = IslandEnqueue(esc, m, 4, cool, &escDrops);
+                Check(m == 1 && esc[0].severity == ES_CRITICAL,
+                      "a repeat never lowers the level the queue already holds");
+
+                // Outside the window it is a new card rather than a repeat. It carries
+                // the same provider, so it *replaces* that provider's pending entry
+                // instead of queueing beside it (which is the documented rule), so what
+                // identifies it as new is the timestamp and a repeat count of 1.
+                // The window runs from the *last* sighting -- every repeat refreshes it.
+                IslandEvent later = warn;
+                later.queuedAt = esc[0].queuedAt + kIslandMergeWindowMs + 1;
+                m = IslandEnqueue(esc, m, 4, later, &escDrops);
+                Check(m == 1 && esc[0].queuedAt == later.queuedAt && esc[0].repeat == 1,
+                      "the same title after the merge window is a new card, not a repeat");
+                IslandEvent again = later;
+                again.queuedAt += 10;
+                m = IslandEnqueue(esc, m, 4, again, &escDrops);
+                Check(m == 1 && esc[0].repeat == 2,
+                      "and a repeat of that new card merges with it, not with the old one");
+            }
         }
 
         // The state machine's transitions (design 7.2), on an explicit clock.
@@ -1492,12 +1958,63 @@ int main() {
             Check(close.x >= card.x && close.x + close.w <= card.x + card.w &&
                       close.y >= card.y && close.y + close.h <= card.y + card.h,
                   "the close button never pokes outside the card");
+
+            // A card can be shorter than the button (a single 18 px row against the 22 px
+            // square). No fixed-size square fits there: the old code clamped the top and
+            // then the bottom clamp pushed it back out, top edge first (y = card.y - 4).
+            printf("  card h  close rect (w,h)  inside\n");
+            const int cardHeights[] = {1, 8, 18, 21, 22, 30, 90, 168};
+            for (int h : cardHeights) {
+                PanelRect shortCard = {10, 20, 360, h};
+                PanelRect btn = ComputeIslandCloseRect(shortCard, cfg.rowHeight);
+                const bool inside = btn.x >= shortCard.x && btn.y >= shortCard.y &&
+                                    btn.x + btn.w <= shortCard.x + shortCard.w &&
+                                    btn.y + btn.h <= shortCard.y + shortCard.h &&
+                                    btn.w >= 1 && btn.h >= 1;
+                printf("  %6d  %9dx%-4d  %s\n", h, btn.w, btn.h, inside ? "yes" : "NO");
+                Check(inside, "the close button fits inside a card of any height");
+                if (h < kIslandCloseSize) {
+                    Check(btn.h == h, "and it shrinks to the card when the card is smaller");
+                }
+            }
+            Check(ComputeIslandCloseRect(card, cfg.rowHeight).w == kIslandCloseSize,
+                  "on a card with room to spare the button keeps its full size");
+
             Check(IslandHitTest(regions, count, close.x + 2, close.y + 2) == IR_CLOSE,
                   "a click on the button is the button");
             Check(IslandHitTest(regions, count, card.x + 5, card.y + 5) == IR_CARD,
                   "a click on the card is the card");
             Check(IslandHitTest(regions, count, card.x - 1, card.y - 1) == IR_NONE,
                   "a click outside the card is nothing");
+            Check(IslandHitTest(regions, count, card.x + 5, card.y + 5) == IR_CARD &&
+                      IslandHitTest(regions, count, close.x + 2, close.y + 2) == IR_CLOSE,
+                  "the button wins over the card inside itself");
+
+            // What a click does with that hit. The rule used to live in WindowProc and
+            // read "if the button was hit *and* the dismiss took effect, else fall
+            // through": a second click on the × during the fade toggled the panel, and so
+            // did a click anywhere on the card.
+            Check(IslandClickActionFor(IR_NONE, true) == ICA_PANEL,
+                  "a click outside the card belongs to the panel");
+            Check(IslandClickActionFor(IR_CARD, true) == ICA_CONSUMED &&
+                      IslandClickActionFor(IR_CARD, false) == ICA_CONSUMED,
+                  "a click on the card is swallowed, never the panel's");
+            Check(IslandClickActionFor(IR_CLOSE, true) == ICA_DISMISS,
+                  "the button dismisses while there is a card to dismiss");
+            Check(IslandClickActionFor(IR_CLOSE, false) == ICA_CONSUMED,
+                  "and during the fade it is still swallowed, not handed to the panel");
+            {
+                IslandView live = {};
+                live.state = IS_CARD;
+                IslandView fading = {};
+                fading.state = IS_COLLAPSING;
+                Check(IslandDismissable(live) && !IslandDismissable(fading),
+                      "a live card can be dismissed and a fading one cannot");
+                Check(IslandClickActionFor(IR_CLOSE, IslandDismissable(live)) == ICA_DISMISS &&
+                          IslandClickActionFor(IR_CLOSE, IslandDismissable(fading)) ==
+                              ICA_CONSUMED,
+                      "so the button's two questions agree on both states");
+            }
 
             int unclickable = 0;
             for (int x = card.x; x < card.x + card.w; x++) {
@@ -1544,6 +2061,27 @@ int main() {
             Check(DesiredTickMs() == 16, "the panel's own intro asks for it as well");
             g_intro.active = savedIntroActive;
             g_islandView = savedView;
+
+            // Turning the island off has to drop a phase that is in flight. Nothing
+            // drives the machine while the feature is off, so the phase stayed POPPING
+            // forever, IslandPhaseAnimating kept the tick pinned at 16 ms for the rest of
+            // the session, and the stale card could not even be dismissed (that path is
+            // gated on the same switch). UpdateIsland is the only thing that advances the
+            // state machine, so it is where the phase has to be dropped.
+            {
+                const bool savedIsland = g_settings.islandEnabled;
+                const bool savedCardValid = g_islandCardValid;
+                g_settings.islandEnabled = false;
+                g_islandView.state = IS_POPPING;
+                g_islandView.phaseStarted = GetTickCount() - 10000;
+                UpdateIsland();
+                Check(g_islandView.state == IS_IDLE,
+                      "turning the island off drops a phase that was in flight");
+                Check(DesiredTickMs() == kCursorPollMs,
+                      "and the tick falls back off the frame rate with it");
+                g_settings.islandEnabled = savedIsland;
+                g_islandCardValid = savedCardValid;
+            }
         }
 
         // Effective CPU clock: Windows exposes a *ratio* (PDH "% Processor
@@ -1630,6 +2168,44 @@ int main() {
                   "and when the API reports nothing, the registry value stands");
         }
 
+        // Which source wins has to survive the *second* registry read. ReadCpuStatic()
+        // runs again on every settings-version change, and an unconditional write to
+        // g_cpuGhzMax there reverted a 2.20 GHz nominal to the registry's 2.42 for the
+        // rest of the session -- the power API is only ever tried once, so nothing put
+        // it back. The latch is what keeps the two apart, so this drives the real
+        // ReadCpuStatic() rather than re-deriving the rule here.
+        {
+            const double savedNominal = g_cpuGhzMax;
+            const double savedFromApi = g_cpuGhzFromApi;
+
+            // Ask the product itself what the registry alone would hand out, rather
+            // than reading the registry a second way here: the fallback's *source* is
+            // what is under test, so the test must not compute it independently.
+            g_cpuGhzFromApi = 0.0;
+            g_cpuGhzMax = 0.0;
+            ReadCpuStatic();
+            const double registryFallback = g_cpuGhzMax;
+
+            // A nominal no registry value can equal, so "the registry overwrote it" is
+            // never mistaken for "the latch held".
+            g_cpuGhzFromApi = 3.3;   // the power API has answered
+            g_cpuGhzMax = 3.3;
+            ReadCpuStatic();
+            Check(g_cpuGhzMax == 3.3,
+                  "a later registry read does not undo the power API's nominal");
+
+            if (registryFallback > 0.0) {
+                printf("  registry fallback = %.2f GHz, API answer = 3.30 GHz (both paths live)\n",
+                       registryFallback);
+            } else {
+                printf("  no ~MHz here: the second registry read had nothing to write, so "
+                       "the check above cannot fail on this machine\n");
+            }
+
+            g_cpuGhzMax = savedNominal;
+            g_cpuGhzFromApi = savedFromApi;
+        }
+
         // The pipe's DACL has to actually admit this user. Getting it wrong is
         // invisible until a real client is refused, so a pipe built with the very
         // same descriptor is opened here -- but only where the environment allows
@@ -1658,8 +2234,9 @@ int main() {
             }
 
             if (!writable) {
-                printf("  this environment refuses pipe clients (err=%lu); "
-                       "the DACL check is skipped here\n", controlErr);
+                Skip("the pipe DACL admits the user running the mod (no pipe clients here)");
+                printf("    control pipe err=%lu (a confined sandbox refuses every descriptor)\n",
+                       controlErr);
             } else {
                 PSECURITY_DESCRIPTOR sd = ExtPipeSecurityDescriptor();
                 SECURITY_ATTRIBUTES sa = {};
@@ -1691,6 +2268,23 @@ int main() {
         g_extLockReady = false;
     }
 
-    printf("\n%s (%d failure(s))\n", g_failures ? "FAILED" : "PASSED", g_failures);
+    // The settings strings are the one place the product has to pair an allocation with
+    // a release, and the stub now models that ownership. Anything still outstanding here
+    // leaked; a free the ledger did not recognise already printed its own line.
+    printf("\n=== settings string ownership ===\n");
+    printf("  handed out %d string(s) during the run, %d still outstanding\n",
+           g_stringsHandedOut, g_handedOutCount);
+    Check(g_handedOutCount == 0, "every settings string the run asked for was released");
+    Check(!g_stringLedgerBroken, "no string was released twice or never handed out");
+
+    // Skips are printed in the last line too: a run that quietly stopped checking half
+    // its invariants must not read like a clean pass.
+    if (g_skips) printf("\nSKIPPED: %d check(s) could not run in this environment\n", g_skips);
+    if (g_skips) {
+        printf("%s (%d failure(s), %d skipped)\n", g_failures ? "FAILED" : "PASSED", g_failures,
+               g_skips);
+    } else {
+        printf("%s (%d failure(s))\n", g_failures ? "FAILED" : "PASSED", g_failures);
+    }
     return g_failures ? 1 : 0;
 }

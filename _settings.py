@@ -32,6 +32,95 @@ def quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def structural_problems(block, first_line_no):
+    """Checks that js-yaml rejects, or that would silently mis-parse.
+
+    These two were added after Windhawk refused the block twice while this script
+    reported "no structural problems found" both times:
+
+      * a sequence entry indented by five spaces instead of four, which js-yaml
+        reports as "bad indentation of a sequence entry";
+      * an entry inserted between another entry's key and its own $name, which
+        leaves two $name keys inside one entry ("duplicated mapping key").
+
+    The duplicate-key and duplicate-option checks are the same class of thing:
+    the block is a mapping, and YAML silently keeps the last of two equal keys.
+    """
+    problems = []
+    entries = []
+    current = None
+
+    for offset, raw in enumerate(block):
+        line_no = first_line_no + offset
+        stripped = raw.strip()
+        if not stripped or stripped in ("/*", "*/"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+
+        if stripped.startswith("- "):
+            if indent == 0:
+                current = {
+                    "line": line_no,
+                    "key": stripped[2:].partition(":")[0].strip(),
+                    "names": 0,
+                    "descriptions": 0,
+                    "options": False,
+                    "items": [],
+                }
+                entries.append(current)
+                continue
+            if indent != 4:
+                problems.append(
+                    f"{line_no}: sequence entry indented by {indent} spaces "
+                    f"(option items need exactly 4): {stripped}"
+                )
+            if current is None:
+                problems.append(f"{line_no}: option item outside any entry: {stripped}")
+            elif not current["options"]:
+                problems.append(
+                    f"{line_no}: option item before the entry's $options block: {stripped}"
+                )
+            else:
+                current["items"].append(stripped[2:].partition(":")[0].strip())
+            continue
+
+        if indent != 2:
+            continue
+        if stripped.startswith("$name:"):
+            if current is not None:
+                current["names"] += 1
+        elif stripped.startswith("$description:"):
+            if current is not None:
+                current["descriptions"] += 1
+        elif stripped.startswith("$options:"):
+            if current is not None:
+                current["options"] = True
+
+    seen_keys = {}
+    for entry in entries:
+        key = entry["key"]
+        if key in seen_keys:
+            problems.append(
+                f"{entry['line']}: duplicated key {key!r} "
+                f"(already used on line {seen_keys[key]})"
+            )
+        seen_keys[key] = entry["line"]
+        if entry["names"] != 1:
+            problems.append(
+                f"{entry['line']}: entry {key!r} has {entry['names']} $name line(s), "
+                f"exactly one is required"
+            )
+        if entry["descriptions"] != 1:
+            problems.append(
+                f"{entry['line']}: entry {key!r} has {entry['descriptions']} "
+                f"$description line(s), exactly one is required"
+            )
+        for item in sorted(set(entry["items"])):
+            if entry["items"].count(item) > 1:
+                problems.append(f"{entry['line']}: option {item!r} is listed twice")
+    return problems
+
+
 def main() -> int:
     write = "--write" in sys.argv
     with open(SOURCE, encoding="utf-8") as handle:
@@ -93,6 +182,11 @@ def main() -> int:
     print(f"settings entries: {entries}")
     print(f"option groups: {groups}")
     print(f"display strings quoted: {quoted}")
+
+    # Structure, not formatting: the checks below are the ones Windhawk's own
+    # parser refused the block for while this script said it was fine.
+    problems.extend(structural_problems(block, start + 2))
+
     if problems:
         print("\nPROBLEMS:")
         for problem in problems:

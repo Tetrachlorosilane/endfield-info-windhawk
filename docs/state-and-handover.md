@@ -12,15 +12,17 @@
   （头顺序 + `ApplyPanelTransform` 未使用）。
 - 7 个导出入口齐全。
 - 依赖仅系统 DLL：`USER32 / GDI32 / PDH / IPHLPAPI / PSAPI / ADVAPI32 / msvcrt / KERNEL32`。
-- 回归测试全绿（316 条断言，含一段**真启动 GDI+** 的排版断言：
+- 回归测试全绿（478 条断言，含一段**真启动 GDI+** 的排版断言：
   文字不折行、且在预算内）。
 - GDI+ 缩放管线用**已知内容**的图验证过（含透明底、纯 RGB、索引色、灰度+alpha、
   16 位、隔行 PNG）。
-- 外部数据（M1）：编译只剩上面那两条已知警告；回归 **316 条断言**全绿（M1、M2、M3 与 CPU 频率共新增 165 条）；
+- 外部数据（M1）：编译只剩上面那两条已知警告；回归 **478 条断言**全绿（M1、M2、M3 与 CPU 频率共新增 318 条）；
   并做了**负对照**——把展开改成递归后，注入断言确实变红（不是"看着像在守"）。
 - 设置块 46 项 / 10 个选项组，`_settings.py` 报 `no structural problems found`。
-- **mod 的日志格式串**用测试宿主查过：`-Wformat` 指向 `endfield-info-windhawk.wh.cpp`
-  的警告为 0（本地 mod build 检查不了这项，见 §3）。
+- **mod 的日志格式串**：`-Wformat` **从来没有检查过它们**（2026-10-14 更正）✗。
+  宿主打的 `Wh_Log` 桩是自造变参函数，没有 format 属性，clang 不会检查；实测同一文件里
+  `printf` 的两处错型各报 1 条、自造桩 0 条。改用 `python _logfmt.py` 审计：105 个调用点、
+  0 处元数/错型问题（负对照实测会红）。详见 AGENTS §3 的方框。
 - 外部数据的**服务端路径**（`ExtHandleLine`：HELLO → SET → 存储 → 查找、换行框架与边缘空格裁剪、
   允许名单拒绝）有断言覆盖（总数见上文，不再重复一个会过期的数字）。
 - **真机整链验证（用户环境，2026-10-13）**：mod 的开机自检两帧被服务端完整收到
@@ -167,7 +169,7 @@
   这块只能靠 mod 的开机自检（`ExtSelfTest` 的两帧是否被服务端记录）与真机日志来验证。
 - **事件面（M2）**：队列规则（替换/合并/优先级/丢弃）、状态机（`StepIsland`）、
   卡片内容模型（`PlanIslandCard`）、severity 配色（`ResolveSeverityColor`）、
-  卡片宽度（`ComputeIslandCardWidth`，含最小宽度与屏幕钳位）都有断言，共 302 条；
+  卡片宽度（`ComputeIslandCardWidth`，含最小宽度与屏幕钳位）都有断言（当时 302 条；当前总数见 §12.1）；
   **卡片绘制本身与宽度改动的观感**只能在机器上看，仍列在未验证之内。
 - **M3 第一片（卡片交互）**：`ComputeIslandRect`（矩形与宽度同源）、`ComputeIslandCloseRect`、
   `BuildIslandRegions`、`IslandHitTest`、`IslandDismiss` 都有断言，其中包括一条**整体性质**：
@@ -216,6 +218,138 @@
   变成 **1400 增 / 1295 删**；"修"时又整file翻成 LF → 1400/1400。写回前先确认原行尾。
 - **辅助函数名先用 `Select-String` 确认**：自检里我写了 `Check ...`，而那份自检的失败计数是 `$bad`，
   于是整段自检中断、连 `SELFTEST PASSED` 都打不出来；而"移除"时只删掉一半，残留 20 行留了数轮。
+
+---
+
+### 10.y 全量源码复查、两处修复与遗留清单（2026-10-14）
+
+一次覆盖 mod（6935 行）、宿主（1696 行）与全部开发脚本的复查。**四条头条**：
+
+1. **CPU 标称频率回归（已修）**：`ReadCpuStatic()` 在每次设置版本变化时重跑，并无条件把注册表
+   `~MHz`（本机 2.42）写进 `g_cpuGhzMax`，而 `CpuNominalEnsure()` 的一次性守卫保证电源 API 的
+   2.20 只应用一次 → **保存过任何设置之后**，`{cpu.ghz}` / `{cpu.ghz.max}` 永久偏高约 10%。
+   修法：新增 `g_cpuGhzFromApi` 锁存来源，注册表只在没有 API 答案时才写 `g_cpuGhzMax`。
+   新增两条断言（`a later registry read does not undo the power API's nominal` 等）；
+   **负对照实测：把修复改回去，恰好这一条变红**（当时 326 条断言 → 旧代码 FAILED 1）。
+2. **"宿主会检查日志格式串"是错的（已更正文档 + 新工具）**：见上文与 AGENTS §3 的方框。
+   属性 / `ms_printf` / `wprintf` / `-fms-compatibility` 四条路实测全堵，MinGW 的 `swprintf`
+   同样不检查 → 新增 `_logfmt.py`（105 个调用点、0 问题；负对照会红）。
+3. **bridge 把 DOM 位置清成 null（已修；很可能是待办 #1 的成因）**：`_netease-bridge.ps1` 里
+   `$positionMs = $null` 出现两次，第二次紧跟在 DOM 取值之后 → 位置退回 store 的 `lineTimeSec`
+   （= 冻结的 `playingLyricLineNumber` 那一行）→ 选行永远选回同一行 → **歌词不换行**。
+   删掉那一行，并在原处留注释说明它必须留在 DOM 之前。⚠️ 该文件是 **CRLF + UTF-8 BOM**，
+   编辑工具会**吃掉 BOM**（Windows PowerShell 5.1 按 GBK 读会乱码）——改完必须字节级检查补回。
+4. **宽扁源图不折半**：`PlanDownscale` 的比例钳位会落进不动点（`200x20` → 12 次 1:1 空转 → `23x2`；
+   `4000x20` 末级一次 173.91×），与注释 "final step within 2x" 和 §5.3「大图逐级折半」冲突。
+
+**第二批已修（2026-10-14；六项，每项都做了负对照）**：
+
+| 修复 | 断言（把修复改回旧写法后**实测变红**） |
+| :-- | :-- |
+| **内联环行的截断预算**：抽出 `ComputeInlineTextLimit`，内联段按"整行 − 光标 − 后面的环"给预算（此前用自身实测 advance，恒不触发截断 → 用 `[[ring:…]]` 的行永不截断、环被挤出面板） | `an inline run with no gauge after it may use the whole row`、`one gauge after the run is reserved out of its budget`、`the run plus the gauges after it exactly fill the row`、`a run already past the right inset gets nothing, never a negative budget` |
+| **收回时间轴**：关键帧 cue 改为 `1.0`（此前把 `kCollapseDurationRatio` 当 cue → 收缩半程即止、后半个时间轴以 16 ms 空转；可见收回只有 `IntroMs/4`） | `the shrink still has work left at the midpoint`、`and it keeps shrinking past the midpoint without passing the tab` |
+| **GPU 有效性标志**：`gpuFanValid` / `gpuPowerValid` / `vramUsedValid` / `vramTotalValid`（此前 PDH 回退机上 `{gpu.fan}`=0、`{gpu.power}`=0、`{gpu.vram.total}`=0.0） | 5 条 `{gpu.fan}` / `{gpu.power}` / `{gpu.vram.*}` → `--` |
+| **`{ext.*}` 行内长度**：暂存缓冲改为 `kExtMaxValueChars + 1`（此前 128 → 静默截到 127 字符，而设置允许 512） | `a long pushed value reaches the row whole, not cut at 127`（399 字符整段到达） |
+| **关掉岛丢相位**：`UpdateIsland` 在 `islandEnabled == false` 时把 `POPPING`/`COLLAPSING` 复位为 `IS_IDLE`（此前状态冻结 → tick 永久 16 ms、卡片也关不掉） | `turning the island off drops a phase that was in flight`、`and the tick falls back off the frame rate with it` |
+| **发布器回收**：`extConsumed` 为假时 `ExtPublisherStop()`（此前关掉开关、或删掉最后一行 `{ext.*}` 后，发布器继续读内存/联网直到卸载） | **无断言**（真 `CreateProcess`）；判据是日志 `nothing consumes {ext.*} any more; stopping it` |
+
+**第三批已修（2026-10-14；三项，每项都做了负对照）**：
+
+| 修复 | 断言 / 负对照 |
+| :-- | :-- |
+| **`PlanDownscale` 的不动点**：去掉"把短边钳回目标"的比例钳位（它让 `200x20` 这类横幅做十几次 1:1 空转、随后一次性压 8.7 倍；`4000x20` 末级 173 倍），改为纯按比例折半、短边允许降到 1px | `no stage reduces the long edge by more than 2x`、`the short side is the exact fit, rounded up by at most a pixel`；把钳位改回去 → 红 |
+| **图片-only 槽的字形回退**：借"第一个已配置的字形"（一个都没有则 `Memory`）现在对**任何**图片槽生效，不再只在"全工程都没有字形"时才借 | `an image-only slot borrows the configured glyph`、`with no glyph anywhere an image-only slot falls back to Memory`；把回退改回旧条件 → 红 |
+| **`_settings.py` 的两条漏检（待办 #6）**：新增"序列项缩进一致性（顶层 0 列 / 选项 4 空格）"与"每条目恰好一个 `$name` / `$description`"，外加顶层键不重复、同组选项不重复、选项必须在 `$options:` 之后 | 逐条注入实测：5 空格缩进、重复 `$name`、重复键、重复选项各自报错并 exit 1；未改动的块仍 `no structural problems found`，`--write` 幂等（字节不变） |
+
+**第四批（用户要求实现 `IconPath`，2026-10-14；含一个附带缺陷，五处负对照共红 12 条）**：
+
+| 内容 | 断言 / 负对照 |
+| :-- | :-- |
+| **`Custom icon file` 真正生效**（此前是死设置项）：`ModSettings::iconPath`，一张图给所有行用；每行优先级 `Row N icon file` > 显式 `None` > 全局图片 > 内置字形 | `the global icon applies to a row that has no file of its own`、`a global icon on its own still means plates are drawn` |
+| **`Row N icon = None` 现在真的表示"这一行不要图标"**（附带缺陷，探针实测 `Icon1=Memory`+`Icon3=None` → 第 3 行拿到 Memory）：`IconSpec::styleSet` 把"显式 None"与"没设置"分开；`None` 连全局图片一起挡 | `an explicit None leaves that row without a glyph`、`an unconfigured row inherits the first real glyph, not a None` |
+| **相同路径只解码/缩放一次**（用户选择"按路径合并缓存、不加第五槽"）：`ResolveIconSlot` 让解析到同一文件的行共用最低那个槽位，每个文件仍只有一个所有者，按槽释放逻辑不变 | `every row shares one cache slot, so the file is decoded once`、`a row that names the global file shares row 1's slot` |
+| **回退规则改为解析式**：`iconFallbackStyle` 由 `ReadSettings` 算一次，`ResolveIconStyle` 取用（不再把字形写进槽位——全局图片不属于任何槽）；`AnyIconConfigured` 改为问 `IconPlateDiameter`（单一来源），否则"全行 None"会被当成"要留图标边距" | `with no glyph anywhere an image-only row falls back to Memory`、`with nothing configured at all no row gets a plate` |
+| **全局图片排在"继承别的行的文件"之前**：有全局图时单行文件是例外、不扩散；没有全局图时"只设 `Row 1 icon file` 就等于所有行都用它"照旧 | `the per-row file does not leak to the rows the global covers`、`one row's file still covers the rows after it when there is no global image` |
+
+README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$description` 都已同步
+（用户文档现在明确写了四级优先级）。
+
+**第五批（修测试装置自身，2026-10-14；六处，逐处都有变异负对照）**：
+
+| 缺口 | 修法 | 负对照（改回去 → 红） |
+| :-- | :-- | :-- |
+| 三处 `printf("… section skipped")` **不增加失败数** | 新增 `Skip()`：打印 `SKIP` 并计入末行的 `skipped`；**产品自身的前置条件算失败**（`CreateRowStringFormat` 返回 null → `Check(false, …)`）。末行现在是 `PASSED (0 failure(s), 1 skipped)` | 让 `CreateRowStringFormat` 早返回 → 那条变 FAIL，且受它影响没跑的检查显示 `Segoe UI is installed (real-text checks) SKIP`（旧写法下末行仍是 PASSED） |
+| 两条**恒真**断言 | 删掉"盘心 = 环心"（同一结构体字段自比）与 `if (firstY == panelH/2) Check(rowCount == 1, …)`（条件与结论代数等价），换成**每行**：`each plate is centred in its own row`、`and the whole plate fits inside that row`、`the plate stays inside the panel's left edge` | `IconPlateCenterForRow` 的 Y 改回 `rowHeight / 2` → 7 条 FAIL（旧断言在第 2..4 行全部漏过） |
+| `kMinLayoutWidth` 只断言了常量、GDI+ 段还**抄了一遍表达式** | 新增产品的 `LayoutWidthFloor()`，绘制（预算与 DrawString 框）与测试都调它；断言 0 / 负数 / 半格 / 正常值 / 恰为下限五例 | `LayoutWidthFloor` 改成 `return width;` → 3 条 FAIL |
+| 尾随空格哨兵 U+2502 **无断言** | 在真 GDI+ 段用真字体量 `"CPU 12%"` 与 `"CPU 12%   "`（实测 62.4 vs 75.1 px） | 把哨兵改成 `L'\0'` → 两者都是 50.3 px，断言 FAIL |
+| 桩的 `Wh_FreeStringSetting` 是空实现（漏 free / double free 都测不出） | 桩按真实 API **每次发放新内存**并记账：每笔发放可查、重复释放/释放非发放指针会打印并置错、末段 `=== settings string ownership ===` 报出未释放数（实测 351 次发放 / 0 未释放） | 删掉 mod 里一处 `Wh_FreeStringSetting(theme)` → `every settings string the run asked for was released` FAIL，并报 13 个未释放 |
+| token 覆盖是**手抄**的 32 个字面量，与 `kVariables[]` 无对应 | 直接遍历 `kVariables[]`，并加"每个注册项都要有采集组"（`group != G_NONE`） | 往 `kVariables[]` 加一个未实现的 `{L"disk", G_SYS}` → `every registered variable resolves` FAIL |
+
+断言数 380 → **434**（第五批，+54：列表改遍历后按注册项计，加上新增的行级几何与下限检查）→ **460**（第六批，+26：灵动岛三条）→ **478**（第七批，+18：剩余五项）。
+**测试装置现在仍有的信任边界**（诚实记录）：`PaintPanel` 的**调用点**依旧不可断言（需要真窗口），
+所以内联预算只测到 `ComputeInlineTextLimit`／`LayoutWidthFloor` 本身，绘制分支里怎么用它们靠读代码；
+`StartIntro` 的关键帧接线没被驱动（收回时长由测试自己乘 `kCollapseDurationRatio` 算出，这是 §7.6 的
+"断言关系"，但也意味着接线错误测不到）；GDI+ 段的像素阈值全是关系式，换字体会让具体数值变但关系不变。
+
+**第六批已修（2026-10-14；灵动岛三条，五处负对照共红 15 条）**：
+
+| 修复 | 断言 / 负对照 |
+| :-- | :-- |
+| **合并窗口吞掉升级**：同 `(provider,title)` 在窗口内重复时**取更高的 severity**（并刷新为最新文本）；此前保留首次的级别 → 状态机看不到 `criticalWaiting`，卡片一直停在 warn | `an escalation inside the merge window raises the queued level`、`so a card already on screen stands down for it`（直接驱动 `StepIsland`）、`a repeat never lowers the level the queue already holds`、`the same title after the merge window is a new card, not a repeat`；去掉取高 → 红 4 条 |
+| **关闭按钮比卡片高**：按钮按卡片尺寸收缩（`min(kIslandCloseSize, card.w, card.h)`）。此前固定 22 px 对单行 18 px 卡片时，上钳位先抬到卡片上沿、下钳位再把它推出卡片（y = card.y − 4） | `the close button fits inside a card of any height`（h = 1/8/18/21/22/30/90/168）、`and it shrinks to the card when the card is smaller`；恢复固定尺寸 → 红 8 条 |
+| **淡出期点击落到面板**：抽出纯函数 `IslandClickActionFor(hit, dismissable)`——按钮命中时**能淡出就淡出、正在淡出也吃掉**；卡片命中一律吃掉；只有卡片之外归面板 | `and during the fade it is still swallowed, not handed to the panel`、`a click on the card is swallowed, never the panel's`、`so the button's two questions agree on both states`；改回"失败就落到面板" → 红 3 条 |
+
+**第七批已修（2026-10-14；剩余五项一次清完，负对照共红 7 条 + 桥自检对照）**：
+
+| 修复 | 断言 / 负对照 |
+| :-- | :-- |
+| **`FitTextToWidth` 不再按进程缓存省略号宽度**（理由写"字体终生固定"，而绘制每帧重建字体 → 改字号后预留宽度失效） | GDI+ 段扫 40..200 共 161 个预算：先用 15 px 字号"弄脏"旧缓存，再要求 24 px 下**每个**预算都不越界（实测陈旧缓存下预算 132 越界 6.1 px）→ 红 |
+| **sampler join 的等待结果不再丢弃**（超时后仍删 `g_valuesLock` = 在另一条线程可能还握着它时删锁） | `ValuesLockCanBeReleased` 只认 `WAIT_OBJECT_0`：`a sampler that did not stop leaves its lock alone`、`and so does a failed wait`；恒真 → 红 2 条 |
+| **自定义图片随入场缩放**：抽出 `ComputeIconImageDrawSize` = `min(自然尺寸, 盘径) × iconScale`（旧条件只在"比盘大"时乘缩放，而缓存图恰好等于盘径） | `and follows the intro as it scales the plate in`、`while the intro still scales it down`、`at zero scale it draws at zero size`；旧条件 → 红 3 条 |
+| **PDH 状态口径统一**：`PdhValueUsable()` 接受 `VALID_DATA` 与 `NEW_DATA`，三条路径共用（GPU 数组读取此前只认 `ERROR_SUCCESS` → 计数器刚建好的第一个采样被丢） | `and so is a counter's first sample (new data)` 等 5 条；只认 `ERROR_SUCCESS` → 红 1 条 |
+| **bridge 的管道连接加等待窗口**：`Connect-PipeClient` 失败重试、等不到返回 `$null`（此前裸 `Connect(3000)` 抛未处理异常、脚本当场死掉、烧掉 mod 的重启预算） | 自检新增 `连不上管道时返回空值（不抛异常）`；对照：换回裸 Connect → **未捕获异常、exit 1**，自检根本跑不完 |
+
+**第八批（2026-10-14，用户真机报告"歌词与标题都为空横线"；**根因在示例发布器**，不是 mod）**：
+
+| 内容 | 证据 / 断言 |
+| :-- | :-- |
+| **`Get-PlayingTrack` 改用窗口枚举，不再用 `Process.MainWindowTitle`**：真机上网易云开着「桌面歌词」时 `MainWindowTitle` **就是「桌面歌词」**，带歌名的窗口反而不是主窗口 → 标题里永远没有「 - 」→ 桥一直停在"没有可用窗口"的等待循环、**从不连接管道** → 两行永远 `--` | 现场取证：`Get-Process -Id 15824` → `cloudmusic / 桌面歌词`；`EnumWindows` 列出该 pid 的**两个**顶层窗口 `[桌面歌词] [下等马 - 洛天依Official/ChiliChill乐团]`。修后自检活体输出同两行，且 `-DryRun -Once` 打出 `-> SET netease title … 下等马`、`-> SET netease lyric … 练就这套拳叫` |
+| **按窗口所属 pid 反查进程名**，而不是"先列出全部进程再筛 pid"：进程**列表**在受限环境里只给一部分（实测沙箱里 `Get-Process`/`tasklist`/Toolhelp 都只看到 13 个进程），而 `Get-Process -Id` 可靠——否则这段在受限环境里永远返回空 | 自检 `窗口枚举：网易云在跑时能看到它的顶层窗口`；活体输出 2 个窗口（正是靠这条路才在沙箱里也拿到证据） |
+| 自检新增 5 项（4 项纯函数 + 1 项活体），并把窗口列表**打印出来**当活体证据 | `曲目标题：桌面歌词窗口不算曲目`、`…挑出带「 - 」的那个`、`…多个候选取最长`、`…空标题与空数组都不算`、`窗口枚举：…`；总计 **36 项**全绿 |
+
+> 这条与交接文档 §12 早就记下的真机事实**同源**（"桌面歌词不是进程主窗口，`MainWindowTitle` 看不到它，
+> 必须 `EnumWindows` 按标题找"）——脚本当初没照做。**教训：文档里的真机事实要当约束用**，
+> 光记下来不等于用上了。
+>
+> 附带观察（不影响功能）：在线歌词**搜索**接口在本机报 `The SSL connection could not be established`
+> （两个端点都失败），但歌词仍从播放器自己的 store 取到了（`-> SET netease lyric … 练就这套拳叫`），
+> 所以搜索只是"store 里没有时的兜底"。要不要修这条另说。
+
+**第九批（2026-10-14，回答"当前歌词是直接获取还是按时间点算的"）**：
+
+| 结论 / 改动 | 真机证据 |
+| :-- | :-- |
+| **当前歌词是"算"的**：取播放**位置**，再在歌词行时间戳上选行（`Select-StoreLineIndex`，纯函数） | 播放器自己的 `playingLyricLineNumber` **冻结在 10**（82 行歌词、那句 `それを珍品として崇めて` = 29.5 s），而真实位置 **90.0 s**、算出来的行是 `つまらない生活の中`——直接读的行只作为过渡一帧，随即被算出来的覆盖 |
+| **位置来源链**（每一步失败静默降级）：迷你条 DOM 的真 currentTime → store 当前行起始时间 → CDP 其它位置 → 内存差分 → SMTC 媒体会话 → 推算时钟 | 本机 SMTC **不可用**（`_netease-position.ps1 -Probe` → `PROBE none (no active media session)`）；CDP **可用**（9229，`playingState=2`）；实际生效 **DOM**：`-> SET netease pos 600000 dom 90.0s` |
+| **新增 `pos` key**（`{ext.netease.pos}`）：把"位置是哪来的"发到面板上，不再只打在 mod 收走的 stdout | 自检新增 4 项 `位置来源标签：…`（36 → **40** 项）；实测 `pos` 帧内容为 `dom 90.0s` |
+| 顺手澄清两处易误读：① 启动那句 `位置：媒体会话不可用，退回推算时钟` **只说明 SMTC 不可用**，不代表整条链退到时钟；② `-PositionSource auto` 的注释原写"memory → media → clock"，与实际顺序不符（已按主循环改写） | README 的发布器一节写明了顺序与 `clock` 的含义 |
+
+**第十批（2026-10-14，用户报告"歌词滞后约 1 秒"，要一个"负延迟"）**：
+
+| 内容 | 依据 / 断言 |
+| :-- | :-- |
+| **滞后的两个来源都已量化**：① 迷你条 DOM 只给 `mm:ss`，位置**向下取整到秒**（真实 90.9 s 报 90）→ 平均落后 0.5 s、最坏 1 s；② 桥每 `-IntervalMs`（默认 1000 ms）才轮询一次 → 平均再落后半周期。**mod 侧可忽略**：sampler 每 50 ms 查一次 `g_extDirty`，值一到就重采样（`[5901]`） | 代码 + 实测量级；`-LeadMs -1` 的自动值 = 半周期 +（`dom` 再 0.5 s）= **1000 ms** |
+| **新增 `-LeadMs`**（"负延迟"）：把**选行用的位置**提早这么多；`-1` 自动、`0` 关掉、正数自定义。发出去的 `pos` 带出提早量（`dom 90.0s +1000ms`），过头了看得见 | 自检 40 → **46** 项：`负延迟：DOM 来源 = 半周期 + 0.5s 取整偏差`、`…精确来源只补半个周期`、`…周期变了自动值跟着变`、`…显式值覆盖自动值（0 = 关掉）`、`pos 标签带出提早量`，以及**组合效果**断言 `负延迟确实把换行提早（9.9s 仍是 0 行，+1s 后是 1 行）` |
+| 实现踩点：**局部变量不能叫 `$leadMs`**——PowerShell 变量名大小写不敏感，会覆盖 `-LeadMs` 参数本身，自动值就永远停在第一次算出来的数（代码里已注明） | 活体输出 `-> SET netease pos 600000 dom 136.0s +1000ms` |
+| 顺手修正 README 两处与实测不符：`-LyricSource store` 原写"精确到客户端自己的当前行"（实测**冻结**）；参数表里的位置顺序与下一行自相矛盾 | README 的发布器一节 |
+
+**其余已确认、尚未修**：**本会话复查列出的项目已全部处理完**。剩下的都是真机项（见 §12.1）
+与 AGENTS §7.13 末尾记的测试装置信任边界（`PaintPanel` 调用点、`StartIntro` 接线）。
+
+**观察记录（不是缺陷，留给真机）**：`FitTextToWidth` 每次多量一次省略号宽度；这发生在
+"某段超预算"的帧里，与旁边的二分测量同量级。若真机上发现滚动文本的帧时间有变化，
+第一个可回退的点是把它改成**按字号键控**的缓存——**不要**改回"按进程"。
+
 ---
 
 ## 12. 交接说明（本会话结束时写入）
@@ -224,32 +358,41 @@
 
 **已验证（有证据）**：
 
-- mod 编译：**恰好 2 条已知警告**，DLL **179712** 字节；回归 **325 断言 × 3 次 `PASSED`**。
+- mod 编译：**恰好 2 条已知警告**，DLL **182272** 字节；回归 **478 断言**全绿（2026-10-14 七批修复后为 478，含 1 条环境性 SKIP）。
 - 设置块：`_settings.py` → `no structural problems found`；独立结构检查 49 条目、顶层 dash 缩进唯一为 0、每条目恰好一个 `$name`/`$description`。
 - 真实管道链：mod 开机自检两帧被服务端完整收到；`_extclient.ps1` 的值**显示在面板上**。
-- `{cpu.ghz}`：用户确认显示**正确**，标称取电源 API 的 **2.20 GHz**（注册表 2.42 被正确忽略）。
+- `{cpu.ghz}`：用户确认显示**正确**，标称取电源 API 的 **2.20 GHz**（注册表 2.42 被正确忽略）。⚠️ 但**保存过任何设置之后**它曾回退到注册表值（2026-10-14 修，见 §10.y 头条 1）。
 - 看门狗：日志出现 `EXT publisher: started pid=…`，命令行按 `CreateProcessW` 约定正确拆分。
 - 歌词来源（部分打通）：`async:lyric.lyricLines`（实测 **64 / 67** 行）与 `tlyricLines`；**真 currentTime** 来自 `#page_pc_mini_bar` 的 `mm:ss / mm:ss`。
-- bridge 自检 **30 项**（含 8 项 `Select-StoreLineIndex`，不假设长度）全绿。
+- bridge 自检 **46 项**（含 8 项 Select-StoreLineIndex 与 5 项窗口/曲名判定，都不假设长度或环境）全绿。
+- 图标全局覆盖（Custom icon file）与 None 语义：2026-10-14 实现并断言（第四批，见 §10.y）。
+- **曲名来源（真机定论，2026-10-14）**：网易云开着「桌面歌词」时 `cloudmusic` 的 `MainWindowTitle`
+  **就是「桌面歌词」**，带歌名的窗口是同一 pid 的**另一个顶层窗口**
+  （`Get-Process -Id 15824` → `cloudmusic / 桌面歌词`；`EnumWindows` 给出
+  `[桌面歌词] [下等马 - 洛天依Official/ChiliChill乐团]`）。**取曲名只能枚举顶层窗口，不能看
+  MainWindowTitle**——与 §12 里"桌面歌词不是主窗口"那条同源，示例发布器当初没照做，
+  于是面板两行一直 `--`（第八批已修）。
 
 **未验证 / 待办（按优先级）**：
 
 1. **面板上的歌词是否真的随播放换行**（用户尚未回报）。排查顺序：bridge 手跑输出 → `Get-CdpDomTime` 是否拿到 `curS` → `times` 是否拉到 → 选行索引是否变化。
+   ⚠️ 2026-10-14：`$positionMs = $null` 被写了两遍、第二遍把 DOM 的真 currentTime 清掉（已修，见 §10.y 头条 3）——**先确认修后是否换行**，再按这个顺序排查。
 2. **发布器重启风暴是否消失**（已改成"等待窗口"而非 `exit 2`）；建议同时设 `External publisher watch process = cloudmusic`。
 3. 作业对象是否收掉**孙进程**、`CREATE_NO_WINDOW` 是否不闪窗、重载无孤儿 —— 三条只能真机看进程列表。
 4. 客户端**升级后** store 自寻址是否仍可用（跑一次 `-ProbeCdp`，它会自寻址并列出可见字段）。
 5. `playingState` 在**暂停**时的取值仍未知（目前不拿它判暂停）。
-6. `_settings.py` 补两条漏检：**同级条目缩进一致性**、**每条目单个 `$name`**（Windhawk 两次报错它都没抓到）。
+6. ~~`_settings.py` 补两条漏检~~ —— **2026-10-14 已补**（缩进一致性、每条目单个 `$name`，外加重复键/重复选项），四条检查都有注入式负对照，见 §10.y 第三批。
 7. `ApplyPanelTransform` 的 `unused function` 警告（加 `__attribute__((unused))` 或挪进测试文件）。
 8. 设计文档里 M3 剩下的部分：`ComputeIslandRect` 接管窗口定位。
 9. AGENTS 的章节顺序：`### 10.x` 那段是追加在 §11 之后的，若在意次序可挪进 §10 末尾。
+10. **测试装置自身的缺口**（§10.y 末尾列了一串）：三处 `section skipped` 仍报 `PASSED`、两条恒真断言、`kMinLayoutWidth` 只断言常量、尾随空格哨兵 U+2502 无断言、桩不模拟字符串所有权、token 列表与 `kVariables[]` 无对应。都能变成会红的断言，是下一批最省事的目标。
 
 ### 12.2 犯错档案（本会话的错误 → 原因 → 防范）
 
 | 错误 | 原因 | 防范 |
 | :-- | :-- | :-- |
-| 设置块缩进错，Windhawk 报 `bad indentation of a sequence entry` | 凭感觉写缩进，而 `_settings.py` 不查这一项 | 抄相邻条目的风格；给 `_settings.py` 补检查 |
-| 条目插在"键"与它自己的 `$name` 之间 → `duplicated mapping key` | 锚点选在 `$name` 上，而它属于**上一行**的条目 | 条目边界是**下一条 `- Key:`**；结构检查保证每条目单 `$name` |
+| 设置块缩进错，Windhawk 报 `bad indentation of a sequence entry` | 凭感觉写缩进，而 `_settings.py` 不查这一项 | 抄相邻条目的风格；给 `_settings.py` 补检查（2026-10-14 已补：它现在查缩进一致性） |
+| 条目插在"键"与它自己的 `$name` 之间 → `duplicated mapping key` | 锚点选在 `$name` 上，而它属于**上一行**的条目 | 条目边界是**下一条 `- Key:`**；结构检查保证每条目单 `$name`（已实现） |
 | 断言里凭空写 `Check` → 自检中断数轮 | 凭记忆用辅助函数名（真实失败计数是 `$bad`） | 插入前先 `Select-String` 找**真正的汇总行**；残留块要整段删除并复核 |
 | 日志清理**误删活代码**（两次，共 6 个编译错误） | 日志与其专用计数器绑定；按**文本**删命中别的函数，按**行号**删又算错一位 | **静默优于删除**（`DBG` 宏保留语句）；删前先编译，只删编译器点名的行 |
 | 20 行补丁在 diff 里变成 1400 行 | `ReadAllText` 读、却 `split` + `join CRLF` 写回 | 写回前确认原行尾；优先 `Replace` + `WriteAllText` |

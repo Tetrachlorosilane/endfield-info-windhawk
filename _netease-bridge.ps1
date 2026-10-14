@@ -60,8 +60,10 @@ param(
     [int]$LyricRetryMs = 20000,
     # 位置来源：memory = 从客户端内存读播放位置（毫秒 int32，差分发现）；
     # media = 媒体会话（SMTC，真实位置）；clock = 推算时钟；
-    # auto = 依次尝试 memory → media → clock
     # cdp = 通过调试端口读页面里的实际播放时间（需要用户自己给快捷方式加调试参数）；
+    # **auto 的实际顺序**（见主循环）：迷你条 DOM 的真 currentTime → store 当前行的起始时间
+    # → CDP 其它位置 → 内存差分 → 媒体会话 → 推算时钟。每一步失败就静默降级，
+    # 所以"到底用了哪个"由发出去的 `pos` key 回答（`{ext.netease.pos}`）。
     [ValidateSet('auto', 'memory', 'cdp', 'media', 'clock')]
     [string]$PositionSource = 'auto',
     # 内存发现时两次采样的间隔（秒）——这段时间里必须在播放
@@ -80,6 +82,11 @@ param(
     [string]$PositionHelper = '',
     # 超过这么久没有新采样就当成不可用（毫秒）
     [int]$PositionStaleMs = 3000,
+    # 歌词行的"负延迟"：把**选行用的位置**提早这么多毫秒（默认 -1 = 按来源自动）。
+    # 用户报告"歌词滞后约 1 秒"，来源就是两处系统性滞后：DOM 只给「分:秒」（位置向下取整
+    # 到秒，平均落后 0.5 s）+ 桥每 IntervalMs 才轮询一次（平均再落后半个周期）。
+    # auto = 半个周期，DOM 来源再补 0.5 s（默认合计 1000 ms）；0 = 关掉；给正数就用自己的值。
+    [int]$LeadMs = -1,
     # 只探一次位置来源并打印结论
     [switch]$ProbePosition
 )
@@ -134,14 +141,83 @@ function Select-LrcLine {
 
 # ---------------------------------------------------------------------------
 # 曲目：从窗口标题拿「歌名 - 歌手」
+#
+# **不能用 Process.MainWindowTitle**。2026-10-14 真机实测：网易云开着「桌面歌词」时，
+# cloudmusic.exe 的 MainWindowTitle 是**「桌面歌词」**，带歌名的那个顶层窗口反而不是
+# 主窗口（`Get-Process -Id 15824` → `MainWindowTitle: 桌面歌词`，而同一个 pid 的另一个
+# 顶层窗口标题是「下等马 - 洛天依Official/ChiliChill乐团」）。于是按 MainWindowTitle
+# 取标题永远拿不到「 - 」，`Get-PlayingTrack` 判为"没有可用窗口"，桥**一直停在等待
+# 循环里、从不连接管道**——面板上 title 与 lyric 两行就永远是 `--`。
+#
+# 所以自己枚举该进程的顶层窗口，挑标题里有「 - 」的那个。
 # ---------------------------------------------------------------------------
-function Get-PlayingTrack {
-    $procs = @(Get-Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.ProcessName -like "*$ProcessName*" -and $_.MainWindowTitle })
-    if ($procs.Count -eq 0) { return $null }
+if (-not ('Endfield.Win32' -as [type])) {
+    Add-Type -Namespace Endfield -Name Win32 -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, System.IntPtr lParam);
+public delegate bool EnumWindowsProc(System.IntPtr hWnd, System.IntPtr lParam);
+[DllImport("user32.dll")] public static extern int GetWindowTextLength(System.IntPtr hWnd);
+[DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)] public static extern int GetWindowText(System.IntPtr hWnd, System.Text.StringBuilder s, int n);
+[DllImport("user32.dll")] public static extern bool IsWindowVisible(System.IntPtr hWnd);
+[DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(System.IntPtr hWnd, out int pid);
+'@
+}
 
-    $title = $procs[0].MainWindowTitle.Trim()
-    # 没在播时标题就是产品名，没有「 - 」
+# 纯函数：从一组窗口标题里挑出曲目标题。没有「 - 」就没有曲目（没在播时标题是产品名，
+# 桌面歌词窗口的标题也是产品名之外的东西）。多个候选取**最长**的——完整标题比截断的长。
+function Select-SongTitle {
+    param([string[]]$Titles)
+    $best = $null
+    foreach ($t in $Titles) {
+        if (-not $t) { continue }
+        $t = $t.Trim()
+        if ($t.IndexOf(' - ') -lt 1) { continue }
+        if (-not $best -or $t.Length -gt $best.Length) { $best = $t }
+    }
+    return $best
+}
+
+# 该进程（名字匹配 `*$ProcessName*`）所有**可见且有标题**的顶层窗口标题。
+#
+# 按**窗口所属进程名**判定，而不是"先列出所有进程、再筛 pid"：进程**列表**在受限环境里
+# 可能只给一部分（实测：沙箱里 `Get-Process` 只返回 13 个进程，而按 pid 单查是可靠的）。
+# 所以这里枚举窗口、取每个窗口的 pid、再按 pid 查进程名；每次调用只为**去重后的几个
+# pid** 各查一次（有标题的顶层窗口通常不到 20 个）。
+function Get-NeteaseWindowTitles {
+    $titles = New-Object System.Collections.ArrayList
+    $ownerNames = @{}
+    $cb = [Endfield.Win32+EnumWindowsProc] {
+        param($hWnd, $lParam)
+        if (-not [Endfield.Win32]::IsWindowVisible($hWnd)) { return $true }
+        $len = [Endfield.Win32]::GetWindowTextLength($hWnd)
+        if ($len -le 0) { return $true }
+        $owner = 0
+        [void][Endfield.Win32]::GetWindowThreadProcessId($hWnd, [ref]$owner)
+        if (-not $ownerNames.ContainsKey($owner)) {
+            $name = ''
+            try { $name = (Get-Process -Id $owner -ErrorAction Stop).ProcessName } catch { $name = '' }
+            $ownerNames[$owner] = $name
+        }
+        if ($ownerNames[$owner] -like "*$ProcessName*") {
+            $sb = New-Object System.Text.StringBuilder ($len + 2)
+            [void][Endfield.Win32]::GetWindowText($hWnd, $sb, $sb.Capacity)
+            [void]$titles.Add($sb.ToString())
+        }
+        return $true
+    }
+    [void][Endfield.Win32]::EnumWindows($cb, [System.IntPtr]::Zero)
+    return $titles.ToArray()
+}
+
+function Get-PlayingTrack {
+    $title = Select-SongTitle (Get-NeteaseWindowTitles)
+    if (-not $title) {
+        # 兜底：枚举拿不到东西时退回主窗口标题（有的客户端/版本里主窗口就是曲目标题）
+        $procs = @(Get-Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProcessName -like "*$ProcessName*" -and $_.MainWindowTitle })
+        if ($procs.Count -gt 0) { $title = Select-SongTitle @($procs[0].MainWindowTitle) }
+    }
+    if (-not $title) { return $null }
+
     $sep = $title.LastIndexOf(' - ')
     if ($sep -lt 1) { return $null }
 
@@ -271,6 +347,42 @@ function Write-Frame {
     $Writer.Flush()
 }
 
+function Connect-PipeClient {
+    # 管道只在 mod 需要外部数据时存在，而且 mod 重载时它会消失又回来，所以"连不上"
+    # 往往是瞬态的，必须等一等。原来这里是一句裸的 $client.Connect(3000)：瞬时拒绝
+    # 变成未处理异常，脚本当场死掉，mod 的看门狗再把它拉起来——重启预算就烧在
+    # "再等一秒就能连上"的事情上。现在按窗口重试，等不到返回 $null（由调用方决定
+    # 怎么处理），**不抛异常**。
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Pipe,
+        [int]$TimeoutMs = 3000,
+        [int]$WaitSeconds = 60
+    )
+    $deadline = (Get-Date).AddSeconds($WaitSeconds)
+    $announced = $false
+    while ($true) {
+        $client = $null
+        try {
+            $client = New-Object System.IO.Pipes.NamedPipeClientStream('.', $Pipe, [System.IO.Pipes.PipeDirection]::InOut)
+            $client.Connect($TimeoutMs)
+            return $client
+        }
+        catch {
+            if ($client) { $client.Dispose() }
+            if ((Get-Date) -ge $deadline) {
+                Write-Host ("管道 {0} 等满 {1} 秒仍连不上：{2}" -f $Pipe, $WaitSeconds, $_.Exception.Message)
+                return $null
+            }
+            if (-not $announced) {
+                $announced = $true
+                Write-Host ("管道 {0} 暂时连不上（mod 可能正在启动或重载），每 2 秒重试" -f $Pipe)
+            }
+            Start-Sleep -Seconds 2
+        }
+    }
+}
+
 function Publish {
     param($Writer, [string]$Key, [string]$Text)
     if ($script:Sent[$Key] -eq $Text) { return $false }
@@ -309,6 +421,40 @@ function Get-PositionMs {
     $seconds = $Sample.Position
     if ($Sample.Status -eq 'Playing') { $seconds += $AgeSeconds }
     [int]([math]::Max(0.0, $seconds) * 1000)
+}
+
+# 位置来源的标签（纯函数，-SelfTest 覆盖）。**这一行的"当前歌词"是算出来的**——用位置在
+# 行时间戳上选行——所以"位置是哪来的"就是它准不准的全部答案。以前这个只能靠猜：链路上
+# 每一步都可能失败并静默降级。现在把它当一个 key 发出去，面板上写 `{ext.netease.pos}`
+# 就能看到（`dom 41.3s` = 迷你条的真 currentTime；`storeline 29.5s` = store 当前行的起始
+# 时间（按行跳变）；`mem`/`cdp` = 内存差分 / CDP 其它位置；`clock` = 推算时钟，会漂）。
+function Format-PositionSource {
+    param([string]$Source, [int]$PositionMs, [int]$LeadMs = 0)
+    $name = switch ($Source) {
+        'media' { 'media' }
+        'dom' { 'dom' }
+        'storeline' { 'storeline' }
+        'cdp' { 'cdp' }
+        'memory' { 'mem' }
+        default { 'clock' }
+    }
+    $leadText = if ($LeadMs -gt 0) { " +$($LeadMs)ms" } else { '' }
+    return ("{0} {1:0.0}s{2}" -f $name, ($PositionMs / 1000.0), $leadText)
+}
+
+# 提早换行多少毫秒（纯函数，-SelfTest 覆盖）。**为什么要提早**——位置有两个系统性滞后：
+#   · 迷你条 DOM 只给「分:秒」，位置是**向下取整到秒**的（真实 90.9 s 报 90）→ 平均落后 0.5 s、
+#     最坏 1 s；
+#   · 桥每 -IntervalMs（默认 1000 ms）才轮询一次 → 平均再落后半个周期。
+# 所以 auto = 半个轮询周期，DOM 来源再补 0.5 s 的取整偏差（默认合计 1 s）。被提早的只是
+# **选行用的位置**：发出去的 `pos` 仍是原始位置并标出提早量（`dom 90.0s +1000ms`），
+# 所以"提早了多少、有没有过头"看得见。`-LeadMs 0` 关掉，`-LeadMs N` 用自己的值。
+function Get-LeadMs {
+    param([string]$Source, [int]$IntervalMs, [int]$OverrideMs = -1)
+    if ($OverrideMs -ge 0) { return $OverrideMs }
+    $lead = [int][math]::Round($IntervalMs / 2.0)
+    if ($Source -eq 'dom') { $lead += 500 }
+    return $lead
 }
 
 $script:PositionProc = $null
@@ -1192,8 +1338,34 @@ if ($SelfTest) {
         @{ Name = '两拍判定：几乎不动 = 暂停'; Ok = (-not (Test-Playing -Prev 1000 -Now 1000 -ElapsedSeconds 1.0 -ToleranceMs 400)) }
         @{ Name = '切歌粗校验：回落或明显跳变 = 有效'; Ok = (Test-PosAfterTrackChange -Prev 60000 -Now 1200) -and (Test-PosAfterTrackChange -Prev 60000 -Now 20000) }
         @{ Name = '切歌粗校验：几乎原样 = 可疑'; Ok = (-not (Test-PosAfterTrackChange -Prev 60000 -Now 60200)) }
+        @{ Name = '连不上管道时返回空值（不抛异常）'; Ok = ($null -eq (Connect-PipeClient -Pipe ("endfield-info-windhawk-selftest-{0}" -f [guid]::NewGuid().ToString('N')) -TimeoutMs 200 -WaitSeconds 0)) }
+        # 曲目标题的判定。真机形状：同一进程里既有「桌面歌词」也有「歌名 - 歌手」，
+        # 而后者不是 MainWindowTitle（2026-10-14 实测，见 Get-PlayingTrack 的注释）。
+        @{ Name = '曲目标题：桌面歌词窗口不算曲目'; Ok = ($null -eq (Select-SongTitle @('桌面歌词', '网易云音乐'))) }
+        @{ Name = '曲目标题：从多窗口里挑出带「 - 」的那个'; Ok = ((Select-SongTitle @('桌面歌词', '下等马 - 洛天依Official/ChiliChill乐团', '网易云音乐')) -eq '下等马 - 洛天依Official/ChiliChill乐团') }
+        @{ Name = '曲目标题：多个候选取最长的'; Ok = ((Select-SongTitle @('A - B', '下等马 - 洛天依Official/ChiliChill乐团')) -eq '下等马 - 洛天依Official/ChiliChill乐团') }
+        @{ Name = '曲目标题：空标题与空数组都不算'; Ok = ($null -eq (Select-SongTitle @('', '   ')) -and $null -eq (Select-SongTitle @())) }
+        # 活的枚举：网易云在跑就必须至少看到一个顶层窗口（不在跑则这条无意义，视为通过）
+        @{ Name = '窗口枚举：网易云在跑时能看到它的顶层窗口'; Ok = ((@(Get-NeteaseWindowTitles).Count -gt 0) -or (-not (Get-NeteasePid))) }
+        # 位置来源标签：面板上的"当前歌词"是算出来的，所以这一行必须能说清位置是哪来的
+        @{ Name = '位置来源标签：迷你条 DOM（真 currentTime）'; Ok = ((Format-PositionSource -Source dom -PositionMs 41300) -eq 'dom 41.3s') }
+        @{ Name = '位置来源标签：store 当前行起始时间'; Ok = ((Format-PositionSource -Source storeline -PositionMs 29521) -eq 'storeline 29.5s') }
+        @{ Name = '位置来源标签：内存差分 / 媒体会话'; Ok = ((Format-PositionSource -Source memory -PositionMs 1000) -eq 'mem 1.0s') -and ((Format-PositionSource -Source media -PositionMs 0) -eq 'media 0.0s') }
+        @{ Name = '位置来源标签：未知来源按推算时钟算'; Ok = ((Format-PositionSource -Source nonsense -PositionMs 500) -eq 'clock 0.5s') }
+        # 负延迟：位置有两个系统性滞后（DOM 向下取整到秒 + 每周期才轮询一次），按来源补偿
+        @{ Name = '负延迟：DOM 来源 = 半周期 + 0.5s 取整偏差'; Ok = ((Get-LeadMs -Source dom -IntervalMs 1000) -eq 1000) }
+        @{ Name = '负延迟：精确来源只补半个周期'; Ok = ((Get-LeadMs -Source media -IntervalMs 1000) -eq 500) -and ((Get-LeadMs -Source memory -IntervalMs 1000) -eq 500) }
+        @{ Name = '负延迟：周期变了自动值跟着变'; Ok = ((Get-LeadMs -Source dom -IntervalMs 400) -eq 700) }
+        @{ Name = '负延迟：显式值覆盖自动值（0 = 关掉）'; Ok = ((Get-LeadMs -Source dom -IntervalMs 1000 -OverrideMs 0) -eq 0) -and ((Get-LeadMs -Source dom -IntervalMs 1000 -OverrideMs 1500) -eq 1500) }
+        @{ Name = 'pos 标签带出提早量'; Ok = ((Format-PositionSource -Source dom -PositionMs 90000 -LeadMs 1000) -eq 'dom 90.0s +1000ms') -and ((Format-PositionSource -Source dom -PositionMs 90000) -eq 'dom 90.0s') }
+        # 组合起来的效果：同一个行边界（10 s），不加提早量时 9.9 s 仍是第 0 行，
+        # 加 1 s 后（=10.9 s）已经是第 1 行 —— 换行确实提前了 1 秒。
+        @{ Name = '负延迟确实把换行提早（9.9s 仍是 0 行，+1s 后是 1 行）'; Ok = (((Select-StoreLineIndex -TimesSec @(0, 10, 20, 30) -PositionMs 9900) -eq 0) -and ((Select-StoreLineIndex -TimesSec @(0, 10, 20, 30) -PositionMs (9900 + 1000)) -eq 1)) }
     )
     $bad = 0
+    # 活体证据：判定用的是这一份窗口列表，打出来省得下一个人再猜一次
+    $liveWindows = @(Get-NeteaseWindowTitles)
+    Write-Host ("网易云顶层窗口（{0} 个）：{1}" -f $liveWindows.Count, (($liveWindows | ForEach-Object { "[$_]" }) -join ' '))
     foreach ($c in $checks) {
         if ($c.Ok) { Write-Host ("  OK   {0}" -f $c.Name) } else { Write-Host ("  FAIL {0}" -f $c.Name); $bad++ }
     }
@@ -1208,11 +1380,15 @@ $track = Get-PlayingTrack
 if (-not $track) {
     # 发布器是被 mod 长期托管的（看门狗 / 作业对象负责收尾），所以"暂时没有窗口"不是退出理由：
     # 早先这里直接 exit 2，于是 mod 在 18 秒里把它启动了 5 次然后判定失败（真机日志 2026-10-13）。
-    Write-Host ("暂时没有可用的网易云窗口（进程名匹配 '*{0}*'，主窗口标题里要有「 - 」）。" -f $ProcessName)
-    Write-Host "每 5 秒重试；窗口出现就继续。若一直不出现，用 -ProcessName 指定真实进程名。当前有标题的进程："
-    Get-Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.MainWindowTitle } |
-        ForEach-Object { Write-Host ("  {0,-28} {1}" -f $_.ProcessName, $_.MainWindowTitle) }
+    Write-Host ("暂时没有可用的网易云窗口（进程名匹配 '*{0}*'，某个顶层窗口标题里要有「 - 」）。" -f $ProcessName)
+    Write-Host "每 5 秒重试；窗口出现就继续。若一直不出现，用 -ProcessName 指定真实进程名。"
+    Write-Host "网易云进程的顶层窗口（这就是判定用的那一份；主窗口标题不算数）："
+    $winTitles = @(Get-NeteaseWindowTitles)
+    if ($winTitles.Count -eq 0) {
+        Write-Host "  （一个都没看到——进程名不对，或者窗口还没建出来）"
+    } else {
+        $winTitles | ForEach-Object { Write-Host ("  [{0}]" -f $_) }
+    }
     while (-not $track) {
         Start-Sleep -Seconds 5
         $track = Get-PlayingTrack
@@ -1256,8 +1432,13 @@ if ($PositionSource -ne 'clock') {
     }
 }
 if (-not $DryRun) {
-    $client = New-Object System.IO.Pipes.NamedPipeClientStream('.', $Pipe, [System.IO.Pipes.PipeDirection]::InOut)
-    $client.Connect(3000)
+    $client = Connect-PipeClient -Pipe $Pipe
+    if (-not $client) {
+        # 等满窗口还是连不上：说明 mod 根本没在跑（或设置里不需要外部数据）。
+        # 干净退出并说清原因，比抛异常好——看门狗会按它自己的窗口再试。
+        Write-Host ("这次不发布：管道 {0} 不可用" -f $Pipe)
+        exit 0
+    }
     $writer = New-Object System.IO.StreamWriter($client, (New-Object System.Text.UTF8Encoding($false)))
     $writer.AutoFlush = $true
     Write-Frame $writer "HELLO 1 $Provider"
@@ -1322,13 +1503,19 @@ try {
             # 首选位置来源：迷你条 DOM 的"已播 / 总长" —— 客户端**自己显示**的真 currentTime
             # （用户在 DevTools 里找到的控件；不锚哈希类名，理由见 Get-CdpDomTime 的注释）
             $positionMs = $null
+            $posSrc = 'clock'
             if ($PositionSource -in 'auto', 'cdp') {
                 $domTime = Get-CdpDomTime
-                if ($domTime -and $domTime.ok) { $positionMs = [int]$domTime.curS * 1000 }
+                if ($domTime -and $domTime.ok) {
+                    $positionMs = [int]$domTime.curS * 1000
+                    $posSrc = 'dom'
+                }
             }            # 首选来源：CDP store —— 精确到客户端自己的当前行 ✓；它的行时间顺便当位置 ✓
             # （用户实测：内存扫描极不稳定 ✗ → CDP/store 优先 ✓、内存降为次选 ✓。
             #   注意：store 的 lineTimeSec 是**行起始时间** ✓，会按行跳变；要连续毫秒仍需内存/SMTC ✓）
-            $positionMs = $null
+            # ⚠ 下面这行 `$positionMs = $null` **必须留在 DOM 那一段之前**：它后面再出现一次，
+            #   就会把刚取到的真 currentTime 清掉，位置只能退回 store 的行起始时间（= 冻结的
+            #   playingLyricLineNumber 那一行），歌词于是永远停在同一行 ✗（2026-10-14 修）。
             $storeLine = $null
             if ($LyricSource -in 'auto', 'store') {
                 $ss = Get-CdpStoreState
@@ -1339,29 +1526,40 @@ try {
                         [void](Publish $writer 'lyric' $storeLine)
                     }
                     if ($ss.trans) { [void](Publish $writer 'translation' ('' + $ss.trans)) }
-                    if ($null -eq $positionMs -and $null -ne $ss.lineTimeSec) { $positionMs = [int]([double]$ss.lineTimeSec * 1000) }
+                    if ($null -eq $positionMs -and $null -ne $ss.lineTimeSec) {
+                        $positionMs = [int]([double]$ss.lineTimeSec * 1000)
+                        $posSrc = 'storeline'
+                    }
                 }
             }
             # 位置降级链：cdp → memory → media → clock（store 没给出位置才往下走 ✓）
             if ($null -eq $positionMs -and $PositionSource -in 'auto', 'cdp') {
                 $positionMs = Get-CdpPositionMs
+                if ($null -ne $positionMs) { $posSrc = 'cdp' }
             }
             if ($null -eq $positionMs -and $PositionSource -in 'auto', 'memory') {
                 $positionMs = Get-MemoryPosition -Now $now
+                if ($null -ne $positionMs) { $posSrc = 'memory' }
             }
             if ($null -eq $positionMs -and $PositionSource -in 'auto', 'cdp') {
                 $positionMs = Get-CdpPositionMs
+                if ($null -ne $positionMs) { $posSrc = 'cdp' }
             }
             if ($null -eq $positionMs -and $positionMode -eq 'media') {
                 $sample = Get-PositionSample
                 if ($sample) {
                     $positionMs = Get-PositionMs -Sample $sample `
                         -AgeSeconds ((Get-Date) - $sample.At).TotalSeconds
+                    if ($null -ne $positionMs) { $posSrc = 'media' }
                 }
             }
             if ($null -eq $positionMs) {
                 $positionMs = [int]((Get-Date) - $started).TotalMilliseconds
+                $posSrc = 'clock'
             }
+            # 换行的"负延迟"（见 Get-LeadMs）。⚠ 变量名**不能**叫 $leadMs：PowerShell 变量名
+            # 大小写不敏感，那会覆盖 -LeadMs 参数本身，自动值就永远停在第一次算出来的数。
+            $leadApply = Get-LeadMs -Source $posSrc -IntervalMs $IntervalMs -OverrideMs $LeadMs
             # 当前行：用位置在 store 的 times 上选（不再用那个冻结的 playingLyricLineNumber）
             # times 只在换歌时取一次（纯数字）；文本/翻译只在行号变化时按需取。
             if ($LyricSource -in 'auto', 'store') {
@@ -1376,7 +1574,10 @@ try {
                     }
                 }
                 if ($script:StoreTimes -and $null -ne $positionMs) {
-                    $idx = Select-StoreLineIndex -TimesSec $script:StoreTimes -PositionMs ([int]$positionMs)
+                    # 选行用**提早后**的位置（见 Get-LeadMs）：只影响换行的时刻，
+                    # 发出去的 pos 仍是原始位置。
+                    $idx = Select-StoreLineIndex -TimesSec $script:StoreTimes `
+                        -PositionMs ([int]$positionMs + $leadApply)
                     if ($idx -ge 0 -and $idx -ne $script:StoreLineIndex) {
                         $ln = Get-CdpStoreLyricLine -Index $idx
                         if ($ln -and $ln.ok) {
@@ -1389,10 +1590,16 @@ try {
                 }
             }
             # 兜底：接口 LRC + 位置选行（store 不可用时才走这条 ✓）
-            $line = if ($storeLine) { $storeLine } else { Select-LrcLine $lyricLines $positionMs }
+            $line = if ($storeLine) { $storeLine } else { Select-LrcLine $lyricLines ([int]$positionMs + $leadApply) }
 
             [void](Publish $writer 'title' ("{0} - {1}" -f $now.Title, $now.Artist))
             if ($line) { [void](Publish $writer 'lyric' $line) }
+            # 位置来源：这是"当前歌词算得准不准"的全部答案，所以发出去而不是只打在看不见的
+            # stdout 上（面板写 `{ext.netease.pos}` 即可）。变化时才有帧（Publish 会去重）。
+            if ($null -ne $positionMs) {
+                [void](Publish $writer 'pos' (Format-PositionSource -Source $posSrc `
+                            -PositionMs ([int]$positionMs) -LeadMs $leadApply))
+            }
             if ($Event -and -not $announced -and $writer) {
                 Write-Frame $writer "EVENT $Provider info $TtlMs $($now.Title) - $($now.Artist)  $line"
                 $announced = $true
