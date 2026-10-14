@@ -70,8 +70,16 @@ own metrics (`0` inherits `Font size` / `Row height`), and a tag at the *start* 
 the row's text overrides the setting: `[[size:18]]` and `[[h:44]]`, in any order
 and repeatable (the last one wins). The panel is as tall as its rows add up to,
 and a row is never shorter than its own font needs - growing a font grows the row
-rather than letting the glyphs spill into the next one. A tag written anywhere but
-the start is ordinary text and is drawn as such.
+rather than letting the glyphs spill into the next one.
+
+`[[size:NN]]` also decorates a *run*, the same way a font tag does: written
+anywhere but the very start it applies to the text it wraps, closed by
+`[[/size]]` (or running to the end of the line). So
+`CPU [[size:20]]{cpu.ghz}GHz[[/size]]` draws only those characters larger. Runs do
+not nest: `[[/size]]` returns to the row's own size. The row's height floor follows
+the largest text in it, and the icon plate follows the global `Font size` only, so
+a bigger row size changes the text and nothing else. A tag written anywhere but the
+start is ordinary text and is drawn as such.
 
 ## Rings, icons and themes
 
@@ -1481,6 +1489,46 @@ static const WCHAR *ParseRowMetricTags(const WCHAR *row, int *fontSize, int *hei
     return p;
 }
 
+// Parses the digits of a [[size:NN]] tag body, [begin,end). Digits only, and the value is
+// clamped to what the painter can draw -- the same rule the row-prefix form uses. Returns
+// false when there is nothing numeric to read, so the caller leaves the tag as text.
+static bool ParseInlineSize(const WCHAR *begin, const WCHAR *end, int *out) {
+    if (!begin || !end || end <= begin) return false;
+    int value = 0;
+    int digits = 0;
+    for (const WCHAR *p = begin; p < end; p++) {
+        if (*p < L'0' || *p > L'9') return false;
+        value = value * 10 + (int)(*p - L'0');
+        if (++digits > 3) return false;
+    }
+    *out = ClampInt(value, kMinRowFontSize, kMaxRowFontSize);
+    return true;
+}
+
+// The largest [[size:NN]] run in a row's text, or 0 when it has none. A row's height has to
+// fit the biggest text in it, so this is what keeps a large run from spilling into the row
+// below: without it the floor would be computed from the row's own size only.
+static int MaxInlineRunSize(const WCHAR *row) {
+    int largest = 0;
+    if (!row) return 0;
+    const WCHAR *p = row;
+    while (*p) {
+        if (p[0] != L'[' || p[1] != L'[') {
+            p++;
+            continue;
+        }
+        const WCHAR *close = wcsstr(p + 2, L"]]");
+        if (!close) break;
+        // "[[/size]]" has a five-character body and is not a size tag.
+        if ((int)(close - (p + 2)) > 5 && _wcsnicmp(p + 2, L"size:", 5) == 0) {
+            int size = 0;
+            if (ParseInlineSize(p + 7, close, &size) && size > largest) largest = size;
+        }
+        p = close + 2;
+    }
+    return largest;
+}
+
 struct ModSettings {
     WCHAR rows[kMaxRows][256] = {};
     int rowCount = 0;
@@ -1501,6 +1549,10 @@ struct ModSettings {
     // either means "inherit the global setting".
     int rowFontSize[kMaxRows] = {};
     int rowHeightPx[kMaxRows] = {};
+    // The largest text that appears in each row: its own size, or the largest [[size:NN]] run
+    // inside it. The row's height floor comes from this, not from the row's own size, or a
+    // big run would be allowed to overflow into the row below.
+    int rowMaxFontSize[kMaxRows] = {};
     // Global candidate list for characters the main family cannot draw ("Fallback fonts"),
     // plus the chains registered from [[font:...]] tags found in the rows. A count of zero
     // means "not configured", which is what keeps the whole multi-font path switched off.
@@ -1576,7 +1628,12 @@ static int RowHeightPx(const ModSettings &settings, int row) {
     const int wanted = (row >= 0 && row < kMaxRows && settings.rowHeightPx[row] > 0)
                            ? settings.rowHeightPx[row]
                            : settings.rowHeight;
-    return MaxInt(wanted, MinimumRowHeightForFont(RowFontSizePx(settings, row)));
+    // The floor comes from the largest text in the row, so a [[size:24]] run inside an
+    // otherwise small row still gets a box that can hold it.
+    const int largest = (row >= 0 && row < kMaxRows && settings.rowMaxFontSize[row] > 0)
+                            ? settings.rowMaxFontSize[row]
+                            : RowFontSizePx(settings, row);
+    return MaxInt(wanted, MinimumRowHeightForFont(largest));
 }
 
 // Top edge of one row, and the height of `count` rows together. These two are the single
@@ -1634,6 +1691,9 @@ static void ReadSettings(ModSettings &s) {
             s.rowHeightPx[slot] = tagHeight > 0
                                       ? ClampInt(tagHeight, kMinRowHeight, kMaxRowHeight)
                                       : settingHeight;
+            // The prefix tags are gone from the stored text, so anything left in it that looks
+            // like [[size:NN]] is an inline run -- and that run may be bigger than the row.
+            s.rowMaxFontSize[slot] = MaxInt(s.rowFontSize[slot], MaxInlineRunSize(s.rows[slot]));
             s.rowCount++;
         }
         Wh_FreeStringSetting(value);
@@ -1642,6 +1702,7 @@ static void ReadSettings(ModSettings &s) {
         s.rows[i][0] = L'\0';
         s.rowFontSize[i] = 0;
         s.rowHeightPx[i] = 0;
+        s.rowMaxFontSize[i] = 0;
     }
 
     PCWSTR clickAction = Wh_GetStringSetting(L"ClickAction");
@@ -3993,6 +4054,9 @@ struct TextSeg {
     // tagFonts, or 0 for "no tag". It is carried per segment rather than per row because a
     // row may switch family mid-sentence.
     int tagChain = 0;
+    // This run's own font size, or 0 for "the row's size". A [[size:NN]] run may start and
+    // end anywhere in the text, so -- like the family -- the size has to live per segment.
+    int runFontSize = 0;
 };
 
 struct RowState {
@@ -4018,6 +4082,11 @@ static const WCHAR kRingMarkEnd = 0xE001;
 // painter never parses markup -- stripping the markers happens in exactly one place.
 static const WCHAR kFontMarkStart = 0xE002;
 static const WCHAR kFontMarkEnd = 0xE003;
+// A [[size:NN]] run. Unlike the font marker this one carries no table index: the size is
+// written into the marker itself as two decimal digits (09..48), which needs no registry and
+// no lookup -- the painter can read the number straight back out of the string.
+static const WCHAR kSizeMarkStart = 0xE004;
+static const WCHAR kSizeMarkEnd = 0xE005;
 
 // Expands tokens, swaps each ring token for a marker, and returns the gauges in
 // source order.
@@ -4098,6 +4167,28 @@ static void ExpandTokensAndRings(const WCHAR *source, const Values &v,
                     p = close + 2;
                     continue;
                 }
+                // [[size:NN]] / [[/size]]: the same mechanism as a font run, for the font
+                // size. A size tag at the very start of the row is a *row* property and was
+                // already consumed by ReadSettings, so anything that reaches this point is a
+                // run inside the text and is marked as one.
+                if (bodyLen > 5 && _wcsnicmp(body, L"size:", 5) == 0) {
+                    int size = 0;
+                    if (ParseInlineSize(body + 5, close, &size) && written + 5 < outCount) {
+                        out[written++] = kSizeMarkStart;
+                        out[written++] = (WCHAR)(L'0' + size / 10);
+                        out[written++] = (WCHAR)(L'0' + size % 10);
+                        out[written++] = kRingMarkEnd;
+                        p = close + 2;
+                        continue;
+                    }
+                    // Not a size this code can draw (a word, an empty value, a number past
+                    // the clamp): leave it as text rather than eating it.
+                }
+                if (bodyLen == 5 && _wcsnicmp(body, L"/size", 5) == 0) {
+                    if (written + 2 < outCount) out[written++] = kSizeMarkEnd;
+                    p = close + 2;
+                    continue;
+                }
             }
         }
         if (*p == L'{') {
@@ -4137,17 +4228,20 @@ static void BuildRowLayout(const WCHAR *marked, int ringCount, RowState &state, 
     // The chain the *next* text segment belongs to. Text before the first tag is chain 0,
     // which is the global fallback list.
     int tagChain = 0;
+    // And the size the next text segment is drawn at, 0 = the row's own size.
+    int runFontSize = 0;
 
-    // A text run ends at a marker, and both markers below flush the run in progress before
-    // moving on. That is what keeps a segment from spanning two font tags -- the run that
-    // follows a tag has to be a segment of its own, or the segment would have no single
-    // family to draw in.
+    // A text run ends at a marker, and every marker below flushes the run in progress before
+    // moving on. That is what keeps a segment from spanning two tags -- the run that follows
+    // a tag has to be a segment of its own, or the segment would have no single family or
+    // size to be drawn in.
     auto flushText = [&]() {
         if (position > textStart && state.segmentCount[row] < kMaxSegments - 1) {
             TextSeg &seg = state.segments[row][state.segmentCount[row]++];
             seg.offset = textStart;
             seg.length = position - textStart;
             seg.tagChain = tagChain;
+            seg.runFontSize = runFontSize;
             textStart = position;
         }
     };
@@ -4183,6 +4277,25 @@ static void BuildRowLayout(const WCHAR *marked, int ringCount, RowState &state, 
             tagChain = 0;
             continue;
         }
+        if (*p == kSizeMarkStart) {
+            flushText();
+            // Two decimal digits, high first. Anything unexpected leaves the run at the
+            // row's own size, which is the safe answer for a marker this code did not write.
+            if (p[1] >= L'0' && p[1] <= L'9' && p[2] >= L'0' && p[2] <= L'9') {
+                runFontSize = ClampInt(((int)(p[1] - L'0')) * 10 + (int)(p[2] - L'0'),
+                                       kMinRowFontSize, kMaxRowFontSize);
+            }
+            while (p[1] && p[1] != kRingMarkEnd) p++;
+            if (p[1] == kRingMarkEnd) p++;
+            continue;
+        }
+        if (*p == kSizeMarkEnd) {
+            flushText();
+            // Back to the row's own size. Runs deliberately do not nest: [[/size]] always
+            // returns to the row, the same way [[/font]] always returns to the global chain.
+            runFontSize = 0;
+            continue;
+        }
         if (*p == kRingMarkEnd) continue;
         state.text[row][out++] = *p;
         position++;
@@ -4193,6 +4306,7 @@ static void BuildRowLayout(const WCHAR *marked, int ringCount, RowState &state, 
         seg.offset = textStart;
         seg.length = position - textStart;
         seg.tagChain = tagChain;
+        seg.runFontSize = runFontSize;
     }
     state.text[row][out] = L'\0';
 }
@@ -4846,18 +4960,26 @@ static void PaintIconGlyph(GpGraphics *graphics, int style, float cx, float cy,
 // Returns the plate diameter for the current settings, or 0 when no icon is on.
 // A custom image counts as an icon even when no built-in glyph was chosen, so
 // setting only a path is enough to get a plate.
-// Diameter of the plate for one row, or 0 when that row has no icon. The diameter follows
-// that row's font size, so a row drawn in a larger font gets a larger plate instead of a
-// small disc floating in a tall row.
+// Diameter of the plate for one row, or 0 when that row has no icon.
+//
+// The diameter follows the **global** Font size, never a row's own size (neither
+// `Row N font size` nor a `[[size:…]]` run). The plate is a panel element, not a piece of
+// the row's text: making it grow with the row's font meant that setting one row to a larger
+// size also redrew its icon larger, which is not what the row asked for, and it moved the
+// text column of every row around with it. `slot` therefore only decides *whether* there is
+// a plate.
 static float IconPlateDiameter(const ModSettings &settings, int slot) {
     if (ResolveIconStyle(settings, slot) <= 0 && !ResolveIconPath(settings, slot)[0]) {
         return 0.0f;
     }
-    return (float)RowFontSizePx(settings, slot) * (float)kIconPlateRatio;
+    return (float)settings.fontSize * (float)kIconPlateRatio;
 }
 
-// The widest plate any row will draw. The text column is shared by every row (one inset for
-// all of them), so it has to clear the largest plate, not the first row's.
+// The plate diameter to reserve room for in the shared text column: the widest plate any row
+// will draw. Every plate is the same size, so this only has to cope with the rows that have
+// **no** plate at all -- the first row may well be one of those (`Row 1 icon = None`), and
+// reading the diameter off row 0 specifically would then inset the text by nothing while the
+// rows below it still draw a disc under it.
 static float MaxIconPlateDiameter(const ModSettings &settings) {
     float widest = 0.0f;
     for (int i = 0; i < kMaxRows; i++) {
@@ -5608,8 +5730,8 @@ static void PaintPanel(HWND hwnd) {
             g_gdiplus.CreateSolidFill(g_settings.background, &background);
             if (background && panelPath) g_gdiplus.FillPath(graphics, (GpBrush *)background, panelPath);
 
-            // One inset for every row, so it has to clear the widest plate: rows may now be
-            // drawn at different font sizes, and a row with a larger font gets a larger plate.
+            // One inset for every row, sized by the widest plate in the panel (they are all
+            // the same size now, but the first row may have no plate at all).
             float iconDiameter = MaxIconPlateDiameter(g_settings);
             bool iconsPresent = AnyIconConfigured(g_settings);
 
@@ -5797,11 +5919,21 @@ static void PaintPanel(HWND hwnd) {
                         wcsncpy(slice, g_rowState.text[r] + seg.offset, length);
                         slice[length] = L'\0';
 
+                        // This run's size: its own [[size:NN]], or the row's size. The font is
+                        // chosen from it before anything is measured, so the fit is computed
+                        // with the font the run will actually be drawn in.
+                        const int segFontSize = seg.runFontSize > 0 ? seg.runFontSize : rowFontSizePx;
+                        GpFont *segMainFont = rowMainFont;
+                        if (segFontSize != rowFontSizePx) {
+                            GpFont *sized = AcquireRowFont(graphics, g_settings.fontFamily, segFontSize);
+                            if (sized) segMainFont = sized;
+                        }
+
                         // Fallback fonts: choose this run's family *before* measuring it, so the
                         // fit is computed with the font it will actually be drawn in. The choice
                         // is made from the whole run, not from whatever survives the trim: the row
                         // says which family it wants, not how much of it fits.
-                        GpFont *runFont = rowMainFont;
+                        GpFont *runFont = segMainFont;
                         if (rowFontPath) {
                             const FontChain &tagChain =
                                 seg.tagChain > 0 ? g_settings.tagFonts[seg.tagChain - 1].chain
@@ -5811,7 +5943,7 @@ static void PaintPanel(HWND hwnd) {
                                                g_settings.fallbackFonts, FontFamilyCovers);
                             if (picked && _wcsicmp(picked, g_settings.fontFamily) != 0) {
                                 GpFont *fallbackFont =
-                                    AcquireRowFont(graphics, picked, rowFontSizePx);
+                                    AcquireRowFont(graphics, picked, segFontSize);
                                 if (fallbackFont) runFont = fallbackFont;
                             }
                         }
@@ -6677,8 +6809,9 @@ static bool RowStateEqual(const RowState &a, const RowState &b, int count) {
             if (a.segments[r][i].offset != b.segments[r][i].offset) return false;
             if (a.segments[r][i].length != b.segments[r][i].length) return false;
             // Two rows can carry identical text with different tags around it: the markers are
-            // stripped, so without this the family could change without a repaint.
+            // stripped, so without this the family or the size could change without a repaint.
             if (a.segments[r][i].tagChain != b.segments[r][i].tagChain) return false;
+            if (a.segments[r][i].runFontSize != b.segments[r][i].runFontSize) return false;
         }
         for (int i = 0; i < a.ringCount[r]; i++) {
             if (!RingSpecsEqual(a.rings[r][i], b.rings[r][i])) return false;

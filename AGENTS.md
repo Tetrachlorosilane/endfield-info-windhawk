@@ -292,7 +292,7 @@ python _preview.py
 `ParseFontChainList` / `FontChainKey` / `RowNeedsFontPath` / `CollectRowFontTags` ·
 `PickFontFamily`（覆盖判定以函数指针注入） ·
 `ParseRowMetricTags` / `RowFontSizePx` / `RowHeightPx` / `RowTopPx` / `PanelRowsHeight` /
-`MinimumRowHeightForFont` / `MaxIconPlateDiameter` ·
+`MinimumRowHeightForFont` / `MaxIconPlateDiameter` / `ParseInlineSize` / `MaxInlineRunSize` ·
 `ExtParseLine` · `ExtSanitize` · `ExtParseNumber` · `ExtLookup` · `ExtNextDeadline` ·
 `ExtEvictIndex` · `ExtProviderAllowed` · `ExtReplyTimeoutsAfter` · `IslandEnqueue` / `StepIsland` / `IslandHitTest` /
 `IslandClickActionFor` · `Select-StoreLineIndex` / `Select-SongTitle` / `Get-LeadMs`（脚本侧）
@@ -359,14 +359,25 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 - **行高下限是"字放得下"，不是美学选择**：`kRowHeightFontSlack = 15` 正是默认 `Row height 30`
   与 `Font size 15` 之差。去掉它，30 px 字号的行会溢出到相邻行上（GDI+ 不裁剪字形）。
   改这个常量会同时改变默认配置的外观，改前先看 §5.1 最后那条断言。
-- **行首标签只认行首，且前缀解析在 `ReadSettings` 里完成、标签已从 `rows[]` 剥掉**：
-  绘制侧与 `ExpandTokensAndRings` 都不知道 `[[size:]]` / `[[h:]]` 存在。写在文本中间的同名标签
-  因此是**普通文字**（不会半路改行高），写错的一律留下原文。
+- **`[[size:NN]]` 有两副面孔，区别只在位置**：写在**行首**是**行属性**（`ReadSettings` 的
+  `ParseRowMetricTags` 把它从 `rows[]` 里剥掉，同时决定该行的字号与高度下限）；写在**别处**是
+  **段属性**（`ExpandTokensAndRings` 换成 `kSizeMarkStart` + 两位十进制数字 + `kRingMarkEnd`，
+  `[[/size]]` 换 `kSizeMarkEnd`），由 `BuildRowLayout` 记进 `TextSeg::runFontSize`。
+  所以"段内 `[[size:20]]` 当普通文字"这条**只对行高成立**：它照样能改字号，但改的是那一段。
+  绘制侧按段取字号（`AcquireRowFont(…, segFontSize)`），段不嵌套——`[[/size]]` 回到该行自己的字号，
+  与 `[[/font]]` 回到主字体是同一条规矩。
+- **行高下限用"这一行里最大的字"**（`ModSettings::rowMaxFontSize` = 本行字号与
+  `MaxInlineRunSize` 的较大者），不是本行字号：否则 `[[size:30]]` 出现在小字行里会溢出到下一行。
+- **图标盘只跟随全局 `Font size`，不跟随任何行字号或段字号。** 用户明确报过这个是 bug
+  （"改变行 size 后图标也跟着变大，应该不对"）：盘是**面板元素**，不是行的一部分；
+  让它跟着行字号变，既改了那一行的图标，又会把**所有行**共用的文字列一起挪动。
+  `MaxIconPlateDiameter` 仍要留着——取"最宽的那个盘"是为了 `Row 1 icon = None` 这种情况
+  （第 0 行没有盘，但下面的行有）。
+- **行首标签只认行首**：前缀解析在 `ReadSettings` 里完成、标签已从 `rows[]` 剥掉，所以绘制侧只看得到
+  段标签；`[[h:…]]` 写在文本中间是**普通文字**，写错的一律留下原文。
 - **`Row N` 系列设置按设置里的行号配对，但一切按发布行序索引**（`rowSlotOf[]` 是那层映射）。
   留空的行会被跳过，所以 `Icon3` / `Row3Height` 属于**第三个设置行**，也就是**第二个显示出来的行**。
   配对错位过一次：`Icon3` 曾落到第二个显示行上，README 的"Row N icon 配 Row N"当时并不是真的。
-- **图标盘直径跟随该行的字号**（`IconPlateDiameter` → `RowFontSizePx`），而文字列的左内缩用
-  **最宽**的那个盘（`MaxIconPlateDiameter`）——文字列是所有行共用的，不能按第一行算。
 - **岛上的卡片不受行高影响**：它有自己的行距，取的是全局 `Row height`。卡片不是"一行"，
   它盖在行上面；如果它的行距跟着下面的行变，一个正在淡出的卡片会在中途改尺寸。
 
@@ -552,17 +563,17 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   `BuildRowLayout` 的输出（它剥掉环标记），拿带标记的文本比会永远判定"变了"。详见 §6 对应三行。
 - **发布器重启预算是"连续"而不是"累计"**（`PublisherEarnedBackRestarts`）：跑满 60 s 就把预算还回来，
   否则 5 次启动（包括用户重启音乐客户端、或手动踢掉发布器）之后永久禁用，只有重载 mod 能救。
-- **一个值一个发布者，而且发布只发生在一处。** 客户端把同一个 key 在一帧里写两次时，mod 会
-  先应用第一条再应用第二条——正常情况下两次落在同一个 burst 里、被 sampler 合并成一次重绘，
-  所以看不出来；**一旦服务端被拖慢（见下一条），两个值就会一拍一拍地交替可见**。
-  真机症状：标题在"歌名"与"歌名 - 歌手"之间闪（`resourceName` 没有作者）、歌词隔一拍跳回
-  客户端那个会冻结的 `playingLyricLineNumber` 行。桥侧的规矩写在 `_netease-bridge.md`
-  （`Get-PublishPlan` 返回有序字典 = 结构上不可能有重复 key），mod 侧不改协议。
-- **不读回复的客户端不许拖慢服务端。** 回复写不出去时 mod 只丢掉结果，但**每次超时要付
-  `kExtIoTimeoutMs`（500 ms）**；out 缓冲约 1300 条回复，按每秒 4 帧算五六分钟后就开始超时，
-  于是管道线程每帧白等半秒、跟不上发布节奏——这就是上面那条"两个值交替可见"的放大器。
-  现在连续两次回复超时就认定该客户端不读（`ExtReplyTimeoutsAfter`，纯函数 + 断言）并
-  **不再回复**它：`OK`/`ERR` 变成可选，读回复的客户端（参考客户端）照旧拿得到。
+- **一个值一个发布者，发布只发生在一处。** 客户端把同一个 key 在一帧里写两次时，mod 先应用
+  第一条再应用第二条——正常情况两次落在同一 burst、被 sampler 合并成一次重绘，所以看不出来；
+  **服务端一旦被拖慢（下一条），两个值就一拍一拍地交替可见**。真机症状：标题在"歌名"与
+  "歌名 - 歌手"之间闪（`resourceName` 没有作者）、歌词隔一拍跳回客户端那个会冻结的
+  `playingLyricLineNumber` 行。规矩：来源只提供数据，发布只在桥的 `Get-PublishPlan` 一处
+  （返回有序字典 = 结构上不可能重复 key），详见 [_netease-bridge.md](_netease-bridge.md)。
+- **不读回复的客户端不许拖慢服务端。** 回复写不出去时 mod 只丢结果，但**每次超时付
+  `kExtIoTimeoutMs`（500 ms）**；out 缓冲约 1300 条回复、每秒 4 帧，五六分钟后开始超时，
+  管道线程于是每帧白等半秒——这就是上一条的放大器。连续两次超时就认定该客户端不读
+  （`ExtReplyTimeoutsAfter`，纯函数 + 断言）并不再回复它；读回复的客户端照旧拿得到。
+  协议细节见 [external-data-island-design.md](docs/external-data-island-design.md) §4.2。
 
 ### 5.7 字体回退与逐段覆盖
 

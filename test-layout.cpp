@@ -1706,19 +1706,33 @@ int main() {
             Check(PanelRowsHeight(s, 4) == RowTopPx(s, 4),
                   "the panel height is the top of the row just past the last one");
 
-            // The plate follows the row's own font, so a taller row gets a bigger disc, and the
-            // text column has to clear the widest of them (there is one column for all rows).
+            // The plate follows the **global** Font size, never a row's own size. Making it
+            // follow the row was a bug the user reported: setting one row larger also redrew
+            // its icon larger, which is not what the row asked for, and it dragged the shared
+            // text column around with it.
             ModSettings icons;
             icons.fontSize = 15;
             icons.rowHeight = 30;
             icons.icons[0].style = 2;
             icons.rowFontSize[1] = 24;
-            printf("    plate diameters: %f %f, widest %f\n", IconPlateDiameter(icons, 0),
-                   IconPlateDiameter(icons, 1), MaxIconPlateDiameter(icons));
-            Check(IconPlateDiameter(icons, 1) > IconPlateDiameter(icons, 0),
-                  "a row with a bigger font gets a bigger plate");
-            Check(MaxIconPlateDiameter(icons) == IconPlateDiameter(icons, 1),
-                  "and the shared text inset clears the widest plate");
+            icons.rowMaxFontSize[1] = 24;
+            printf("    plate diameters: %f %f (row 2 draws at %d px)\n", IconPlateDiameter(icons, 0),
+                   IconPlateDiameter(icons, 1), RowFontSizePx(icons, 1));
+            Check(IconPlateDiameter(icons, 1) == IconPlateDiameter(icons, 0),
+                  "a row with a bigger font keeps the same plate: icons follow Font size");
+            Check(MaxIconPlateDiameter(icons) == IconPlateDiameter(icons, 0),
+                  "and the shared text inset is that one plate size");
+
+            // A row with no plate must not collapse the inset for the rows that have one.
+            ModSettings noneFirst;
+            noneFirst.fontSize = 15;
+            noneFirst.rowHeight = 30;
+            noneFirst.icons[0].styleSet = true;   // explicit None on row 1
+            noneFirst.icons[0].style = 0;
+            noneFirst.icons[1].style = 2;         // Memory on row 2
+            Check(IconPlateDiameter(noneFirst, 0) == 0.0f, "the first row can have no plate");
+            Check(MaxIconPlateDiameter(noneFirst) > 0.0f,
+                  "while the inset still reserves room for the plate below it");
         }
 
         // --- ReadSettings wiring ---
@@ -1797,6 +1811,139 @@ int main() {
             Check(s.rowFontSize[0] == 0, "and they do not leak onto the first");
             Check(RowFontSizePx(s, 1) == 26 && RowHeightPx(s, 1) == 50,
                   "the drawn row uses them");
+        }
+
+        // --- a [[size:NN]] run inside the text ---
+        //
+        // The row-prefix form makes the whole line that size; the same tag written anywhere
+        // else decorates just the run it wraps, exactly like [[font:...]] does. Both are
+        // asserted here because the difference is *where* the tag is, not what it says.
+        {
+            printf("    ParseInlineSize: ");
+            int size = 0;
+            const WCHAR digits18[] = L"18";
+            const WCHAR digit5[] = L"5";
+            const WCHAR digits100[] = L"100";
+            const WCHAR word[] = L"abc";
+            const WCHAR digits1234[] = L"1234";
+            Check(ParseInlineSize(digits18, digits18 + 2, &size) && size == 18,
+                  "a plain size parses");
+            Check(ParseInlineSize(digit5, digit5 + 1, &size) && size == kMinRowFontSize,
+                  "below the minimum it clamps up");
+            Check(ParseInlineSize(digits100, digits100 + 3, &size) && size == kMaxRowFontSize,
+                  "above the maximum it clamps down");
+            Check(!ParseInlineSize(word, word + 3, &size), "a word is not a size");
+            Check(!ParseInlineSize(nullptr, nullptr, &size), "a null body is not a size");
+            Check(!ParseInlineSize(digits1234, digits1234 + 4, &size), "four digits is not a size");
+            printf("\n");
+
+            struct RunCase {
+                const WCHAR *row;
+                const WCHAR *expectText;
+                int expectSegments;
+                int expectSizes[kMaxSegments];
+            };
+            // Only inline runs here. A [[size:NN]] at the very start of a row is a *row*
+            // property, consumed by ReadSettings before the expander ever sees the text, so it
+            // is asserted through ReadSettings below instead (calling the expander directly
+            // with an unstripped prefix would test a path the product never takes).
+            const RunCase runCases[] = {
+                // "BIG" is the run; the row's own size stays inherited (0).
+                {L"A[[size:24]]BIG[[/size]]C", L"ABIGC", 3, {0, 24, 0, 0}},
+                // No closing tag: the run goes to the end of the line.
+                {L"A[[size:30]]to the end", L"Ato the end", 2, {0, 30, 0, 0}},
+                // A malformed tag stays visible; a stray close still ends a run, so it splits
+                // the text into two runs that happen to share the row's size.
+                {L"x[[size:abc]]y[[/size]]z", L"x[[size:abc]]yz", 2, {0, 0, 0, 0}},
+                // Two runs in one row.
+                {L"[[size:12]]a[[/size]]b[[size:28]]c[[/size]]", L"abc", 3, {12, 0, 28, 0}},
+            };
+            for (const RunCase &c : runCases) {
+                WCHAR marked[640];
+                RingSpec rings[kMaxRingsPerRow];
+                int ringCount = 0;
+                ModSettings s;
+                s.fontSize = 15;
+                s.rowHeight = 30;
+                ExpandTokensAndRings(c.row, Values(), s, marked, 640, rings, &ringCount,
+                                     kMaxRingsPerRow);
+                RowState state;
+                BuildRowLayout(marked, ringCount, state, 0);
+                wprintf(L"    \"%ls\" -> text=\"%ls\" segs=%d\n", c.row, state.text[0],
+                        state.segmentCount[0]);
+                Check(wcscmp(state.text[0], c.expectText) == 0, "run: tag stripped, text kept");
+                Check(state.segmentCount[0] == c.expectSegments, "run: segment count");
+                bool sizesOk = state.segmentCount[0] == c.expectSegments;
+                for (int i = 0; i < state.segmentCount[0] && sizesOk; i++) {
+                    if (state.segments[0][i].runFontSize != c.expectSizes[i]) sizesOk = false;
+                }
+                Check(sizesOk, "run: each segment's own size");
+            }
+
+            // The row-prefix path: the tag is consumed as the row's size, and the text that
+            // reaches the expander is the rest of the line, so it carries no run marker.
+            const StubSetting runRows[] = {
+                {L"Row1", L"A[[size:24]]BIG[[/size]]C"},
+                {L"Row2", L"[[size:20]]all at 20"},
+                {L"Row3", L"small [[size:32]]BIG"},
+            };
+            g_stubStrings = runRows;
+            g_stubStringCount = (int)(sizeof(runRows) / sizeof(runRows[0]));
+            g_stubInts = nullptr;         // the previous block's Row3Height must not leak in
+            g_stubIntCount = 0;
+            ModSettings s;
+            ReadSettings(s);
+            printf("    rows: base sizes %d %d %d, largest %d %d %d\n", s.rowFontSize[0],
+                   s.rowFontSize[1], s.rowFontSize[2], s.rowMaxFontSize[0], s.rowMaxFontSize[1],
+                   s.rowMaxFontSize[2]);
+            Check(s.rowFontSize[0] == 0 && s.rowMaxFontSize[0] == 24,
+                  "a run sets the row's *largest* text, not its base size");
+            Check(s.rowFontSize[1] == 20 && s.rowMaxFontSize[1] == 20,
+                  "a prefix tag sets the base size and leaves no run behind");
+            Check(s.rowFontSize[2] == 0 && s.rowMaxFontSize[2] == 32,
+                  "and a run later in the line still counts towards the largest");
+            {
+                WCHAR marked[640];
+                RingSpec rings[kMaxRingsPerRow];
+                int ringCount = 0;
+                ExpandTokensAndRings(s.rows[1], Values(), s, marked, 640, rings, &ringCount,
+                                     kMaxRingsPerRow);
+                RowState state;
+                BuildRowLayout(marked, ringCount, state, 0);
+                printf("    the prefix row expands to text=\"%ls\" segs=%d size=%d\n",
+                       state.text[0], state.segmentCount[0], state.segments[0][0].runFontSize);
+                Check(wcscmp(state.text[0], L"all at 20") == 0 &&
+                          state.segmentCount[0] == 1 &&
+                          state.segments[0][0].runFontSize == 0,
+                      "and the stored text has no run marker left in it");
+            }
+            // The height floor follows the largest text in the row, so a big run cannot spill
+            // into the row below. Row 2 is plain 20 px text, which already raises its floor.
+            Check(RowHeightPx(s, 0) == 24 + kRowHeightFontSlack,
+                  "the row grows to fit its biggest run");
+            Check(RowHeightPx(s, 1) == 20 + kRowHeightFontSlack,
+                  "a row of 20 px text gets the floor for 20 px");
+            Check(RowHeightPx(s, 2) == 32 + kRowHeightFontSlack,
+                  "and so does a row whose run is bigger than its base size");
+
+            // A change of run size with identical text still has to be a change, or the row
+            // would keep drawing the old size.
+            {
+                RowState a = {};
+                RowState b = {};
+                a.segmentCount[0] = 1;
+                b.segmentCount[0] = 1;
+                a.segments[0][0].length = 3;
+                b.segments[0][0].length = 3;
+                wcscpy(a.text[0], L"abc");
+                wcscpy(b.text[0], L"abc");
+                a.segments[0][0].runFontSize = 12;
+                b.segments[0][0].runFontSize = 24;
+                Check(!RowStateEqual(a, b, 1),
+                      "a run size change is a layout change, so the row is repainted");
+                b.segments[0][0].runFontSize = 12;
+                Check(RowStateEqual(a, b, 1), "and the same sizes compare equal");
+            }
         }
 
         // ComputeGeometry is where the window height, the hit-test height and the intro's
