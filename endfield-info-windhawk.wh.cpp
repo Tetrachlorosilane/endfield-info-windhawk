@@ -6956,6 +6956,11 @@ struct ExtSession {
     int      windowCount = 0;
     unsigned dropped = 0;
     unsigned setLogs = 0;
+    // Reply bookkeeping: how many replies in a row have been cancelled after the timeout,
+    // and whether that has been taken as "this client does not read them" (see
+    // ExtReplyTimeoutsAfter).
+    unsigned replyTimeouts = 0;
+    bool     repliesAbandoned = false;
 };
 
 static bool ExtIsSpace(WCHAR c) {
@@ -7196,30 +7201,69 @@ static int ExtReadFrame(HANDLE pipe, OVERLAPPED *ov, char *buffer, DWORD cap, DW
     return -1;
 }
 
-static void ExtWriteLine(HANDLE pipe, OVERLAPPED *ov, const WCHAR *text) {
+// A client that never reads its replies fills the out buffer, and every reply write from
+// then on is cancelled after the full I/O timeout -- 500 ms of the pipe thread's time, per
+// frame, for a reply nobody will ever read. That is not hypothetical: the NetEase bridge
+// publishes about four values a second and never reads. Its out buffer held ~1300 replies,
+// so five minutes in, each frame began to cost half a second; the server fell behind the
+// publisher, and because two values for one key are then applied one timeout apart, the
+// panel visibly alternated between them (the song title with and without its artist, the
+// lyric on the right line and on the frozen one). Ignoring the *outcome* of the write was
+// already deliberate; ignoring its *cost* was the bug.
+//
+// Two consecutive timeouts is enough to conclude the client is not reading. A client that
+// does read -- the reference clients do -- never even reaches one, because it drains the
+// buffer long before it fills.
+static const unsigned kExtReplyTimeoutLimit = 2;
+
+// The reply bookkeeping as a pure state transition, so the rule above is asserted instead
+// of being inferred from a pipe: the new consecutive-timeout count, and whether that count
+// means this client has stopped reading.
+static unsigned ExtReplyTimeoutsAfter(int ioResult, unsigned previous, bool *abandon) {
+    if (abandon) *abandon = false;
+    if (ioResult == 1) return 0;          // it went out: the client is reading
+    if (ioResult != -2) return previous;  // a hard failure says nothing about reading
+    const unsigned next = previous + 1;
+    if (abandon) *abandon = next >= kExtReplyTimeoutLimit;
+    return next;
+}
+
+static void ExtWriteLine(HANDLE pipe, OVERLAPPED *ov, const WCHAR *text, ExtSession *ses) {
+    // A client that is not reading gets no further replies (see the note above), so its
+    // frames cost nothing but the read that carries them.
+    if (ses && ses->repliesAbandoned) return;
+
     char utf8[96];
     int n = WideCharToMultiByte(CP_UTF8, 0, text, -1, utf8, (int)sizeof(utf8) - 2, nullptr, nullptr);
     if (n <= 1) return;
     utf8[n - 1] = '\n';                     // replace the terminator: one line per reply
     ResetEvent(ov->hEvent);
     DWORD written = 0;
-    if (WriteFile(pipe, utf8, (DWORD)n, &written, ov)) return;
-    if (GetLastError() != ERROR_IO_PENDING) return;
-    DWORD got = 0;
-    // A client that never reads its replies fills the out buffer. That must not
-    // take the server down with it, so the outcome is deliberately ignored -- but
-    // the OVERLAPPED still has to be left clean for the next operation.
-    if (ExtWaitIo(pipe, ov, &got) == -2) {
+    int io = 1;
+    if (!WriteFile(pipe, utf8, (DWORD)n, &written, ov)) {
+        io = GetLastError() == ERROR_IO_PENDING ? ExtWaitIo(pipe, ov, &written) : -1;
+    }
+    if (io == -2) {
+        // The OVERLAPPED has to be left clean for the next operation, whichever it is.
         CancelIoEx(pipe, ov);
         DWORD ignored = 0;
         GetOverlappedResult(pipe, ov, &ignored, TRUE);
     }
+    if (!ses) return;
+    bool abandon = false;
+    ses->replyTimeouts = ExtReplyTimeoutsAfter(io, ses->replyTimeouts, &abandon);
+    if (abandon && !ses->repliesAbandoned) {
+        ses->repliesAbandoned = true;
+        Wh_Log(L"EXT client is not reading its replies (%u in a row, %d ms each): no more "
+               L"replies on this connection; its frames are now read as fast as they arrive",
+               ses->replyTimeouts, kExtIoTimeoutMs);
+    }
 }
 
-static void ExtReplyErr(HANDLE pipe, OVERLAPPED *ov, int code) {
+static void ExtReplyErr(HANDLE pipe, OVERLAPPED *ov, int code, ExtSession *ses) {
     WCHAR text[24];
     swprintf(text, 24, L"ERR %d", code);
-    ExtWriteLine(pipe, ov, text);
+    ExtWriteLine(pipe, ov, text, ses);
 }
 
 // What this pipe actually is, as the OS sees it. Message mode is what the protocol
@@ -7271,11 +7315,11 @@ static const WCHAR *ExtCmdName(ExtCmd cmd) {
 // exactly the confusion this caused once: the client saw ERR 405 while the log
 // showed nothing but a successful connect.
 static int ExtRefuse(HANDLE pipe, OVERLAPPED *ov, int code, const ExtCommand &cmd,
-                     const ExtSession &ses) {
+                     ExtSession &ses) {
     Wh_Log(L"EXT err code=%d cmd=%s provider=%s keyLen=%d", code, ExtCmdName(cmd.cmd),
            ses.provider[0] ? ses.provider : (cmd.provider ? L"(unregistered)" : L"(none)"),
            cmd.keyLen);
-    ExtReplyErr(pipe, ov, code);
+    ExtReplyErr(pipe, ov, code, &ses);
     return code;
 }
 
@@ -7286,7 +7330,7 @@ static int ExtHandleLine(HANDLE pipe, OVERLAPPED *ov, const WCHAR *line, ExtSess
     if (code != 0) return ExtRefuse(pipe, ov, code, cmd, ses);
     if (cmd.cmd == EC_BYE) {
         Wh_Log(L"EXT bye provider=%s", ses.provider[0] ? ses.provider : L"(none)");
-        ExtWriteLine(pipe, ov, L"OK bye");
+        ExtWriteLine(pipe, ov, L"OK bye", &ses);
         return 0;
     }
 
@@ -7312,7 +7356,7 @@ static int ExtHandleLine(HANDLE pipe, OVERLAPPED *ov, const WCHAR *line, ExtSess
         wcsncpy(ses.provider, cmd.provider, cmd.providerLen);
         ses.provider[cmd.providerLen] = L'\0';
         Wh_Log(L"EXT hello provider=%s slot=%d", ses.provider, ses.slot);
-        ExtWriteLine(pipe, ov, L"OK");
+        ExtWriteLine(pipe, ov, L"OK", &ses);
         return 0;
     }
 
@@ -7329,7 +7373,7 @@ static int ExtHandleLine(HANDLE pipe, OVERLAPPED *ov, const WCHAR *line, ExtSess
                 Wh_Log(L"EXT event dropped reason=ttl0");
                 g_extStallLogs++;
             }
-            ExtWriteLine(pipe, ov, L"OK");
+            ExtWriteLine(pipe, ov, L"OK", &ses);
             return 0;
         }
         IslandEvent ev = {};
@@ -7357,7 +7401,7 @@ static int ExtHandleLine(HANDLE pipe, OVERLAPPED *ov, const WCHAR *line, ExtSess
         // Wake the HUD through its thread, never through the window handle: this
         // thread cannot know whether the window still exists (design 5.6.3 R5).
         if (g_hudThreadId) PostThreadMessageW(g_hudThreadId, kMsgIslandEvent, 0, 0);
-        ExtWriteLine(pipe, ov, L"OK");
+        ExtWriteLine(pipe, ov, L"OK", &ses);
         return 0;
     }
     if (!ExtNameValid(cmd.key, cmd.keyLen, false)) return ExtRefuse(pipe, ov, 400, cmd, ses);
@@ -7369,7 +7413,7 @@ static int ExtHandleLine(HANDLE pipe, OVERLAPPED *ov, const WCHAR *line, ExtSess
     if (cmd.cmd == EC_DEL) {
         ExtInvalidate(ses.slot, key);
         InterlockedExchange(&g_extDirty, 1);   // show "--" without waiting a whole interval
-        ExtWriteLine(pipe, ov, L"OK");
+        ExtWriteLine(pipe, ov, L"OK", &ses);
         return 0;
     }
 
@@ -7382,7 +7426,7 @@ static int ExtHandleLine(HANDLE pipe, OVERLAPPED *ov, const WCHAR *line, ExtSess
         ses.dropped++;
         if (ses.dropped == 1 || (ses.dropped % 64) == 0)
             Wh_Log(L"EXT drop reason=rate provider=%s count=%u", ses.provider, ses.dropped);
-        ExtReplyErr(pipe, ov, 404);
+        ExtReplyErr(pipe, ov, 404, &ses);
         return 404;                            // dropped, connection stays open
     }
 
@@ -7393,7 +7437,7 @@ static int ExtHandleLine(HANDLE pipe, OVERLAPPED *ov, const WCHAR *line, ExtSess
     if (ttl == 0) {                            // "publish nothing" is a delete
         ExtInvalidate(ses.slot, key);
         InterlockedExchange(&g_extDirty, 1);
-        ExtWriteLine(pipe, ov, L"OK");
+        ExtWriteLine(pipe, ov, L"OK", &ses);
         return 0;
     }
 
@@ -7404,7 +7448,7 @@ static int ExtHandleLine(HANDLE pipe, OVERLAPPED *ov, const WCHAR *line, ExtSess
     if (ses.setLogs < 4 || (ses.setLogs % 256) == 0)
         Wh_Log(L"EXT set provider=%s key=%s chars=%d ttl=%lu", ses.provider, key, cmd.textLen, ttl);
     ses.setLogs++;
-    ExtWriteLine(pipe, ov, L"OK");
+    ExtWriteLine(pipe, ov, L"OK", &ses);
     return 0;
 }
 
@@ -7426,7 +7470,7 @@ static void ExtServeClient(HANDLE pipe, OVERLAPPED *ov, ExtSession &ses) {
         if (read < 0) break;
         if (read == 0) {
             Wh_Log(L"EXT err code=402: frame larger than %d bytes", kExtMaxLineBytes);
-            ExtReplyErr(pipe, ov, 402);
+            ExtReplyErr(pipe, ov, 402, &ses);
             break;
         }
         if (got == 0) {
@@ -7445,7 +7489,7 @@ static void ExtServeClient(HANDLE pipe, OVERLAPPED *ov, ExtSession &ses) {
                                        kExtMaxLineBytes);
         if (wide <= 0) {
             Wh_Log(L"EXT err code=400: frame is not valid UTF-8 (bytes=%lu)", got);
-            ExtReplyErr(pipe, ov, 400);
+            ExtReplyErr(pipe, ov, 400, &ses);
             continue;
         }
         line[wide] = L'\0';

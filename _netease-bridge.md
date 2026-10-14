@@ -8,20 +8,38 @@
 
 | key | 内容 |
 | :-- | :-- |
-| `title` | `歌名 - 歌手` |
-| `lyric` | **当前**歌词行 |
-| `translation` | 当前行的翻译（客户端给了才有） |
+| `title` | `歌名 - 歌手`（**只有一个发布者**，见下面的"一轮一个 key 一次"） |
+| `lyric` | **当前**歌词行（按位置在行时间戳上算出来的那行） |
+| `translation` | 当前行的翻译；这一行没有翻译时发空串（清掉上一行的） |
 | `pos` | 当前歌词用的**位置来源**与秒数，如 `dom 90.0s +1000ms`（排错用） |
+
+### 一轮一个 key 一次
+
+每一轮要发的帧都由 `Get-PublishPlan` 生成：它返回一个**有序字典**，而字典不允许重复键，
+所以"同一个 key 两个发布者"在结构上不可能出现。这条不是洁癖——真机上正是它造成了两个症状：
+
+* 客户端的 store 里 `resourceName` 是**没有作者**的歌名，早先它和最后拼好的"歌名 - 歌手"
+  抢同一个 `title` key；两者在一轮里先后发出，面板就在"有作者"和"没作者"之间**闪**。
+* store 的"当前行"来自客户端自己的 `playingLyricLineNumber`，**实测会冻结**
+  （2026-10-14：位置已经走到第 21 行以上，它一直报第 10 行）。它和按位置算出来的那行抢
+  `lyric` key，于是歌词隔一拍就**跳回旧行**，看起来就是"对不准真实位置"。
+
+规矩：**来源只提供数据，发布只发生在一处**（`Get-PublishPlan` 的返回值）。
+`Publish` 里还有一条运行期点名（同一轮同一个 key 出现两次就打印一行），
+它是给"又有人在别处直接 Publish"准备的——结构保证之外的第二道网。
 
 ## 怎么跑
 
 ```powershell
-# 0) 离线自检：不联网、不连管道，只跑纯函数（46 项）
+# 0) 离线自检：不联网、不连管道，只跑纯函数（56 项）
 pwsh -ExecutionPolicy Bypass -File _netease-bridge.ps1 -SelfTest
 
 # 1) 先看这台机器有什么：媒体会话 / CDP 调试端口
 pwsh -ExecutionPolicy Bypass -File _netease-bridge.ps1 -ProbePosition
 pwsh -ExecutionPolicy Bypass -File _netease-bridge.ps1 -ProbeCdp
+
+# 1b) 歌词"算在哪一行"对不对：把位置算出来的行与客户端自己报的行并排打出来
+pwsh -ExecutionPolicy Bypass -File _netease-bridge.ps1 -ProbeStore -ProbeRounds 8
 
 # 2) 先看不发：把将要发送的帧打印出来（一次迭代）
 pwsh -ExecutionPolicy Bypass -File _netease-bridge.ps1 -DryRun -Once
@@ -33,6 +51,11 @@ pwsh -ExecutionPolicy Bypass -File _netease-bridge.ps1 -Ttl 600000
 #    pwsh -NoProfile -File C:\...\_netease-bridge.ps1
 #    只有某行真的引用了 {ext.*} 且 External data 打开时才会启动，卸载时被作业对象收走
 ```
+
+**这个桥从不读 mod 的回复**（协议里每条命令有一行 `OK`/`ERR`，它只写不读）。这在 mod 侧是
+被容忍的：回复发不出去时 mod 只把结果丢掉、不阻塞；连续两次超时之后它会认定"这个客户端不读"
+并**不再回复**。留着一条通道不读不会有任何影响，但要知道你在依赖那条容忍
+（否则`ERR 405` 这类诊断也不会出现在你眼前——那要看 mod 的日志，不是桥的输出）。
 
 常用参数：
 
@@ -47,7 +70,7 @@ pwsh -ExecutionPolicy Bypass -File _netease-bridge.ps1 -Ttl 600000
 | `-LeadMs` | **负延迟**：换行提早多少毫秒。`-1`（默认）按来源自动，`0` 关掉 |
 | `-ProcessName` | 进程名匹配，默认 `cloudmusic` |
 | `-SongId` | 手工指定歌曲 id，跳过搜索 |
-| `-ProbePosition` / `-ProbeCdp` | 只探测并打印结论，不发布 |
+| `-ProbePosition` / `-ProbeCdp` / `-ProbeStore` | 只探测并打印结论，不发布（`-ProbeStore` 用来核对"歌词算在哪一行"） |
 | `-DryRun` / `-Once` / `-SelfTest` | 不发送 / 只跑一次 / 离线自检 |
 
 ## 需要什么
@@ -61,7 +84,7 @@ pwsh -ExecutionPolicy Bypass -File _netease-bridge.ps1 -Ttl 600000
 
 ## 输出与判读
 
-* 自检最后一行 `SELFTEST PASSED`（46 项）。任何一项 FAIL 都是真问题，不是环境噪声。
+* 自检最后一行 `SELFTEST PASSED`（56 项）。任何一项 FAIL 都是真问题，不是环境噪声。
 * 启动时会说明位置来源：`位置：媒体会话（真实位置…）` / `…退回推算时钟（拖动进度条后会失准…）`。
   ⚠️ 这句**只说明 SMTC 这一条**；整条链到底用了哪个来源，看 `pos` key，不要看这句话。
 * 面板上写 `{ext.netease.pos}` 就能看到 `dom 90.0s +1000ms` 这类的值：
@@ -78,6 +101,13 @@ pwsh -ExecutionPolicy Bypass -File _netease-bridge.ps1 -Ttl 600000
   到 60 秒、并会丢弃等太久的旧事件（10 秒 / critical 40 秒）作为兜底 ✓。
 * **歌词密的时候不要每条都弹。** 卡片展示一张要几秒，事件来得比这快只会积压。`-EventMinIntervalMs`
   （默认 4000）是桥这一侧的节流闸门；被它挡下的那条不算"已播报"，所以下一拍还会重试 ✓。
+* **同一个 key 一轮只能发一次**（见上面"一轮一个 key 一次"）。两个发布者不会立刻报错，
+  它表现为**面板在两个值之间闪**——"作者忽隐忽现、歌词跳回旧行"就是这么来的。
+* **不读回复的客户端会让服务端为每一帧等 500 ms。** mod 的 out 缓冲存得下约 1300 条回复，
+  按每秒 4 帧算，**五六分钟**后写回复就会超时。超过的代价不在客户端：mod 的管道线程每帧
+  白等一个 500 ms 超时，于是它跟不上发布节奏，积压的值一拍一拍地被应用——
+  两个发布者写出的两个值因此在屏幕上**交替可见**（这就是"播放一段时间后才开始闪"的原因）。
+  mod 侧现在连续两次超时就认定"这个客户端不读"并不再回复 ✓；桥自己不读回复是有意为之 ✓。
 
 * **曲名必须枚举顶层窗口，不能看 `Process.MainWindowTitle`。** 真机实测：开着「桌面歌词」时
   `cloudmusic` 的 `MainWindowTitle` **就是「桌面歌词」**，带歌名的窗口是同一个 pid 的另一个
@@ -85,8 +115,10 @@ pwsh -ExecutionPolicy Bypass -File _netease-bridge.ps1 -Ttl 600000
   **从不连接管道**，面板两行永远 `--`。现在按窗口所属 pid 反查进程名，再挑标题里带「 - 」的。
 * **进程列表在受限环境里可能只给一部分**（实测：沙箱里 `Get-Process` / `tasklist` / Toolhelp
   都只看到 13 个进程），所以判定走"窗口 → pid → 按 pid 查进程名"，那条路是可靠的。
-* **播放器自己的"当前行号"（`playingLyricLineNumber`）会冻结**（实测 82 行歌词它一直报第 10 行）。
-  所以当前行是**用位置在行时间戳上算出来的**，直接读只作为过渡一帧。
+* **播放器自己的"当前行号"（`playingLyricLineNumber`）会冻结**（实测 82 行歌词它一直报第 10 行；
+  2026-10-14 复测：26 行的歌，位置从 167 s 走到 177 s（第 21→24 行），它**一直报第 10 行**）。
+  所以当前行是**用位置在行时间戳上算出来的**，那个行号一次都不能拿来当值发布
+  （`-ProbeStore` 就是用来并排看这两者的）。
 * **位置有两个系统性滞后**，这就是"歌词比声音晚约 1 秒"的来源：迷你条只给「分:秒」
   （向下取整到秒，平均落后 0.5 s）+ 桥每 `-IntervalMs`（默认 1000 ms）才轮询一次（再落后半个
   周期）。`-LeadMs` 默认按来源补掉这两项（`dom` 时合计 1000 ms），觉得抢拍就 `-LeadMs 500`，

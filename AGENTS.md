@@ -294,7 +294,7 @@ python _preview.py
 `ParseRowMetricTags` / `RowFontSizePx` / `RowHeightPx` / `RowTopPx` / `PanelRowsHeight` /
 `MinimumRowHeightForFont` / `MaxIconPlateDiameter` ·
 `ExtParseLine` · `ExtSanitize` · `ExtParseNumber` · `ExtLookup` · `ExtNextDeadline` ·
-`ExtEvictIndex` · `ExtProviderAllowed` · `IslandEnqueue` / `StepIsland` / `IslandHitTest` /
+`ExtEvictIndex` · `ExtProviderAllowed` · `ExtReplyTimeoutsAfter` · `IslandEnqueue` / `StepIsland` / `IslandHitTest` /
 `IslandClickActionFor` · `Select-StoreLineIndex` / `Select-SongTitle` / `Get-LeadMs`（脚本侧）
 
 **新增绘制逻辑时照此办理。** 如果一段逻辑无法在测试里调用，它就无法被守住。
@@ -552,6 +552,17 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   `BuildRowLayout` 的输出（它剥掉环标记），拿带标记的文本比会永远判定"变了"。详见 §6 对应三行。
 - **发布器重启预算是"连续"而不是"累计"**（`PublisherEarnedBackRestarts`）：跑满 60 s 就把预算还回来，
   否则 5 次启动（包括用户重启音乐客户端、或手动踢掉发布器）之后永久禁用，只有重载 mod 能救。
+- **一个值一个发布者，而且发布只发生在一处。** 客户端把同一个 key 在一帧里写两次时，mod 会
+  先应用第一条再应用第二条——正常情况下两次落在同一个 burst 里、被 sampler 合并成一次重绘，
+  所以看不出来；**一旦服务端被拖慢（见下一条），两个值就会一拍一拍地交替可见**。
+  真机症状：标题在"歌名"与"歌名 - 歌手"之间闪（`resourceName` 没有作者）、歌词隔一拍跳回
+  客户端那个会冻结的 `playingLyricLineNumber` 行。桥侧的规矩写在 `_netease-bridge.md`
+  （`Get-PublishPlan` 返回有序字典 = 结构上不可能有重复 key），mod 侧不改协议。
+- **不读回复的客户端不许拖慢服务端。** 回复写不出去时 mod 只丢掉结果，但**每次超时要付
+  `kExtIoTimeoutMs`（500 ms）**；out 缓冲约 1300 条回复，按每秒 4 帧算五六分钟后就开始超时，
+  于是管道线程每帧白等半秒、跟不上发布节奏——这就是上面那条"两个值交替可见"的放大器。
+  现在连续两次回复超时就认定该客户端不读（`ExtReplyTimeoutsAfter`，纯函数 + 断言）并
+  **不再回复**它：`OK`/`ERR` 变成可选，读回复的客户端（参考客户端）照旧拿得到。
 
 ### 5.7 字体回退与逐段覆盖
 

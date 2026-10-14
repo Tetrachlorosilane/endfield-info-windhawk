@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     示例：把网易云音乐正在播放的曲名与歌词推进 endfield-info-windhawk 的命名管道。
 
@@ -94,7 +94,11 @@ param(
     # auto = 半个周期，DOM 来源再补 0.5 s（默认合计 1000 ms）；0 = 关掉；给正数就用自己的值。
     [int]$LeadMs = -1,
     # 只探一次位置来源并打印结论
-    [switch]$ProbePosition
+    [switch]$ProbePosition,
+    # 只读诊断：把"按位置算出来的行"和"客户端自己认为的行"并排打出来（见下）
+    [switch]$ProbeStore,
+    # 探针轮数
+    [int]$ProbeRounds = 10
 )
 
 $ErrorActionPreference = 'Stop'
@@ -345,6 +349,9 @@ function Get-LyricLines {
 # 管道客户端：协议 v1，一行一帧，只在内容变化时写
 # ---------------------------------------------------------------------------
 $script:Sent = @{}
+# 一轮里发过的 key（诊断用，见 Publish）与它已经报过几次。
+$script:IterationKeys = @{}
+$script:DuplicateKeys = 0
 
 function Write-Frame {
     param($Writer, [string]$Line)
@@ -391,11 +398,37 @@ function Connect-PipeClient {
 
 function Publish {
     param($Writer, [string]$Key, [string]$Text)
+    # 一轮里同一个 key 被写两次 = 面板会在两个值之间闪。真机踩到过（store 的曲名没有作者，
+    # 和最后拼好的"歌名 - 作者"抢同一个 key），所以这里点名；结构上的保证是 Get-PublishPlan
+    # 返回有序字典——字典不可能有重复键，两处发布者从此写不出来。
+    if ($script:IterationKeys.ContainsKey($Key)) {
+        if ($script:DuplicateKeys -lt 8) {
+            $script:DuplicateKeys++
+            Write-Host ("  ! 同一个 key 在一轮里发了两次：{0}（面板会在两个值之间闪）" -f $Key)
+        }
+    }
+    $script:IterationKeys[$Key] = $true
     if ($script:Sent[$Key] -eq $Text) { return $false }
     $script:Sent[$Key] = $Text
     if ($TtlMs -gt 0) { Write-Frame $Writer "SET $Provider $Key $TtlMs $Text" }
     else { Write-Frame $Writer "SET $Provider $Key - $Text" }
     $true
+}
+
+# 一轮要发的帧，key -> 文本。**故意做成返回有序字典的纯函数**：字典不允许重复键，
+# 于是"同一个 key 有两个发布者"这件事在结构上不可能发生——那正是真机上"作者忽隐忽现、
+# 歌词跳回旧行"的成因（store 的 resourceName 与拼好的标题抢 title；store 那个会冻结的
+# 当前行与按位置选出的行抢 lyric）。自检直接断言这个形状。
+# 空值不发：lyric/pos 取不到时整条 key 缺席（而不是发空串把上一轮的值盖掉）；
+# translation 例外——它总是出现，空串的含义是"这一行没有翻译，清掉上一行的"。
+function Get-PublishPlan {
+    param([string]$Title, [string]$Artist, [string]$Line, [string]$Translation, [string]$Pos)
+    $plan = [ordered]@{}
+    $plan['title'] = if ($Artist) { '{0} - {1}' -f $Title, $Artist } else { $Title }
+    if ($Line) { $plan['lyric'] = $Line }
+    $plan['translation'] = $Translation
+    if ($Pos) { $plan['pos'] = $Pos }
+    return $plan
 }
 
 # 岛事件的节流。歌词密的时候（或窗口标题抖动被误判成"换歌"时），事件会来得比卡片能展示的
@@ -1395,6 +1428,16 @@ if ($SelfTest) {
         @{ Name = '负延迟：周期变了自动值跟着变'; Ok = ((Get-LeadMs -Source dom -IntervalMs 400) -eq 700) }
         @{ Name = '负延迟：显式值覆盖自动值（0 = 关掉）'; Ok = ((Get-LeadMs -Source dom -IntervalMs 1000 -OverrideMs 0) -eq 0) -and ((Get-LeadMs -Source dom -IntervalMs 1000 -OverrideMs 1500) -eq 1500) }
         @{ Name = 'pos 标签带出提早量'; Ok = ((Format-PositionSource -Source dom -PositionMs 90000 -LeadMs 1000) -eq 'dom 90.0s +1000ms') -and ((Format-PositionSource -Source dom -PositionMs 90000) -eq 'dom 90.0s') }
+        # 一轮的发布计划。真机缺陷就在这个形状上：同一个 key 有两个发布者时，面板会在两个值
+        # 之间闪 —— store 的 resourceName 没有作者、store 的当前行来自会冻结的行号，两者都曾
+        # 直接 Publish，与最后拼好的值抢同一个 key（2026-10-14 实测 storeIndex 冻结在 10，
+        # 而位置已经走到第 21 行以上）。有序字典让重复键在结构上不可能，这里钉住形状。
+        @{ Name = '发布计划：标题带作者'; Ok = ((Get-PublishPlan -Title 'A' -Artist 'B' -Line 'x' -Translation '' -Pos 'p')['title'] -eq 'A - B') }
+        @{ Name = '发布计划：没有作者时不留下悬空的分隔符'; Ok = ((Get-PublishPlan -Title 'A' -Artist '' -Line 'x' -Translation '' -Pos 'p')['title'] -eq 'A') }
+        @{ Name = '发布计划：整轮恰好 title/lyric/translation/pos 四个 key'; Ok = (((Get-PublishPlan -Title 'A' -Artist 'B' -Line 'x' -Translation 't' -Pos 'p').Keys -join ',') -eq 'title,lyric,translation,pos') }
+        @{ Name = '发布计划：取不到歌词时不发 lyric（而不是发空串盖掉上一行）'; Ok = (-not (Get-PublishPlan -Title 'A' -Artist 'B' -Line '' -Translation '' -Pos 'p').Contains('lyric')) }
+        @{ Name = '发布计划：翻译总是出现（空串 = 这一行没有翻译，清掉上一行的）'; Ok = ((Get-PublishPlan -Title 'A' -Artist 'B' -Line 'x' -Translation '' -Pos '').Contains('translation')) }
+        @{ Name = '发布计划：没有位置时不发 pos'; Ok = (-not (Get-PublishPlan -Title 'A' -Artist 'B' -Line 'x' -Translation '' -Pos '').Contains('pos')) }
         # 组合起来的效果：同一个行边界（10 s），不加提早量时 9.9 s 仍是第 0 行，
         # 加 1 s 后（=10.9 s）已经是第 1 行 —— 换行确实提前了 1 秒。
         @{ Name = '负延迟确实把换行提早（9.9s 仍是 0 行，+1s 后是 1 行）'; Ok = (((Select-StoreLineIndex -TimesSec @(0, 10, 20, 30) -PositionMs 9900) -eq 0) -and ((Select-StoreLineIndex -TimesSec @(0, 10, 20, 30) -PositionMs (9900 + 1000)) -eq 1)) }
@@ -1413,6 +1456,35 @@ if ($SelfTest) {
 # ---------------------------------------------------------------------------
 # 主循环
 # ---------------------------------------------------------------------------
+if ($ProbeStore) {
+    # 只读探针：歌词"算在哪一行"（位置 + store 的行时间表）与"客户端自己认为在哪一行"
+    # （playingLyricLineNumber）并排打出来。两者不一致、或者后者长时间不动，就是
+    # "歌词对不准真实位置"的直接证据——所以**值绝不能用后者发布**（真机 2026-10-14）。
+    Write-Host ("store 探针：{0} 轮，每 {1} ms 一轮" -f $ProbeRounds, $IntervalMs)
+    $stx = Get-CdpStoreLyricTimes
+    Write-Host ("行时间表：ok={0} 行数={1} trackId={2}" -f `
+        $(if ($stx) { $stx.ok } else { 'n/a' }), `
+        $(if ($stx -and $stx.times) { @($stx.times).Count } else { 0 }), `
+        $(if ($stx) { $stx.trackId } else { '' }))
+    for ($i = 1; $i -le $ProbeRounds; $i++) {
+        $dom = Get-CdpDomTime
+        $ss = Get-CdpStoreState
+        $posMs = if ($dom -and $dom.ok) { [int]$dom.curS * 1000 } else { $null }
+        $sel = -2
+        if ($stx -and $stx.ok -and $null -ne $posMs) {
+            $sel = Select-StoreLineIndex -TimesSec ([object[]]$stx.times) -PositionMs $posMs
+        }
+        $storeIdx = if ($ss -and $ss.ok -and $null -ne $ss.index) { [int]$ss.index } else { -2 }
+        Write-Host ("  {0,2}. pos={1,-8} storeIndex={2,-4} byPosition={3,-4} times={4,-5} offset={5,-6} used={6,-14} storeLine='{7}'" -f `
+            $i, $(if ($null -eq $posMs) { 'n/a' } else { "$($posMs)ms" }), $storeIdx, $sel, `
+            $(if ($stx -and $stx.times) { @($stx.times).Count } else { 0 }), `
+            $(if ($ss) { $ss.offset } else { '' }), $(if ($ss) { $ss.usedLyric } else { '' }), `
+            $(if ($ss) { $ss.line } else { '' }))
+        if ($i -lt $ProbeRounds) { Start-Sleep -Milliseconds $IntervalMs }
+    }
+    exit 0
+}
+
 $track = Get-PlayingTrack
 if (-not $track) {
     # 发布器是被 mod 长期托管的（看门狗 / 作业对象负责收尾），所以"暂时没有窗口"不是退出理由：
@@ -1488,12 +1560,21 @@ $lastRaw = $track.Raw
 $announced = $false
 # 上一条岛事件的时间。初值取最小时间，于是"从未发过"永远允许第一条 ✓。
 $script:LastEventAt = [datetime]::MinValue
+# store（客户端自己的状态）缓存：曲目 id、行时间表、当前行号/文本/翻译。显式初始化一次，
+# 免得"读到没赋值过的变量"看起来像有默认值。
+$script:StoreTimes = $null
+$script:StoreTimesTrack = ''
+$script:StoreLineIndex = -1
+$script:StoreLineText = ''
+$script:StoreLineTrans = ''
 $lyricAttemptAt = Get-Date
 $lyricMisses = 0
 
 try {
     while ($true) {
         Start-Sleep -Milliseconds $IntervalMs
+        # 逐轮清空：同一轮里同一个 key 出现两次是缺陷，Publish 会点名（见那里的注释）。
+        $script:IterationKeys.Clear()
         $now = Get-PlayingTrack
 
         if ($now -and $now.Raw -ne $lastRaw) {
@@ -1556,16 +1637,18 @@ try {
             # ⚠ 下面这行 `$positionMs = $null` **必须留在 DOM 那一段之前**：它后面再出现一次，
             #   就会把刚取到的真 currentTime 清掉，位置只能退回 store 的行起始时间（= 冻结的
             #   playingLyricLineNumber 那一行），歌词于是永远停在同一行 ✗（2026-10-14 修）。
+            # ⚠ store 是**数据来源**，不是发布者：这里只把它的值读进变量，这一轮的最后统一发一次
+            #   （见 Get-PublishPlan）。这里曾经有三个 Publish('title'/'lyric'/'translation')，
+            #   它们和最后那批发布抢同一个 key：store 的 resourceName 没有作者，于是面板在
+            #   "歌名"与"歌名 - 作者"之间闪（作者忽隐忽现）；store 的当前行来自会冻结的
+            #   playingLyricLineNumber，于是歌词隔一拍就跳回旧行（2026-10-14 -DryRun 实测）。
             $storeLine = $null
             if ($LyricSource -in 'auto', 'store') {
                 $ss = Get-CdpStoreState
                 if ($ss -and $ss.ok) {
-                    if ($ss.name) { [void](Publish $writer 'title' ('' + $ss.name)) }
-                    if ($ss.line) {
-                        $storeLine = '' + $ss.line
-                        [void](Publish $writer 'lyric' $storeLine)
-                    }
-                    if ($ss.trans) { [void](Publish $writer 'translation' ('' + $ss.trans)) }
+                    # 只在按位置选行的通路不可用时当兜底（见下面 $line 的拼装）；
+                    # 绝不在这里发布，也不把 store 的翻译当值——它属于 store 自己那一行。
+                    if ($ss.line) { $storeLine = '' + $ss.line }
                     if ($null -eq $positionMs -and $null -ne $ss.lineTimeSec) {
                         $positionMs = [int]([double]$ss.lineTimeSec * 1000)
                         $posSrc = 'storeline'
@@ -1611,6 +1694,7 @@ try {
                         $script:StoreTimesTrack = '' + $stx.trackId
                         $script:StoreLineIndex = -1
                         $script:StoreLineText = ''
+                        $script:StoreLineTrans = ''
                     }
                 }
                 if ($script:StoreTimes -and $null -ne $positionMs) {
@@ -1623,7 +1707,9 @@ try {
                         if ($ln -and $ln.ok) {
                             $script:StoreLineIndex = $idx
                             $script:StoreLineText = '' + $ln.text
-                            if ($ln.trans) { [void](Publish $writer 'translation' ('' + $ln.trans)) }
+                            # 翻译跟着**这一行**走：新行没有翻译就清空，不能留着上一行的
+                            # （它是同一个 key，留着的表现就是"翻译和歌词对不上"）。
+                            $script:StoreLineTrans = if ($ln.trans) { '' + $ln.trans } else { '' }
                         }
                     }
                     if ($script:StoreLineText) { $storeLine = $script:StoreLineText }
@@ -1632,14 +1718,13 @@ try {
             # 兜底：接口 LRC + 位置选行（store 不可用时才走这条 ✓）
             $line = if ($storeLine) { $storeLine } else { Select-LrcLine $lyricLines ([int]$positionMs + $leadApply) }
 
-            [void](Publish $writer 'title' ("{0} - {1}" -f $now.Title, $now.Artist))
-            if ($line) { [void](Publish $writer 'lyric' $line) }
-            # 位置来源：这是"当前歌词算得准不准"的全部答案，所以发出去而不是只打在看不见的
-            # stdout 上（面板写 `{ext.netease.pos}` 即可）。变化时才有帧（Publish 会去重）。
-            if ($null -ne $positionMs) {
-                [void](Publish $writer 'pos' (Format-PositionSource -Source $posSrc `
-                            -PositionMs ([int]$positionMs) -LeadMs $leadApply))
-            }
+            # 一轮的帧只在这里生成：每个 key 恰好一条（见 Get-PublishPlan）。
+            $plan = Get-PublishPlan -Title $now.Title -Artist $now.Artist -Line $line `
+                -Translation $script:StoreLineTrans -Pos $(if ($null -ne $positionMs) {
+                    Format-PositionSource -Source $posSrc -PositionMs ([int]$positionMs) `
+                        -LeadMs $leadApply
+                } else { '' })
+            foreach ($key in $plan.Keys) { [void](Publish $writer $key $plan[$key]) }
             if ($Event -and -not $announced) {
                 # 只有真的发出去了才算"播报过"：被节流掉的话，下一拍还有机会。
                 if (Write-IslandEvent -Writer $writer -Provider $Provider -CardMs $EventTtlMs `

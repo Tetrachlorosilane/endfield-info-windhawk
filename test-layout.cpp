@@ -2236,6 +2236,28 @@ int main() {
         Check(ExtParseTtl(L"250", 3, 5000, &ttl) && ttl == 250, "an explicit ttl is used as given");
         Check(!ExtParseTtl(L"abc", 3, 5000, &ttl), "a non-numeric ttl is refused");
 
+        // Replies to a client that never reads them. Each cancelled reply costs the pipe
+        // thread the whole I/O timeout (500 ms), so a publisher that ignores them used to
+        // slow the server down to about two frames a second -- and the two values it wrote
+        // for one key then landed one timeout apart, which is what made the panel flicker.
+        {
+            bool abandon = false;
+            Check(ExtReplyTimeoutsAfter(1, 0, &abandon) == 0 && !abandon,
+                  "a reply that goes out means the client is reading");
+            Check(ExtReplyTimeoutsAfter(-2, 0, &abandon) == 1 && !abandon,
+                  "one timeout is not yet proof that nobody is reading");
+            Check(ExtReplyTimeoutsAfter(-2, 1, &abandon) == 2 && abandon,
+                  "two in a row is: stop replying to this connection");
+            Check(ExtReplyTimeoutsAfter(-2, 9, &abandon) == 10 && abandon,
+                  "and the count keeps rising once it has been decided");
+            Check(ExtReplyTimeoutsAfter(-1, 1, &abandon) == 1 && !abandon,
+                  "a hard write failure says nothing about whether the client reads");
+            Check(ExtReplyTimeoutsAfter(0, 1, &abandon) == 1 && !abandon,
+                  "and neither does any other outcome");
+            Check(ExtReplyTimeoutsAfter(1, 1, &abandon) == 0,
+                  "the count is consecutive, not cumulative: a success resets it");
+        }
+
         {
             ModSettings rows;
             wcsncpy(rows.rows[0], L"CPU {cpu}%  {ext.music.title}", 255);
