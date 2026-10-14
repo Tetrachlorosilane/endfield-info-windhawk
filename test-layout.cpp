@@ -1758,6 +1758,51 @@ int main() {
                   "while the inset still reserves room for the plate below it");
         }
 
+        // --- RowMetrics: one owner for every derived pixel size ---
+        //
+        // The sizes used to be worked out at each use site and drifted apart (the plate
+        // followed a row's font while the shared text column did not). These assertions pin
+        // the single derivation the drawing code now reads: given the two numbers a row has,
+        // what size is its text, how tall is its box, how big is its plate.
+        {
+            ModSettings s;
+            s.fontSize = 15;
+            s.rowHeight = 30;
+            s.icons[0].style = 2;                          // row 1: Memory
+            s.icons[1].styleSet = true;                    // row 2: explicit None
+            s.icons[1].style = 0;
+            s.icons[2].style = 2;                          // row 3: Memory, with its own metrics
+            s.rowFontSize[1] = 24;
+            s.rowHeightPx[1] = 40;
+            s.rowFontSize[2] = 32;
+            s.rowMaxFontSize[2] = 32;
+
+            const RowMetrics r0 = MetricsForRow(s, 0);
+            const RowMetrics r1 = MetricsForRow(s, 1);
+            const RowMetrics r2 = MetricsForRow(s, 2);
+            printf("    RowMetrics: r0 f=%g h=%g plate=%g | r1 f=%g h=%g plate=%g | "
+                   "r2 f=%g h=%g plate=%g\n", r0.fontSize, r0.lineHeight, r0.plateDiameter,
+                   r1.fontSize, r1.lineHeight, r1.plateDiameter, r2.fontSize, r2.lineHeight,
+                   r2.plateDiameter);
+
+            Check(r0.fontSize == 15.0f && r0.lineHeight == 30.0f,
+                  "a row that inherits the global metrics reports them");
+            Check(r1.fontSize == 24.0f && r1.lineHeight == 40.0f,
+                  "a row with its own font size and height reports those");
+            Check(r2.fontSize == 32.0f &&
+                      r2.lineHeight == (float)MinimumRowHeightForFont(32),
+                  "and a row whose font raises its floor reports the floored height");
+            Check(r0.plateDiameter == (float)15 * (float)kIconPlateRatio,
+                  "the plate diameter comes from the global Font size");
+            Check(r1.plateDiameter == 0.0f, "an explicit None means no plate at all");
+            Check(r2.plateDiameter == r0.plateDiameter,
+                  "a row drawn at 32 px still has the 15 px plate: the two are independent");
+            // The relationship, not the number: whatever the table says, a row's box has to
+            // hold the text that row draws at its largest.
+            Check(r2.lineHeight >= (float)MinimumRowHeightForFont((int)r2.fontSize),
+                  "every row's box holds at least its own font");
+        }
+
         // --- ReadSettings wiring ---
         {
             const StubSetting tagged[] = {

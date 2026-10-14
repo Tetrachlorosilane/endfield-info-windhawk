@@ -1653,6 +1653,36 @@ static int RowTopPx(const ModSettings &settings, int row) {
     return top;
 }
 
+// ---------------------------------------------------------------------------
+// Row metrics: every pixel size the drawing code needs, derived in one place.
+//
+// These values used to be worked out at each use site, and they drifted: the plate started
+// following a row's font size while the shared text column kept using the global one, so
+// setting one row larger also redrew its icon and moved every other row's text. The rule now
+// is that a size has exactly one owner, and that owner is here. The inputs are the two
+// numbers a row already has -- the size its text is drawn at, and the height of its box.
+//
+// Deliberately *not* a field here: the row's minimum height. The floor follows the **largest**
+// text in the row (a [[size:30]] run inside a small row still has to fit), so it cannot be
+// derived from the row's base size; `MinimumRowHeightForFont` owns it and `RowHeightPx` calls
+// it with the largest size. A field that could not answer for the row would be worse than none.
+// ---------------------------------------------------------------------------
+struct RowMetrics {
+    float fontSize;       // the size this row's text is drawn at
+    float lineHeight;     // the height of this row's box
+    float plateDiameter;  // this row's icon plate (0.0f = this row has no icon)
+};
+
+static RowMetrics MetricsForRow(const ModSettings &settings, int row) {
+    RowMetrics metrics = {};
+    metrics.fontSize = (float)RowFontSizePx(settings, row);
+    metrics.lineHeight = (float)RowHeightPx(settings, row);
+    const bool hasIcon =
+        ResolveIconStyle(settings, row) > 0 || ResolveIconPath(settings, row)[0] != L'\0';
+    metrics.plateDiameter = hasIcon ? (float)settings.fontSize * (float)kIconPlateRatio : 0.0f;
+    return metrics;
+}
+
 static int PanelRowsHeight(const ModSettings &settings, int count) {
     int height = 0;
     for (int i = 0; i < count && i < kMaxRows; i++) height += RowHeightPx(settings, i);
@@ -4989,10 +5019,7 @@ static void PaintIconGlyph(GpGraphics *graphics, int style, float cx, float cy,
 // text column of every row around with it. `slot` therefore only decides *whether* there is
 // a plate.
 static float IconPlateDiameter(const ModSettings &settings, int slot) {
-    if (ResolveIconStyle(settings, slot) <= 0 && !ResolveIconPath(settings, slot)[0]) {
-        return 0.0f;
-    }
-    return (float)settings.fontSize * (float)kIconPlateRatio;
+    return MetricsForRow(settings, slot).plateDiameter;
 }
 
 // The plate diameter to reserve room for in the shared text column: the widest plate any row
@@ -5844,9 +5871,12 @@ static void PaintPanel(HWND hwnd) {
                     // This row's own box: rows are not interchangeable any more, so the top
                     // edge is the sum of the rows above it and everything inside the row --
                     // the plate, the gauges, the text -- is placed against this height.
-                    const int rowFontSizePx = RowFontSizePx(g_settings, r);
-                    const int rowHeightPx = RowHeightPx(g_settings, r);
-                    const float rowHeight = (float)rowHeightPx;
+                    // Asked once, from the one place that derives sizes (RowMetrics). The
+                    // name is distinct from RowTextMetrics (which measures one line's text)
+                    // on purpose: these are the row's box sizes, not a measurement.
+                    const RowMetrics rowMetrics = MetricsForRow(g_settings, r);
+                    const int rowFontSizePx = (int)rowMetrics.fontSize;
+                    const float rowHeight = rowMetrics.lineHeight;
                     const float top = (float)RowTopPx(g_settings, r);
                     const float centerY = top + rowHeight / 2.0f;
                     float cursor = leftInset;
