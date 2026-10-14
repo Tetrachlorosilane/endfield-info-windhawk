@@ -1356,6 +1356,32 @@ try {
             if ($null -eq $positionMs) {
                 $positionMs = [int]((Get-Date) - $started).TotalMilliseconds
             }
+            # 当前行：用位置在 store 的 times 上选（不再用那个冻结的 playingLyricLineNumber）
+            # times 只在换歌时取一次（纯数字）；文本/翻译只在行号变化时按需取。
+            if ($LyricSource -in 'auto', 'store') {
+                $trackNow = if ($ss -and $ss.ok) { '' + $ss.trackId } else { '' }
+                if (-not $script:StoreTimes -or $script:StoreTimesTrack -ne $trackNow) {
+                    $stx = Get-CdpStoreLyricTimes
+                    if ($stx -and $stx.ok) {
+                        $script:StoreTimes = [object[]]$stx.times
+                        $script:StoreTimesTrack = '' + $stx.trackId
+                        $script:StoreLineIndex = -1
+                        $script:StoreLineText = ''
+                    }
+                }
+                if ($script:StoreTimes -and $null -ne $positionMs) {
+                    $idx = Select-StoreLineIndex -TimesSec $script:StoreTimes -PositionMs ([int]$positionMs)
+                    if ($idx -ge 0 -and $idx -ne $script:StoreLineIndex) {
+                        $ln = Get-CdpStoreLyricLine -Index $idx
+                        if ($ln -and $ln.ok) {
+                            $script:StoreLineIndex = $idx
+                            $script:StoreLineText = '' + $ln.text
+                            if ($ln.trans) { [void](Publish $writer 'translation' ('' + $ln.trans)) }
+                        }
+                    }
+                    if ($script:StoreLineText) { $storeLine = $script:StoreLineText }
+                }
+            }
             # 兜底：接口 LRC + 位置选行（store 不可用时才走这条 ✓）
             $line = if ($storeLine) { $storeLine } else { Select-LrcLine $lyricLines $positionMs }
 
