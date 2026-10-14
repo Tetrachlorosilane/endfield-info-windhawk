@@ -281,7 +281,12 @@ through WMI.
     - On: Show event cards
 */
 // ==/WindhawkModSettings==
-
+// 开发期诊断开关：默认**静默**。这些日志曾经是排查布局/图标/性能的唯一手段，所以保留语句，
+// 需要时把 kDbgTrace 改成 true 即可打开。**不删除**它们是有理由的：删掉会让它们专用的计数器
+// 变成 unused（有一次误删还伤到了活代码），而这里的参数在 `if (kDbgTrace)` 内仍然被求值，
+// 因此既静默、又不会引入 unused 级联。
+static const bool kDbgTrace = false;
+#define DBG(...) do { if (kDbgTrace) Wh_Log(__VA_ARGS__); } while (0)
 #include <winsock2.h>
 #include <netioapi.h>
 #include <iphlpapi.h>
@@ -3813,7 +3818,7 @@ static void LogBitmapContent(const WCHAR *label, GpImage *image) {
         }
     }
     if (samples == 0) return;
-    Wh_Log(L"%s: %ux%u sampled RGBA avg = %u,%u,%u,%u over %d px (%d nearly opaque)",
+    DBG(L"%s: %ux%u sampled RGBA avg = %u,%u,%u,%u over %d px (%d nearly opaque)",
            label, w, h, sumR / samples, sumG / samples, sumB / samples, sumA / samples,
            samples, opaque);
 }
@@ -4190,7 +4195,7 @@ static void PaintIconPlate(GpGraphics *graphics, const ModSettings &settings,
     GpImage *image = iconPath[0] ? IconImageFor(slot, iconPath, target, &imageFailed) : nullptr;
     if (g_iconDrawLogs < 8) {
         g_iconDrawLogs++;
-        Wh_Log(L"Icon%d draw: plate diameter target=%d  image=%s  built-in glyph=%d",
+        DBG(L"Icon%d draw: plate diameter target=%d  image=%s  built-in glyph=%d",
                slot + 1, target, image ? L"custom" : L"none", ResolveIconStyle(settings, slot));
     }
     if (image) {
@@ -4598,11 +4603,11 @@ static void PaintPanel(HWND hwnd) {
                 static int dumpBudget = 8;
                 if (dumpBudget > 0) {
                     dumpBudget--;
-                    Wh_Log(L"Paint#%d rows=%d published=%d visibleRows=%d collapsed=%d size=%dx%d",
+                    DBG(L"Paint#%d rows=%d published=%d visibleRows=%d collapsed=%d size=%dx%d",
                            8 - dumpBudget, rows, g_publishedRows, g_visibleRows,
                            collapsed ? 1 : 0, width, height);
                     for (int d = 0; d < kMaxRows; d++) {
-                        Wh_Log(L"  row%d segs=%d textLen=%d inline=%d text=\"%ls\"",
+                        DBG(L"  row%d segs=%d textLen=%d inline=%d text=\"%ls\"",
                                d, g_rowState.segmentCount[d],
                                (int)wcslen(g_rowState.text[d]),
                                g_rowState.inlineRing[d] ? 1 : 0,
@@ -4738,7 +4743,7 @@ static void PaintPanel(HWND hwnd) {
                         float drawWidth = advance > kMinLayoutWidth ? advance : kMinLayoutWidth;
                         RectF layout(cursor, top, drawWidth, (float)g_settings.rowHeight);
                         if (logDraws) {
-                            Wh_Log(L"    draw row=%d seg=%d x=%.1f y=%.1f w=%.1f "
+                            DBG(L"    draw row=%d seg=%d x=%.1f y=%.1f w=%.1f "
                                    L"adv=%.1f inline=%d fitted=%d \"%ls\"",
                                    r, s, layout.X, layout.Y,
                                    layout.Width, advance, inlineFlow ? 1 : 0,
@@ -5019,7 +5024,7 @@ static void ReassertTopmost(HWND hwnd) {
     bool ok = ForceTopmost(hwnd);
     // Log only genuine losses, not the routine refresh, so the log stays useful.
     if (!topmost || !ok) {
-        Wh_Log(L"Topmost lost and re-asserted: was=%d now=%d setpos=%d err=%lu",
+        DBG(L"Topmost lost and re-asserted: was=%d now=%d setpos=%d err=%lu",
                topmost ? 1 : 0, IsTopmost(hwnd) ? 1 : 0, ok ? 1 : 0, GetLastError());
     }
 }
@@ -5116,7 +5121,7 @@ static void UpdateProximity(HWND hwnd) {
         GetCursorPos(&cursor);
         const RECT &rect = g_monitors[g_anchorIndex].rect;
         int depth = g_settings.hotZoneDepth + (g_expanded ? g_panelHeight : 0);
-        Wh_Log(L"Proximity: collapsing. cursor=(%ld,%ld) monitor.top=%ld depth=%d "
+        DBG(L"Proximity: collapsing. cursor=(%ld,%ld) monitor.top=%ld depth=%d "
                L"panel=%dx%d painted=%d",
                cursor.x, cursor.y, rect.top, depth, g_settings.panelWidth,
                g_displayHeight, g_paintedHeight);
@@ -5238,7 +5243,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             mem.cb = sizeof(mem);
             GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&mem, sizeof(mem));
             unsigned long long elapsed = GetTickCount64() - g_perfBaseTick;
-            Wh_Log(L"[perf] up=%llus rows=%d groups=0x%X samples=%llu paints=%llu cpu=%llums "
+            DBG(L"[perf] up=%llus rows=%d groups=0x%X samples=%llu paints=%llu cpu=%llums "
                    L"cpu/sample=%.3fms ws=%.1fMB private=%.1fMB visible=%d expanded=%d prox=%d",
                    elapsed / 1000ULL, g_visibleRows, g_activeGroups, g_sampleCount, g_paintCount,
                    cpuMs, g_sampleCount ? (double)cpuMs / (double)g_sampleCount : 0.0,
@@ -5356,7 +5361,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             }
             SetVisible(hwnd, true);
         }
-        Wh_Log(L"Click: %s, display mode = %s",
+        DBG(L"Click: %s, display mode = %s",
                g_settings.clickToggle ? L"toggle" : L"mode switch",
                g_modeProximity ? L"proximity" : L"always");
         return 0;
@@ -6835,7 +6840,7 @@ static bool g_isToolModProcessLauncher = false;
 static HANDLE g_toolModProcessMutex = nullptr;
 
 static void WINAPI EntryPoint_Hook() {
-    Wh_Log(L">");
+    DBG(L">");
     ExitThread(0);
 }
 
