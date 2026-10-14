@@ -653,6 +653,57 @@ function Get-CdpPositionMs {
 # 客户端升级后若失效会自己再找一次 ✓ -ProbeCdp 同样走这条自寻址的路 ✓。
 # 单位陷阱（同一首歌、同一切片里三种单位 ✗）：`lyricLines[i].time` 是**秒** ✓、
 # `curTrack.duration` 是**毫秒** ✓、`playing.resourceDuration` 是**秒** ✓。
+# 迷你条上的"已播 / 总长"（mm:ss / mm:ss）—— 这是客户端**自己显示**的真 currentTime。
+# 真机实测（2026-10-13，用户在 DevTools 里找到的控件）：
+#   #page_pc_mini_bar … div.curtime-thumb … span.cmd-button-content  ->  "02:58 / 03:06"
+# **不锚带哈希的类名**（TimeWarpper_t1eityq1 / SpaceContainer_s8o78dm 会随构建变），
+# 只锚 "#page_pc_mini_bar + 文本形状 m:ss / m:ss"；并顺带读进度柄比例做交叉校验。
+function Get-CdpDomTime {
+    if (-not (Get-CdpTab)) { return $null }
+    $expr = @"
+(function(){
+  try{
+    var root = document.querySelector('#page_pc_mini_bar') || document;
+    var nodes = root.querySelectorAll('span,div');
+    var re = /^\s*(\d{1,3}):(\d{2})\s*\/\s*(\d{1,3}):(\d{2})\s*$/;
+    for (var i = 0; i < nodes.length && i < 4000; i++) {
+      var t = (nodes[i].textContent || '').trim(), m = re.exec(t);
+      if (m) {
+        var ratio = null;
+        try {
+          var th = root.querySelector('[class*=curtime], [class*=TimeWarpper], [class*=thumb]');
+          var st = th ? (th.getAttribute('style') || '') : '';
+          var lm = /left:\s*([\d.]+)%/.exec(st);
+          if (lm) ratio = (+lm[1]) / 100;
+        } catch (e2) { }
+        return JSON.stringify({ ok:true, curS:(+m[1])*60+(+m[2]), totalS:(+m[3])*60+(+m[4]), ratio:ratio, raw:t });
+      }
+    }
+    return JSON.stringify({ ok:false, why:'no mm:ss / mm:ss inside #page_pc_mini_bar' });
+  }catch(x){ return JSON.stringify({ ok:false, why:''+x }); }
+})()
+"@
+    $raw = Invoke-CdpExpression -Expression $expr
+    if (-not $raw) { return $null }
+    $m = [regex]::Match($raw, '"value"\s*:\s*"((?:[^"\\]|\\.)*)"', 'Singleline')
+    if (-not $m.Success) { return $null }
+    try { return (('"' + $m.Groups[1].Value + '"') | ConvertFrom-Json) | ConvertFrom-Json } catch { return $null }
+}
+
+# 纯函数：在 times（**秒**，注意单位）上按位置（**毫秒**）选行；返回索引，-1 = 无法判定。
+# **不假设长度**（同一客户端上实测见过 64 行与 67 行）；跳过 null 时间戳；越界钳位到末行。
+function Select-StoreLineIndex {
+    param([double[]]$TimesSec, [int]$PositionMs)
+    if (-not $TimesSec -or $TimesSec.Count -eq 0) { return -1 }
+    $idx = -1
+    for ($i = 0; $i -lt $TimesSec.Count; $i++) {
+        $v = $TimesSec[$i]
+        if ($null -eq $v) { continue }
+        if ([double]$v * 1000.0 -le $PositionMs) { $idx = $i } else { break }
+    }
+    if ($idx -lt 0) { return 0 }
+    return $idx
+}
 function Get-CdpStoreState {
     if (-not (Get-CdpTab)) { return $null }
     $expr = @'
@@ -1177,7 +1228,13 @@ try {
                     }
                 }
             }
-            # 首选来源：CDP store —— 精确到客户端自己的当前行 ✓；它的行时间顺便当位置 ✓
+            # 首选位置来源：迷你条 DOM 的"已播 / 总长" —— 客户端**自己显示**的真 currentTime
+            # （用户在 DevTools 里找到的控件；不锚哈希类名，理由见 Get-CdpDomTime 的注释）
+            $positionMs = $null
+            if ($PositionSource -in 'auto', 'cdp') {
+                $domTime = Get-CdpDomTime
+                if ($domTime -and $domTime.ok) { $positionMs = [int]$domTime.curS * 1000 }
+            }            # 首选来源：CDP store —— 精确到客户端自己的当前行 ✓；它的行时间顺便当位置 ✓
             # （用户实测：内存扫描极不稳定 ✗ → CDP/store 优先 ✓、内存降为次选 ✓。
             #   注意：store 的 lineTimeSec 是**行起始时间** ✓，会按行跳变；要连续毫秒仍需内存/SMTC ✓）
             $positionMs = $null
@@ -1191,7 +1248,7 @@ try {
                         [void](Publish $writer 'lyric' $storeLine)
                     }
                     if ($ss.trans) { [void](Publish $writer 'translation' ('' + $ss.trans)) }
-                    if ($null -ne $ss.lineTimeSec) { $positionMs = [int]([double]$ss.lineTimeSec * 1000) }
+                    if ($null -eq $positionMs -and $null -ne $ss.lineTimeSec) { $positionMs = [int]([double]$ss.lineTimeSec * 1000) }
                 }
             }
             # 位置降级链：cdp → memory → media → clock（store 没给出位置才往下走 ✓）
