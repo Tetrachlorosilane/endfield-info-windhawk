@@ -1161,26 +1161,6 @@ if ($SelfTest) {
         if ($got -ne $c.want) { $bad++; Write-Host ("  FAIL Select-StoreLineIndex: {0} (got {1}, want {2})" -f $c.d, $got, $c.want) }
         else { Write-Host ("  OK   Select-StoreLineIndex: {0}" -f $c.d) }
     }
-        # --- Select-StoreLineIndex（选行纯函数）---------------------------------
-        # 不假设长度：~80 行、间距不规则的数组也必须正确（用户点名要求）
-        $irr = [object[]]@(0..79 | ForEach-Object { [double]($_ * 2.5) })   # object[]：才能真正放 null
-        $irr[3] = $null                       # 元信息行没有时间戳 → 跳过
-        $okA = (Select-StoreLineIndex -TimesSec $irr -PositionMs 0) -eq 0
-        $okB = (Select-StoreLineIndex -TimesSec $irr -PositionMs 2500) -eq 1
-        $okC = (Select-StoreLineIndex -TimesSec $irr -PositionMs 2501) -eq 1
-        $okD = (Select-StoreLineIndex -TimesSec $irr -PositionMs 5000) -eq 2
-        $okE = (Select-StoreLineIndex -TimesSec $irr -PositionMs 999999) -eq 79
-        $okF = (Select-StoreLineIndex -TimesSec ([double[]]@()) -PositionMs 1000) -eq -1
-        $okG = (Select-StoreLineIndex -TimesSec ([double[]]@(5)) -PositionMs 100) -eq 0
-        $okH = (Select-StoreLineIndex -TimesSec ([double[]](1..2000 | ForEach-Object { [double]$_ })) -PositionMs 1500500) -eq 1500
-        Check ($okA) "Select-StoreLineIndex：位置 0 → 第 0 行（前奏）"
-        Check ($okB) "Select-StoreLineIndex：恰好落在某行起点 → 取该行（闭区间）"
-        Check ($okC) "Select-StoreLineIndex：行间 → 仍取上一行"
-        Check ($okD) "Select-StoreLineIndex：跨过 null 行不崩、仍取最近一行"
-        Check ($okE) "Select-StoreLineIndex：晚于末行 → 钳到末行（不越界）"
-        Check ($okF) "Select-StoreLineIndex：空数组 → -1（调用方据此退回 LRC）"
-        Check ($okG) "Select-StoreLineIndex：单行数组 → 0"
-        Check ($okH) "Select-StoreLineIndex：2000 行数组 → 命中第 1500 行（无固定长度假设）"
     $fixture = @"
 [ti:示例]
 [00:00.00]第一句
@@ -1375,6 +1355,32 @@ try {
             }
             if ($null -eq $positionMs) {
                 $positionMs = [int]((Get-Date) - $started).TotalMilliseconds
+            }
+            # 当前行：用位置在 store 的 times 上选（不再用那个冻结的 playingLyricLineNumber）
+            # times 只在换歌时取一次（纯数字）；文本/翻译只在行号变化时按需取。
+            if ($LyricSource -in 'auto', 'store') {
+                $trackNow = if ($ss -and $ss.ok) { '' + $ss.trackId } else { '' }
+                if (-not $script:StoreTimes -or $script:StoreTimesTrack -ne $trackNow) {
+                    $stx = Get-CdpStoreLyricTimes
+                    if ($stx -and $stx.ok) {
+                        $script:StoreTimes = [object[]]$stx.times
+                        $script:StoreTimesTrack = '' + $stx.trackId
+                        $script:StoreLineIndex = -1
+                        $script:StoreLineText = ''
+                    }
+                }
+                if ($script:StoreTimes -and $null -ne $positionMs) {
+                    $idx = Select-StoreLineIndex -TimesSec $script:StoreTimes -PositionMs ([int]$positionMs)
+                    if ($idx -ge 0 -and $idx -ne $script:StoreLineIndex) {
+                        $ln = Get-CdpStoreLyricLine -Index $idx
+                        if ($ln -and $ln.ok) {
+                            $script:StoreLineIndex = $idx
+                            $script:StoreLineText = '' + $ln.text
+                            if ($ln.trans) { [void](Publish $writer 'translation' ('' + $ln.trans)) }
+                        }
+                    }
+                    if ($script:StoreLineText) { $storeLine = $script:StoreLineText }
+                }
             }
             # 兜底：接口 LRC + 位置选行（store 不可用时才走这条 ✓）
             $line = if ($storeLine) { $storeLine } else { Select-LrcLine $lyricLines $positionMs }
