@@ -82,6 +82,11 @@ param(
     [string]$PositionHelper = '',
     # 超过这么久没有新采样就当成不可用（毫秒）
     [int]$PositionStaleMs = 3000,
+    # 歌词行的"负延迟"：把**选行用的位置**提早这么多毫秒（默认 -1 = 按来源自动）。
+    # 用户报告"歌词滞后约 1 秒"，来源就是两处系统性滞后：DOM 只给「分:秒」（位置向下取整
+    # 到秒，平均落后 0.5 s）+ 桥每 IntervalMs 才轮询一次（平均再落后半个周期）。
+    # auto = 半个周期，DOM 来源再补 0.5 s（默认合计 1000 ms）；0 = 关掉；给正数就用自己的值。
+    [int]$LeadMs = -1,
     # 只探一次位置来源并打印结论
     [switch]$ProbePosition
 )
@@ -424,7 +429,7 @@ function Get-PositionMs {
 # 就能看到（`dom 41.3s` = 迷你条的真 currentTime；`storeline 29.5s` = store 当前行的起始
 # 时间（按行跳变）；`mem`/`cdp` = 内存差分 / CDP 其它位置；`clock` = 推算时钟，会漂）。
 function Format-PositionSource {
-    param([string]$Source, [int]$PositionMs)
+    param([string]$Source, [int]$PositionMs, [int]$LeadMs = 0)
     $name = switch ($Source) {
         'media' { 'media' }
         'dom' { 'dom' }
@@ -433,7 +438,23 @@ function Format-PositionSource {
         'memory' { 'mem' }
         default { 'clock' }
     }
-    return ("{0} {1:0.0}s" -f $name, ($PositionMs / 1000.0))
+    $leadText = if ($LeadMs -gt 0) { " +$($LeadMs)ms" } else { '' }
+    return ("{0} {1:0.0}s{2}" -f $name, ($PositionMs / 1000.0), $leadText)
+}
+
+# 提早换行多少毫秒（纯函数，-SelfTest 覆盖）。**为什么要提早**——位置有两个系统性滞后：
+#   · 迷你条 DOM 只给「分:秒」，位置是**向下取整到秒**的（真实 90.9 s 报 90）→ 平均落后 0.5 s、
+#     最坏 1 s；
+#   · 桥每 -IntervalMs（默认 1000 ms）才轮询一次 → 平均再落后半个周期。
+# 所以 auto = 半个轮询周期，DOM 来源再补 0.5 s 的取整偏差（默认合计 1 s）。被提早的只是
+# **选行用的位置**：发出去的 `pos` 仍是原始位置并标出提早量（`dom 90.0s +1000ms`），
+# 所以"提早了多少、有没有过头"看得见。`-LeadMs 0` 关掉，`-LeadMs N` 用自己的值。
+function Get-LeadMs {
+    param([string]$Source, [int]$IntervalMs, [int]$OverrideMs = -1)
+    if ($OverrideMs -ge 0) { return $OverrideMs }
+    $lead = [int][math]::Round($IntervalMs / 2.0)
+    if ($Source -eq 'dom') { $lead += 500 }
+    return $lead
 }
 
 $script:PositionProc = $null
@@ -1331,6 +1352,15 @@ if ($SelfTest) {
         @{ Name = '位置来源标签：store 当前行起始时间'; Ok = ((Format-PositionSource -Source storeline -PositionMs 29521) -eq 'storeline 29.5s') }
         @{ Name = '位置来源标签：内存差分 / 媒体会话'; Ok = ((Format-PositionSource -Source memory -PositionMs 1000) -eq 'mem 1.0s') -and ((Format-PositionSource -Source media -PositionMs 0) -eq 'media 0.0s') }
         @{ Name = '位置来源标签：未知来源按推算时钟算'; Ok = ((Format-PositionSource -Source nonsense -PositionMs 500) -eq 'clock 0.5s') }
+        # 负延迟：位置有两个系统性滞后（DOM 向下取整到秒 + 每周期才轮询一次），按来源补偿
+        @{ Name = '负延迟：DOM 来源 = 半周期 + 0.5s 取整偏差'; Ok = ((Get-LeadMs -Source dom -IntervalMs 1000) -eq 1000) }
+        @{ Name = '负延迟：精确来源只补半个周期'; Ok = ((Get-LeadMs -Source media -IntervalMs 1000) -eq 500) -and ((Get-LeadMs -Source memory -IntervalMs 1000) -eq 500) }
+        @{ Name = '负延迟：周期变了自动值跟着变'; Ok = ((Get-LeadMs -Source dom -IntervalMs 400) -eq 700) }
+        @{ Name = '负延迟：显式值覆盖自动值（0 = 关掉）'; Ok = ((Get-LeadMs -Source dom -IntervalMs 1000 -OverrideMs 0) -eq 0) -and ((Get-LeadMs -Source dom -IntervalMs 1000 -OverrideMs 1500) -eq 1500) }
+        @{ Name = 'pos 标签带出提早量'; Ok = ((Format-PositionSource -Source dom -PositionMs 90000 -LeadMs 1000) -eq 'dom 90.0s +1000ms') -and ((Format-PositionSource -Source dom -PositionMs 90000) -eq 'dom 90.0s') }
+        # 组合起来的效果：同一个行边界（10 s），不加提早量时 9.9 s 仍是第 0 行，
+        # 加 1 s 后（=10.9 s）已经是第 1 行 —— 换行确实提前了 1 秒。
+        @{ Name = '负延迟确实把换行提早（9.9s 仍是 0 行，+1s 后是 1 行）'; Ok = (((Select-StoreLineIndex -TimesSec @(0, 10, 20, 30) -PositionMs 9900) -eq 0) -and ((Select-StoreLineIndex -TimesSec @(0, 10, 20, 30) -PositionMs (9900 + 1000)) -eq 1)) }
     )
     $bad = 0
     # 活体证据：判定用的是这一份窗口列表，打出来省得下一个人再猜一次
@@ -1527,6 +1557,9 @@ try {
                 $positionMs = [int]((Get-Date) - $started).TotalMilliseconds
                 $posSrc = 'clock'
             }
+            # 换行的"负延迟"（见 Get-LeadMs）。⚠ 变量名**不能**叫 $leadMs：PowerShell 变量名
+            # 大小写不敏感，那会覆盖 -LeadMs 参数本身，自动值就永远停在第一次算出来的数。
+            $leadApply = Get-LeadMs -Source $posSrc -IntervalMs $IntervalMs -OverrideMs $LeadMs
             # 当前行：用位置在 store 的 times 上选（不再用那个冻结的 playingLyricLineNumber）
             # times 只在换歌时取一次（纯数字）；文本/翻译只在行号变化时按需取。
             if ($LyricSource -in 'auto', 'store') {
@@ -1541,7 +1574,10 @@ try {
                     }
                 }
                 if ($script:StoreTimes -and $null -ne $positionMs) {
-                    $idx = Select-StoreLineIndex -TimesSec $script:StoreTimes -PositionMs ([int]$positionMs)
+                    # 选行用**提早后**的位置（见 Get-LeadMs）：只影响换行的时刻，
+                    # 发出去的 pos 仍是原始位置。
+                    $idx = Select-StoreLineIndex -TimesSec $script:StoreTimes `
+                        -PositionMs ([int]$positionMs + $leadApply)
                     if ($idx -ge 0 -and $idx -ne $script:StoreLineIndex) {
                         $ln = Get-CdpStoreLyricLine -Index $idx
                         if ($ln -and $ln.ok) {
@@ -1554,7 +1590,7 @@ try {
                 }
             }
             # 兜底：接口 LRC + 位置选行（store 不可用时才走这条 ✓）
-            $line = if ($storeLine) { $storeLine } else { Select-LrcLine $lyricLines $positionMs }
+            $line = if ($storeLine) { $storeLine } else { Select-LrcLine $lyricLines ([int]$positionMs + $leadApply) }
 
             [void](Publish $writer 'title' ("{0} - {1}" -f $now.Title, $now.Artist))
             if ($line) { [void](Publish $writer 'lyric' $line) }
@@ -1562,7 +1598,7 @@ try {
             # stdout 上（面板写 `{ext.netease.pos}` 即可）。变化时才有帧（Publish 会去重）。
             if ($null -ne $positionMs) {
                 [void](Publish $writer 'pos' (Format-PositionSource -Source $posSrc `
-                            -PositionMs ([int]$positionMs)))
+                            -PositionMs ([int]$positionMs) -LeadMs $leadApply))
             }
             if ($Event -and -not $announced -and $writer) {
                 Write-Frame $writer "EVENT $Provider info $TtlMs $($now.Title) - $($now.Artist)  $line"
