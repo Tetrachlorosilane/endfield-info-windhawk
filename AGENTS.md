@@ -25,7 +25,7 @@
 
 ```
 endfield-info-windhawk/
-├── endfield-info-windhawk.wh.cpp      唯一的交付物（约 226 KB）
+├── endfield-info-windhawk.wh.cpp      唯一的交付物（约 308 KB 源码）
 ├── README.md                          用户文档
 ├── AGENTS.md                          本文
 ├── docs/                              规划与设计文档（不是实现说明）
@@ -36,6 +36,7 @@ endfield-info-windhawk/
 ├── test-layout.cpp                    回归测试宿主（打桩 Windhawk API）
 ├── test-gdiplus-scale.cpp             GDI+ 缩放探针（独立 exe）
 ├── _settings.py                       校验 mod 头部的设置块结构
+├── _logfmt.py                         审计宽格式日志调用点（编译器查不了宽格式，见 §3）
 ├── _preview.py                        渲染 assets/panel-preview.png
 ├── _extclient.py                      外部数据管道的冒烟客户端（Python）
 ├── _extclient.ps1                     第二客户端（.NET）——**真机验证过的是这一个**
@@ -45,7 +46,7 @@ endfield-info-windhawk/
 ```
 
 `test-layout.cpp` 与 `test-gdiplus-scale.cpp` 是**开发工具**，不随 mod 交付。
-`_settings.py` / `_preview.py` 需要 Pillow 与 Python。
+`_settings.py` 需要 Pillow 与 Python；`_logfmt.py` 只需要 Python。
 
 > 本机 `python` 解析到的是 Windows Store 的占位程序，不一定真的能执行。
 > 如果 `python` 打开的是应用商店，用 DSH 运行时自带的解释器：
@@ -66,7 +67,7 @@ endfield-info-windhawk/
   `// ==WindhawkModSettings==` 块里的静态 YAML。字体、图标路径这类只能手输 + 校验。
 
 **约束**：不使用 `new` / `delete` / `std::*` / 异常。原因是**体积**
-（去掉堆分配后约 158 KB，静态链接 libc++ 会涨到约 590 KB），
+（去掉堆分配后 DLL 约 176 KB，2026-10-14 实测 180736 B；静态链接 libc++ 会涨到约 590 KB），
 **不是**因为运行时不可用——Windhawk 会自带并注入 `libc++.whl`，堆分配其实能用。
 早先 AGENTS 里"堆分配不可用"的说法是错的，已更正。
 
@@ -100,7 +101,8 @@ libc++）编译，并打印导出符号表。
 > 日志调用连同它们的格式串在本地被编译掉，DLL 里搜不到任何日志字符串——我为此白排查过一轮
 > （"DLL 里没有新日志"其实什么也没证明）。去掉 `-DWH_EDITING` 也救不了：那会引用
 > `InternalWh_*`，而它们由 Windhawk 自己提供，本地链接不过。
-> **要检查日志格式串，用测试宿主**（它打桩了一个真的 `Wh_Log`，会走 `-Wformat`）。
+> **要检查日志格式串，别指望编译器**——宽格式它一条都查不了（原因与实测见下面的方框），
+> 用 `python _logfmt.py`。
 
 ### 设置块校验（改过设置项就跑）
 
@@ -142,10 +144,17 @@ $wc = 'D:\Program Files\Windhawk\Compiler'
 > `FILE_WRITE_DATA`、`GENERIC_ALL` 全部 `err=5`。因此宿主**没法**做管道端到端测试
 > （客户端要写），管道读写路径只能靠真机日志——§10 的"未验证"里也记着这条。
 
-> **mod 的日志格式串是在这里被检查的**：宿主打桩了一个真的 `Wh_Log`，所以 mod 里每个
-> `Wh_Log(L"...%s", ...)` 都会被真的编译并走 `-Wformat`。**不要给这条命令加
-> `-Wno-format`**，那会把这项检查一起关掉（加过一次，等于把唯一的日志类型检查关了）。
-> 宿主自己那 15 条 `%08X` 收 `DWORD` 的警告是它自己的 printf，与 mod 无关。
+> **mod 的日志格式串不在这里检查——而且编译器根本查不了宽格式。** 这一段曾经写着
+> "宿主打桩了真的 `Wh_Log`，所以每个 `Wh_Log(L"...%s", ...)` 都会走 `-Wformat`"，
+> 那是**错的**：`Wh_Log` 是自造的变参函数，clang 只对带 format 属性的函数或 printf 家族
+> 做检查。2026-10-14 实测（Windhawk clang 20）四条路全堵：
+> `format(printf,1,2)` 挂在 `wchar_t*` 格式参数上是**硬错误**（`format argument not a string type`）；
+> `ms_printf` / `wprintf` 不被这个 target 支持（`-Wignored-attributes`）；
+> `-fms-compatibility` 会把编译器自己的头文件打崩；连 MinGW 的 `swprintf` 也不查
+> （`swprintf(b,0,L"%s",1)` 无任何诊断，所以 mod 自己的缓冲格式化同样无人检查）。
+> 那次实测还证明：同一文件里 `printf` 的两处错型各报 1 条，而自造桩的错型 **0 条**。
+> **替代检查**：`python _logfmt.py`（105 个调用点/元数 + 可判定的错型；负对照实测会红）。
+> 宿主自己那 15 条 `%08X` 收 `DWORD` 的警告是它自己的窄 printf，与 mod 无关。
 
 **宿主原理**：`test-layout.cpp` 把 Windhawk API（`Wh_GetIntSetting` / `Wh_GetStringSetting` /
 `Wh_Log` / `Wh_SetFunctionHook`）打桩，然后 `#include "endfield-info-windhawk.wh.cpp"`。
@@ -261,10 +270,12 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   **不要把这个函数拆回内联**：测试必须和绘制走同一个函数，
   否则测的是测试自己那份副本（这一点已实测踩到，见 §7 第 8 条）。
 - **GDI+ 不按 layout 框裁剪文本。** 关掉换行后，超宽的文本会**直接画到框外**、
-  压在后面的环上。所以每段在 `DrawString` 前要按自己的预算
-  （内联段 = 实测 advance，右停靠段 = `metrics.textWidth`）调用
-  `FitTextToWidth()` 截断。`FitTextToWidth` / `FitCharacterCount` /
-  `FitCharsWithEllipsis` 是纯函数或注入测量的函数，都有断言。
+  压在后面的环上。所以每段在 `DrawString` 前要按自己的预算调用 `FitTextToWidth()` 截断：
+  右停靠段 = `metrics.textWidth`，**内联段 = `ComputeInlineTextLimit(textRight, cursor,
+  跟在它后面的环数, ringSize)`**。内联段曾经写成"实测 advance"，那是个**恒真的预算**
+  （该函数第一句就是"已经放得下吗"），于是用了 `[[ring:…]]` 的行**从不截断**：文字切在
+  位图外缘且没有 `…`，它自己的环被挤出面板。`FitTextToWidth` / `FitCharacterCount` /
+  `FitCharsWithEllipsis` / `ComputeInlineTextLimit` 是纯函数或注入测量的函数，都有断言。
 - **`DrawString` 的框宽下限是 `kMinLayoutWidth`（1.0）**，不能是 0：
   0 宽会让 GDI+ 把整段裁掉，这与第一条是同一个坑的另一面。
   截断与框用的是同一个下限，两者不能各写一个数字。
@@ -277,7 +288,10 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   否则残留字段可能从某条路径泄漏进预设配色。
 - **环色优先级**：`:COLOR` > `Ring colour`（仅 Custom）> 主题边框色。
 - **`{gpu.temp}` 等"已知但取不到"的变量渲染为 `--`**，未知变量保持字面文本。
-  二者必须区分（见 §6 第 3 条）。
+  二者必须区分（见 §6 第 3 条）。**每个 NVML-only 读数都要有自己的有效性标志**
+  （`gpuTempValid` / `gpuFanValid` / `gpuPowerValid` / `vramUsedValid` / `vramTotalValid`）：
+  少一个标志，"这台机器读不到"就会被画成一个看着很像真读数的 `0`——温度、风扇、功耗、
+  显存总量各栽过一次。
 
 ### 5.3 图标
 
@@ -299,8 +313,12 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 ### 5.4 动画
 
 - **`g_displayHeight` 是静止几何**（`PlaceWindow` 与 `WM_NCHITTEST` 都用它），
-  **`g_paintedHeight` 是当前帧绘制高度**。动画**不得**写回前者。
-  曾混用 → 窗口与命中矩形在动画中途缩到标签尺寸 → "弹出后立刻收起"。
+  **`g_paintedHeight` 是当前帧绘制高度**。**展开**方向动画不得写回前者
+  （曾混用 → 窗口与命中矩形在动画中途缩到标签尺寸 → "弹出后立刻收起"）。
+  **例外是收起方向**：`PaintPanel` 的收缩分支逐帧把 `g_displayHeight` 跟到绘制高度并
+  `PlaceWindow`——这正是修掉收起闪烁的手段（见下一条），此刻窗口与位图同高、命中矩形
+  跟着窗口，仍然自洽；动画结束时 `UpdateIntro` 把静止值写回。**不要"恢复"成展开时那样
+  不写它**，那会让展开高度的位图被裁进 8px 窗口——这一条与下一条是一体的。
 - **热区起点用 `kPanelTopOffset`（窗口实际顶部）**，不是显示器顶边。
   曾用显示器顶边 → 面板最上面 6px 落在自己的热区之外。
 - **动画进度每帧只采样一次。** `IntroCue()` 每次都重算 `GetTickCount()`，
@@ -317,6 +335,10 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   to the resting (tab) height, so the frame has to grow it back"* 正是这个往返的补偿——
   **补偿存在，说明顺序错了**。
 - **展开与收回刻意不对称**：展开先生长定型、再让内容分层浮现；收回贯穿整段、时长为一半。
+- **收回的关键帧 cue 是 `1.0`，不是 `kCollapseDurationRatio`。** 那个常量是**时长比例**；
+  把它当 cue 用（`{kCollapseDurationRatio, end}`）会让收缩在半程就结束，剩下半程窗口停在
+  标签高度、而帧时钟仍以 16 ms 重绘它——可见收回只有 `IntroMs/4`（README 写的是"一半"）。
+  断言：`the shrink still has work left at the midpoint`。
 - **方向判定用 `start = fromHeight`、`end = toHeight`**，方向由两者大小自然决定。
   曾按方向重排 start/end → 收回时高度反而在增长。
 - **过冲强度 `kPanelBounceStrength = 0.04`**（原项目 0.275）。0.275 在 250px 面板上是
@@ -424,6 +446,12 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 | `CreateNamedPipe` 的 `nMaxInstances` 传 1 而线程数是 4 | 日志写着 `serving 4 pipe instance(s)`，实际 3 个线程以 `CreateNamedPipe failed: 231` 当场退出，只支持 1 个并发客户端 | **没有断言能覆盖**（这是 API 调用点的常量错，宿主里没有真管道）；判别依据是错误码语义——**断言覆盖不到的地方，日志就是防线** |
 | 读用 `INFINITE` 等完成事件，完成事件一旦丢失线程就永久停住 | 客户端**连上了**（`ExtLogClient` 有），之后日志**完全静默**——连 `client done` 都没有，行永远 `--` | 等待加 500 ms 上界 + `PeekNamedPipe` 判定；缓冲有数据却没完成就重投。判别日志：`EXT read#1 result=… got=…`、`read completion never arrived with N bytes queued`、`no frame for 2s and the pipe buffer is empty` |
 | 收起时先把窗口缩到标签高度、再长回来画（`SetExpanded` 里那次 `PlaceWindow`） | 收起瞬间闪出一条"切片"，极短、难复现；鼠标离开检测区延迟后触发 | **无法断言**（这是分层窗口的帧内顺序，不是数值）。判据是流程：窗口尺寸必须与**同一帧提交的位图**一致；收起方向由绘制侧逐帧跟随内容（`if (expanded) PlaceWindow(hwnd);`） |
+| 内联环行的截断预算写成"实测 advance" | 用了 `[[ring:…]]` 的行**永不截断**：文字切在位图外缘（没有 `…`），它自己的环被挤出面板 | `ComputeInlineTextLimit` 的关系断言（run + 后面的环 = 整行） |
+| 收回关键帧把**时长比例**当 **cue** 用 | 收缩在半程就完成、后半个时间轴是死区：可见收回只有 `IntroMs/4`（README 写"一半"），且那半程仍以 16 ms 重绘空转 | `the shrink still has work left at the midpoint` |
+| GPU 的风扇/功耗/显存总量没有有效性标志 | 非 NVIDIA（PDH 回退）机器上 `{gpu.fan}`=0、`{gpu.power}`=0、`{gpu.vram.total}`=0.0——看着像真读数 | `{gpu.fan}` → `--` 等 5 条 unavailable 断言 |
+| 行内展开用 128 字符暂存缓冲 | `{ext.*}` 的值被静默截到 127 字符（设置允许 512，且不带 `…`） | 399 字符的值整段到达行里 |
+| 关掉岛不丢相位 | `POPPING`/`COLLAPSING` 冻结 → `IslandPhaseAnimating` 恒真 → tick 永久钉在 16 ms，卡片也关不掉 | `turning the island off drops a phase that was in flight` |
+| 发布器没有回收路径 | 关掉 `External data`、或删掉最后一行 `{ext.*}` 后，mod 启动的发布器继续跑（读内存/联网）直到卸载 | **没有断言**（真 `CreateProcess`）；判据是日志 `nothing consumes {ext.*} any more; stopping it` |
 
 ### 排查心法：先分类，再定位
 
@@ -571,8 +599,10 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 2. 在 `LookupRaw`（格式化字符串）或 `LookupNumber`（数值）里实现。
 3. 若是数值变量，加进 `IsKnownNumberVariable`，这样"本机取不到"时会渲染 `--`
    而不是字面文本。
-4. 在 `test-layout.cpp` 的 token 覆盖列表里加一行——
-   **有测试保证"32 个变量全部能解析"**，漏了会被测出来。
+4. 在 `test-layout.cpp` 的 token 覆盖列表里加一行。**注意那张列表与 `kVariables[]` 之间
+   没有任何自动对应**（全文不引用 `kVariables[]`，它只查"展开后还剩不剩花括号"，而
+   `Values` 是手工填满的）：**加进 `kVariables[]` 却忘了这张列表，测试照样全绿**——
+   已用变异实验证实。两处一起改。
 5. 更新 README 的「变量速查」表。
 
 > `{ext.*}` 是**运行期**变量，**不要**注册进 `kVariables[]`：那张表是编译期的采集通路清单，

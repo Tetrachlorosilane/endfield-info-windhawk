@@ -33,8 +33,8 @@ if (Test-Path -LiteralPath $flagsFile) {
 # NOTE: this mod deliberately avoids new/delete, std::* and exceptions.
 # That is a *size* decision, not a loadability one: Windhawk ships and injects
 # libc++.whl (Engine\Mods\<arch>\libc++.whl), so a mod importing it does run.
-# Steering clear of heap allocation keeps the DLL at ~122 KB instead of ~578 KB
-# with "-static-libstdc++ -static-libgcc".
+# Steering clear of heap allocation keeps the DLL at ~176 KB (measured 180736 B on
+# 2026-10-14) instead of ~578 KB with "-static-libstdc++ -static-libgcc".
 $libs = '-shared -O2 -luser32 -lgdi32 -lpdh -liphlpapi -lpsapi -ladvapi32'
 $command = "`"$compiler\bin\clang++.exe`" $flags $libs -o `"$output`" `"$source`""
 

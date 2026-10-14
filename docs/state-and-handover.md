@@ -12,15 +12,17 @@
   （头顺序 + `ApplyPanelTransform` 未使用）。
 - 7 个导出入口齐全。
 - 依赖仅系统 DLL：`USER32 / GDI32 / PDH / IPHLPAPI / PSAPI / ADVAPI32 / msvcrt / KERNEL32`。
-- 回归测试全绿（316 条断言，含一段**真启动 GDI+** 的排版断言：
+- 回归测试全绿（340 条断言，含一段**真启动 GDI+** 的排版断言：
   文字不折行、且在预算内）。
 - GDI+ 缩放管线用**已知内容**的图验证过（含透明底、纯 RGB、索引色、灰度+alpha、
   16 位、隔行 PNG）。
-- 外部数据（M1）：编译只剩上面那两条已知警告；回归 **316 条断言**全绿（M1、M2、M3 与 CPU 频率共新增 165 条）；
+- 外部数据（M1）：编译只剩上面那两条已知警告；回归 **340 条断言**全绿（M1、M2、M3 与 CPU 频率共新增 180 条）；
   并做了**负对照**——把展开改成递归后，注入断言确实变红（不是"看着像在守"）。
 - 设置块 46 项 / 10 个选项组，`_settings.py` 报 `no structural problems found`。
-- **mod 的日志格式串**用测试宿主查过：`-Wformat` 指向 `endfield-info-windhawk.wh.cpp`
-  的警告为 0（本地 mod build 检查不了这项，见 §3）。
+- **mod 的日志格式串**：`-Wformat` **从来没有检查过它们**（2026-10-14 更正）✗。
+  宿主打的 `Wh_Log` 桩是自造变参函数，没有 format 属性，clang 不会检查；实测同一文件里
+  `printf` 的两处错型各报 1 条、自造桩 0 条。改用 `python _logfmt.py` 审计：105 个调用点、
+  0 处元数/错型问题（负对照实测会红）。详见 AGENTS §3 的方框。
 - 外部数据的**服务端路径**（`ExtHandleLine`：HELLO → SET → 存储 → 查找、换行框架与边缘空格裁剪、
   允许名单拒绝）有断言覆盖（总数见上文，不再重复一个会过期的数字）。
 - **真机整链验证（用户环境，2026-10-13）**：mod 的开机自检两帧被服务端完整收到
@@ -167,7 +169,7 @@
   这块只能靠 mod 的开机自检（`ExtSelfTest` 的两帧是否被服务端记录）与真机日志来验证。
 - **事件面（M2）**：队列规则（替换/合并/优先级/丢弃）、状态机（`StepIsland`）、
   卡片内容模型（`PlanIslandCard`）、severity 配色（`ResolveSeverityColor`）、
-  卡片宽度（`ComputeIslandCardWidth`，含最小宽度与屏幕钳位）都有断言，共 302 条；
+  卡片宽度（`ComputeIslandCardWidth`，含最小宽度与屏幕钳位）都有断言（当时 302 条；当前总数见 §12.1）；
   **卡片绘制本身与宽度改动的观感**只能在机器上看，仍列在未验证之内。
 - **M3 第一片（卡片交互）**：`ComputeIslandRect`（矩形与宽度同源）、`ComputeIslandCloseRect`、
   `BuildIslandRegions`、`IslandHitTest`、`IslandDismiss` 都有断言，其中包括一条**整体性质**：
@@ -216,6 +218,64 @@
   变成 **1400 增 / 1295 删**；"修"时又整file翻成 LF → 1400/1400。写回前先确认原行尾。
 - **辅助函数名先用 `Select-String` 确认**：自检里我写了 `Check ...`，而那份自检的失败计数是 `$bad`，
   于是整段自检中断、连 `SELFTEST PASSED` 都打不出来；而"移除"时只删掉一半，残留 20 行留了数轮。
+
+---
+
+### 10.y 全量源码复查、两处修复与遗留清单（2026-10-14）
+
+一次覆盖 mod（6935 行）、宿主（1696 行）与全部开发脚本的复查。**四条头条**：
+
+1. **CPU 标称频率回归（已修）**：`ReadCpuStatic()` 在每次设置版本变化时重跑，并无条件把注册表
+   `~MHz`（本机 2.42）写进 `g_cpuGhzMax`，而 `CpuNominalEnsure()` 的一次性守卫保证电源 API 的
+   2.20 只应用一次 → **保存过任何设置之后**，`{cpu.ghz}` / `{cpu.ghz.max}` 永久偏高约 10%。
+   修法：新增 `g_cpuGhzFromApi` 锁存来源，注册表只在没有 API 答案时才写 `g_cpuGhzMax`。
+   新增两条断言（`a later registry read does not undo the power API's nominal` 等）；
+   **负对照实测：把修复改回去，恰好这一条变红**（当时 326 条断言 → 旧代码 FAILED 1）。
+2. **"宿主会检查日志格式串"是错的（已更正文档 + 新工具）**：见上文与 AGENTS §3 的方框。
+   属性 / `ms_printf` / `wprintf` / `-fms-compatibility` 四条路实测全堵，MinGW 的 `swprintf`
+   同样不检查 → 新增 `_logfmt.py`（105 个调用点、0 问题；负对照会红）。
+3. **bridge 把 DOM 位置清成 null（已修；很可能是待办 #1 的成因）**：`_netease-bridge.ps1` 里
+   `$positionMs = $null` 出现两次，第二次紧跟在 DOM 取值之后 → 位置退回 store 的 `lineTimeSec`
+   （= 冻结的 `playingLyricLineNumber` 那一行）→ 选行永远选回同一行 → **歌词不换行**。
+   删掉那一行，并在原处留注释说明它必须留在 DOM 之前。⚠️ 该文件是 **CRLF + UTF-8 BOM**，
+   编辑工具会**吃掉 BOM**（Windows PowerShell 5.1 按 GBK 读会乱码）——改完必须字节级检查补回。
+4. **宽扁源图不折半**：`PlanDownscale` 的比例钳位会落进不动点（`200x20` → 12 次 1:1 空转 → `23x2`；
+   `4000x20` 末级一次 173.91×），与注释 "final step within 2x" 和 §5.3「大图逐级折半」冲突。
+
+**第二批已修（2026-10-14；六项，每项都做了负对照）**：
+
+| 修复 | 断言（把修复改回旧写法后**实测变红**） |
+| :-- | :-- |
+| **内联环行的截断预算**：抽出 `ComputeInlineTextLimit`，内联段按"整行 − 光标 − 后面的环"给预算（此前用自身实测 advance，恒不触发截断 → 用 `[[ring:…]]` 的行永不截断、环被挤出面板） | `an inline run with no gauge after it may use the whole row`、`one gauge after the run is reserved out of its budget`、`the run plus the gauges after it exactly fill the row`、`a run already past the right inset gets nothing, never a negative budget` |
+| **收回时间轴**：关键帧 cue 改为 `1.0`（此前把 `kCollapseDurationRatio` 当 cue → 收缩半程即止、后半个时间轴以 16 ms 空转；可见收回只有 `IntroMs/4`） | `the shrink still has work left at the midpoint`、`and it keeps shrinking past the midpoint without passing the tab` |
+| **GPU 有效性标志**：`gpuFanValid` / `gpuPowerValid` / `vramUsedValid` / `vramTotalValid`（此前 PDH 回退机上 `{gpu.fan}`=0、`{gpu.power}`=0、`{gpu.vram.total}`=0.0） | 5 条 `{gpu.fan}` / `{gpu.power}` / `{gpu.vram.*}` → `--` |
+| **`{ext.*}` 行内长度**：暂存缓冲改为 `kExtMaxValueChars + 1`（此前 128 → 静默截到 127 字符，而设置允许 512） | `a long pushed value reaches the row whole, not cut at 127`（399 字符整段到达） |
+| **关掉岛丢相位**：`UpdateIsland` 在 `islandEnabled == false` 时把 `POPPING`/`COLLAPSING` 复位为 `IS_IDLE`（此前状态冻结 → tick 永久 16 ms、卡片也关不掉） | `turning the island off drops a phase that was in flight`、`and the tick falls back off the frame rate with it` |
+| **发布器回收**：`extConsumed` 为假时 `ExtPublisherStop()`（此前关掉开关、或删掉最后一行 `{ext.*}` 后，发布器继续读内存/联网直到卸载） | **无断言**（真 `CreateProcess`）；判据是日志 `nothing consumes {ext.*} any more; stopping it` |
+
+**其余已确认、尚未修**（按建议顺序）：
+
+| 类别 | 问题（位置见当次复查报告） |
+| :-- | :-- |
+| 绘制 | `FitTextToWidth` 的省略号宽度缓存在函数 static，注释称"字体终生固定"，实际字体每次绘制按设置重建 → 改字号后预留宽度失效 |
+| 外部数据 | `WaitForSingleObject(sampler, 2000)` 超时被忽略，随后仍 `DeleteCriticalSection` |
+| 灵动岛 | 合并窗口只看 `(provider,title)` → 同标题的 `warn → critical` 升档被吞 |
+| 灵动岛 | `ComputeIslandCloseRect` 在 `card.h < 22`（`rowHeight` 下限 18）时 y = −4，跑出卡片 |
+| 灵动岛 | 淡出期间再点 × → `IslandDismiss` 幂等返回 false → 落到面板自己的点击行为 |
+| 图标 | 图片-only 槽 + 别处有字形时，载入失败**没有**字形回退（注释声称会借用） |
+| 图标 | 自定义图片不参与入场 `iconScale`（`dw > 2*plateRadius*1.01` 对缓存图恒假） |
+| 图标 | `PlanDownscale` 的比例钳位不动点：短边 ≤ target 的宽扁源图一次都不折半（见上面头条 4） |
+| GPU | PDH 数组读只认 `CStatus == ERROR_SUCCESS`，而 CPU 路径接受 `PDH_CSTATUS_NEW_DATA` |
+| 脚本 | `_settings.py` 两条漏检仍在（同级缩进一致性、每条目单个 `$name`）——即待办 #6 |
+| 脚本 | bridge 的 `$client.Connect(3000)` 无 try/catch → 瞬态管道失败即退出，烧掉 mod 的重启预算 |
+
+**测试装置（这 340 条断言的可信度）**：`kMinLayoutWidth` 只断言了常量；收回时长由测试自己乘
+`kCollapseDurationRatio`（从不调用 `StartIntro`）；"盘心 = 环心"是拿 `g.centerX` 和自己比的
+**恒真**断言；token 覆盖是手抄的 32 个字面量，全文不引用 `kVariables[]`（**新增**变量不会被测到）；
+`Wh_FreeStringSetting` 是空实现（漏 free / double free 都测不出）；GDI+ 段内三处
+`section skipped` **不增加失败数**；尾随空格哨兵 U+2502 无断言。
+"跳过 = 通过"与"改坏不会红"都已被变异实验证实。
+
 ---
 
 ## 12. 交接说明（本会话结束时写入）
@@ -224,10 +284,10 @@
 
 **已验证（有证据）**：
 
-- mod 编译：**恰好 2 条已知警告**，DLL **179712** 字节；回归 **325 断言 × 3 次 `PASSED`**。
+- mod 编译：**恰好 2 条已知警告**，DLL **179712** 字节；回归 **340 断言**全绿（2026-10-14 两批修复后为 340）。
 - 设置块：`_settings.py` → `no structural problems found`；独立结构检查 49 条目、顶层 dash 缩进唯一为 0、每条目恰好一个 `$name`/`$description`。
 - 真实管道链：mod 开机自检两帧被服务端完整收到；`_extclient.ps1` 的值**显示在面板上**。
-- `{cpu.ghz}`：用户确认显示**正确**，标称取电源 API 的 **2.20 GHz**（注册表 2.42 被正确忽略）。
+- `{cpu.ghz}`：用户确认显示**正确**，标称取电源 API 的 **2.20 GHz**（注册表 2.42 被正确忽略）。⚠️ 但**保存过任何设置之后**它曾回退到注册表值（2026-10-14 修，见 §10.y 头条 1）。
 - 看门狗：日志出现 `EXT publisher: started pid=…`，命令行按 `CreateProcessW` 约定正确拆分。
 - 歌词来源（部分打通）：`async:lyric.lyricLines`（实测 **64 / 67** 行）与 `tlyricLines`；**真 currentTime** 来自 `#page_pc_mini_bar` 的 `mm:ss / mm:ss`。
 - bridge 自检 **30 项**（含 8 项 `Select-StoreLineIndex`，不假设长度）全绿。
