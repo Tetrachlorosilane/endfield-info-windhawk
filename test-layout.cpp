@@ -16,6 +16,7 @@
 #include <psapi.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
 
@@ -45,10 +46,47 @@ static int Wh_GetIntSetting(PCWSTR name, ...) {
     const WCHAR *v = StubLookup(g_stubInts, g_stubIntCount, name);
     return v[0] ? _wtoi(v) : 0;
 }
-static PCWSTR Wh_GetStringSetting(PCWSTR name, ...) {
-    return StubLookup(g_stubStrings, g_stubStringCount, name);
+
+// The real Wh_GetStringSetting hands back a freshly allocated copy that the caller must
+// release with Wh_FreeStringSetting (windhawk_api.h:230-245). A stub that returned a
+// pointer into its own table could not tell a leak from a double free -- both were
+// invisible, and both are easy to introduce. Every handout is recorded here, every free
+// has to match one, and whatever is still outstanding at the end of main is a leak.
+static const WCHAR *g_handedOut[64];
+static int g_handedOutCount = 0;
+static bool g_stringLedgerBroken = false;
+static int g_stringsHandedOut = 0;
+
+static WCHAR *StubDupString(const WCHAR *value) {
+    const size_t chars = wcslen(value) + 1;
+    WCHAR *copy = (WCHAR *)malloc(chars * sizeof(WCHAR));
+    if (!copy) return nullptr;
+    wcscpy(copy, value);
+    if (g_handedOutCount < (int)(sizeof(g_handedOut) / sizeof(g_handedOut[0]))) {
+        g_handedOut[g_handedOutCount++] = copy;
+    } else {
+        g_stringLedgerBroken = true;   // more outstanding strings than the ledger holds
+    }
+    g_stringsHandedOut++;
+    return copy;
 }
-static void Wh_FreeStringSetting(PCWSTR) {}
+
+static PCWSTR Wh_GetStringSetting(PCWSTR name, ...) {
+    return StubDupString(StubLookup(g_stubStrings, g_stubStringCount, name));
+}
+
+static void Wh_FreeStringSetting(PCWSTR value) {
+    if (!value) return;                 // the real API tolerates a null release
+    for (int i = 0; i < g_handedOutCount; i++) {
+        if (g_handedOut[i] != value) continue;
+        g_handedOut[i] = g_handedOut[--g_handedOutCount];
+        free((void *)value);
+        return;
+    }
+    printf("  Wh_FreeStringSetting on a pointer that was never handed out "
+           "(double free, or a free of something else)\n");
+    g_stringLedgerBroken = true;
+}
 static void Wh_Log(const WCHAR *fmt, ...) {
     va_list args;
     va_start(args, fmt);
@@ -61,10 +99,19 @@ static bool Wh_SetFunctionHook(void *, void *, void **) { return true; }
 #include "endfield-info-windhawk.wh.cpp"
 
 static int g_failures = 0;
+static int g_skips = 0;
 
 static void Check(bool ok, const char *label) {
     printf("  %-58s %s\n", label, ok ? "OK" : "FAIL");
     if (!ok) g_failures++;
+}
+
+// A check that cannot run in this environment. It is counted and printed, never silently
+// skipped: "the check passed" and "the check never ran" used to look identical in the
+// output, which is the trap AGENTS 3 warns about.
+static void Skip(const char *label) {
+    printf("  %-58s SKIP\n", label);
+    g_skips++;
 }
 
 int main() {
@@ -242,18 +289,20 @@ int main() {
             printf("  %4d  %7.0f  ", rowCount, panelH);
             for (int r = 0; r < rowCount; r++) {
                 float px = 0.0f, py = 0.0f;
-                IconPlateCenterForRow(s, r, (float)(r * s.rowHeight), (float)s.rowHeight,
-                                      &px, &py);
+                const float rowTop = (float)(r * s.rowHeight);
+                IconPlateCenterForRow(s, r, rowTop, (float)s.rowHeight, &px, &py);
                 printf("%.0f ", py);
+                // The centre has to be the middle of *that* row, and the plate has to
+                // fit inside it. A "panel centre only coincides with a plate on one row"
+                // check used to sit here whose condition was algebraically identical to
+                // its conclusion -- it could not fail, and so proved nothing.
+                Check(py == rowTop + s.rowHeight / 2.0f,
+                      "each plate is centred in its own row");
+                Check(py - IconPlateDiameter(s, r) / 2.0f >= rowTop - 0.01f &&
+                          py + IconPlateDiameter(s, r) / 2.0f <= rowTop + s.rowHeight + 0.01f,
+                      "and the whole plate fits inside that row");
             }
             printf("\n");
-
-            float px = 0.0f, firstY = 0.0f;
-            IconPlateCenterForRow(s, 0, 0.0f, (float)s.rowHeight, &px, &firstY);
-            Check(firstY == s.rowHeight / 2.0f, "first row plate sits at half a row");
-            if (firstY == panelH / 2.0f) {
-                Check(rowCount == 1, "panel centre only coincides with a plate on one row");
-            }
         }
 
         // Ripples must be emitted per plate, each from its own centre. Two icons
@@ -279,40 +328,31 @@ int main() {
         // The plate and its rings are different sizes but must share one centre.
         // This is the assertion that pins the reported symptom: the rings have to
         // come out of the plate, not from somewhere near it.
-        printf("\n  row  plate centre      ring centre       plate r  ring r(0)  r(0.5)  r(1)\n");
-        double worstCenterError = 0.0;
+        // The plate and its rings are different sizes but share one centre. Both painters
+        // take that centre from this geometry value, so a check that reads the centre out
+        // of the struct twice ("ring centre == plate centre") is algebraically true and
+        // cannot fail -- there was one here, and it proved nothing. What is worth
+        // asserting is that the value itself is sane: the plate has to fit the panel.
+        printf("\n  row  plate centre      ring r    plate r  ring r(0)  r(0.5)  r(1)\n");
         for (int r = 0; r < 4; r++) {
             IconGeometry g = ComputeIconGeometry(s, r, (float)(r * s.rowHeight));
             if (!g.present) continue;
 
-            // The plate is drawn at (g.centerX, g.centerY); the rings are drawn at
-            // the same two values. Recompute what the ring painter uses so the test
-            // fails if a future edit offsets one of them again.
-            float ringCenterX = g.centerX;
-            float ringCenterY = g.centerY;   // no vertical offset of any kind
-            double errX = (double)(ringCenterX - g.centerX);
-            double errY = (double)(ringCenterY - g.centerY);
-            double err = errX < 0 ? -errX : errX;
-            double errYAbs = errY < 0 ? -errY : errY;
-            if (errYAbs > err) err = errYAbs;
-            if (err > worstCenterError) worstCenterError = err;
-
             float r0 = RingRadiusAt(g, 0, 0.0);
             float rMid = RingRadiusAt(g, 0, 0.5);
             float rEnd = RingRadiusAt(g, 0, 1.0);
-            printf("  %3d  (%6.1f,%6.1f)  (%6.1f,%6.1f)  %7.1f  %7.1f  %6.1f  %5.1f\n",
-                   r + 1, g.centerX, g.centerY, ringCenterX, ringCenterY,
-                   g.plateRadius, r0, rMid, rEnd);
-            Check(worstCenterError == 0.0, "ring centre equals plate centre exactly");
+            printf("  %3d  (%6.1f,%6.1f)  %7.1f  %7.1f  %7.1f  %6.1f  %5.1f\n",
+                   r + 1, g.centerX, g.centerY, g.plateRadius, r0, rMid, rEnd);
+            Check(g.centerX - g.plateRadius >= 0.0f,
+                  "the plate stays inside the panel's left edge");
 
             // Sizes differ on purpose, and the rings must always be the larger of
             // the two: a ring smaller than the plate would sit on the glyph.
             Check(g.plateRadius != rEnd, "rings and plate have different sizes");
             Check(r0 >= g.plateRadius - 0.01f, "the innermost ring starts at the plate edge");
             Check(rEnd > g.plateRadius, "rings expand outward past the plate");
-            Check(rMid > r0 && rEnd > rMid, "ring radius grows with progress");        }
-        printf("  worst plate/ring centre mismatch = %.1f px\n", worstCenterError);
-        Check(worstCenterError == 0.0, "plate and ring centres never drift apart");
+            Check(rMid > r0 && rEnd > rMid, "ring radius grows with progress");
+        }
 
         // 2. The ripple's anchor must be the first row's plate, and the plate must
         //    be drawn under the same transform as the ripple.
@@ -902,9 +942,17 @@ int main() {
         Check(FitCharsWithEllipsis(40, 400.0f, 0.0f, widthOfChars, &l) == 0,
               "an unmeasurable ellipsis falls back to a plain trim");
 
-        // The box handed to DrawString follows the same floor, so the fit and the box
-        // cannot disagree about how little room is too little.
-        Check(kMinLayoutWidth >= 1.0f, "the layout box floor is never degenerate");
+        // The box handed to DrawString and the trim budget share one floor, so the two
+        // cannot disagree about how little room is too little. Asked through the product
+        // function rather than by copying the expression (the old assertion here only
+        // checked the constant, and the GDI+ section copied the expression itself).
+        Check(LayoutWidthFloor(0.0f) == kMinLayoutWidth, "a zero-width box is raised to the floor");
+        Check(LayoutWidthFloor(-5.0f) == kMinLayoutWidth, "so is a negative one");
+        Check(LayoutWidthFloor(kMinLayoutWidth / 2.0f) == kMinLayoutWidth,
+              "and anything under the floor");
+        Check(LayoutWidthFloor(120.0f) == 120.0f, "a usable width is left alone");
+        Check(LayoutWidthFloor(kMinLayoutWidth) == kMinLayoutWidth,
+              "the floor itself passes through unchanged");
     }
 
     printf("\n=== ComputeRowTextMetrics ===\n");
@@ -981,16 +1029,13 @@ int main() {
         wcscpy(t.uptimeText, L"1d 02:03");
         t.modWsMb = 7.5; t.modCpuMs = 123;
 
-        const WCHAR *tokens[] = {
-            L"cpu", L"cpu.user", L"cpu.kernel", L"cpu.ghz", L"cpu.ghz.max",
-            L"cpu.name", L"cpu.cores", L"cpu.threads",
-            L"mem", L"mem.used", L"mem.total", L"mem.free", L"mem.commit",
-            L"net.down", L"net.up", L"net.down.bps", L"net.up.bps", L"net.total", L"net.nics",
-            L"gpu", L"gpu.mem", L"gpu.temp", L"gpu.name", L"gpu.vram.used",
-            L"gpu.vram.total", L"gpu.fan", L"gpu.power",
-            L"time", L"date", L"uptime", L"mod.ws", L"mod.cpu",
-        };
-        for (const WCHAR *token : tokens) {
+        // Iterate the product's own registry rather than a hand-written copy of it. A
+        // variable added to kVariables[] used to be invisible here -- the list below was
+        // a second copy that nothing compared against the first, so registering a
+        // variable without implementing it left every assertion green, which is the
+        // opposite of what AGENTS 9 claims.
+        for (int i = 0; i < kVariableCount; i++) {
+            const WCHAR *token = kVariables[i].name;
             WCHAR row[128];
             swprintf(row, 128, L"[{%ls}]", token);
             WCHAR marked[640];
@@ -1001,7 +1046,10 @@ int main() {
             // The expansion must not still contain a brace.
             bool resolved = wcschr(marked, L'{') == nullptr;
             if (!resolved) printf("    {%ls} -> \"%ls\"\n", token, marked);
-            Check(resolved, "token resolves (no leftover braces)");
+            Check(resolved, "every registered variable resolves (no leftover braces)");
+            // A registration with no group would never be collected, so the token would
+            // render a value that is always zero.
+            Check(kVariables[i].group != G_NONE, "every registered variable names a collector");
         }
     }
 
@@ -1110,7 +1158,7 @@ int main() {
             }
         }
         if (!gdiplusReady) {
-            printf("  GDI+ did not start on this machine; section skipped\n");
+            Skip("GDI+ starts on this machine (real-text checks)");
         } else {
             const int width = 420, height = 30;
             BITMAPINFO bmi = {};
@@ -1137,7 +1185,11 @@ int main() {
                 GpFont *font = nullptr;
                 if (family) g_gdiplus.CreateFont(family, 15.0f, 0, 0, &font);
                 GpStringFormat *format = CreateRowStringFormat();
-                if (!format) printf("  CreateRowStringFormat failed; section skipped\n");
+                // Product code: a null here is a failure, not a reason to skip. The
+                // NoWrap/fitting checks below are the only automatic defence for the
+                // "text wraps and the first line rides up" regression, and they used to
+                // disappear from the output without a trace.
+                Check(format != nullptr, "CreateRowStringFormat builds the row format");
 
                 if (font && format) {
                     const float boxHeight = 30.0f;
@@ -1174,7 +1226,7 @@ int main() {
                         wcsncpy(buffer, seg.text, 639);
                         buffer[639] = L'\0';
 
-                        float budget = seg.budget > kMinLayoutWidth ? seg.budget : kMinLayoutWidth;
+                        float budget = LayoutWidthFloor(seg.budget);
                         float natural = MeasureAdvance(graphics, font, format, buffer, boxHeight);
 
                         bool fitted = FitTextToWidth(graphics, font, format, buffer,
@@ -1206,6 +1258,21 @@ int main() {
                     Check(fitAllSingle, "a fitted run is drawn on one line");
                     Check(allInsideBudget, "every fitted run stays inside its budget");
                     Check(allFitted, "a run wider than its budget is actually trimmed");
+
+                    // The trailing-space sentinel: GDI+ MeasureString deliberately ignores
+                    // trailing spaces, so "9%  " would advance no further than "9%" and an
+                    // inline gauge would land on top of the '%'. Measured here with the
+                    // real font; remove the sentinel from MeasureAdvance and this goes red.
+                    {
+                        const float bare =
+                            MeasureAdvance(graphics, font, format, L"CPU 12%", boxHeight);
+                        const float padded =
+                            MeasureAdvance(graphics, font, format, L"CPU 12%   ", boxHeight);
+                        printf("  trailing spaces: \"CPU 12%%\" = %.1f px, with 3 spaces = %.1f px\n",
+                               bare, padded);
+                        Check(padded > bare + 1.0f,
+                              "trailing spaces advance the run (that is what the sentinel buys)");
+                    }
                     if (!allInsideBudget)
                         printf("  worst overflow = %.1f px\n", worstOverflow);
 
@@ -1224,14 +1291,14 @@ int main() {
                                "without NoWrap this was 2+\n", naturalWide, lines);
                     }
                 } else {
-                    printf("  Segoe UI could not be created; section skipped\n");
+                    Skip("Segoe UI is installed (real-text checks)");
                 }
                 if (format) g_gdiplus.DeleteStringFormat(format);
                 if (font) g_gdiplus.DeleteFont(font);
                 if (family) g_gdiplus.DeleteFontFamily(family);
                 g_gdiplus.DeleteGraphics(graphics);
             } else {
-                printf("  could not build the probe surface; section skipped\n");
+                Skip("the probe surface could be built (real-text checks)");
             }
             if (bitmap) g_gdiplus.DisposeImage((GpImage *)bitmap);
             if (dib) DeleteObject(dib);
@@ -1943,8 +2010,9 @@ int main() {
             }
 
             if (!writable) {
-                printf("  this environment refuses pipe clients (err=%lu); "
-                       "the DACL check is skipped here\n", controlErr);
+                Skip("the pipe DACL admits the user running the mod (no pipe clients here)");
+                printf("    control pipe err=%lu (a confined sandbox refuses every descriptor)\n",
+                       controlErr);
             } else {
                 PSECURITY_DESCRIPTOR sd = ExtPipeSecurityDescriptor();
                 SECURITY_ATTRIBUTES sa = {};
@@ -1976,6 +2044,23 @@ int main() {
         g_extLockReady = false;
     }
 
-    printf("\n%s (%d failure(s))\n", g_failures ? "FAILED" : "PASSED", g_failures);
+    // The settings strings are the one place the product has to pair an allocation with
+    // a release, and the stub now models that ownership. Anything still outstanding here
+    // leaked; a free the ledger did not recognise already printed its own line.
+    printf("\n=== settings string ownership ===\n");
+    printf("  handed out %d string(s) during the run, %d still outstanding\n",
+           g_stringsHandedOut, g_handedOutCount);
+    Check(g_handedOutCount == 0, "every settings string the run asked for was released");
+    Check(!g_stringLedgerBroken, "no string was released twice or never handed out");
+
+    // Skips are printed in the last line too: a run that quietly stopped checking half
+    // its invariants must not read like a clean pass.
+    if (g_skips) printf("\nSKIPPED: %d check(s) could not run in this environment\n", g_skips);
+    if (g_skips) {
+        printf("%s (%d failure(s), %d skipped)\n", g_failures ? "FAILED" : "PASSED", g_failures,
+               g_skips);
+    } else {
+        printf("%s (%d failure(s))\n", g_failures ? "FAILED" : "PASSED", g_failures);
+    }
     return g_failures ? 1 : 0;
 }

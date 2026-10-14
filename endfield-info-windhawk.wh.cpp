@@ -3161,6 +3161,15 @@ static float ComputeInlineTextLimit(float textRight, float cursor, int ringsAfte
     return limit > 0.0f ? limit : 0.0f;
 }
 
+// The floor both the trim budget and the DrawString box use. A zero-width box makes GDI+
+// drop the whole run -- that is the other half of the "every row after the first
+// disappeared" bug -- so the floor lives in one function that both call sites ask,
+// instead of the same expression being written out twice (the regression test used to
+// copy the expression, which meant it tested its own copy; see AGENTS 7.8).
+static float LayoutWidthFloor(float width) {
+    return width > kMinLayoutWidth ? width : kMinLayoutWidth;
+}
+
 // Colour of a ring gauge. Precedence, highest first:
 //
 //   1. the per-ring :COLOR field in [[ring:VALUE:MAX:THICK:COLOR]]
@@ -4877,7 +4886,7 @@ static void PaintPanel(HWND hwnd) {
                             limit = ComputeInlineTextLimit(metrics.textRight, cursor, ringsAfter,
                                                            g_settings.ringSize);
                         }
-                        float budget = limit > kMinLayoutWidth ? limit : kMinLayoutWidth;
+                        float budget = LayoutWidthFloor(limit);
 
                         // The run's own width is what an inline gauge is placed after
                         // (including the spaces written before it); a parked run is
@@ -4901,7 +4910,7 @@ static void PaintPanel(HWND hwnd) {
                                                      (float)g_settings.rowHeight);
                         }
 
-                        float drawWidth = advance > kMinLayoutWidth ? advance : kMinLayoutWidth;
+                        float drawWidth = LayoutWidthFloor(advance);
                         RectF layout(cursor, top, drawWidth, (float)g_settings.rowHeight);
                         if (logDraws) {
                             DBG(L"    draw row=%d seg=%d x=%.1f y=%.1f w=%.1f "
