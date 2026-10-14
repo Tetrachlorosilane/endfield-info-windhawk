@@ -113,9 +113,19 @@ python _settings.py
 检查设置块结构并统一 `$name` / `$description` 的引号。期望输出含
 `no structural problems found`。
 
+它查的结构项是**被 Windhawk 的解析器拒绝过、而它当时却说没事**的那些：
+
+- **序列项的缩进**：顶层条目必须在第 0 列，`$options` 下的选项项必须正好 4 空格
+  （5 空格 → js-yaml `bad indentation of a sequence entry`）；
+- **每条目恰好一个 `$name` / 一个 `$description`**（把新条目插到上一条目的键与它自己的
+  `$name` 之间 → `duplicated mapping key`）；
+- **顶层键不重复**、**同一 `$options` 组内选项不重复**（YAML 会静默保留最后一个）；
+- 选项项必须出现在它那条目的 `$options:` 之后。
+
 注意：`$name` / `$description` 必须**单引号包裹**（裸的 `-` 会被 YAML 解析成序列，
 导致 `bad indentation of a mapping entry`）；数值设置项**不要加引号**，否则
 `Wh_GetIntSetting` 取不到。
+`--write` 只重写这两种显示串，且是幂等的（实测字节不变）。
 
 ### 回归测试（改过任何绘制/布局/配色/动画逻辑就跑）
 
@@ -306,9 +316,13 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 - **用户路径必须裁剪引号与前后空白**（`CopyUserPath`）。
   曾把 `"C:\...\img.png"` 的引号一起传给文件 API → "文件明明在却 could not load"。
 - **图片载入失败必须回退到内置字形。** 否则只剩空盘，看起来像"图标变纯白"，
-  会把人引向完全错误的排查方向。
+  会把人引向完全错误的排查方向。借用规则在 `ReadSettings`：**任何**只有图片的槽都会借到
+  第一个已配置的字形，一个都没有时用 `Memory`——不是"全工程都没有字形"那一种情形才借，
+  混合配置（第 1 行图片、第 2 行 Network）曾经正好漏在缝里。
 - **自定义图片在载入时按盘径重采样一次**，不在每帧缩放。大图一步压到 23px 会有锯齿，
-  且每帧重采样很贵。
+  且每帧重采样很贵。**逐级折半对"短边已经小于目标箱"的横幅同样成立**：
+  `PlanDownscale` 只按比例折半，不把短边钳回目标（那个钳位有不动点，会让宽扁图做十几次
+  1:1 空转、然后一次性压 173 倍）；短边在中间步骤允许降到 1px，末级仍由长边定尺。
 
 ### 5.4 动画
 
@@ -452,6 +466,8 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 | 行内展开用 128 字符暂存缓冲 | `{ext.*}` 的值被静默截到 127 字符（设置允许 512，且不带 `…`） | 399 字符的值整段到达行里 |
 | 关掉岛不丢相位 | `POPPING`/`COLLAPSING` 冻结 → `IslandPhaseAnimating` 恒真 → tick 永久钉在 16 ms，卡片也关不掉 | `turning the island off drops a phase that was in flight` |
 | 发布器没有回收路径 | 关掉 `External data`、或删掉最后一行 `{ext.*}` 后，mod 启动的发布器继续跑（读内存/联网）直到卸载 | **没有断言**（真 `CreateProcess`）；判据是日志 `nothing consumes {ext.*} any more; stopping it` |
+| `PlanDownscale` 的比例钳位有不动点 | 短边已小于目标箱的宽扁图（横幅）**一次都不折半**：十几次 1:1 空转之后一次性压 173 倍——正是要修的锯齿形态 | `no stage reduces the long edge by more than 2x`、`the short side is the exact fit, rounded up by at most a pixel` |
+| 图片-only 槽只在"全工程都没有字形"时才借字形 | 混合配置（第 1 行图片、第 2 行 Network）里图片载入失败仍是**空盘**，看着像"图标变纯白" | `an image-only slot borrows the configured glyph`、`with no glyph anywhere an image-only slot falls back to Memory` |
 
 ### 排查心法：先分类，再定位
 

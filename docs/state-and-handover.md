@@ -12,11 +12,11 @@
   （头顺序 + `ApplyPanelTransform` 未使用）。
 - 7 个导出入口齐全。
 - 依赖仅系统 DLL：`USER32 / GDI32 / PDH / IPHLPAPI / PSAPI / ADVAPI32 / msvcrt / KERNEL32`。
-- 回归测试全绿（340 条断言，含一段**真启动 GDI+** 的排版断言：
+- 回归测试全绿（366 条断言，含一段**真启动 GDI+** 的排版断言：
   文字不折行、且在预算内）。
 - GDI+ 缩放管线用**已知内容**的图验证过（含透明底、纯 RGB、索引色、灰度+alpha、
   16 位、隔行 PNG）。
-- 外部数据（M1）：编译只剩上面那两条已知警告；回归 **340 条断言**全绿（M1、M2、M3 与 CPU 频率共新增 180 条）；
+- 外部数据（M1）：编译只剩上面那两条已知警告；回归 **366 条断言**全绿（M1、M2、M3 与 CPU 频率共新增 206 条）；
   并做了**负对照**——把展开改成递归后，注入断言确实变红（不是"看着像在守"）。
 - 设置块 46 项 / 10 个选项组，`_settings.py` 报 `no structural problems found`。
 - **mod 的日志格式串**：`-Wformat` **从来没有检查过它们**（2026-10-14 更正）✗。
@@ -253,6 +253,14 @@
 | **关掉岛丢相位**：`UpdateIsland` 在 `islandEnabled == false` 时把 `POPPING`/`COLLAPSING` 复位为 `IS_IDLE`（此前状态冻结 → tick 永久 16 ms、卡片也关不掉） | `turning the island off drops a phase that was in flight`、`and the tick falls back off the frame rate with it` |
 | **发布器回收**：`extConsumed` 为假时 `ExtPublisherStop()`（此前关掉开关、或删掉最后一行 `{ext.*}` 后，发布器继续读内存/联网直到卸载） | **无断言**（真 `CreateProcess`）；判据是日志 `nothing consumes {ext.*} any more; stopping it` |
 
+**第三批已修（2026-10-14；三项，每项都做了负对照）**：
+
+| 修复 | 断言 / 负对照 |
+| :-- | :-- |
+| **`PlanDownscale` 的不动点**：去掉"把短边钳回目标"的比例钳位（它让 `200x20` 这类横幅做十几次 1:1 空转、随后一次性压 8.7 倍；`4000x20` 末级 173 倍），改为纯按比例折半、短边允许降到 1px | `no stage reduces the long edge by more than 2x`、`the short side is the exact fit, rounded up by at most a pixel`；把钳位改回去 → 红 |
+| **图片-only 槽的字形回退**：借"第一个已配置的字形"（一个都没有则 `Memory`）现在对**任何**图片槽生效，不再只在"全工程都没有字形"时才借 | `an image-only slot borrows the configured glyph`、`with no glyph anywhere an image-only slot falls back to Memory`；把回退改回旧条件 → 红 |
+| **`_settings.py` 的两条漏检（待办 #6）**：新增"序列项缩进一致性（顶层 0 列 / 选项 4 空格）"与"每条目恰好一个 `$name` / `$description`"，外加顶层键不重复、同组选项不重复、选项必须在 `$options:` 之后 | 逐条注入实测：5 空格缩进、重复 `$name`、重复键、重复选项各自报错并 exit 1；未改动的块仍 `no structural problems found`，`--write` 幂等（字节不变） |
+
 **其余已确认、尚未修**（按建议顺序）：
 
 | 类别 | 问题（位置见当次复查报告） |
@@ -262,14 +270,12 @@
 | 灵动岛 | 合并窗口只看 `(provider,title)` → 同标题的 `warn → critical` 升档被吞 |
 | 灵动岛 | `ComputeIslandCloseRect` 在 `card.h < 22`（`rowHeight` 下限 18）时 y = −4，跑出卡片 |
 | 灵动岛 | 淡出期间再点 × → `IslandDismiss` 幂等返回 false → 落到面板自己的点击行为 |
-| 图标 | 图片-only 槽 + 别处有字形时，载入失败**没有**字形回退（注释声称会借用） |
 | 图标 | 自定义图片不参与入场 `iconScale`（`dw > 2*plateRadius*1.01` 对缓存图恒假） |
-| 图标 | `PlanDownscale` 的比例钳位不动点：短边 ≤ target 的宽扁源图一次都不折半（见上面头条 4） |
 | GPU | PDH 数组读只认 `CStatus == ERROR_SUCCESS`，而 CPU 路径接受 `PDH_CSTATUS_NEW_DATA` |
-| 脚本 | `_settings.py` 两条漏检仍在（同级缩进一致性、每条目单个 `$name`）——即待办 #6 |
 | 脚本 | bridge 的 `$client.Connect(3000)` 无 try/catch → 瞬态管道失败即退出，烧掉 mod 的重启预算 |
+| 设置 | `IconPath`（Custom icon file）是死设置项：界面里有、`ReadSettings` 从不读 |
 
-**测试装置（这 340 条断言的可信度）**：`kMinLayoutWidth` 只断言了常量；收回时长由测试自己乘
+**测试装置（这 366 条断言的可信度）**：`kMinLayoutWidth` 只断言了常量；收回时长由测试自己乘
 `kCollapseDurationRatio`（从不调用 `StartIntro`）；"盘心 = 环心"是拿 `g.centerX` 和自己比的
 **恒真**断言；token 覆盖是手抄的 32 个字面量，全文不引用 `kVariables[]`（**新增**变量不会被测到）；
 `Wh_FreeStringSetting` 是空实现（漏 free / double free 都测不出）；GDI+ 段内三处
@@ -284,7 +290,7 @@
 
 **已验证（有证据）**：
 
-- mod 编译：**恰好 2 条已知警告**，DLL **179712** 字节；回归 **340 断言**全绿（2026-10-14 两批修复后为 340）。
+- mod 编译：**恰好 2 条已知警告**，DLL **180736** 字节；回归 **366 断言**全绿（2026-10-14 三批修复后为 366）。
 - 设置块：`_settings.py` → `no structural problems found`；独立结构检查 49 条目、顶层 dash 缩进唯一为 0、每条目恰好一个 `$name`/`$description`。
 - 真实管道链：mod 开机自检两帧被服务端完整收到；`_extclient.ps1` 的值**显示在面板上**。
 - `{cpu.ghz}`：用户确认显示**正确**，标称取电源 API 的 **2.20 GHz**（注册表 2.42 被正确忽略）。⚠️ 但**保存过任何设置之后**它曾回退到注册表值（2026-10-14 修，见 §10.y 头条 1）。
@@ -295,21 +301,23 @@
 **未验证 / 待办（按优先级）**：
 
 1. **面板上的歌词是否真的随播放换行**（用户尚未回报）。排查顺序：bridge 手跑输出 → `Get-CdpDomTime` 是否拿到 `curS` → `times` 是否拉到 → 选行索引是否变化。
+   ⚠️ 2026-10-14：`$positionMs = $null` 被写了两遍、第二遍把 DOM 的真 currentTime 清掉（已修，见 §10.y 头条 3）——**先确认修后是否换行**，再按这个顺序排查。
 2. **发布器重启风暴是否消失**（已改成"等待窗口"而非 `exit 2`）；建议同时设 `External publisher watch process = cloudmusic`。
 3. 作业对象是否收掉**孙进程**、`CREATE_NO_WINDOW` 是否不闪窗、重载无孤儿 —— 三条只能真机看进程列表。
 4. 客户端**升级后** store 自寻址是否仍可用（跑一次 `-ProbeCdp`，它会自寻址并列出可见字段）。
 5. `playingState` 在**暂停**时的取值仍未知（目前不拿它判暂停）。
-6. `_settings.py` 补两条漏检：**同级条目缩进一致性**、**每条目单个 `$name`**（Windhawk 两次报错它都没抓到）。
+6. ~~`_settings.py` 补两条漏检~~ —— **2026-10-14 已补**（缩进一致性、每条目单个 `$name`，外加重复键/重复选项），四条检查都有注入式负对照，见 §10.y 第三批。
 7. `ApplyPanelTransform` 的 `unused function` 警告（加 `__attribute__((unused))` 或挪进测试文件）。
 8. 设计文档里 M3 剩下的部分：`ComputeIslandRect` 接管窗口定位。
 9. AGENTS 的章节顺序：`### 10.x` 那段是追加在 §11 之后的，若在意次序可挪进 §10 末尾。
+10. **测试装置自身的缺口**（§10.y 末尾列了一串）：三处 `section skipped` 仍报 `PASSED`、两条恒真断言、`kMinLayoutWidth` 只断言常量、尾随空格哨兵 U+2502 无断言、桩不模拟字符串所有权、token 列表与 `kVariables[]` 无对应。都能变成会红的断言，是下一批最省事的目标。
 
 ### 12.2 犯错档案（本会话的错误 → 原因 → 防范）
 
 | 错误 | 原因 | 防范 |
 | :-- | :-- | :-- |
-| 设置块缩进错，Windhawk 报 `bad indentation of a sequence entry` | 凭感觉写缩进，而 `_settings.py` 不查这一项 | 抄相邻条目的风格；给 `_settings.py` 补检查 |
-| 条目插在"键"与它自己的 `$name` 之间 → `duplicated mapping key` | 锚点选在 `$name` 上，而它属于**上一行**的条目 | 条目边界是**下一条 `- Key:`**；结构检查保证每条目单 `$name` |
+| 设置块缩进错，Windhawk 报 `bad indentation of a sequence entry` | 凭感觉写缩进，而 `_settings.py` 不查这一项 | 抄相邻条目的风格；给 `_settings.py` 补检查（2026-10-14 已补：它现在查缩进一致性） |
+| 条目插在"键"与它自己的 `$name` 之间 → `duplicated mapping key` | 锚点选在 `$name` 上，而它属于**上一行**的条目 | 条目边界是**下一条 `- Key:`**；结构检查保证每条目单 `$name`（已实现） |
 | 断言里凭空写 `Check` → 自检中断数轮 | 凭记忆用辅助函数名（真实失败计数是 `$bad`） | 插入前先 `Select-String` 找**真正的汇总行**；残留块要整段删除并复核 |
 | 日志清理**误删活代码**（两次，共 6 个编译错误） | 日志与其专用计数器绑定；按**文本**删命中别的函数，按**行号**删又算错一位 | **静默优于删除**（`DBG` 宏保留语句）；删前先编译，只删编译器点名的行 |
 | 20 行补丁在 diff 里变成 1400 行 | `ReadAllText` 读、却 `split` + `join CRLF` 写回 | 写回前确认原行尾；优先 `Replace` + `WriteAllText` |
