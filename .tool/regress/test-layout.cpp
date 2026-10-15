@@ -5418,17 +5418,40 @@ int main() {
         // --- M2: the event channel (design 4.2 / 7.2 / 7.3) -----------------------
         {
             ExtCommand ev;
-            Check(ExtParseLine(L"EVENT music info 8000 Title body text here", ev) == 0 &&
+            // The event's text field carries two fields: the title, then -- after a run
+            // of two or more spaces -- the artist. A title *contains* spaces (`Blue
+            // Hour`), so a token-shaped title is what used to chop it: the old parse
+            // gave titleLen 4 ("Blue") and dropped `Hour  Mili` onto the second row.
+            Check(ExtParseLine(L"EVENT music info 8000 Blue Hour  Mili", ev) == 0 &&
                       ev.cmd == EC_EVENT && ev.severity == ES_INFO && ev.ttlLen == 4 &&
-                      ev.titleLen == 5 && ev.bodyLen == 14,
-                  "EVENT parses provider, severity, ttl, title and the rest as body");
+                      ev.titleLen == 9 && wcsncmp(ev.title, L"Blue Hour", 9) == 0 &&
+                      ev.artistLen == 4 && wcscmp(ev.artist, L"Mili") == 0,
+                  "EVENT keeps a title with spaces and splits the artist off at two spaces");
+            // Both halves may contain single spaces. This is the frame the bridge emits.
+            Check(ExtParseLine(L"EVENT netease info 6000 \x94C1\x82B1\x98DE  Mili / \x585E\x58EC\x5531\x7247-MSR",
+                               ev) == 0 &&
+                      ev.titleLen == 3 && wcsncmp(ev.title, L"\x94C1\x82B1\x98DE", 3) == 0 &&
+                      wcscmp(ev.artist, L"Mili / \x585E\x58EC\x5531\x7247-MSR") == 0,
+                  "the bridge's real frame splits into song name and artist");
+            // One space is text, not a separator -- that is the whole reason the rule is
+            // a *run* of two.
+            Check(ExtParseLine(L"EVENT music info 8000 Blue Hour", ev) == 0 &&
+                      ev.titleLen == 9 && ev.artistLen == 0,
+                  "a single space does not split; the event then has no artist at all");
+            // An old-format frame (one text field, never a separator) is not an error
+            // and not a guess: the whole text is the title and the card draws one row.
+            Check(ExtParseLine(L"EVENT music info 8000 Title body text here", ev) == 0 &&
+                      ev.titleLen == 20 && ev.artistLen == 0,
+                  "a frame without the separator is a title-only event (old format)");
             Check(ExtParseLine(L"EVENT music critical - T b", ev) == 0 &&
-                      ev.severity == ES_CRITICAL && ev.ttlLen == 1,
+                      ev.severity == ES_CRITICAL && ev.ttlLen == 1 && ev.titleLen == 3,
                   "critical severity and the default-ttl marker parse");
             Check(ExtParseLine(L"EVENT music nope 8000 T b", ev) == 400,
                   "an unknown severity is a parse error");
             Check(ExtParseLine(L"EVENT music info 8000", ev) == 400,
-                  "EVENT without a title is a parse error");
+                  "EVENT without any text is a parse error");
+            Check(ExtParseLine(L"EVENT music info 8000 ", ev) == 400,
+                  "an event whose text is only whitespace is a parse error");
             Check(ExtParseLine(L"SET music title - x", ev) == 0 && ev.cmd == EC_SET,
                   "SET still parses now that EVENT does");
         }
@@ -5456,6 +5479,34 @@ int main() {
             n = IslandEnqueue(q, n, 4, c, &drops);
             Check(n == 1 && wcscmp(q[0].title, L"C") == 0 && q[0].severity == ES_CRITICAL,
                   "a replaced slot takes the arriving severity");
+
+            // The event's identity is *both* fields. `repeat` is the badge the user reads
+            // as "the same thing again", so an event that only matches on the title would
+            // count two different tracks (or the same track before and after its artist
+            // arrived) as one.
+            {
+                IslandEvent one = {};
+                wcsncpy(one.provider, L"music", kExtProviderChars);
+                wcsncpy(one.title, L"Blue Hour", kIslandTitleChars - 1);
+                wcsncpy(one.artist, L"Mili", kIslandArtistChars - 1);
+                one.severity = ES_INFO; one.ttlMs = 6000; one.repeat = 1; one.queuedAt = 1000;
+                IslandEvent mq[kIslandQueueMax] = {};
+                unsigned mdrops = 0;
+                int mn = IslandEnqueue(mq, 0, 4, one, &mdrops);
+                Check(mn == 1 && wcscmp(mq[0].title, L"Blue Hour") == 0 &&
+                          wcscmp(mq[0].artist, L"Mili") == 0,
+                      "an event is queued with both of its fields");
+                IslandEvent same = one; same.queuedAt = 1500;
+                mn = IslandEnqueue(mq, mn, 4, same, &mdrops);
+                Check(mn == 1 && mq[0].repeat == 2,
+                      "the same title *and* artist inside the window is a repeat");
+                IslandEvent reArtist = one;
+                wcsncpy(reArtist.artist, L"Other", kIslandArtistChars - 1);
+                reArtist.queuedAt = 2000;
+                mn = IslandEnqueue(mq, mn, 4, reArtist, &mdrops);
+                Check(mn == 1 && mq[0].repeat == 1 && wcscmp(mq[0].artist, L"Other") == 0,
+                      "the same title with another artist is a new event, not a repeat");
+            }
 
             IslandEvent d = b;
             wcsncpy(d.provider, L"discord", kExtProviderChars); d.queuedAt = 4000;
@@ -5488,20 +5539,20 @@ int main() {
                 IslandEvent warn = {};
                 wcsncpy(warn.provider, L"music", kExtProviderChars);
                 wcsncpy(warn.title, L"Now playing", kIslandTitleChars - 1);
-                wcsncpy(warn.body, L"battery 15%", kIslandBodyChars - 1);
+                wcsncpy(warn.artist, L"battery 15%", kIslandArtistChars - 1);
                 warn.severity = ES_WARN; warn.ttlMs = 6000; warn.repeat = 1;
                 warn.queuedAt = 1000;
 
+                // The same event (both identity fields) re-reported as critical.
                 IslandEvent hot = warn;
-                wcsncpy(hot.body, L"battery 4%, plug in now", kIslandBodyChars - 1);
                 hot.severity = ES_CRITICAL; hot.queuedAt = 1500;   // inside the window
 
                 int m = IslandEnqueue(esc, 0, 4, warn, &escDrops);
                 m = IslandEnqueue(esc, m, 4, hot, &escDrops);
                 Check(m == 1 && esc[0].severity == ES_CRITICAL,
                       "an escalation inside the merge window raises the queued level");
-                Check(esc[0].repeat == 2 && wcscmp(esc[0].body, hot.body) == 0,
-                      "and it still counts as the same thing, with the newest text");
+                Check(esc[0].repeat == 2 && wcscmp(esc[0].artist, hot.artist) == 0,
+                      "and it still counts as the same thing -- both fields match");
 
                 // The symptom, driven through the real state machine: a warn card on
                 // screen must give way when the queue now holds a critical.
@@ -5641,12 +5692,40 @@ int main() {
             ev.repeat = 1;
             IslandCardLayout p1 = PlanIslandCard(ev);
             Check(p1.lines == 1 && !p1.hasBadge,
-                  "a card without a body is one line and carries no merge badge");
-            wcsncpy(ev.body, L"B", kIslandBodyChars - 1);
+                  "a card without an artist is one line and carries no merge badge");
+            wcsncpy(ev.artist, L"B", kIslandArtistChars - 1);
             ev.repeat = 7;
             IslandCardLayout p2 = PlanIslandCard(ev);
             Check(p2.lines == 2 && p2.hasBadge && wcscmp(p2.badge, L"\x00D7" L"7") == 0,
-                  "a body adds the second line and a repeat adds the merged count");
+                  "an artist adds the second line and a repeat adds the merged count");
+
+            // Frame -> parse -> the product's own "what the card holds" step -> the plan
+            // the painter asks for. The conversion is `ExtEventFromCommand`, not a copy of
+            // it in the test: the first version of this check sanitized the two slices
+            // here, and reverting the product to "sanitize to the end of the frame buffer"
+            // left the host green -- it was asserting on itself (AGENTS 7.8). The third
+            // frame is the interesting one: it *has* the separator, so a shape-based rule
+            // would draw an empty row two.
+            const WCHAR *rowFrames[3] = {
+                L"EVENT music info 8000 Blue Hour  Mili",
+                L"EVENT music info 8000 Blue Hour",
+                L"EVENT music info 8000 Blue Hour  ",
+            };
+            const int rowWant[3] = {2, 1, 1};
+            const char *rowLabel[3] = {
+                "a frame with an artist draws two rows, the title intact",
+                "a frame without a separator draws one row (no blank second row)",
+                "a separator with nothing after it draws one row, not an empty row two",
+            };
+            for (int i = 0; i < 3; i++) {
+                ExtCommand pc;
+                const bool parsed = ExtParseLine(rowFrames[i], pc) == 0;
+                const IslandEvent fe = ExtEventFromCommand(pc, L"music", 6000, 1000);
+                const IslandCardLayout lp = PlanIslandCard(fe);
+                Check(parsed && lp.lines == rowWant[i] && wcscmp(fe.title, L"Blue Hour") == 0 &&
+                          (i == 0 ? wcscmp(fe.artist, L"Mili") == 0 : fe.artist[0] == L'\0'),
+                      rowLabel[i]);
+            }
             Check(ResolveSeverityColor(ES_CRITICAL, 0xFF112233) == 0xFFE4573D &&
                       ResolveSeverityColor(ES_WARN, 0xFF112233) == 0xFFF2C14E &&
                       ResolveSeverityColor(ES_INFO, 0xFF112233) == 0xFF112233,

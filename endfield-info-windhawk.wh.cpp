@@ -148,9 +148,10 @@ also the shortest way to see how a name is written. Erase the tag to lose the ic
 ## The island (optional notifications)
 
 Set `Island` to on and a card can appear under the capsule for an event pushed by
-another program: a title, a body line, a severity (`info` / `warn` / `critical`,
-which picks the colour) and a lifetime. It fades out on its own, and the card's
-close button dismisses it early. Nothing shows a card unless a program pushes one.
+another program: a title, an artist line (`EVENT` carries both -- two fields, not one
+folded string), a severity (`info` / `warn` / `critical`, which picks the colour) and a
+lifetime. It fades out on its own, and the card's close button dismisses it early.
+Nothing shows a card unless a program pushes one.
 
 ## External data (`{ext.provider.key}`)
 
@@ -366,7 +367,7 @@ deliberate trade for accuracy, and it only happens when you asked for it.
   $description: '120-640. Narrowest width for an event card. The card grows with its text but never below this, and never past 640.'
 - IslandEnabled: Off
   $name: 'Notification island'
-  $description: 'Turns an external event into a temporary card: title, optional body, a severity colour and a repeat badge. The card covers the rows while it is up and gives them back when it goes.'
+  $description: 'Turns an external event into a temporary card: title, optional artist, a severity colour and a repeat badge. The card covers the rows while it is up and gives them back when it goes.'
   $options:
     - Off: Values only
     - On: Show event cards
@@ -3192,13 +3193,18 @@ static bool ExtNameValid(const WCHAR *s, int len, bool provider) {
 // without rescanning them, so injected text can never become a variable. The
 // assertion in the regression test exists so that property cannot be lost
 // silently by someone "helpfully" making expansion recursive.
-static void ExtSanitize(const WCHAR *src, WCHAR *dst, int cap) {
+//
+// `len` is the field's own length rather than "until the NUL". An EVENT's title is a
+// *slice* of the frame -- the artist follows it in the same buffer -- and sanitizing
+// to the end of the buffer copies the second row into the first one, which is exactly
+// what the end-to-end assertion (frame -> parse -> sanitize -> `PlanIslandCard`) caught.
+static void ExtSanitizeSlice(const WCHAR *src, int len, WCHAR *dst, int cap) {
     if (cap <= 0) return;
     if (cap < 3) { dst[0] = L'\0'; return; }
     int n = 0;
     bool more = false;
-    for (const WCHAR *p = src; p && *p; p++) {
-        WCHAR c = *p;
+    for (int i = 0; src && i < len && src[i]; i++) {
+        WCHAR c = src[i];
         if (c == L'\r' || c == L'\n') continue;
         if (c == L'\t') c = L' ';
         else if (c < 0x20 || c == 0x7F || (c >= 0x80 && c <= 0x9F)) continue;
@@ -3214,6 +3220,10 @@ static void ExtSanitize(const WCHAR *src, WCHAR *dst, int cap) {
     }
     if (more) dst[n++] = 0x2026;   // HORIZONTAL ELLIPSIS
     dst[n] = L'\0';
+}
+
+static void ExtSanitize(const WCHAR *src, WCHAR *dst, int cap) {
+    ExtSanitizeSlice(src, src ? (int)wcslen(src) : 0, dst, cap);
 }
 
 // Strict: [+-]?digits[.digits]? and nothing else. "73%", " 42", "4 2", ".5", "1."
@@ -3427,12 +3437,14 @@ static void ExtLogStatus(const WCHAR *name, int nameLen, int status) {
 // nests with g_extLock: the HUD never touches the value store, and a pipe thread
 // that enqueues an event touches nothing else. Everything below that decides
 // *order* is a pure function, so the rules -- replace your own pending event, merge
-// an identical title, prefer the higher severity, drop the weakest when full -- are
-// asserted without a window or a pipe.
+// an identical event (both of its fields), prefer the higher severity, drop the
+// weakest when full -- are asserted without a window or a pipe.
 // ---------------------------------------------------------------------------
 static const int    kIslandQueueMax = 8;              // ExtEventQueue clamps to 1..8
+// The card's two rows: the track's name and its artist. Two fields, not one
+// folded string -- see ExtSplitEventText for the frame's shape.
 static const int    kIslandTitleChars = 96;
-static const int    kIslandBodyChars = 160;
+static const int    kIslandArtistChars = 160;
 static const DWORD  kIslandMergeWindowMs = 2000;
 // Phase durations. They live here, not in the drawing code, because the state
 // machine is what decides when a phase is over; the visual layer reads the same
@@ -3462,7 +3474,7 @@ enum ExtSeverity { ES_INFO = 0, ES_WARN = 1, ES_CRITICAL = 2 };
 struct IslandEvent {
     WCHAR       provider[kExtProviderChars + 1];
     WCHAR       title[kIslandTitleChars];
-    WCHAR       body[kIslandBodyChars];
+    WCHAR       artist[kIslandArtistChars];
     ExtSeverity severity;
     DWORD       ttlMs;
     unsigned    repeat;
@@ -3543,7 +3555,13 @@ static int IslandEnqueue(IslandEvent *queue, int count, int cap, const IslandEve
 
     for (int i = 0; i < count; i++) {
         if (_wcsicmp(queue[i].provider, ev.provider) != 0) continue;
+        // "The same thing again" means the same *track*, and a track's identity is
+        // both fields: the same title with a different artist is a different song
+        // (and, more often, the same song whose artist finally arrived), so it must
+        // not be counted as a repeat of it. A repeat can only raise the level,
+        // never lower it (below), and only a repeat may bump the badge.
         if (_wcsicmp(queue[i].title, ev.title) == 0 &&
+            _wcsicmp(queue[i].artist, ev.artist) == 0 &&
             (DWORD)(ev.queuedAt - queue[i].queuedAt) <= kIslandMergeWindowMs) {
             // The same thing again: bump the badge instead of queueing a twin.
             //
@@ -3553,9 +3571,6 @@ static int IslandEnqueue(IslandEvent *queue, int count, int cap, const IslandEve
             // machine never saw a critical waiting and the card stayed at warn. Take the
             // higher of the two -- a repeat can raise the level, never lower it.
             if (ev.severity > queue[i].severity) queue[i].severity = ev.severity;
-            // The newest text describes the same thing most accurately.
-            wcsncpy(queue[i].body, ev.body, kIslandBodyChars - 1);
-            queue[i].body[kIslandBodyChars - 1] = L'\0';
             queue[i].repeat++;
             queue[i].queuedAt = ev.queuedAt;
             queue[i].ttlMs = ev.ttlMs;
@@ -3668,14 +3683,18 @@ static bool IslandTakeMatching(IslandEvent *queue, int *count, const IslandEvent
 
 // What the card shows, decided without touching GDI+ so it can be asserted.
 struct IslandCardLayout {
-    int   lines;          // 1 without a body, 2 with one
+    int   lines;          // 1 without an artist, 2 with one -- never 2 with a blank row
     bool  hasBadge;       // repeat > 1
     WCHAR badge[8];
 };
 
 static IslandCardLayout PlanIslandCard(const IslandEvent &ev) {
     IslandCardLayout plan = {};
-    plan.lines = ev.body[0] ? 2 : 1;
+    // The row count comes from the *sanitized* artist being non-empty, not from the
+    // frame having carried a field: a frame that ends in the separator (or whose
+    // artist is only spaces, which ExtSanitize trims away) must draw one row, since
+    // a blank second row is what "the card lost its artist" looks like.
+    plan.lines = ev.artist[0] ? 2 : 1;
     plan.hasBadge = ev.repeat > 1;
     if (plan.hasBadge) {
         unsigned shown = ev.repeat > 99 ? 99 : ev.repeat;
@@ -3697,7 +3716,7 @@ static DWORD ResolveSeverityColor(ExtSeverity sev, DWORD themeText) {
 
 struct IslandMetrics {
     int titleChars;
-    int bodyChars;
+    int artistChars;
 };
 
 // The card's own metrics, from the card that is actually on screen. One helper, so the width
@@ -3706,7 +3725,7 @@ struct IslandMetrics {
 static IslandMetrics IslandCardMetrics() {
     IslandMetrics m = {};
     m.titleChars = (int)wcslen(g_islandCard.title);
-    m.bodyChars = (int)wcslen(g_islandCard.body);
+    m.artistChars = (int)wcslen(g_islandCard.artist);
     return m;
 }
 
@@ -3719,7 +3738,7 @@ static const int kIslandMaxWidth = 640;
 
 static int ComputeIslandCardWidth(const IslandMetrics &m, const ModSettings &cfg,
                                   int monitorWidth) {
-    int chars = m.titleChars > m.bodyChars ? m.titleChars : m.bodyChars;
+    int chars = m.titleChars > m.artistChars ? m.titleChars : m.artistChars;
     if (chars < 0) chars = 0;
     int width = 26 + chars * (cfg.rowHeight / 2);      // padding, accent bar, glyphs
     if (width < cfg.islandMinWidth) width = cfg.islandMinWidth;
@@ -6846,9 +6865,9 @@ static bool IslandDismiss(IslandView *v, DWORD now) {
 // The button consumes the click whether or not there is still a fade to start: the old
 // code demanded IslandDismiss() == true, so a *second* click on the × during the fade
 // fell straight through to the panel's own click behaviour and toggled the panel -- which
-// reads as "the × closed the panel". The card body consumes as well, for the same reason:
-// clicking the card to read it must not toggle the panel either. Only a click outside the
-// card belongs to the panel.
+// reads as "the × closed the panel". The card's own area consumes as well, for the same
+// reason: clicking the card to read it must not toggle the panel either. Only a click
+// outside the card belongs to the panel.
 enum IslandClickAction { ICA_PANEL = 0, ICA_CONSUMED, ICA_DISMISS };
 
 static IslandClickAction IslandClickActionFor(IslandRegion hit, bool dismissable) {
@@ -8389,10 +8408,10 @@ static void PaintPanel(HWND hwnd) {
 
                     // The rows' rule, applied here too: measure and ellipsise to the
                     // budget, because GDI+ would otherwise draw straight past the box.
-                    WCHAR fitted[kIslandBodyChars];
-                    wcsncpy(fitted, g_islandCard.title, kIslandBodyChars - 1);
-                    fitted[kIslandBodyChars - 1] = L'\0';
-                    FitTextToWidth(graphics, font, format, fitted, kIslandBodyChars, textWidth,
+                    WCHAR fitted[kIslandArtistChars];
+                    wcsncpy(fitted, g_islandCard.title, kIslandArtistChars - 1);
+                    fitted[kIslandArtistChars - 1] = L'\0';
+                    FitTextToWidth(graphics, font, format, fitted, kIslandArtistChars, textWidth,
                                    lineHeight);
                     g_gdiplus.SetSolidFillColor(
                         textBrush, WithOpacity(g_settings.text, cardAlpha));
@@ -8400,15 +8419,16 @@ static void PaintPanel(HWND hwnd) {
                     g_gdiplus.DrawString(graphics, fitted, -1, font, &titleRect, format,
                                          (GpBrush *)textBrush);
                     if (plan.lines > 1) {
-                        wcsncpy(fitted, g_islandCard.body, kIslandBodyChars - 1);
-                        fitted[kIslandBodyChars - 1] = L'\0';
-                        FitTextToWidth(graphics, font, format, fitted, kIslandBodyChars,
+                        // Row two is the artist: the same track identity, the other half.
+                        wcsncpy(fitted, g_islandCard.artist, kIslandArtistChars - 1);
+                        fitted[kIslandArtistChars - 1] = L'\0';
+                        FitTextToWidth(graphics, font, format, fitted, kIslandArtistChars,
                                        textWidth, lineHeight);
                         g_gdiplus.SetSolidFillColor(
                             textBrush,
                             WithOpacity(g_settings.text, kTextSecondaryOpacity * cardAlpha));
-                        RectF bodyRect(textX, pad + lineHeight, textWidth, lineHeight);
-                        g_gdiplus.DrawString(graphics, fitted, -1, font, &bodyRect,
+                        RectF artistRect(textX, pad + lineHeight, textWidth, lineHeight);
+                        g_gdiplus.DrawString(graphics, fitted, -1, font, &artistRect,
                                              format, (GpBrush *)textBrush);
                     }
                     // The close affordance, drawn from the same rectangle the hit test
@@ -9429,10 +9449,11 @@ struct ExtCommand {
     const WCHAR *key = nullptr;      int keyLen = 0;
     const WCHAR *ttl = nullptr;      int ttlLen = 0;
     const WCHAR *text = nullptr;     int textLen = 0;
-    // EVENT only.
+    // EVENT only. The frame's text field holds two fields: the title, then -- after a
+    // run of two or more spaces -- the artist. See ExtSplitEventText.
     ExtSeverity severity = ES_INFO;
     const WCHAR *title = nullptr;    int titleLen = 0;
-    const WCHAR *body = nullptr;     int bodyLen = 0;
+    const WCHAR *artist = nullptr;   int artistLen = 0;
 };
 
 struct ExtSession {
@@ -9463,6 +9484,45 @@ static bool ExtToken(const WCHAR **cursor, const WCHAR **start, int *len) {
     *len = (int)(p - s);
     *cursor = p;
     return true;
+}
+
+// The EVENT frame's text field is two fields in one rest-of-line.
+//
+// "The last parameter is always the rest of the line" is what lets a value contain
+// spaces (design 4.1), but the card has two rows and they are two *things*: the
+// track's name and its artist. Folding them into one string is what the panel could
+// no longer take apart (and a folded string cannot tell "no artist" from "empty
+// artist"), while making either one a token is worse: both contain spaces
+// (`Blue Hour`, `Mili / 塞壬唱片-MSR`), so a token form would chop the title at its
+// first space and drop the rest on row two -- which is exactly what the event
+// channel did before this rule existed.
+//
+// So the separator is the first run of **two or more spaces**: what a human types to
+// line two columns up, and what the bridge has always emitted between the two rows
+// (`"{0}  {1}"`). Everything before it is the title, everything after it is the
+// artist; no run at all means the event carries no artist and the card draws **one**
+// row (`PlanIslandCard`), never a blank second one.
+//
+// The rule is total -- the *first* run splits, so an artist may itself contain a run
+// while a title may not. That is the one shape this wire can express, and the
+// publisher is the side that can see it: the bridge collapses such a run before
+// framing and says so, because a title is not something this side may silently edit.
+static void ExtSplitEventText(const WCHAR *text, const WCHAR **title, int *titleLen,
+                              const WCHAR **artist, int *artistLen) {
+    const WCHAR *p = text ? text : L"";
+    const WCHAR *run = nullptr;                 // start of the first qualifying run
+    const WCHAR *after = nullptr;               // first character of the artist field
+    for (const WCHAR *q = p; *q; q++) {
+        if (*q != L' ') continue;
+        const WCHAR *end = q;
+        while (*end == L' ') end++;
+        if (end - q >= 2) { run = q; after = end; break; }
+        q = end - 1;                            // a lone space: part of the title
+    }
+    *title = p;
+    *titleLen = (int)((run ? run : p + wcslen(p)) - p);
+    *artist = after ? after : p + wcslen(p);
+    *artistLen = (int)wcslen(*artist);
 }
 
 // Returns 0 for "handled or ignorable", otherwise the error code to answer with.
@@ -9515,10 +9575,11 @@ static int ExtParseLine(const WCHAR *line, ExtCommand &out) {
         if (!ExtToken(&cursor, &sev, &sevLen)) return 400;
         if (!ExtParseSeverity(sev, sevLen, &out.severity)) return 400;
         if (!ExtToken(&cursor, &out.ttl, &out.ttlLen)) return 400;
-        if (!ExtToken(&cursor, &out.title, &out.titleLen)) return 400;
         while (ExtIsSpace(*cursor)) cursor++;
-        out.body = cursor;                       // the rest of the line, spaces and all
-        out.bodyLen = (int)wcslen(cursor);
+        if (!*cursor) return 400;                // an event with no text is not an event
+        // The rest of the line is the card's two rows (see ExtSplitEventText); the
+        // artist pointer may equal the title's end, with a length of 0.
+        ExtSplitEventText(cursor, &out.title, &out.titleLen, &out.artist, &out.artistLen);
         out.cmd = EC_EVENT;
         return 0;
     }
@@ -9809,6 +9870,27 @@ static int ExtRefuse(HANDLE pipe, OVERLAPPED *ov, int code, const ExtCommand &cm
     return code;
 }
 
+// Turns a parsed EVENT into the event the queue and the HUD work with, in one place.
+//
+// This is the step that decides what the card's two rows actually contain, and it has
+// to be one function rather than two copies: the first version of the assertion for it
+// sanitized the two slices *in the test*, so reverting this to the old
+// sanitize-to-end-of-buffer call left the host green -- it was asserting on its own copy
+// (AGENTS 7.8). Both fields are slices of the frame, so both are sanitized by length.
+static IslandEvent ExtEventFromCommand(const ExtCommand &cmd, const WCHAR *provider,
+                                       DWORD ttlMs, DWORD now) {
+    IslandEvent ev = {};
+    wcsncpy(ev.provider, provider ? provider : L"", kExtProviderChars);
+    ev.provider[kExtProviderChars] = L'\0';
+    ExtSanitizeSlice(cmd.title ? cmd.title : L"", cmd.titleLen, ev.title, kIslandTitleChars);
+    ExtSanitizeSlice(cmd.artist ? cmd.artist : L"", cmd.artistLen, ev.artist, kIslandArtistChars);
+    ev.severity = cmd.severity;
+    ev.ttlMs = ttlMs;
+    ev.repeat = 1;
+    ev.queuedAt = now;
+    return ev;
+}
+
 static int ExtHandleLine(HANDLE pipe, OVERLAPPED *ov, const WCHAR *line, ExtSession &ses) {
     ExtCommand cmd;
     int code = ExtParseLine(line, cmd);
@@ -9862,15 +9944,9 @@ static int ExtHandleLine(HANDLE pipe, OVERLAPPED *ov, const WCHAR *line, ExtSess
             ExtWriteLine(pipe, ov, L"OK", &ses);
             return 0;
         }
-        IslandEvent ev = {};
-        wcsncpy(ev.provider, ses.provider, kExtProviderChars);
-        ev.provider[kExtProviderChars] = L'\0';
-        ExtSanitize(cmd.title ? cmd.title : L"", ev.title, kIslandTitleChars);
-        ExtSanitize(cmd.body ? cmd.body : L"", ev.body, kIslandBodyChars);
-        ev.severity = cmd.severity;
-        ev.ttlMs = ttl;
-        ev.repeat = 1;
-        ev.queuedAt = GetTickCount();
+        // The two rows come out of one function (ExtEventFromCommand), which is what the
+        // host assertion drives as well.
+        IslandEvent ev = ExtEventFromCommand(cmd, ses.provider, ttl, GetTickCount());
         int queued = 0;
         if (g_islandLockReady) {
             EnterCriticalSection(&g_islandLock);
@@ -9881,8 +9957,8 @@ static int ExtHandleLine(HANDLE pipe, OVERLAPPED *ov, const WCHAR *line, ExtSess
             LeaveCriticalSection(&g_islandLock);
         }
         // Counts and lengths only: an event's text is content and never goes to the log.
-        Wh_Log(L"EXT event provider=%s sev=%d ttl=%lu titleLen=%d bodyLen=%d queue=%d drops=%u",
-               ev.provider, (int)ev.severity, ttl, (int)wcslen(ev.title), (int)wcslen(ev.body),
+        Wh_Log(L"EXT event provider=%s sev=%d ttl=%lu titleLen=%d artistLen=%d queue=%d drops=%u",
+               ev.provider, (int)ev.severity, ttl, (int)wcslen(ev.title), (int)wcslen(ev.artist),
                queued, g_islandDrops);
         // Wake the HUD through its thread, never through the window handle: this
         // thread cannot know whether the window still exists (design 5.6.3 R5).

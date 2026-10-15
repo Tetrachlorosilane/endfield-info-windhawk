@@ -24,7 +24,9 @@
 
     它怎么发：
       只用协议 v1 的三条：`HELLO 1 <provider>` 握手，`SET <p> <key> <ttl|-> <text>`
-      推值，`EVENT <p> <severity> <ttl|-> <标题> <正文...>` 让岛上弹卡片。
+      推值，`EVENT <p> <severity> <ttl|-> <歌名>  <歌手>` 让岛上弹卡片
+      （两个文本字段之间是**两个空格**：歌名与歌手都可能带空格，token 形式会把歌名
+      切在第一个空格上。没有歌手时**不写**分隔符，卡片就只画一行）。
       **只在内容变化时才写**：一秒一次地重复同一句歌词是没有意义的流量，
       管道的限速会把它丢掉，但更好的做法是根本不发。
 
@@ -35,7 +37,7 @@
     # 真发：曲名进 {ext.netease.title}，当前歌词行进 {ext.netease.lyric}
     pwsh -File _netease-bridge.ps1 -Ttl 600000
 
-    # 顺带在换歌时弹一次岛（正文就是第一句歌词）
+    # 顺带在换歌时弹一次岛（卡片两行 = 歌名 / 歌手）
     pwsh -File _netease-bridge.ps1 -Event -Ttl 600000
 
 .EXAMPLE
@@ -52,7 +54,7 @@ param(
     [int]$TtlMs = 600000,
     # 进程名匹配（网易云 PC 版：cloudmusic）。**只在没有调试端口时**用于最后的标题兜底。
     [string]$ProcessName = 'cloudmusic',
-    # 换歌时发一条 EVENT，让灵动岛弹一次
+    # 换歌时发一条 EVENT，让灵动岛弹一次（卡片两行 = 歌名 / 歌手）
     [switch]$Event,
     # 卡片在屏时长（毫秒）。**这不是值的寿命**：值用 -TtlMs（默认 10 分钟），事件用它。
     # 早先两处都发 $TtlMs，于是每张卡片在屏幕上待 10 分钟：队列只有 8 格，两张卡就能把
@@ -221,6 +223,8 @@ $script:Sent = @{}
 # 一轮里发过的 key（诊断用，见 Publish）与它已经报过几次。
 $script:IterationKeys = @{}
 $script:DuplicateKeys = 0
+# 岛事件文本里"自带两空格"报过几次（有界，见 Write-IslandEvent）。
+$script:EventFieldNotes = 0
 
 function Write-Frame {
     param($Writer, [string]$Line)
@@ -321,17 +325,55 @@ function Test-EventAllowed {
 }
 
 # 发一条岛事件：受最小间隔约束，用的是卡片的在屏时长（$EventTtlMs）而不是值的寿命（$TtlMs）。
+# 帧由 `Format-IslandEventFrame` 生成（纯函数，自检覆盖），这里只管节流与"说不出口的事要说"。
 function Write-IslandEvent {
-    param($Writer, [string]$Provider, [int]$CardMs, [string]$Title, [string]$Body)
-    if (-not $Writer) { return $false }
+    param($Writer, [string]$Provider, [int]$CardMs, [string]$Title, [string]$Artist)
+    # `-DryRun` 没有 writer，但**它要打印的就是这一帧**：帧文本是"桥发了什么"唯一能被逐字
+    # 审查的那一层，而 `Write-Frame` 在 DryRun 下只打印、不写管道。所以这里放行的判据是
+    # "没 writer 且不是 DryRun"（以前只看 writer → `-DryRun -Event` 永远看不到 EVENT 帧，
+    # 也就没法在没连 mod 的情况下核对两个字段）。
+    if (-not $Writer -and -not $DryRun) { return $false }
     $now = Get-Date
     if (-not (Test-EventAllowed -Now $now -LastAt $script:LastEventAt -MinMs $EventMinIntervalMs)) {
         Write-Host ("跳过岛事件（距上一条不足 {0} ms）：{1}" -f $EventMinIntervalMs, $Title)
         return $false
     }
     $script:LastEventAt = $now
-    Write-Frame $Writer ("EVENT {0} info {1} {2}  {3}" -f $Provider, $CardMs, $Title, $Body)
+    # 字段自己带了"两空格运行"就会被当成分隔符（见 Format-IslandEventFrame）：帧里会被
+    # 折成一个空格（卡片上看不出来），但这件事不能悄悄发生 —— 说一次（有界），并且值通道
+    # 里的 `{ext.<p>.title}` / `{ext.<p>.artist}` 发的仍是原文。
+    if ($script:EventFieldNotes -lt 4 -and (($Title -match '  ') -or ($Artist -match '  '))) {
+        $script:EventFieldNotes++
+        Write-Host '  ! 卡片文本里本来就带连续两个空格：帧按第一处切开两行、卡片上折成一个空格（值通道不受影响）'
+    }
+    Write-Frame $Writer (Format-IslandEventFrame -Provider $Provider -CardMs $CardMs `
+            -Title $Title -Artist $Artist)
     return $true
+}
+
+# 岛事件的**帧**（纯函数，-SelfTest 覆盖）。三处必须一致：这里、mod 侧解析器
+# （`ExtParseLine` 的 EVENT 分支 / `ExtSplitEventText`）、设计文档的协议表
+# （docs/external-data-island-design.md §4.2）。
+#
+#   形状：`EVENT <provider> <severity> <ttl> <title>  <artist>`
+#
+# **两个字段之间是两个空格**，因为帧的最后一个参数是"其余全部"（所以文本里可以有空格），
+# 而卡片有两行、两行是两个字段。不能把标题做成一个 token：歌名与歌手**都带空格**
+# （`Blue Hour` / `Mili / 塞壬唱片-MSR`），token 形式会把标题切在第一个空格上 —— 那正是
+# 改前的行为（卡片第一行只剩 `Blue`，`Hour Mili` 全落到第二行）。也不能用一个空格当分隔符：
+# 歌名里到处都是单个空格。两个空格是人手对齐两列时会打的，而且**桥一直就是这么发的**
+# （改前的 `"{0}  {1}"` 已是这个形状，只是 mod 侧当时按 token 解析、没人读这个分隔符）。
+#
+# 两个字段各自都不能**自己**带"两空格运行"：第一处这样的运行就是分隔符。双空格在卡片上
+# 与一个空格同宽（看不出来），所以这里折成一个；调用方负责把这件事说出来（有界计数）。
+# 没有歌手时**不写分隔符**：帧里没有分隔符 = 卡片只画一行，而不是画一个空行
+# （mod 侧 `PlanIslandCard` 的 `ev.artist[0] ? 2 : 1`）。
+function Format-IslandEventFrame {
+    param([string]$Provider, [int]$CardMs, [string]$Title, [string]$Artist)
+    $t = ("$Title" -replace '  +', ' ').Trim()
+    $a = ("$Artist" -replace '  +', ' ').Trim()
+    if ($a) { return ("EVENT {0} info {1} {2}  {3}" -f $Provider, $CardMs, $t, $a) }
+    return ("EVENT {0} info {1} {2}" -f $Provider, $CardMs, $t)
 }
 
 # ---------------------------------------------------------------------------
@@ -1625,6 +1667,34 @@ if ($SelfTest) {
         @{ Name = '岛事件：间隔不足时不发（密集歌词不刷屏）'; Ok = (-not (Test-EventAllowed -Now $stamp.AddMilliseconds(3999) -LastAt $stamp -MinMs 4000)) }
         @{ Name = '岛事件：达到最小间隔才发'; Ok = (Test-EventAllowed -Now $stamp.AddMilliseconds(4000) -LastAt $stamp -MinMs 4000) }
         @{ Name = '岛事件：间隔设为 0 表示不节流'; Ok = (Test-EventAllowed -Now $stamp -LastAt $stamp -MinMs 0) }
+        # ---- 岛事件帧：两个字段、一个分隔符（与 mod 侧 ExtSplitEventText 同一条规则）------
+        # 这一组是"桥发的帧"与"mod 的解析器"之间唯一的合同，所以它逐字钉住帧的形状。
+        @{ Name = '岛帧：两个字段之间正好是两个空格（mod 就在第一处这样的运行上切开）'; Ok = ((Format-IslandEventFrame -Provider netease -CardMs 6000 -Title 'Blue Hour' -Artist 'Mili') -eq 'EVENT netease info 6000 Blue Hour  Mili') }
+        @{ Name = '岛帧：标题里的单个空格留在标题里（token 形式会把它切在第一个空格上）'; Ok = ((Format-IslandEventFrame -Provider netease -CardMs 6000 -Title 'Blue Hour' -Artist 'Mili / 塞壬唱片-MSR') -eq 'EVENT netease info 6000 Blue Hour  Mili / 塞壬唱片-MSR') }
+        @{ Name = '岛帧：歌手为空时不写分隔符（= 卡片只画一行，不是画一个空行）'; Ok = ((Format-IslandEventFrame -Provider netease -CardMs 6000 -Title 'Blue Hour' -Artist '') -eq 'EVENT netease info 6000 Blue Hour') }
+        @{ Name = '岛帧：字段自己带的两空格被折成一个（否则第一处这样的运行会被当成分隔符）'; Ok = ((Format-IslandEventFrame -Provider netease -CardMs 6000 -Title 'A  B' -Artist 'C  D') -eq 'EVENT netease info 6000 A B  C D') }
+        @{ Name = '岛帧：发出去的帧里"两空格运行"恰好只出现一次（那一处就是分隔符）'; Ok = (@([regex]::Matches((Format-IslandEventFrame -Provider p -CardMs 6000 -Title 'A  B  C' -Artist 'D  E'), '  +')).Count -eq 1) }
+        # 负对照：把歌手拼进标题（旧协议的形状）得到的帧与两字段帧**不同** —— 上面那几条
+        # 不是恒真（旧写法里根本没有第二个字段，卡片也就只有一行可画）。
+        @{ Name = '岛帧：旧协议（歌名 - 歌手 一条、无分隔符）与两字段帧不同 —— 上面几条不是恒真'; Ok = ((Format-IslandEventFrame -Provider p -CardMs 6000 -Title 'A - B' -Artist '') -ne (Format-IslandEventFrame -Provider p -CardMs 6000 -Title 'A' -Artist 'B')) }
+        # `-DryRun -Event` 必须能把 EVENT 帧**打出来**（帧文本是"桥发了什么"唯一能被逐字
+        # 审查的那一层）；没连管道又不是 DryRun 时才该拒绝。这两半必须同时成立，否则
+        # "看不到帧"和"没有帧可看"长得一模一样。
+        $drySaved = $DryRun
+        $lastEventSaved = $script:LastEventAt
+        try {
+            $DryRun = $true
+            $script:LastEventAt = [datetime]::MinValue
+            $dryOk = Write-IslandEvent -Writer $null -Provider netease -CardMs 6000 -Title 'T' -Artist 'A'
+            $DryRun = $false
+            $script:LastEventAt = [datetime]::MinValue
+            $noWriterOk = Write-IslandEvent -Writer $null -Provider netease -CardMs 6000 -Title 'T' -Artist 'A'
+        }
+        finally {
+            $DryRun = $drySaved
+            $script:LastEventAt = $lastEventSaved
+        }
+        @{ Name = '岛帧：DryRun 下即使没有 writer 也会走到"把帧打出来"（没有 writer 又不是 DryRun 才拒绝）'; Ok = ($dryOk -and (-not $noWriterOk)) }
         # title 与 artist 是**两个 key、两个值**：`title` 里不许再有歌手，`artist` 不许缺。
         # 这组是这次拆分协议的判据，负对照（把歌手拼回 title）在下面 1616 那条上。
         @{ Name = '发布计划：title 只有歌名（歌手的名字不出现在 title 里，也不留分隔符）'; Ok = ((Get-PublishPlan -Title '铁花飞' -Artist 'Mili' -Line 'x' -Translation '' -Pos 'p')['title'] -eq '铁花飞') }
@@ -1864,18 +1934,22 @@ try {
             foreach ($key in $plan.Keys) { [void](Publish $writer $key $plan[$key]) }
             if ($Event -and -not $announced) {
                 # 只有真的发出去了才算"播报过"：被节流掉的话，下一拍还有机会。
-                # **卡片的两行就是曲目的两半**：第一行歌名、第二行歌手。`title`/`artist`
-                # 拆成两个 key 之后，岛卡片没有第三个字段可放第三件东西，而"换歌播报"
-                # 要说的正是"现在是哪首歌"——所以这里给身份，不再给第一句歌词（歌词随
-                # 后一拍就进面板的 lyric 行，卡片只是换歌那一下的通知；卡片自己也只画
-                # 得下两行，`plan.lines` 见 EvaluateIslandCard）。歌手为空时正文留空，
-                # 卡片自动只画一行（mod 侧 `ev.body[0] ? 2 : 1`）。
+                # **卡片的两行就是曲目身份的两半**：第一行歌名、第二行歌手，两个字段各自
+                # 独立（帧的形状见 Format-IslandEventFrame）。岛卡片只有两行，"换歌播报"
+                # 要说的正是"现在是哪首歌"，所以这里给身份，不给第一句歌词（歌词随后一拍
+                # 就进面板的 lyric 行）。歌手为空时帧里没有分隔符，卡片自动只画一行
+                # （mod 侧 `PlanIslandCard` 的 `ev.artist[0] ? 2 : 1`）。
                 if (Write-IslandEvent -Writer $writer -Provider $Provider -CardMs $EventTtlMs `
-                        -Title $ident.Title -Body $ident.Artist) {
+                        -Title $ident.Title -Artist $ident.Artist) {
                     $announced = $true
                 }
             }
         }
+        # `-Once` 是文档里那条"先看不发"命令（`-DryRun -Once`）的另一半：它此前只是个
+        # 声明，主循环从不看它，那条命令于是会一直跑下去（`-DryRun` 又不连管道，看起来
+        # 就像"什么都没发生"）。跑完一轮就退出，`-> ` 打出来的帧——**包括 EVENT 那一帧**——
+        # 才是一份能整段复制、逐字对照的输出。
+        if ($Once) { break }
     }
 }
 finally {

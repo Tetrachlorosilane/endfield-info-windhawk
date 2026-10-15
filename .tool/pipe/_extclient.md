@@ -11,13 +11,20 @@ PowerShell（**真机验证过的是这一个**）与 Python 版（参数同义�
 ```powershell
 pwsh -ExecutionPolicy Bypass -File .tool/pipe/_extclient.ps1
 pwsh -ExecutionPolicy Bypass -File .tool/pipe/_extclient.ps1 -Key progress -Ttl 60000 -Text 0.42
+pwsh -ExecutionPolicy Bypass -File .tool/pipe/_extclient.ps1 -Event -Text 'Blue Hour' -Artist 'Mili'
 pwsh -ExecutionPolicy Bypass -File .tool/pipe/_extclient.ps1 -Raw 'GARBAGE'   # 看错误码
 python .tool/pipe/_extclient.py "Now Playing: Blue Hour"
 python .tool/pipe/_extclient.py --key progress --ttl 60000 0.42
+python .tool/pipe/_extclient.py --event --artist Mili "Blue Hour"
 ```
 
 参数：`-Provider`（默认 `music`）、`-Key`（`title`）、`-Ttl`（`600000`，`[int]`）、`-Text`、`-Raw`、
-`-Event`、`-Severity`（`info` / `warn` / `critical`）；事件模式下 `-Text` 是卡片标题、`-Key` 不用。
+`-Event`、`-Artist`、`-Severity`（`info` / `warn` / `critical`）；事件模式下 `-Key` 不用，
+`-Text` 是卡片**第一行**、`-Artist` 是**第二行**（留空 = 卡片只画一行）。
+帧的形状是 `EVENT <provider> <severity> <ttl> <title>  <artist>`：**两个文本字段之间是两个空格**
+（一个空格是文本的一部分——歌名里本来就有空格），协议正文见
+[external-data-island-design.md](../../docs/external-data-island-design.md) §4.7。
+卡片要真的出现，还需要设置里 `Notification island` 为 On（事件本身照样会被 `OK` 接收）。
 
 ## 需要什么
 

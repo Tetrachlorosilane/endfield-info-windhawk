@@ -11,6 +11,7 @@
 # Usage:
 #   pwsh -File .tool/pipe/_extclient.ps1
 #   pwsh -File .tool/pipe/_extclient.ps1 -Key progress -Ttl 60000 -Text 0.42
+#   pwsh -File .tool/pipe/_extclient.ps1 -Event -Text 'Blue Hour' -Artist 'Mili'
 #   pwsh -File .tool/pipe/_extclient.ps1 -Raw 'GARBAGE'   # to see an error code
 
 param(
@@ -18,6 +19,8 @@ param(
     [string]$Key = 'title',
     [int]$Ttl = 600000,
     [string]$Text = 'Now Playing: Blue Hour',
+    # Event mode only: the card's second row (the artist). Empty = no second row.
+    [string]$Artist = '',
     [string]$Raw = '',
     [switch]$Event,
     [ValidateSet('info', 'warn', 'critical')]
@@ -28,8 +31,13 @@ $ErrorActionPreference = 'Stop'
 $name = 'endfield-info-windhawk'
 
 $lines = if ($Raw) { @($Raw) } elseif ($Event) {
-    # In event mode -Text is the card's title and -Key is unused.
-    @("HELLO 1 $Provider", "EVENT $Provider $Severity $Ttl $Text")
+    # In event mode -Text is the card's first row and -Artist its optional second one.
+    # The EVENT frame's two text fields are separated by **two spaces** -- a single
+    # space is part of the text, because a title has spaces in it. See the mod's
+    # ExtSplitEventText and docs/external-data-island-design.md 4.7; no artist = no
+    # separator = the card draws one row.
+    $card = if ($Artist) { "$Text  $Artist" } else { $Text }
+    @("HELLO 1 $Provider", "EVENT $Provider $Severity $Ttl $card")
 } else {
     @("HELLO 1 $Provider", "SET $Provider $Key $Ttl $Text")
 }

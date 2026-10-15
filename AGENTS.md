@@ -309,7 +309,8 @@ python .tool/preview/_preview.py
 `PickFontFamily`（覆盖判定以函数指针注入） ·
 `ParseRowMetricTags` / `RowFontSizePx` / `RowHeightPx` / `RowTopPx` / `PanelRowsHeight` /
 `MinimumRowHeightForFont` / `ParseInlineSize` / `MaxInlineRunSize` ·
-`ExtParseLine` · `ExtSanitize` · `ExtParseNumber` · `ExtLookup` · `ExtNextDeadline` ·
+`ExtParseLine` / `ExtSplitEventText` / `ExtSanitize` / `ExtSanitizeSlice` / `ExtEventFromCommand` /
+`ExtParseNumber` · `ExtLookup` · `ExtNextDeadline` ·
 `ExtEvictIndex` · `ExtProviderAllowed` · `ExtReplyTimeoutsAfter` · `IslandEnqueue` / `StepIsland` / `IslandHitTest` /
 `IslandClickActionFor` · `Select-StoreLineIndex` / `Select-SongTitle` / `Get-LeadMs` /
 `Split-VinylParagraphs` / `ConvertFrom-VinylSeconds` / `Test-VinylJumpPlausible` /
@@ -421,8 +422,9 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 **动管道、岛、卡片或 tick 的代码前 → 读
 [docs/external-data-island-design.md](docs/external-data-island-design.md) 的「命名管道不变量」一节。**
 
-这一节的**全部不变量**（锁序、I/O 超时、实例数、开机自检、事件队列、卡片几何/命中、
-卡片宽度静态不动画、点击归属）都在那里，本文只留这个指针（搬出去是因为 AGENTS 会被静默截断）。
+这一节的**全部不变量**（锁序、I/O 超时、实例数、开机自检、事件队列、**事件帧的两个文本字段
+= 卡片的两行**、卡片几何/命中、卡片宽度静态不动画、点击归属）都在那里，本文只留这个指针
+（搬出去是因为 AGENTS 会被静默截断）。
 
 ### 5.7 字体回退与逐段覆盖
 

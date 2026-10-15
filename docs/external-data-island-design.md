@@ -1,9 +1,18 @@
 # 外部数据源与「灵动岛」形态设计（提案）
 
-**状态**：提案，尚未实现。**目标读者**：实现这个 mod 的人/模型。
+**状态**：数据面/事件面已实现（见 §13）。**目标读者**：实现这个 mod 的人/模型。
 **前置阅读**：[README.md](../README.md) 的「全部设置项」、[AGENTS.md](../AGENTS.md) 的 §4/§5。
 
 > 行号基于提交 `3db06ab`。行号会漂移，**以符号名为准**。
+
+> ⚠ **灵动岛的「视觉层」不在用户的测试范围内，用户从来没有审查过它（2026-10-16 用户明确说明）。**
+> 本文里凡是"已实现"，只说明代码与断言在仓库里，**不说明它在屏幕上是正确的**：动画、几何、
+> 定位、命中、悬停、关闭按钮、置顶、卡片生命周期都属于这一层，没有用户本人的审查之前
+> **不要去"修"它们**（那样的修复是白费力气，还会掩盖真正该被审的东西）。
+> 例外是**协议与解析**这一层——`EVENT` 帧的字段、切分规则、行数，都是文本，能被逐字验证，
+> 详见 §4.7。未验证清单见
+> [state-and-handover.md](state-and-handover.md) 的「未验证（需要真实运行环境）」（§12.1 一带），
+> 那里同时写着这条范围缺口，不要在两处各写一份。
 
 本文回答两件事，它们是**两个独立阶段**，不要混着做：
 
@@ -140,7 +149,7 @@ A 是 B 的数据底座：先有 `{ext.…}` 这种变量，B 的"事件"才有�
 | `HELLO` | `HELLO <proto> <provider> [glyph\|badge]` | 注册提供者。`proto` 目前只有 `1`。可选的第 4 个字段是内置字形名（白名单）或 1–2 字符文本徽章，供卡片/图标位使用（§14 Q2）。未 `HELLO` 就 `SET` → `ERR 401` |
 | `SET` | `SET <provider> <key> <ttl\|-> <text...>` | 定义/覆盖一个值。`ttl` 单位 ms，`-` 表示用设置默认值 |
 | `DEL` | `DEL <provider> <key>` | 删除该键（`{ext.p.k}` 立刻回到"未知/--"分支，见 §5） |
-| `EVENT` | `EVENT <provider> <severity> <ttl\|-> <title> <body...>` | 一次性事件，进入灵动岛队列（B 阶段用） |
+| `EVENT` | `EVENT <provider> <severity> <ttl\|-> <title>  <artist>` | 一次性事件，进入灵动岛队列（B 阶段用）。**两个文本字段 = 卡片的两行**，中间是**两个空格**（§4.7）；没有分隔符 = 没有 `artist`，卡片只画一行 |
 | `BYE` | `BYE` | 关闭连接；不等价于 `DEL`（值按 ttl 过期） |
 | 应答 | `OK [detail]` / `ERR <code> [detail]` | 每条命令**恰好一条**应答 |
 
@@ -201,7 +210,7 @@ C: SET music title - Now Playing: Blue Hour
 S: OK
 C: SET music progress 60000 0.42
 S: OK
-C: EVENT music info 8000 曲目切换 Blue Hour — 海の声
+C: EVENT music info 8000 Blue Hour  Mili / 塞壬唱片-MSR
 S: OK
 C: BYE
 ```
@@ -211,6 +220,43 @@ C: BYE
 ```
 ♪ {ext.music.title}   [[ring:{ext.music.progress}:1:5:FF6FB3E0]]
 ```
+
+### 4.7 `EVENT` 的两个文本字段（= 卡片的两行）
+
+**实现落点**：`ExtSplitEventText`（纯函数，`ExtParseLine` 的 `EVENT` 分支调它）→
+`ExtSanitizeSlice` → `IslandEvent::title` / `IslandEvent::artist` → `PlanIslandCard` 的
+`ev.artist[0] ? 2 : 1` → 绘制侧与 `IslandCardWidth` 各读一个字段。桥那一侧是
+`Format-IslandEventFrame`（纯函数，`-SelfTest` 覆盖），**三处必须一致**：桥的发射器、
+mod 的解析器、本节这张表。
+
+帧的最后一个参数是"其余全部"（§4.1，所以文本里可以有空格），而卡片有两行、两行是
+**两个字段**（歌名、歌手），所以规则是：
+
+```
+title  := 文本里第一处"两个或更多连续空格"之前的全部（单个空格是文本的一部分）
+artist := 那一处运行之后的全部；**没有这样的运行 = 没有 artist**（不是空串）
+```
+
+- **为什么不能是 token**：歌名与歌手**都带空格**（`Blue Hour` / `Mili / 塞壬唱片-MSR`），
+  token 形式会把标题切在**第一个**空格上。这正是这一版之前的行为：真实帧
+  `EVENT netease info 6000 Blue Hour  Mili` 的标题只拿到 `Blue`（token），其余落到第二行；
+  而且 mod 侧当时对标题做的是"到缓冲区结尾"的消毒，第一行还会把第二行的文字一起复制进去。
+- **为什么是两个空格而不是一个**：单个空格到处都是（歌名里就有）；两个空格是人手对齐
+  两列时会打的，而且**桥一直就是这么发的**（改前的格式串 `"{0}  {1}"` 已经是这个形状，
+  只是解析器当时按 token 读、没人认这个分隔符）。
+- **规则是全函数、不做猜测**：第一处运行切开，之后的部分（包括里面还有的运行）都是
+  artist。代价只有一个：**标题里不能自己带两个连续空格**——那个位置会被当成字段边界。
+  发布器是能看到这件事的一侧：桥在成帧前把连续空格折成一个（卡片上与一个空格同宽，
+  看不出来）并**说一次**（有界计数），而**值通道不受影响**——`{ext.p.title}` 发的仍是原文。
+- **旧格式的帧会怎样**（"a frame we cannot parse is reported, not guessed" 的落点）：
+  `EVENT` 的字段数**没有变**（仍然是一个"其余全部"文本字段），所以没有"解析不了的旧帧"。
+  旧客户端发 `EVENT p info 8000 标题 正文`（单个空格）时，整段文本都是标题、**没有 artist**
+  → 卡片画**一行**（不是画一个空行，也不是把正文猜成 artist）。带两个空格、原本想表达
+  "标题 + 正文"的旧帧，现在按新规则读成"标题 + artist"：两行都在，**但两行的文字都与改前
+  不同**——这正是修掉的缺陷（改前第一行是"从标题 token 起直到行尾"的全部、第二行是被切掉的
+  那半截；HEAD 代码实测见 [state-and-handover.md](state-and-handover.md) §13 第十一批）。
+- **没有 artist 的事件一律只画一行**：判据是**消毒之后**的 `artist` 非空（`ExtSanitizeSlice`
+  会把 `\t`/`\r\n` 与控制字符清掉、并裁掉空白），所以"帧里带了分隔符但后面空的"也只画一行。
 
 ---
 
@@ -483,7 +529,9 @@ Windhawk 没有动态下拉框，所以"允许的提供者"这类只能用**分�
 ### 7.3 队列与优先级
 
 - 同 `provider` 的新事件**替换**自己尚未展示的事件（"曲目切换"连点三次只该弹一次）。
-- 相同 `(provider, title)` 在 2 s 内重复 → 不排队，而是给当前卡片加计数徽标。
+- 相同 `(provider, title, artist)` 在 2 s 内重复 → 不排队，而是给当前卡片加计数徽标。
+  身份是**两个字段**（§4.7）：同一标题配另一个 artist 是另一件事（更常见的是同一首歌的
+  歌手信息后一拍才到），把它算成"同一件事又来了"会让徽标数出并不存在的重复。
 - 队列按 `severity` 分层：`critical` 抢占当前 `info`；同级按 FIFO。
 - 队列满 → 丢弃**最低优先级 + 最早**的一条，计 `drops`。
 - `critical` 的 ttl 到期也**不**自动消失？→ **要消失**。理由：本 mod 没有常驻通知中心，
@@ -494,19 +542,23 @@ Windhawk 没有动态下拉框，所以"允许的提供者"这类只能用**分�
 ```c
 struct IslandCard {
     const WCHAR *provider;     // 由 HELLO 提供；用于日志与合并，不直接绘制
-    const WCHAR *title;        // 主行，单行截断
-    const WCHAR *body;         // 副行，可为空
+    const WCHAR *title;        // 主行（歌名），单行截断
+    const WCHAR *artist;       // 副行（歌手），**空 = 只画一行**（§4.7）
     int   glyph;               // HELLO 指定的内置字形（IconStyleFromName 白名单，[756]）；
                                // glyph == kBadge 时改用 badgeText。不接受路径或图片字节（§14 Q2）
     WCHAR badgeText[3];        // 1–2 字符文本徽章
     DWORD accent;              // 只能由 severity 派生：info=主题 accent，warn=黄，critical=红；
                                // **提供者不能指定颜色**（§14 Q4）
-    unsigned repeat;           // 合并计数
+    unsigned repeat;           // 合并计数（**两个字段都相同**才算同一件事，§7.3）
 };
 ```
 
 卡片是"主视觉 + 0–2 行副文本 + 可选本地按钮"，**不是**行列表的变形。
 它需要 `PaintPanel` 里一条**并列的绘制分支**，而不是硬塞进 `RowState`。
+
+**两个字段就是卡片的两行**（§4.7）：`title` 行 + 可选的 `artist` 行。行数由**消毒之后**
+的 `artist` 是否为空决定（`PlanIslandCard`），所以"帧里带了分隔符但后面空的"也只画一行。
+（卡片长什么样属于视觉层，见本文开头的范围说明：**未被用户审查过**。）
 
 ---
 
@@ -589,14 +641,15 @@ IslandRect ComputeIslandRect(const IslandState &s, const ContentMetrics &m,
 
 | 纯函数 | 断言（`.tool/regress/test-layout.cpp`） |
 | :-- | :-- |
-| `ExtParseLine` | 命令/参数切分；缺参 → 400；未知命令 → 400；`SET p k - 含 空格 的文本` 文本完整保留；`#` 注释；空行 |
-| `ExtSanitize` | 去 `\r\n`、`\t`→空格、去 C0/C1；截断到上限且**末尾加 `…`**；`{cpu}` **原样保留**（负对照：若实现里加了展开，此断言必须变红） |
+| `ExtParseLine` | 命令/参数切分；缺参 → 400；未知命令 → 400；`SET p k - 含 空格 的文本` 文本完整保留；`#` 注释；空行；**`EVENT` 的两个文本字段**：标题里的单个空格不被切开、第一处"两个及以上空格"之后是 `artist`、没有这样的运行 = 没有 artist、全是空白的文本 → 400 |
+| `ExtEventFromCommand` | 帧 → 卡片两个字段的**唯一**一步：两个字段都按**长度**消毒（切片不能"消毒到缓冲区结尾"，否则第一行会吞掉第二行）；再经 `PlanIslandCard` 断言三种帧的行数（有 artist → 2；无分隔符 → 1；分隔符后为空 → 1）——`帧 → parse → 转换 → 行数`整条关系，测试**不许自己复刻**这一步（AGENTS §7.8） |
+| `ExtSanitize` / `ExtSanitizeSlice` | 去 `\r\n`、`\t`→空格、去 C0/C1；截断到上限且**末尾加 `…`**；`{cpu}` **原样保留**（负对照：若实现里加了展开，此断言必须变红）；切片版只吃 `len` 个字符 |
 | `ExtParseNumber` | `42`/`-1.5` → true；`73%`、` 42`、`4 2`、`.`、空 → false（**明确不接受** `.5` 与 `1e3`，并断言） |
 | `ExtLookup` | 未过期 → `ER_VALUE`；过期 → `ER_EXPIRED`；不存在 → `ER_EXPIRED`；`ext.` 后格式非法 → `ER_NONE` |
 | `ExtStoreValue` | 容量满时淘汰"最早过期"；同 ttl 淘汰最久未更新；溢出计 `drops` |
 | `ExtNextDeadline` | 多条取**最小**到期时刻；无有效条目 → 0；`ttl=0` 的 `SET` 按 `DEL` 处理、**不**产生 deadline（否则 HUD 会空转戳） |
 | `RequiredGroups` | 含 `{ext.p.k}` → 置 `G_EXT`；`{ext.}` 非法 → **不**置位 |
-| `StepIsland` | 抢占（critical 抢 info）；同 provider 替换；2 s 内同标题合并计数；队列满丢最低优先级；ttl 到期回 Idle |
+| `StepIsland` | 抢占（critical 抢 info）；同 provider 替换；2 s 内**两个字段都相同**才合并计数（同一标题、不同 artist = 另一件事，§7.3）；队列满丢最低优先级；ttl 到期回 Idle |
 | `ComputeIslandRect` | 各状态下矩形正确；**超宽文本不引起宽度无界增长**（必须钳到屏宽上限） |
 | `HitTestIsland` | 圆角外 `HTTRANSPARENT`；按钮区域内命中对应 actionId；动画期间用并集 |
 
@@ -612,7 +665,7 @@ IslandRect ComputeIslandRect(const IslandState &s, const ContentMetrics &m,
 | 里程碑 | 内容 | 验收 |
 | :-- | :-- | :-- |
 | **M1 数据面** | **已实现**：`G_EXT` + 槽位表 + 管道线程 + `{ext.p.k}` + ttl/消毒/限速 + 设置项 + §5.6.3 的 R1/R1b/R3/R7 | 关掉开关时空闲成本为 0；`{ext.p.k}` 能显示；提供者退出后 **≤100 ms** 变 `--`（§5.6.2）；推 100 条 `SET` 后 `[perf]` 里 `paints` 只涨 1–2（合并生效）；`.tool/regress/test-layout.cpp` 全绿 + `.tool/checks/_settings.py` `no structural problems found` + `build.ps1` 只剩那 2 条已知警告 |
-| **M2 事件面** | **已实现**：`EVENT` + 队列/优先级/合并 + `Popping/Card/Collapsing` + 卡片绘制（accent/主行/副行/重复徽标）+ 由卡片自身相位驱动的淡入淡出。**与本文的偏离，三处**：① 宽度由纯函数 `ComputeIslandCardWidth`（用户可配的最小宽度，上限取"屏宽 − 24"与 640 中较小者）给出**静态宽度**，而不是完整的 `ComputeIslandRect`——位置与高度仍由既有静止几何给出；② **宽度动画被移除**：只要窗口宽度会在帧间变化，就必然存在"窗口已改、位图未提"的那一帧（真机实测为极短闪烁，四轮调参都无法消除），现在宽度由 `PaintPanel` 在创建位图**之前**一次性设定，任一帧内窗口与提交的位图尺寸恒等（同 AGENTS §5.4）；③ "动画期间取两态并集"这条规则**未落代码**，随宽度动画一起推迟到 M3，与区域表、本地按钮一并实现（那时它才有真实用武之地） | 连点同 provider 只弹一次（✓ 断言）；critical 抢 info（✓ 断言）；ttl 到期收回（✓ 断言）；收回后基础面板仍可点（✓ 命中仍用静止几何）。真机已验证：收起闪烁修复后无闪烁、文字与底色一起淡出 |
+| **M2 事件面** | **已实现**：`EVENT` + 队列/优先级/合并 + `Popping/Card/Collapsing` + 卡片绘制（accent/主行/副行/重复徽标）+ 由卡片自身相位驱动的淡入淡出。**事件的两个文本字段（§4.7）也已落地**：`title` + `artist` 是帧里的两个字段、卡片的两行，行数由消毒后的 `artist` 是否为空决定，合并的判据是**两个字段都相同**。**与本文的偏离，三处**：① 宽度由纯函数 `ComputeIslandCardWidth`（用户可配的最小宽度，上限取"屏宽 − 24"与 640 中较小者）给出**静态宽度**，而不是完整的 `ComputeIslandRect`——位置与高度仍由既有静止几何给出；② **宽度动画被移除**：只要窗口宽度会在帧间变化，就必然存在"窗口已改、位图未提"的那一帧（真机实测为极短闪烁，四轮调参都无法消除），现在宽度由 `PaintPanel` 在创建位图**之前**一次性设定，任一帧内窗口与提交的位图尺寸恒等（同 AGENTS §5.4）；③ "动画期间取两态并集"这条规则**未落代码**，随宽度动画一起推迟到 M3，与区域表、本地按钮一并实现（那时它才有真实用武之地） | 连点同 provider 只弹一次（✓ 断言）；critical 抢 info（✓ 断言）；ttl 到期收回（✓ 断言）；收回后基础面板仍可点（✓ 命中仍用静止几何）；**没有 artist 的事件只画一行**（✓ 断言覆盖"无分隔符"与"分隔符后为空"两种帧）；**同一标题不同歌手不算重复**（✓ 断言）。当时在机器上看到过"收起闪烁修复后无闪烁、文字与底色一起淡出"——**但那不是用户的审查**：视觉层从未进入他的测试范围（见本文开头的范围说明），所以这一格里的"已实现"只指代码与断言 |
 | **M3 卡片与交互** | **第一片已落地**：`ComputeIslandRect`（矩形与宽度同源，绘制与命中都从它取）、`ComputeIslandCloseRect`（由卡片矩形派生，且钳在卡片内）、区域表（后写在上）+ `IslandHitTest`（取最后一个命中）+ `IslandDismiss`（与 ttl 到期同一条路、幂等）+ 卡片右上角 × 的绘制与点击。**已落地**：悬停（`WM_MOUSEMOVE` 驱动 + `WM_MOUSELEAVE` 收尾，只占消息不占定时器，高亮矩形与点击矩形同源）、帧率决策（`DesiredTickMs` / `ApplyTickRate`：只有面板高度动画或岛上相位在跑时才是 16 ms，其余时间 40 ms 廉价轮询）。**待做**：`ComputeIslandRect` 进一步接管窗口定位（目前窗口定位仍走既有 `PlaceWindow` 的居中公式）；以及"两态并集"是否还需要——现在没有动画窗口期，倾向前者不需要 | 可见即可点（✓ 断言：逐像素遍历卡片，无 `IR_NONE`）；圆角外仍穿透（未变）；**不**出现"窗口缩到 8px"回归（✓ 区域表不含窗口尺寸）；命中不许另算一套几何（✓ 同一批纯函数） |
 | **M4 打磨** | 提供者图标（内置字形白名单）、每提供者配色档、诊断页 | 文档与 AGENTS 更新；`.tool/pipe/_extclient.py` 进仓库 |
 
@@ -940,10 +993,19 @@ python .tool/checks/_settings.py                          # no structural proble
 - **关闭卡片与 ttl 到期走同一条路**（`IslandDismiss` → `COLLAPSING`），所以淡出与状态机不会分叉；
   它**幂等**，第二次点击不会重启淡出。**卡片在屏时长由 `IslandCardDuration` 决定**：`ExtEventMs` 是
   默认值，提供者给的 ttl 只是上限（封顶 `kIslandMaxCardMs`）——值寿命不是展示时长。
+- **`EVENT` 的两个文本字段（歌名 / 歌手）是"三处必须一致"的东西**（§4.7）：桥的
+  `Format-IslandEventFrame`、mod 的 `ExtSplitEventText`（经 `ExtParseLine` →
+  `ExtEventFromCommand` → `PlanIslandCard`）、本节与 §4.2 的协议表。规则是**第一处两个
+  及以上连续空格**为界，没有这样的运行 = 没有 artist = 卡片**只画一行**（判据是消毒之后的
+  `artist` 是否为空，所以"带了分隔符但后面空的"也只画一行——空行是"卡片把歌手弄丢了"
+  的样子）。**两个字段都是帧缓冲里的切片**，所以必须走 `ExtSanitizeSlice`（按长度消毒）；
+  按"到缓冲区结尾"消毒会让第一行把第二行一起复制进去。跨进程的这条关系有端到端断言
+  （`帧 → 解析 → 转换 → 行数`），而且转换那一步是**产品里的同一个函数**——测试里再抄一份
+  就等于没测（AGENTS §7.8，这一条是实测踩出来的）。
 - **合并窗口内"同一件事又来了"只加计数，但 `severity` 必须取两者中更高的那个。** 否则
   "同一个标题，现在变成 critical"这条**升级会被窗口整个吞掉**：条目留在原级别 → 状态机看不到
-  `criticalWaiting` → 卡片一直停在 warn。文本取最新的一条（同标题的最新读数是更准的），
-  而**窗口从最后一次出现算起**（每次重复都刷新它，断了两倍窗口才算新事件）。
+  `criticalWaiting` → 卡片一直停在 warn。**"同一件事"= 两个身份字段都相同**（同标题不同
+  artist 是另一件事）；**窗口从最后一次出现算起**（每次重复都刷新它，断了两倍窗口才算新事件）。
   断言不只查队列字段，还直接驱动 `StepIsland`：屏幕上正显示的 warn 卡必须为它让位。
 - **关闭按钮不得比卡片大。** 卡片可以只有一行（`rowHeight` 下限 18）而按钮默认 22 px，
   这时**没有任何位置能同时满足上下两个钳位**：旧代码先把 y 抬到卡片上沿、再被下钳位推出卡片

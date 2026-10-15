@@ -192,6 +192,12 @@
   卡片内容模型（`PlanIslandCard`）、severity 配色（`ResolveSeverityColor`）、
   卡片宽度（`ComputeIslandCardWidth`，含最小宽度与屏幕钳位）都有断言（当时 302 条；当前总数见 §12.1）；
   **卡片绘制本身与宽度改动的观感**只能在机器上看，仍列在未验证之内。
+- **灵动岛的「视觉层」至今不在用户的测试范围内，用户也从未审查过它（2026-10-16 用户明确说明）。**
+  所以上面那两条里的"已实现"只表示代码与断言在仓库里，**不表示它在屏幕上是对的**：
+  动画/几何/定位/命中/悬停/关闭按钮/置顶/卡片生命周期**都还没有被有效审查过**，
+  在没有用户本人审查之前**不要去"修"它们**——那样的修复是白费力气，而且会掩盖真正该被审的东西。
+  可以参考的只有两类证据：宿主里那些纯函数断言，以及日志/探针。**要改视觉层，先请用户审查。**
+  协议侧（`EVENT` 帧的两个字段、解析、行数）不在这条限制之内——它是文本，可以被逐字验证。
 - **M3 第一片（卡片交互）**：`ComputeIslandRect`（矩形与宽度同源）、`ComputeIslandCloseRect`、
   `BuildIslandRegions`、`IslandHitTest`、`IslandDismiss` 都有断言，其中包括一条**整体性质**：
   逐像素遍历卡片，要求没有任何像素落在 `IR_NONE`（"看得见的都能点"）。悬停不占定时器
@@ -427,7 +433,16 @@ README 的图标一节与设置表、[invariants/icons.md](invariants/icons.md)�
 | 实现踩点：**局部变量不能叫 `$leadMs`**——PowerShell 变量名大小写不敏感，会覆盖 `-LeadMs` 参数本身，自动值就永远停在第一次算出来的数（代码里已注明） | 活体输出 `-> SET netease pos 600000 dom 136.0s +1000ms`（当年）；现在形如 `vinyl 157.2s +500ms` |
 | 顺手修正 README 两处与实测不符（历史）：`-LyricSource store` 原写"精确到客户端自己的当前行"（实测**冻结**）；参数表里的位置顺序与下一行自相矛盾 | README 的发布器一节；**`-LyricSource` 参数本身已在 2026-10-15 删除** |
 
-**其余已确认、尚未修**：**本会话复查列出的项目已全部处理完**。剩下的都是真机项（见 §12.1）
+**第十一批（2026-10-16，用户要求"事件自带歌名与歌手两个字段"）**：
+
+| 内容 | 依据 / 断言 |
+| :-- | :-- |
+| **事件帧的标题被切在第一个空格上（真缺陷，从事件通道落地起就在）**：`EVENT` 的标题曾经是一个 token，而歌名与歌手**都带空格**（`Blue Hour` / `Mili / 塞壬唱片-MSR`）。用 HEAD 的代码 + 桥自己发的那一帧实测：`EVENT netease info 6000 Blue Hour  Mili / 塞壬唱片-MSR` → 卡片第一行 `Blue Hour  Mili / 塞壬唱片-MSR`、第二行 `Hour  Mili / 塞壬唱片-MSR` | 新断言第一条 `EVENT keeps a title with spaces and splits the artist off at two spaces`（在 HEAD 上**实测红**：`titleLen` 是 4 而不是 9）；对照 `a frame without a separator draws one row (no blank second row)`（HEAD 上画 2 行：`Blue Hour` / `Hour`） |
+| **标题按"到缓冲区结尾"消毒（附带缺陷）**：`ExtSanitize` 一直吃到 NUL，而标题是帧缓冲里的**切片**，于是第一行把第二行的文字也复制进去。修法 `ExtSanitizeSlice(src, len, dst, cap)`。**第一版断言在测试里自己做了这次消毒**，把产品改回旧写法宿主照样全绿（AGENTS §7.8 的又一个实例）——把"帧 → 卡片字段"抽成产品函数 `ExtEventFromCommand` 之后，负对照才变红 | `a frame with an artist draws two rows, the title intact`；负对照实测：`ExtSanitizeSlice` 改回 `ExtSanitize` → 红 1 条（`title="Blue Hour  Mili"`） |
+| **协议形状**：`EVENT <p> <sev> <ttl> <title>  <artist>`，**第一处两个及以上连续空格**是字段边界；没有这样的运行 = 没有 artist = 卡片**只画一行**（判据是**消毒之后**的 `ev.artist[0]`）。合并的判据随之是**两个字段都相同**（同标题不同 artist 是另一件事） | 边界断言三条（单个空格不切 / 分隔符后为空只画一行 / 文本为空 400）+ `the same title with another artist is a new event, not a repeat`；负对照：单个空格也切 → 红 7 条、卡片恒两行 → 红 3 条、合并忽略 artist → 红 6 条 |
+| **桥侧**：`Format-IslandEventFrame`（纯函数）取代内联格式串；字段自己带连续空格时折成一个（卡片上同宽、看不出来）并**说一次**（有界计数）；**值通道不受影响**（`{ext.<p>.title}` 发的仍是原文） | 自检 103 → **109** 项：帧逐字相等、单空格留在标题里、无歌手不写分隔符、帧里"两空格运行"恰好一次、旧协议对照 |
+
+
 与 AGENTS §7.13 末尾记的测试装置信任边界（`PaintPanel` 的**调用点**；`StartIntro` 接线自
 `fdf5806` 起已由宿主驱动两个方向，2026-10-15 更正——见本文件前面的更正条）。
 

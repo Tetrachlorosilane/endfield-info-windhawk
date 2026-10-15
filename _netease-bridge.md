@@ -23,6 +23,13 @@
 > 依赖旧写法的面板配置要在那一行补上 `{ext.netease.artist}`；只写 `{ext.netease.title}`
 > 的配置从此**看不到歌手**（不会报错，就是少了）。
 
+**换歌卡片走的是另一条通道**（`EVENT`，不是 `SET`）：卡片的两个字段就是曲目身份的两半，
+帧的形状是 `EVENT netease info <卡片时长> <歌名>  <歌手>` —— **两个文本字段之间是两个空格**，
+因为一个空格是歌名的一部分（`Blue Hour`）；没有歌手时**不写分隔符**，卡片就只画一行。
+形状由 `Format-IslandEventFrame`（纯函数，`-SelfTest` 覆盖）给出，与 mod 的
+`ExtSplitEventText` 是同一条规则；协议表见
+[docs/external-data-island-design.md](docs/external-data-island-design.md) §4.7。
+
 ### 数据只有一条来源：客户端自己的黑胶页
 
 位置、当前行、曲名、歌手全部来自 CDP 调试页面（`--remote-debugging-port=9229`）：
@@ -105,7 +112,7 @@ pwsh -ExecutionPolicy Bypass -File _netease-bridge.ps1 -Ttl 600000
 | 参数 | 作用 |
 | :-- | :-- |
 | `-TtlMs` | 值的寿命，默认 600000（10 分钟）。歌在播就给长一点，别让行里闪 `--` |
-| `-Event` | 换歌时发一条 `EVENT`，让灵动岛弹一次 |
+| `-Event` | 换歌时发一条 `EVENT`，让灵动岛弹一次（卡片两行 = 歌名 / 歌手） |
 | `-EventTtlMs` | **卡片**在屏时长，默认 6000 ms。⚠️ 不要用 `-TtlMs`：那是**值的**寿命，把它当卡片时长用，一张卡就占住岛十分钟 |
 | `-EventMinIntervalMs` | 两条岛事件之间的最小间隔，默认 4000 ms；被节流掉的那条下一拍还有机会发 |
 | `-LeadMs` | **负延迟**：换行提早多少毫秒。`-1`（默认）= 半个 `-IntervalMs`（默认 **500 ms**）；`0` 关掉 |
