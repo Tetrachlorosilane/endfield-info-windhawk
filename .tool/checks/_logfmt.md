@@ -43,6 +43,9 @@ Python 即可（只 import `re` / `sys` / `pathlib`）。本机 `python` 若是 
 
 ## 为什么这个脚本存在（原 AGENTS §3 的实测记录，2026-10-14 搬来）
 
+> AGENTS §3 现在只留这条检查的**入口**（"宽格式它一条都查不了，用 `python .tool/checks/_logfmt.py`"），
+> 实测记录与推导在这里，运行与判读在 [../regress/test-layout.md](../regress/test-layout.md) 的「坑」一节。
+
 > **mod 的日志格式串不在这里检查——而且编译器根本查不了宽格式。** 这一段曾经写着
 > "宿主打桩了真的 `Wh_Log`，所以每个 `Wh_Log(L"...%s", ...)` 都会走 `-Wformat`"，
 > 那是**错的**：`Wh_Log` 是自造的变参函数，clang 只对带 format 属性的函数或 printf 家族

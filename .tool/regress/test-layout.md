@@ -42,3 +42,10 @@ Windhawk 的 clang++ 与 Windows，不需要管理员权限。最后一段会真
 - 宿主**测不了**管道读写（客户端要写，沙箱/宿主都做不到）。这里的 `Wh_Log` 桩也**不检查格式串**：
   clang 只查带 format 属性的函数，而这个工具链上宽字符 format 属性是硬错误、`ms_printf` / `wprintf`
   又不受支持——宽格式要用 `python .tool/checks/_logfmt.py` 查。
+- **本地编不出"安装版"。** `compile_flags.txt` 带 `-DWH_EDITING`，在这个宏下 `windhawk_api.h` 把
+  `Wh_Log` 定义成空的内联函数、`WH_MOD_ID` 变成占位符，也不引入 `windhawk_api_internal.h`。
+  所以本地 build **是语法/类型门，不是与安装版逐位一致的产物**：日志调用连同它们的格式串在本地被
+  编译掉，DLL 里搜不到任何日志字符串——"DLL 里没有新日志"**什么也没证明**（为此白排查过一轮）。
+  去掉 `-DWH_EDITING` 也救不了：那会引用 `InternalWh_*`，而它们由 Windhawk 自己提供，本地链接不过。
+  要检查日志格式串，用 `python .tool/checks/_logfmt.py`（原理见
+  [_logfmt.md](../checks/_logfmt.md)）。

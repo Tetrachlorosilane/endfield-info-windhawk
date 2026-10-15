@@ -5,15 +5,19 @@
 
 **读本文之前先读 README 的「功能」与「全部设置项」两节**，否则不知道这些代码在服务什么。
 
+**各子系统的规范条文在 [docs/invariants/](docs/invariants/)**：§5 是那张索引表——
+每条只写"什么时候必须读它"和最要命的 1–3 条，全文（含断言名与实测数字）在对应文件里。
+改动相关代码前先读索引指到的那一个。
+
 ---
 
 ## 0. 三条铁律
 
 在动任何代码之前先内化这三条。它们各自对应一次真实回归。
 
-1. **不要"修一个、猜一个"。** 本项目大量缺陷的症状是**屏幕上某个东西消失或位置不对**，
-   而原因可能在采样、布局、变换、配色解析、文件载入中的任意一层。
-   已经有多次"我以为是 A，实际是 B"的记录（见 §6）。**先取证据，再改代码。**
+1. **不要"修一个、猜一个"。** 本项目的缺陷症状**高度重叠**——"屏幕上某个东西消失或位置不对"
+   可能是采样、布局、变换、配色解析、文件载入中的任意一层。已经有多次"我以为是 A，实际是 B"
+   的记录。**先取证据，再改代码**：§6 给了按层分类的顺序，§7 是真实弯路的清单。
 2. **可断言的行为必须写进 `.tool/regress/test-layout.cpp`。** 这个 mod 无法自动化 UI 测试，
    回归测试是唯一的自动防线。凡是"编译通过但屏幕上看得出错"的逻辑，都必须有断言。
 3. **偏离原项目时，把偏离和理由写进注释与 README。** 本移植有意偏离原 Avalonia 实现的
@@ -27,13 +31,22 @@
 endfield-info-windhawk/
 ├── endfield-info-windhawk.wh.cpp      唯一的交付物（含 Windhawk 元数据与注释内 Readme）
 ├── README.md                          用户文档（安装、设置、变量、排查）
-├── AGENTS.md                          本文（实现与不变量）
+├── AGENTS.md                          本文（实现与不变量索引）
 ├── CHANGELOG.md                       版本与变更（发布说明的来源）
 ├── LICENSE                            MIT
-├── docs/                              规划、设计与交接文档
-│   ├── external-data-island-design.md 设计：外部数据（M1 数据面、M2 事件面均已实现）
+├── docs/                              规划、设计与规范条文
+│   ├── invariants/                    按子系统拆的规范条文（原 AGENTS §5 的正文）
+│   │   ├── layout.md           行高/前缀和/面板宽度/静态数组 0 默认值 · 改布局前读
+│   │   ├── text-measurement.md 笔进 vs 墨迹、FitTextToWidth、NoWrap · 改截断/测量前读
+│   │   ├── markup.md           size/font/gap/对齐组/[[/]] 的编译与实例化 · 加标记前读
+│   │   ├── icons.md            行内图标的几何、图片与缓存 · 碰图标前读
+│   │   ├── animation.md        展开/收起、高度与窗口的同帧一致 · 碰动画前读
+│   │   ├── theme.md            配色优先级、-- 与 PDH 有效性（原 §5.2）· 碰配色前读
+│   │   ├── window.md           窗口样式/置顶/平台限制（原 §5.5 + §8 的窗口部分）· 碰窗口前读
+│   │   └── fonts.md            回退链与逐段覆盖的成本闸门（原 §5.7）· 碰字体前读
+│   ├── external-data-island-design.md 设计：外部数据（M1 数据面、M2 事件面均已实现）；§5.6 的不变量也在这里
 │   ├── font-and-row-metrics-design.md 设计：多字体回退 + 按行字号/高度（含"未配置零成本"闸门）
-│   ├── platform-notes.md              GDI+ 导出名/常量、NVML 加载缺陷（原 AGENTS §8）
+│   ├── platform-notes.md              GDI+ 导出名/常量、头文件顺序、NVML 加载缺陷（原 AGENTS §8）
 │   ├── panel-width-design.md          设计：面板宽度（Fixed / Fit content、三条不变量、负对照清单）
 │   ├── inline-markup-design.md        设计：行内图标 + 留白/对齐（**§7 第 3、4、5 步均已实现**）+ 一次性编译（**已实现**）
 │   └── state-and-handover.md          验证状态、真机更正、犯错档案、待办
@@ -56,7 +69,8 @@ endfield-info-windhawk/
 调用它们，删了会静默降级。删除用 `git mv` 进 `.Trash/`。
 
 分工：**README 讲用户怎么用**，**脚本的 `.md` 讲这个脚本怎么跑**，**AGENTS（本文）讲实现、
-不变量与踩过的坑**。同一个事实不要在三处各写一遍——写在你改代码时需要看到的那一处。
+不变量与踩过的坑**，**`docs/invariants/` 讲某个子系统的规范条文**。同一个事实不要在多处各写一遍
+——写在你改代码时需要看到的那一处。
 
 `.tool/` 下的工具都是**开发工具**，不随 mod 交付。
 
@@ -116,7 +130,8 @@ libc++）编译，并打印导出符号表。
 > （"DLL 里没有新日志"其实什么也没证明）。去掉 `-DWH_EDITING` 也救不了：那会引用
 > `InternalWh_*`，而它们由 Windhawk 自己提供，本地链接不过。
 > **要检查日志格式串，别指望编译器**——宽格式它一条都查不了（原因与实测见下面的方框），
-> 用 `python .tool/checks/_logfmt.py`。
+> 用 `python .tool/checks/_logfmt.py`。完整推导见 [.tool/checks/_logfmt.md](.tool/checks/_logfmt.md)
+> 与 [.tool/regress/test-layout.md](.tool/regress/test-layout.md) 的「坑」一节。
 
 ### 设置块校验（改过设置项就跑）
 
@@ -169,7 +184,8 @@ $wc = 'D:\Program Files\Windhawk\Compiler'
 > 末行变成 `PASSED (0 failure(s), 1 skipped)`。**跳过不等于通过**——要验证 DACL 得在普通
 > 终端里跑一次。实测边界：**只读**打开可以（`GENERIC_READ` → `opened=1`），而
 > `GENERIC_WRITE`、`FILE_WRITE_DATA`、`GENERIC_ALL` 全部 `err=5`。因此宿主**没法**做管道
-> 端到端测试（客户端要写），管道读写路径只能靠真机日志——§10 的"未验证"里也记着这条。
+> 端到端测试（客户端要写），管道读写路径只能靠真机日志——[docs/state-and-handover.md](docs/state-and-handover.md)
+> 的「未验证」里也记着这条。
 
 > 宿主还替产品守了三件它自己容易犯的事：**设置字符串的所有权**（桩按真实 API 每次发放新内存，
 > 漏 free / double free / 泄漏都会在末段 `=== settings string ownership ===` 里报出来）、
@@ -214,8 +230,8 @@ python .tool/checks/_deadcode.py
 用于测试配置解析（主题优先级、图标路径裁剪）。
 
 测试**最后一段会真启动 GDI+**（`g_gdiplus.Load()` + `Startup`），用真字体量
-"这段文字会不会折行、会不会冲出预算"。这是唯一能守住 §5.1 那条
-"文字不得折行"的办法：纯函数测不了 GDI+ 的排版行为。GDI+ 起不来时该段打印一行
+"这段文字会不会折行、会不会冲出预算"。这是唯一能守住 [text-measurement.md](docs/invariants/text-measurement.md)
+那条"文字不得折行"的办法：纯函数测不了 GDI+ 的排版行为。GDI+ 起不来时该段打印一行
 `SKIP` 并计入末行的 `skipped` 数（不再是一句容易被忽略的 "section skipped"），
 所以没有 GDI+ 的环境里测试仍可用，但**不会被误读成全绿**。
 
@@ -304,327 +320,106 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 
 ---
 
-## 5. 不变量（不要破坏）
+## 5. 不变量（不要破坏）——按子系统拆到 `docs/invariants/`
 
-每一条都对应一次真实回归，改动相关代码前先读它的测试。
+每一条都对应一次真实回归。**这里是索引，不是全文**：每节只写触发条件、
+最要命的几条（写在下面，读一眼就够），以及规范条文的落点。
+**改相关代码前读指到的那个文件**——断言名、实测数字、容错清单都在那里。
 
 ### 5.1 布局
 
-- **`ComputeRowTextMetrics` 对无环行必须返回完整内宽。** 曾返回 0，
-  导致 GDI+ 把整行裁掉 → "第一行之后都不显示"。
-- **`ComputeRowTextMetrics` 的 `textWidth` 不得为负**，下限为 0。
-- **内联环的判进必须包含尾随空格。** GDI+ 的 `MeasureString` 故意不计尾随空格，
-  所以用**哨兵字符 U+2502**：测 `文字+哨兵` 再减哨兵宽度。
-  曾少算这一点，导致环压在 `%` 上。
-- **行的 `StringFormat` 必须带 `StringFormatFlagsNoWrap`（`0x1000`），
-  且只能由 `CreateRowStringFormat()` 建。** 这个 mod 的行是"一行读数"，
-  没有第二行的位置。丢了 NoWrap 的后果不是"多出一行"，而是
-  **该段首行上浮**：框高只有一行（`RowHeight`），而 `LineAlign = Center`
-  会把折行后的多行整体垂直居中。一行由多段（文字/环/文字）拼成、
-  每段各有自己的框，于是折行的那段与相邻段**基线不一致** →
-  观感就是"第一行文字不在一条直线上"。断言用真 GDI+ 覆盖（见 §3）。
-  **不要把这个函数拆回内联**：测试必须和绘制走同一个函数，
-  否则测的是测试自己那份副本（这一点已实测踩到，见 §7 第 8 条）。
-- **GDI+ 不按 layout 框"溢出"文本，它把放不下的字形丢掉。** 所以每段在 `DrawString` 前要按自己的预算调用 `FitTextToWidth()` 截断：
-  右停靠段 = `metrics.textWidth`，**内联段 = `ComputeInlineTextLimit(textRight, cursor,
-  跟在它后面的环数, ringSize)`**。内联段曾经写成"实测 advance"，那是个**恒真的预算**
-  （该函数第一句就是"已经放得下吗"），于是用了 `[[ring:…]]` 的行**从不截断**：文字切在
-  位图外缘且没有 `…`，它自己的环被挤出面板。`FitTextToWidth` / `FitCharacterCount` /
-  `FitCharsWithEllipsis` / `ComputeInlineTextLimit` 是纯函数或注入测量的函数，都有断言。
-- **"文字有多宽"有两个数，不是一个：`MeasureAdvance`（笔的终点）和 `MeasureDrawnWidth`（GDI+ 报的墨迹范围）。**
-  `GdipMeasureString` 报的是**墨迹范围**，最后一个字形的墨迹会超过笔的终点（右侧边距），
-  所以两者能差出字号的三分之一（15 px 的 `W`：笔进 14.43、报 19.43，`WW`/`WWW` 同样是 5.00）。
-  **GDI+ 对放不下的字形不是溢出，是丢弃**：`WWW` 放进"笔进那么宽"（43.29）的框只出来两个字，
-  48.29 才三个——这就是"最后一个字不画"。
-  用谁：**行流游标 / 组的定位 / 自然宽度 = `MeasureAdvance`；layout 框与组的宽度 = `MeasureDrawnWidth`（两者取大）**。
-  组的宽度必须用后者，因为它同时是相位 C 的预算：用笔进求和，组内每段都被交给一个差一个右侧边距的预算，
-  "一个字符偏移原位、多个字符少最后一个、末尾加空格就好"三种症状都是这一个差。
-  **不要再把两个数合并**：合成笔进 → 框太窄丢末字；合成墨迹 → 续段预留过多，小字号下
-  `[[center]]W[[/center]]` 的预算会小于笔进、整段被截没（宿主实测 10 px 下 `lost=102`）。
-  `LayoutWidthFloor` 仍只是"框宽下限"（1.0），**不是**把宽度取整到更窄。
-- **`DrawString` 的框宽下限是 `kMinLayoutWidth`（1.0）**，不能是 0：
-  0 宽会让 GDI+ 把整段裁掉，这与第一条是同一个坑的另一面。
-  截断与框用的是同一个下限（`LayoutWidthFloor`），两者不能各写一个数字。
-- **`FitTextToWidth` 不缓存省略号宽度。** 它曾经"按进程缓存一次"，理由写着"字体终生固定"——
-  **不成立**：绘制每帧按设置重建字体。于是改字号后缓存还是旧字号的宽度，被截断的行可以
-  比预算宽出这个差值（实测 24 px 字体下某个预算超 6.1 px）。现在每次量一次（旁边本来就有
-  一次二分测量，多这一次可以忽略）。断言是**扫一遍预算**（40..200）而不是试一个：
-  预留被低估时只有"刚好填满预留"的那些预算会越界。
-- **行不再是等高的**：每行有自己的字号与行高（`Row N font size` / `Row N height`，或行首的
-  `[[size:NN]]` / `[[h:NN]]`，标签优先）。三个派生量只有一处实现，谁都不许再自己乘一遍：
-  `RowFontSizePx`（0 = 继承全局）、`RowHeightPx`（**不小于 `MinimumRowHeightForFont`**）、
-  `RowTopPx` / `PanelRowsHeight`（前缀和）。`ComputeGeometry` 的 `g_panelHeight` **必须**来自
-  `PanelRowsHeight`——它同时是窗口高度、命中矩形高度与入场目标高度，**写成 `rowHeight × 行数`
-  就会让面板高度与画面不一致**（这一条有断言：`ComputeGeometry` 算出的高度必须等于各行之和）。
-- **行高下限是"字放得下"，不是美学选择**：`kRowHeightFontSlack = 15` 正是默认 `Row height 30`
-  与 `Font size 15` 之差。去掉它，30 px 字号的行会溢出到相邻行上（GDI+ 不裁剪字形）。
-  改这个常量会同时改变默认配置的外观，改前先看 §5.1 最后那条断言。
-- **`[[size:NN]]` 有两副面孔，区别只在位置**：写在**行首**是**行属性**（`ReadSettings` 的
-  `ParseRowMetricTags` 把它从 `rows[]` 里剥掉，同时决定该行的字号与高度下限）；写在**别处**是
-  **段属性**（`InstantiateRowProgram` 换成 `kSizeMarkStart` + 两位十进制数字 + `kRingMarkEnd`，
-  `[[/size]]` 换 `kSizeMarkEnd`），由 `BuildRowLayout` 记进 `TextSeg::runFontSize`。
-  所以"段内 `[[size:20]]` 当普通文字"这条**只对行高成立**：它照样能改字号，但改的是那一段。
-  绘制侧按段取字号（`AcquireRowFont(…, segFontSize)`），段不嵌套——`[[/size]]` 回到该行自己的字号，
-  与 `[[/font]]` 回到主字体是同一条规矩。
-- **行高下限用"这一行里最大的字"**（`ModSettings::rowMaxFontSize` = 本行字号与
-  `MaxInlineRunSize` 的较大者），不是本行字号：否则 `[[size:30]]` 出现在小字行里会溢出到下一行。
-- **图标跟随"它自己出现处的字号"，不跟随全局 `Font size`。** 图标是行里的**内容**
-  （`[[icon:…]]` 元素），和它旁边的文字同一层：`[[size:24]]…[[icon:Memory]]…[[/size]]` 里就是
-  24 px 那个图标，同一行里两个尺寸的图标是两个不同大小的盘子（`IconDiameterForFontSize` 是
-  唯一乘系数的地方，尺寸取 `ElementFontSizePx` = 段字号或该行字号）。
-  这条曾经**反过来**过：图标是行首的**盘**（面板元素，属于所有行共用的左侧一列），
-  所以它只跟随全局字号，`Row N icon` / `Custom icon file` 九个设置项就是这么用的。
-  那次用户报的是"改变行 size 后图标也跟着变大，应该不对"——在**行首盘**的模型下他是对的：
-  盘不是那一行的内容，让它跟着行字号变还会把**所有行**共用的文字列一起挪动。
-  改成行内元素后前提变了（盘不再存在、文字列也不再有共用的内缩），所以规则随之反转；
-  两条规则各自都对，错的是拿旧模型的那条去套新模型。
-  `RowMetrics` 里因此**没有**盘径字段：一个"每行一个盘径"的字段在新模型下必然是假的。
-- **行首标签只认行首**：前缀解析在 `ReadSettings` 里完成、标签已从 `rows[]` 剥掉，所以绘制侧只看得到
-  段标签；`[[h:…]]` 写在文本中间是**普通文字**，写错的一律留下原文。
-- **两套"行号"必须分清**：设置按**设置里的行号**命名，绘制只知道**显示顺序**。
-  留空的行会被跳过，两者因此会错位：`Row N font size` / `Row N height` 是**这一行自己的属性**，
-  读取时按设置行号、存进被画出来的那一行（`rowSlotOf[]`），所以 `Row3Height` 落在第二个显示行上。
-  （图标不再有这个坑：它写在行里，跟着那一行走。）
-- **每帧的重活是"测量"，而它被缓存掉了**（`RowLayoutPlan` + `EnsureRowPlan`）：选族（覆盖查询）与
-  拟合（`FitTextToWidth` 的二分、哨兵、省略号）只在**文本或几何变化时**跑一次，中间那些帧只
-  `DrawString`。**注意前提**：标记解析（`InstantiateRowProgram` / `BuildRowLayout`）本来就只在
-  `PublishRows` 里跑，不在每帧——所以"每帧解析文本"从来不是本项目的成本，别按那个去优化。
-  新鲜度键的**每个字段都要有断言**（`RowPlanIsFresh` 的纪元/宽度/行高/字号/行数/段数；
-  行内缩曾经也是键里的一项，它随行首图标盘一起消失、成了常量，那一项断言也随之删除）；
-  纪元由 `ReleaseFontResources` 与 `PublishRows`（只在内容真的变了时）自增，**新增任何
-  "改了就该重排"的状态都要加进这两处之一**，否则屏幕会留着上一份文本。证据链：
-  `g_measureCalls`（产品计数器，`[perf]` 里的 `meas=`）——宿主断言"复用计划时测量次数为 0"。
-- **`[[gap:…]]` 的单位由写法决定，像素上限由标记的位数决定。** 裸数字 = **字号倍数**
-  （`[[gap:1.5]]`，存百分之一 em），带 `px` = **绝对像素**（存百分之一像素）；
-  乘字号只发生在 `GapPixels` **一处**，问的是与图标直径同一个 `ElementFontSizePx`
-  （所以 `[[size:24]]` 里的 gap 和图标一起变大），钳位只在 `ClampGapPx` 一处。
-  **上限 99 px**（`kMaxGapPx = 99`）：标记用**四位十进制**写像素的百分之一，
-  9999 就是它能写的最大值；写成 512 会让 `(51200 / 1000) % 10` 取到第二位数字，
-  于是 100 px 以上的 gap 前两位被换位。**改上限就要同时看 `kGapMarkerMaxValue`。**
-  `[[gap:0]]` 合法（零推进，不许变负或 NaN）；读不出来的（`[[gap:]]` / `abc` / 负数 /
-  `100px` / `655.36px`）一律**留下原文**。
-- **`[[/]]`（不用写名字的收尾）是编译期脱糖，不许让布局或绘制认识它**：
-  `CompileRowSuffix` / `InstantiateRowProgram` 各一份**同规则的开块栈**（三种 kind 各最多一帧、收尾弹栈顶），
-  标记一律经 `WriteBlockClose`；**memo 键要带开块状态**（只按位置会少标记）。
-- **对齐组是标记 + 段上的 `group` 号，不是编译期的树。** `[[left]]`/`[[center]]`/`[[right]]`
-  在实例化时写成一对标记（开 = 标记+对齐数字+结束符，关 = 标记+结束符），
-  `BuildRowLayout` 按位置切成 `TextSeg::group`；`BuildRowPlan` 分三段做：
-  **A** 逐元素测量（组内元素以组开头为原点）、**B** 组的宽度（**各部件 `drawnWidth` 之和**）
-  与左/中/右定位、**C** 平移到最终 x（**元素也一起平移**，否则预算会拿"组局部"的游标去比
-  "面板绝对"的右边缘，`right - x` 变成负数、整段被截没）并按"它不能越过的边"重新拟合组内文字。
-  **不嵌套是结构性的**（第二个开标记就是关上一个），所以不需要栈；
-  组里只有一层，`AlignGroupPlan` 是 `RowLayoutPlan` 里的定长数组（`kMaxAlignGroups` 10）。
-- **"组右边缘"对文字永远不比面板文字列更紧，所以相位 C 的重新拟合是安全冗余。**
-  第一遍已经按面板列把每段文字拟合过了，而组的宽度是这些段的宽度之和——
-  组不可能比列宽（除非组里有固定尺寸元素，那时整组被夹到列的左边缘）。
-  因此真正约束文字的是**列**，`RunBudgetRightEdge`（列与组的较近者）保证的是
-  "预算永远来自不能越过的边"这条形状，不是"组一定会截断文字"。
-  **不要因为"它反正不会生效"就删掉它**：删了它，一个直接拿自己实测宽度当预算的实现
-  （`FitTextToWidth` 第一句就是"放得下吗"，于是恒真）就会把文字画到面板外——负对照实测会红。
-- **组比文字列宽时退化成靠左**：夹到列的左边缘，文字各自按列截断，
-  固定尺寸元素（图标、环）允许超出——这是刻意的，也是"组内的字符"与"面板边界"冲突时
-  唯一不撒谎的取舍。
-- **一段文字在组内与组外的宽度可以不同**：相位 C 用组的右边缘（或列）重新拟合，
-  所以"同一串字写在组里更短"是正常的，不是 bug。断言用**关系**（右边缘 ≤ 组右边缘/列右边缘）
-  而不是硬编码宽度。
-- **组内的 run 在相位 A 按"组自己的坐标系"拟合，绝不按行流的游标**（`groupOrigin`）：
-  组是整体、在相位 B 才定位的，行流游标对它的落点一无所知。用行流游标曾让
-  `[[center]]ABC[[/center]]` 在**前面有一段长读数**时画出 `AB`（再长一个字整组消失），
-  而组明明落在面板中间、位置完全正确——因为相位 B/C 只会**缩短** run，那一次截断是永久的。
-  断言（前缀 0..40 个 `W` × 三种对齐）：
-  `a group's content survives a long flow run before it (all three alignments)`、
-  `and the group's width counts the characters the flow run was stealing`。
-- **静态数组里的结构体，默认成员初始值必须是 0。** 一个非零的默认值（`int group = -1;`）
-  会让编译器把这**整个对象**的镜像放进 `.data`（文件里真实存在），而不是留在 `.bss`
-  （只有虚拟大小，不占文件字节）。`RowLayoutPlan::segments[12]` × `g_rowPlans[4]` 因此
-  一次把 **93,696 字节**的纯零内存写进了 DLL：191,488 → 290,304，而 `.text` 只涨了 5.2 KB
-  （**这条是量出来的**：`git worktree` 建父提交编译，再比 PE 段表）。
-  所以 `RowSegmentPlan::group` / `TextSeg::group` 的"没有组"是 **`kAlignSegFlow` = 0**
-  （标记里的组号是 1..3，0 空着），`AlignGroupPlan::lastSegment` 也不再需要 -1——
-  组就是"同号连续段的最大区间"，两端一扫描就知道。
-  **判据：会进静态数组的结构体，新增字段的默认值只能是 0**；真要非零，就只在对象本身
-  很小的静态量上用（或让该对象走运行期构造）。量法（标准库解析 PE 段表，看 `.data` 的 raw）：
-  ```python
-  # .data raw 应保持 ~1 KB；涨到几十 KB 就是非零默认值把对象拖进了文件镜像
-  import struct, sys
-  d = open(sys.argv[1], 'rb').read()
-  e = struct.unpack_from('<I', d, 0x3C)[0]
-  n = struct.unpack_from('<H', d, e + 6)[0]
-  opt = struct.unpack_from('<H', d, e + 20)[0]
-  for i in range(n):
-      o = e + 24 + opt + i * 40
-      nm = d[o:o+8].rstrip(b'\0').decode()
-      vs, va, raw, pra = struct.unpack_from('<IIII', d, o + 8)
-      print(f"{nm:10} {vs:>9} {raw:>9}")
-  ```
-- **岛上的卡片不受行高影响**：它有自己的行距，取的是全局 `Row height`。卡片不是"一行"，
-  它盖在行上面；如果它的行距跟着下面的行变，一个正在淡出的卡片会在中途改尺寸。
-- **「面板有多宽」只有一个所有者：`EnsurePanelWidth`**（Fit content = `ResolvePanelWidth`，
-  Fixed = `Panel width`）。宽度**在 HUD 侧从实测内容解析**（设置期量不出来：没有行程序、
-  字号、`GpGraphics`），`ModSettings::panelWidth` 因此只是 Fixed 的宽度 + 测量基准宽度。
-- **解析出的宽度对一个状态恒定，并在位图与 `PlaceWindow` 之前确定**：
-  `EnsurePanelWidth` → `FrameWidthFor` → `PlaceWindow` → `CreateDIBSection`，
-  同一帧窗口与位图是同一个数。**每帧重算就是被移除过四次的宽度动画**（§7.12）；
-  缓存键（纪元 + 已发布行 + 卡片态 + 显示器宽）不能省。
-- **`ComputeGeometry` 只「播种」宽度（`if (g_panelWidth <= 0)`），不覆盖已解析的值。**
-  它还会在展开/收起/改设置时被调用，覆盖一次就是"窗口用解析值、几何用配置值"。
-  第一版断言在它之后把解析值补写回去，于是**恒真**（§7.13）——现在产品侧不覆盖、
-  测试侧按同样的顺序走。上限过屏幕钳位（monitor − 24），下限**不**过；
-  `min > max` 退化成常数。规则、退化情形与全部断言见
-  [docs/panel-width-design.md](docs/panel-width-design.md)。**改宽度代码前先读它**。
+**改行高、行顶、前缀和、面板宽度、`ComputeGeometry`、绘制预算或静态数组字段前 →
+读 [docs/invariants/layout.md](docs/invariants/layout.md)**
+（同时读 [text-measurement.md](docs/invariants/text-measurement.md) 与
+[markup.md](docs/invariants/markup.md)）。
+
+- **行高与面板高度只有一个来源**：`RowFontSizePx` / `RowHeightPx` / `RowTopPx` /
+  `PanelRowsHeight`。`ComputeGeometry` 的 `g_panelHeight` **必须**来自 `PanelRowsHeight`，
+  写成 `rowHeight × 行数` 就会让面板高度与画面不一致。
+- **面板宽度只有一个所有者：`EnsurePanelWidth`**（Fit content = `ResolvePanelWidth`，
+  Fixed = `Panel width`），解析出的宽度对一个状态恒定、且在位图与 `PlaceWindow` **之前**确定；
+  `ComputeGeometry` 只**播种**（`if (g_panelWidth <= 0)`），不覆盖。完整规则见
+  [docs/panel-width-design.md](docs/panel-width-design.md)（**改宽度代码前先读它**）。
+- **会进静态数组的结构体，新增字段的默认值只能是 0**：一个非零默认值会把**整个对象**的镜像
+  拖进 `.data`（`RowLayoutPlan::segments[12]` × `g_rowPlans[4]` 实测多出 **93,696 字节**）。
+
+全文另有：行高下限 `kRowHeightFontSlack = 15`、`rowMaxFontSize` 取"这一行最大的字"、
+`[[size:]]` 行首 vs 段内、行首标签只认行首、两套"行号"（`rowSlotOf[]`）、
+卡片行距取全局 `Row height`、每帧测量缓存与 `RowPlanIsFresh` 的新鲜度键（纪元/宽度/行高/字号/行数/段数）。
 
 ### 5.2 配色
 
-- **命名主题完全胜出，颜色字段被忽略。** 只有 `Theme = Custom` 才读颜色字段。
-  曾做成"预设打底、字段覆盖"，结果预设永远看不到。
-- **进入命名主题分支时要显式清 `ringColorUserSet`**，而不是仅仅不读它——
-  否则残留字段可能从某条路径泄漏进预设配色。
-- **环色优先级**：`:COLOR` > `Ring colour`（仅 Custom）> 主题边框色。
-- **`{gpu.temp}` 等"已知但取不到"的变量渲染为 `--`**，未知变量保持字面文本。
-  二者必须区分（见 §6 第 3 条）。**每个 NVML-only 读数都要有自己的有效性标志**
-  （`gpuTempValid` / `gpuFanValid` / `gpuPowerValid` / `vramUsedValid` / `vramTotalValid`）：
-  少一个标志，"这台机器读不到"就会被画成一个看着很像真读数的 `0`——温度、风扇、功耗、
-  显存总量各栽过一次。
-- **PDH 的"这个值能不能用"只有一个判据**：`PdhValueUsable()` 接受 `PDH_CSTATUS_VALID_DATA`
-  **和** `PDH_CSTATUS_NEW_DATA`。CPU 时钟路径一直接受两者，而 GPU 的数组读取只接受
-  `ERROR_SUCCESS`（即 VALID_DATA）——于是**计数器刚建好时的第一个采样被丢掉**，
-  表现为 GPU 读数晚一拍才出现。三条路径现在问同一个函数。
+**改主题解析、颜色设置项、环色优先级，或"取不到的读数"（`--`）/ PDH 有效性判定前 →
+读 [docs/invariants/theme.md](docs/invariants/theme.md)**。
+
+- **命名主题完全胜出，颜色字段被忽略**（只有 `Theme = Custom` 才读颜色字段），
+  进入命名主题分支要**显式清 `ringColorUserSet`**；环色优先级 `:COLOR` > `Ring colour` > 主题边框色。
+- **"已知但取不到"渲染为 `--`，未知变量保持字面文本**——每个 NVML-only 读数都要有自己的有效性
+  标志（`gpuTempValid` / `gpuFanValid` / `gpuPowerValid` / `vramUsedValid` / `vramTotalValid`）。
+- **PDH 只有一个判据 `PdhValueUsable()`**：接受 `PDH_CSTATUS_VALID_DATA` **和**
+  `PDH_CSTATUS_NEW_DATA`（GPU 曾只认前者，于是第一个采样被丢掉）。
 
 ### 5.3 行内图标
 
-图标是**标签放进去的普通元素**（`[[icon:…]]`），不再是设置项，也不再是行首那个盘：
+**加图标字形、改 `[[icon:]]` 解析、动图标直径/圆心/涟漪、碰图片载入/重采样/缓存前 →
+读 [docs/invariants/icons.md](docs/invariants/icons.md)**。
 
-- **`[[icon:字形]]` / `[[icon:file=路径]]`，`ParseIconTag` 在编译期解析**：字形名走
-  `IconStyleFromName`（`CPU` / `Memory`/`RAM` / `Disk` / `Network`/`Net` / `GPU`），
-  路径是**行文本里的一段切片**（`RowPart::offset/length`）——盘径与图片路径都不进 `RowPart`
-  的数组，否则每个 element 都要背一个 `MAX_PATH`。
-  **拼错的一律留下原文**（未知字形、空 body、`file=` 后面什么都没有、缺 `]]`），
-  与其它标签同一条容错规矩：一个空盘子会让人往完全错误的方向查。
-- **它占自己的盒子，行是"流"。** `BuildRowPlan` 把每个图标变成 `x` + `diameter`，
-  后面的元素从 `x + diameter + kIconContentGap` 开始；图标在**该行的垂直中心**
-  （`IconElementCenter`，盘和它的涟漪都用这一个点算）。
-  **没有行首盘，也没有"所有行共用的文字列内缩"**：文字从行自己的 `kRowTextLeftInset` 开始。
-  所以"图标画在哪个 x"只有 `BuildRowPlan` 一个来源，绘制侧只读计划。
-- **每个图标一个尺寸，没有全局图标尺寸。** 直径 = **该元素所在处**的字号 × `kIconPlateRatio`
-  （`IconDiameterForFontSize`，唯一乘系数的地方），字号取 `ElementFontSizePx`（段字号或该行字号）。
-  见 §5.1 那条：这条规则与旧的"盘只跟随全局字号"是同一个问题的两个前提。
-- **环半径从盘半径起步**向外扩张（`RingRadiusAt(plateRadius, …)`）。
-  曾用 `盘半径 × 0.5` 起步，环比盘小、压在字形上，看起来像"不同心"。
-- **环必须画在入场世界变换之内**，否则与盘处于不同坐标系。
-- **涟漪默认只从一行的第一个图标发出**（那是"每行一个盘冒涟漪"的旧观感），
-  其余默认安静；`:ripple` / `:noripple` 逐图标覆盖（`IconElementRipples`，"第一个"按**布局里
-  第一个图标段**算，不是按编译顺序）。
-- **自定义图片：小而宽高不等的源图，两轴不能分别钳位。** 曾导致 2:1 的图被压成 1.35:1。
-- **用户路径必须裁剪引号与前后空白**（`CopyUserPath`，`[[icon:file="C:\a b.png"]]` 也走它）。
-  曾把引号一起传给文件 API → "文件明明在却 could not load"。
-- **图片载入失败必须回退到内置字形**。否则只剩空盘，看起来像"图标变纯白"，会把人引向
-  完全错误的排查方向。行内模型里这条由 `kIconImageFallbackGlyph`（`Memory`）实现：
-  图片图标的 `entry.glyph` 在 `BuildRowPlan` 里补成它，`PaintIconElement` 先试图片、
-  失败才画这个字形。
-- **图片按路径缓存，不再按行**（`g_iconCache`，`kIconCacheSlots` 个条目）：
-  一行里同一个文件出现两次、或四行都写它，都只解码一次。
-  **淘汰规则**：先占空条目，否则丢弃**最久未使用**的那个（条目级 LRU，`lastUsed` 时钟）；
-  换路径时 `ReleaseIconEntry` 是唯一的释放点。
-  每个条目里再留 `kIconVariants` 份重采样结果（变体级 LRU）：**同一个文件在两个字号下出现是
-  两个重采样目标**，只留一份会让它在同一帧里反复重建位图。
-  条目里**不放 GDI+ 句柄以外的东西**，`RowPart` / `RowProgram` 里则一个句柄都没有。
-- **自定义图片在载入时按该图标直径重采样一次**，不在每帧缩放。大图一步压到 23px 会有锯齿，
-  且每帧重采样很贵。**逐级折半对"短边已经小于目标箱"的横幅同样成立**：
-  `PlanDownscale` 只按比例折半，不把短边钳回目标（那个钳位有不动点，会让宽扁图做十几次
-  1:1 空转、然后一次性压 173 倍）；短边在中间步骤允许降到 1px，末级仍由长边定尺。
-- **图片的绘制尺寸 = min(自然尺寸, 图标直径) × 入场缩放**（`ComputeIconImageDrawSize`）。
-  "不放大超过自然尺寸"是给**基准**尺寸的天花板，不是第二次钳位。它曾经被写成
-  "只有比盘还大的图才乘缩放"，而缓存图恰好**等于**盘径，于是自定义图片只会淡入、
-  不随盘子长大（内置字形那条路径一直是乘缩放的）。
+- **图标跟随"它自己出现处的字号"，不跟随全局 `Font size`**（直径 = 该处字号 ×
+  `kIconPlateRatio`，`IconDiameterForFontSize` 是唯一乘系数的地方）。
+- **环半径从盘半径起步向外扩张**（`RingRadiusAt(plateRadius, …)`），
+  且环必须画在入场世界变换之内，否则与盘不同坐标系。
+- **图片载入失败必须回退到内置字形**（`kIconImageFallbackGlyph` = `Memory`），
+  否则只剩空盘、看起来像"图标变纯白"。
+
+全文另有：`ParseIconTag` 的容错（拼错留原文）、元素占自己的盒子（`kIconContentGap` /
+`kRowTextLeftInset`）、涟漪只从布局里第一个图标段发出、`CopyUserPath` 裁引号、
+按路径缓存（`kIconCacheSlots` / `kIconVariants` / LRU）、`PlanDownscale` 逐级折半的不动点、
+`ComputeIconImageDrawSize` 的入场缩放。
 
 ### 5.4 动画
 
+**改展开/收起、入场关键帧、`g_displayHeight` / `g_paintedHeight`、`PlaceWindow` 的调用时机、
+热区，或让宽度随时间变化前 → 读 [docs/invariants/animation.md](docs/invariants/animation.md)**。
+
+- **窗口尺寸的变化必须与它提交的位图在同一帧内一致**：展开可以先定位，收起必须由绘制侧逐帧
+  跟随内容（`if (expanded) PlaceWindow(hwnd);`）。**补偿代码存在，说明顺序错了。**
 - **`g_displayHeight` 是静止几何**（`PlaceWindow` 与 `WM_NCHITTEST` 都用它），
-  **`g_paintedHeight` 是当前帧绘制高度**。**展开**方向动画不得写回前者
-  （曾混用 → 窗口与命中矩形在动画中途缩到标签尺寸 → "弹出后立刻收起"）。
-  **例外是收起方向**：`PaintPanel` 的收缩分支逐帧把 `g_displayHeight` 跟到绘制高度并
-  `PlaceWindow`——这正是修掉收起闪烁的手段（见下一条），此刻窗口与位图同高、命中矩形
-  跟着窗口，仍然自洽；动画结束时 `UpdateIntro` 把静止值写回。**不要"恢复"成展开时那样
-  不写它**，那会让展开高度的位图被裁进 8px 窗口——这一条与下一条是一体的。
-- **热区起点用 `kPanelTopOffset`（窗口实际顶部）**，不是显示器顶边。
-  曾用显示器顶边 → 面板最上面 6px 落在自己的热区之外。
-- **动画进度每帧只采样一次。** `IntroCue()` 每次都重算 `GetTickCount()`，
-  调用方若各自再算一次，两次采样可能对"动画是否结束"给出不同答案 → 最后一帧高度回跳。
-  以 `g_intro.active` 为唯一状态。
-- **收回时窗口必须逐帧跟随收缩**（收缩路径每帧调 `PlaceWindow`）。
-  否则展开高度的位图会被裁进 8px 窗口。
-- **但绝不能在收起开始时先把窗口缩到标签高度。** 曾经的顺序是「`SetExpanded(false)` 先把窗口缩到
-  8px → `PaintPanel` 再把它长回动画高度才画」，同一拍内 168→8→168 的往返里存在
-  「窗口 8px 高、却没有任何位图与之匹配」的一瞬间，合成器只能给出一条切片——**那就是收起时的
-  闪烁**。规矩：**窗口尺寸的变化必须与它提交的位图在同一帧内一致**。展开方向可以先定位
-  （面板长进一片本来什么都没有的空间），收起方向必须由绘制侧逐帧跟随内容
-  （`if (expanded) PlaceWindow(hwnd);`）。绘制分支里那句 *"SetExpanded already shrank the window
-  to the resting (tab) height, so the frame has to grow it back"* 正是这个往返的补偿——
-  **补偿存在，说明顺序错了**。
-- **宽度不是动画通道，也不许变成动画通道。** `EnsurePanelWidth` 只在一个**状态**改变时
-  重新解析宽度（缓存键见 §5.1），解析发生在位图与 `PlaceWindow` **之前**，所以"窗口尺寸的
-  变化必须与它提交的位图在同一帧内一致"这条在宽度方向上是靠**顺序**满足的，不是靠补偿：
-  `FrameWidthFor` → `PlaceWindow` → `CreateDIBSection(width)`。Fit content 模式下
-  展开/收起**不改宽度**（行没变，宽度就没变），卡片来了又走才让它换到卡片自己的规则再换回来。
-  **不要因为"宽度现在会变了"就把逐帧过渡加回来**——那正是 §7.12 里改了四轮的那个闪烁。
-- **展开与收回刻意不对称**：展开先生长定型、再让内容分层浮现；收回贯穿整段、时长为
-  **四分之一**（`kCollapseDurationRatio = 0.25`）。
-- **收回的关键帧 cue 是 `1.0`，不是 `kCollapseDurationRatio`。** 那个常量是**时长比例**；
-  把它当 cue 用（`{kCollapseDurationRatio, end}`）会让收缩在半程就结束，剩下半程窗口停在
-  标签高度、而帧时钟仍以 16 ms 重绘它——可见收回只有 `IntroMs × ratio²`（当年 ratio 还是
-  1/2，所以是 `IntroMs/4`；现在 ratio 是 1/4，再犯就是 `IntroMs/16`）。
-  断言：`the shrink still has work left at the midpoint`。
-- **文字淡入的终点有自己的常量 `kCueContentFull`，不是共用的 `kCueContentReady`。**
-  后者是 `Fade`（`introStyle == 1`）那条纯淡入分支的窗口末端，**那条分支没有提速**，
-  所以改淡入速度时不能去挪它。阶梯淡入的四个中间级是**窗口内的分数**
-  （`kCueTextFadeAt1..4`），窗口 = `kCueContentSpan / kCueTextFadeSpeed`——改速度只动
-  后者一处，升上来的形状不变；起点 `kCueContentIn` 不动（必须晚于 `kCueSettle`，
-  "先长定型、数字再浮现"）。
-- **方向判定用 `start = fromHeight`、`end = toHeight`**，方向由两者大小自然决定。
-  曾按方向重排 start/end → 收回时高度反而在增长。
-- **过冲强度 `kPanelBounceStrength = 0.04`**（原项目 0.275）。0.275 在 250px 面板上是
-  弹过头 14px 再收回，正是"弹出又收回"的观感来源。
+  **`g_paintedHeight` 是当前帧绘制高度**——展开方向不得写回前者，收起方向的跟随是刻意的例外。
+- **宽度不是动画通道**，也不许变成动画通道（每帧重算就是被移除过四次的宽度动画）。
+
+全文另有：热区起点 `kPanelTopOffset`、每帧只采样一次进度、`kCollapseDurationRatio = 0.25`
+与"收回 cue 是 `1.0` 不是这个常量"、`kCueContentFull` vs `kCueContentReady`、
+方向判定 `start = fromHeight` / `end = toHeight`、`kPanelBounceStrength = 0.04`。
 
 ### 5.5 窗口与置顶
 
-- 面板**永远不隐藏**，收起只是缩成 8px 标签。否则收起后无法点回来。
-- `WS_EX_NOACTIVATE` 始终保留（不抢焦点）。
-- 只有 `WM_NCHITTEST` 在圆角外返回 `HTTRANSPARENT`，因此圆角外点击会穿透。
-- 置顶用三重手段：创建时样式位 + `SetWindowPos` 显式写位 + 每 100ms 重申。
-  **周期性重申换来的不是正确性而是延迟**（已用独立探针验证），所以不要因为
-  "反正会重申"就省掉创建时的样式位。
+**改窗口样式、`WS_EX_*`、`WM_NCHITTEST`、圆角穿透、置顶策略或多显示器锚定前 →
+读 [docs/invariants/window.md](docs/invariants/window.md)**。
+
+- 面板**永远不隐藏**（收起只是缩成 8px 标签），`WS_EX_NOACTIVATE` 始终保留；
+  只有 `WM_NCHITTEST` 在圆角外返回 `HTTRANSPARENT`（圆角外点击穿透）。
+- **置顶用三重手段**（创建时样式位 + `SetWindowPos` 显式写位 + 每 100ms 重申）：
+  周期性重申换来的是延迟而不是正确性，所以不要省掉创建时的样式位。
+- **全屏独占的 3D 应用无法被覆盖**——平台限制，不是代码问题。
 
 ### 5.6 外部数据（命名管道）
 
-- 这一节的**全部不变量**（锁序、I/O 超时、实例数、开机自检、事件队列、卡片几何/命中）已搬到
-  [docs/external-data-island-design.md](docs/external-data-island-design.md) 的「命名管道不变量」一节；
-  **动管道、岛、卡片或 tick 的代码前先读那里**（搬出去是因为 AGENTS 会被静默截断）。
+**动管道、岛、卡片或 tick 的代码前 → 读
+[docs/external-data-island-design.md](docs/external-data-island-design.md) 的「命名管道不变量」一节。**
+
+这一节的**全部不变量**（锁序、I/O 超时、实例数、开机自检、事件队列、卡片几何/命中、
+卡片宽度静态不动画、点击归属）都在那里，本文只留这个指针（搬出去是因为 AGENTS 会被静默截断）。
 
 ### 5.7 字体回退与逐段覆盖
 
+**动 `Fallback fonts` / `[[font:…]]` 的解析与容错、覆盖查询、字体对象缓存，或改
+`ReadSettings` 里的标记编译前 → 读 [docs/invariants/fonts.md](docs/invariants/fonts.md)**。
+
 - **成本闸门（这条是这个功能的形状）**：`Fallback fonts` 为空**且**该行没有 `[[font:…]]` 标签时，
-  走的就是**单字体那条老路**——一行一个 `GpFont`、零覆盖查询、零额外分段。闸门由
-  `RowNeedsFontPath(rowHasTag, hasGlobalChain)` 判定，**在配置期**（`ReadSettings` 扫原文，结果存进
-  `rowFontTag[]`），不在每帧判定。不要说"反正有缓存"就把它去掉。
-- **纯 ASCII 的段不查覆盖**（`PickFontFamily` 的第一条规则）。全英文面板即使配了回退链也不付代价，
-  这是性能承诺的另一半；`[perf]` 的 `glyphq=` 就是量它的。
-- **逐段覆盖的语义有两档**：`[[font:族名]]` 里的**第一个**族名在 ASCII 段上直接生效（零查询）；
-  非 ASCII 段按顺序问覆盖（一个都不覆盖时继续问全局链，最后才是主字体）。所以"给一段指定字体"
-  不会在中文段上强行画出豆腐块。回退决策是**逐段**的：混排的一段整段交给第一个覆盖全段的候选。
-- **标记机制与 `[[ring:]]` 是同一个实现**：展开期把标签换成 `kFontMarkStart` + 链序号 + `kRingMarkEnd`，
-  `BuildRowLayout` 剥标记并给每个 `TextSeg` 带上 `tagChain`。**剥标记只有这一处**，绘制侧从不解析标记。
-  标签 → 链序号用的是**规范文本**（`FontChainKey`），所以行里写 `A ; B` 与 `A;B` 命中同一条链。
-- **坏标签绝不吞文字。** 族名写错/没装/超过 6 条链的 `[[font:…]]`，以及**画不出来的 `[[ring:…]]`**，
-  都**原样留在文本里**。曾经的实现是"消费掉但不产出"：屏幕上少一段读数，而删掉的正是唯一线索
-  （`ParseRing` 的注释从第一天起就承诺"调用方回退到原文"，代码却没有）。两条都有断言。
-- **覆盖查询缓存 256 槽**（键 = 族哈希 + 字符，无堆分配），**字体对象缓存 8 槽**（键 = 族 + 字号）。
-  字体缓存里**空槽优先于 LRU**——否则两个字号交替绘制时每帧重建对象，缓存等于没有（实测断言抓到过）。
-  设置变更时在 HUD 线程整体释放（`ReleaseFontResources`），卸载时在 `GDI+ Shutdown` **之前**释放。
-- **回退族名与标签族名都要过 `FontIsInstalled`**（与主字体同一个列表）。`CreateFontW` 对未知族名会
-  **替换**成某个字体，而那个替身会照常回答覆盖查询——于是"回退生效了"是假的，画出来的也不是任何人都
-  指定的字体。没装的因此被丢弃（标签随之原文显示，日志一条汇总）。
-- **行内标记在读取设置时编译一次**（`CompileRowText` → `ModSettings::rowProgram[]`，与 `rows[]` 同一份数据），
-  发布路径只展开 `{变量}` 与环的数值字段（`InstantiateRowProgram`），发布期不再解析标签、也不再查链序号。
+  走的就是**单字体那条老路**——一行一个 `GpFont`、零覆盖查询、零额外分段
+  （`RowNeedsFontPath(rowHasTag, hasGlobalChain)`，**在配置期**判定）。
+- **纯 ASCII 的段不查覆盖**：全英文面板即使配了回退链也不付代价（`[perf]` 的 `glyphq=` 量它）。
+- **坏标签绝不吞文字**：族名拼错/没装/超过 6 条链，以及画不出来的 `[[ring:…]]`，一律**原样留在文本里**。
 
 ---
 
@@ -643,7 +438,7 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 1. **采样层**：`Paint` 日志里的 `published` vs `visibleRows`。
    `published` 小 → 采样端问题，与绘制无关。
 2. **布局层**：`rowN segs= textLen= inline=` 与逐段 `draw row= seg= x= y= w= adv=`。
-   **`w=1.0 adv=0.0` 就是"文本被裁没"**，这是 5.1 第一条的指纹。
+   **`w=1.0 adv=0.0` 就是"文本被裁没"**，这是 §5.1 第一条的指纹。
 3. **几何层**：`BuildRowPlan` 给每个元素算出的 `x` / 直径（行内图标是不是落在它该在的地方、
    大小跟着谁），以及逐段 `draw row= seg= x= y= w= adv=`。
 4. **配色层**：`Theme=... bg=...` 那行确认谁赢了。
@@ -731,29 +526,19 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 
 ## 8. 外部依赖与平台约束
 
-### GDI+ 通过 `GetProcAddress` 动态绑定
+**GDI+ 的导出名陷阱与常量、头文件顺序、NVML 加载缺陷、窗口侧的平台限制**（原 §5.5 的窗口部分
+在 §5.5）都搬到 [docs/platform-notes.md](docs/platform-notes.md) 了（**只读参考**：
+查导出名、查加载缺陷、查头文件顺序时用）。
 
-- **不包含 `gdiplus.h`**，所有函数与常量手动 `RESOLVE`。**导出名陷阱**（`GdipMultiplyWorldTransform`、
-  `GdipDrawLines`、`GdiplusStartup` 没有 `Gdip` 前缀…）与常量值见 [docs/platform-notes.md](docs/platform-notes.md)。
-- 没有 arc 原语（圆用两段 `AddPathArc`）；没有 `min`/`max` 宏，用 `ClampInt`/`MinInt`/`MaxInt`/`MinDouble`。
+- **不包含 `gdiplus.h`**：所有函数与常量手动 `RESOLVE` 并 `GetProcAddress` 绑定；
+  没有 arc 原语（圆用两段 `AddPathArc`）；没有 `min`/`max` 宏，用 `ClampInt`/`MinInt`/`MaxInt`/`MinDouble`。
+- **头文件顺序（MinGW 特有）**：`winsock2.h` → `netioapi.h` → `iphlpapi.h` → `windows.h`。
+  顺序错了会 `unknown type name 'PMIB_IF_TABLE2'`。
+- **一个真实的驱动安装缺陷**：某些驱动把 `nvml.dll` 放进 `System32` 却不放依赖 `nvml_loader.dll`
+  → `LoadLibrary` 报 `126` **而文件存在**；判别依据 `error=126, already-in-system32=1` 是它，
+  `error=2` 才是文件真的不存在。
 
-### 头文件顺序（MinGW 特有）
-
-`winsock2.h` → `netioapi.h` → `iphlpapi.h` → `windows.h`。
-顺序错了会 `unknown type name 'PMIB_IF_TABLE2'`。
-
-### 平台限制
-
-- **全屏独占（exclusive fullscreen）的 3D 应用无法被覆盖**——它绕过 DWM 合成，
-  任何窗口都不可能叠在上面。这是平台限制，不是可以通过代码解决的问题。
-- **多显示器**：锚定"最上方"的显示器（`rect.top` 最小者，平手时取主显示器）。
-  本机只验证过 2 台。
-
-### NVML 与一个真实的驱动安装缺陷
-
-- 某些驱动把 `nvml.dll` 放进 `System32` 却不放依赖 `nvml_loader.dll` → `LoadLibrary` 报 `126` **而文件存在**；
-  `LoadNvmlWithDependencies()` 先预载 loader。判别依据：`error=126, already-in-system32=1` 是它，
-  `error=2` 才是文件真的不存在。细节见 [docs/platform-notes.md](docs/platform-notes.md)。
+---
 
 ## 9. 修改指南
 
@@ -790,6 +575,7 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 3. 改实现，跑到 `PASSED (0 failure(s))`。
 4. 同步 `.tool/preview/_preview.py`（若涉及版面）。
 5. 若偏离了原项目，把偏离与理由写进注释。
+6. **改动落在哪个子系统，就先读 [`docs/invariants/`](docs/invariants/) 里对应的那一个**（§5 的索引）。
 
 ### 收尾检查（任何改动之后）
 
@@ -831,6 +617,12 @@ python .tool/checks/_deadcode.py     # 死代码：只写不读的字段、#if 0
   <https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-dedicated-process>
 - 本地工具链：`D:\Program Files\Windhawk\Compiler\`（clang 20.1.3 + MinGW）
 - 真实编译参数：`C:\ProgramData\Windhawk\EditorWorkspace\compile_flags.txt`
+- 本仓库的规范条文（**按子系统**，§5 的正文）：
+  [docs/invariants/](docs/invariants/)——
+  [layout](docs/invariants/layout.md) · [text-measurement](docs/invariants/text-measurement.md) ·
+  [markup](docs/invariants/markup.md) · [icons](docs/invariants/icons.md) ·
+  [animation](docs/invariants/animation.md) · [theme](docs/invariants/theme.md) ·
+  [window](docs/invariants/window.md) · [fonts](docs/invariants/fonts.md)
 - 本仓库的设计文档（**M1 与 M2 已实现；M3 进行中——几何/区域/命中/关闭按钮/悬停/帧率决策均已落地，
   剩下 `ComputeIslandRect` 接管窗口定位；M4 仍是提案**，不要当成现有行为）：
   [docs/external-data-island-design.md](docs/external-data-island-design.md)

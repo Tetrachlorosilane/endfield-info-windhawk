@@ -15,7 +15,8 @@ in this toolchain checks them**:
   * MinGW's `swprintf` is not checked either: `swprintf(b, 0, L"%s", 1)` produces no
     diagnostic, so the mod's own buffer formatting is unchecked too.
 
-All four were measured with the Windhawk clang 20 on 2026-10-14; see AGENTS §3.
+All four were measured with the Windhawk clang 20 on 2026-10-14; the record lives in
+`.tool/checks/_logfmt.md` (moved out of AGENTS §3, which now only names this script).
 The consequence is that the host's `Wh_Log` stub proves nothing about format
 strings, so this script stands in for the check that cannot exist. It is a syntax
 level check, not a compiler: it says what it could not decide instead of guessing.

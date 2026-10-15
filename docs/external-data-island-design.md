@@ -171,7 +171,7 @@ text     := 任意 UTF-16 可表示字符，去掉 C0/C1 控制字符（\t→空
 
 | 规则 | 做法 | 理由 |
 | :-- | :-- | :-- |
-| 单行化 | 丢弃 `\r`、`\n`，`\t` → 空格，其余 C0 控制字符（0x00–0x1F）与 C1（0x80–0x9F）删除 | 行是"一行读数"，换行会破坏版面与截断逻辑（AGENTS §5.1） |
+| 单行化 | 丢弃 `\r`、`\n`，`\t` → 空格，其余 C0 控制字符（0x00–0x1F）与 C1（0x80–0x9F）删除 | 行是"一行读数"，换行会破坏版面与截断逻辑（[invariants/text-measurement.md](invariants/text-measurement.md) 第 7 条 NoWrap；索引 AGENTS §5.1） |
 | 长度 | 截断到 `ExtMaxValue`（默认 256 字符），截断点加 `…` | 行缓冲是定长 `WCHAR[640]`（[2341](../endfield-info-windhawk.wh.cpp#L2341)），长文本会把同一行别的变量挤掉 |
 | **不展开 token** | `{` / `}` 原样保留为字符 | 否则提供者能注入 `{cpu}`，甚至递归注入 `{ext.…}`（§9 威胁 4） |
 | 数值旁路 | 严格解析 `[+-]?digits[.digits]?`（无空格、无 `%`、无千分位）成功时，额外存一个 `double` | 让 `[[ring:{ext.p.k}]]`、`{ext.p.k|0}` 能工作；**显示仍是原始文本** |
@@ -645,7 +645,7 @@ IslandRect ComputeIslandRect(const IslandState &s, const ContentMetrics &m,
 
 ### Q2 图标 → **只接受内置字形 + 1–2 字符文本徽章，不接受图片字节**
 
-- 传字节需要 `IStream`（`CreateStreamOnHGlobal` 在 ole32），会破坏 AGENTS §10 明确记录的
+- 传字节需要 `IStream`（`CreateStreamOnHGlobal` 在 ole32），会破坏 AGENTS §11 明确记录的
   "依赖仅 8 个系统 DLL"这一性质；
 - 更要紧的是**职责边界**：那等于把 GDI+ 的图片解码器开放给任意同用户进程
   （GDI+ 解码器有历史漏洞），换来的只是一个**纯装饰**效果；
@@ -667,7 +667,7 @@ IslandRect ComputeIslandRect(const IslandState &s, const ContentMetrics &m,
 
 ### Q4 配色 → **只给 `severity` 档位，不给颜色**
 
-与 AGENTS §5.2 的既有决定同源：**配色单一来源**。"命名主题完全胜出、颜色字段只在
+与 [invariants/theme.md](invariants/theme.md)（索引 AGENTS §5.2）的既有决定同源：**配色单一来源**。"命名主题完全胜出、颜色字段只在
 `Theme = Custom` 下生效"这条规则是花了代价才建立起来的；允许任意 AARRGGBB 会让面板
 变成调色板。
 
@@ -868,7 +868,7 @@ python .tool/checks/_settings.py                          # no structural proble
 
 **新增 API 全部落在已链接的 DLL 里**：管道与进程查询在 kernel32（默认链接）；
 `OpenProcessToken` / `GetTokenInformation`（§14 Q1 的可选开关）在 advapi32，而 `@compilerOptions`
-与测试宿主的链接行**都已有** `-ladvapi32` → **不需要改任何链接参数**，AGENTS §10 的依赖清单保持不变。
+与测试宿主的链接行**都已有** `-ladvapi32` → **不需要改任何链接参数**，AGENTS §11 的依赖清单保持不变。
 
 ---
 

@@ -267,7 +267,8 @@
 > `Custom icon file`）被整体删除，图标改为行内标签 `[[icon:…]]`
 > （见 [inline-markup-design.md](inline-markup-design.md) §7 第 4 步、CHANGELOG「删除的与不兼容的」）。
 > 下表里的断言**已经随功能一起删除**，`ModSettings` 里也不再有任何图标字段——
-> 不要照着它去找那些断言。行内图标的不变量与断言现在记在 AGENTS §5.3 与
+> 不要照着它去找那些断言。行内图标的不变量与断言现在记在
+> [invariants/icons.md](invariants/icons.md)（索引 AGENTS §5.3）与
 > `.tool/regress/test-layout.cpp` 的 `=== inline icons: the tag, the glyph and the ripple switch ===` /
 > `=== inline icon images: one cache entry per file, bounded ===` 两节。
 > 下面这段留着是因为其中的**教训**仍然成立：一个"有设置项、却从来没被读取"的死设置项
@@ -282,7 +283,8 @@
 | **回退规则改为解析式**：`iconFallbackStyle` 由 `ReadSettings` 算一次，`ResolveIconStyle` 取用（不再把字形写进槽位——全局图片不属于任何槽）；`AnyIconConfigured` 改为问 `IconPlateDiameter`（单一来源），否则"全行 None"会被当成"要留图标边距" | `with no glyph anywhere an image-only row falls back to Memory`、`with nothing configured at all no row gets a plate` |
 | **全局图片排在"继承别的行的文件"之前**：有全局图时单行文件是例外、不扩散；没有全局图时"只设 `Row 1 icon file` 就等于所有行都用它"照旧 | `the per-row file does not leak to the rows the global covers`、`one row's file still covers the rows after it when there is no global image` |
 
-README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$description` 都已同步
+README 的图标一节与设置表、[invariants/icons.md](invariants/icons.md)（索引 AGENTS §5.3）、
+本文件 §13 的缺陷总表、以及 `IconPath` 的 `$description` 都已同步
 （用户文档现在明确写了四级优先级）。
 
 **第五批（修测试装置自身，2026-10-14；六处，逐处都有变异负对照）**：

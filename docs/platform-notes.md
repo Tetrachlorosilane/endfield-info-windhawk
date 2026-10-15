@@ -1,4 +1,4 @@
-# 平台与外部依赖笔记（原 AGENTS §8）
+# 平台与外部依赖笔记（原 AGENTS §8；规范条文在 [invariants/window.md](invariants/window.md)）
 
 > 从 AGENTS.md 搬出来（64 KB 指令预算）。这里是**只读参考**：查导出名、查 NVML 的加载缺陷时用。
 
@@ -18,7 +18,8 @@
 
 **常量**：`PixelFormat32bppPARGB = 0x000E200B`（已核对）、`InterpolationModeHighQualityBicubic = 7`。
 
-**没有 arc 原语**：圆用 `AddPathArc` 两段闭合路径填充；环用 `GdipDrawEllipse`。
+**没有 arc 原语**：圆用 `AddPathArc` 两段闭合路径填充（`AGENTS.md` §8 的原话：圆用两段
+`AddPathArc`）；环用 `GdipDrawEllipse`。
 
 **没有 `min` / `max` 宏**（那是 MSVC 的）。用本文件的 `ClampInt` / `MinInt` / `MaxInt` / `MinDouble`。
 
@@ -39,5 +40,18 @@
 
 **日志里的判别依据**：`error=126, already-in-system32=1` 就是上述缺陷；
 `error=2` 才是文件真的不存在。
+
+## 头文件顺序（MinGW 特有，原 AGENTS §8）
+
+`winsock2.h` → `netioapi.h` → `iphlpapi.h` → `windows.h`。
+顺序错了会 `unknown type name 'PMIB_IF_TABLE2'`。
+
+## 窗口侧的平台限制
+
+**全屏独占（exclusive fullscreen）的 3D 应用无法被覆盖**（它绕过 DWM 合成），
+以及**多显示器锚定规则**（`rect.top` 最小者，平手取主显示器；本机只验证过 2 台）——
+这两条是改窗口行为时会撞上的约束，**规范条文与"何时读"在
+[invariants/window.md](invariants/window.md) 第 2 节**（原 AGENTS §8：这是平台限制，
+不是可以通过代码解决的问题）。
 
 ---

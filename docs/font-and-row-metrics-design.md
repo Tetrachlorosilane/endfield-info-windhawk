@@ -36,7 +36,8 @@
 
 多字体意味着对每段文字做**字形覆盖查询**（`GetGlyphIndicesW`，缺字形返回 `0xFFFF`），再按
 (族, 字号) 取字体对象。一条纯 ASCII 行根本不需要这些：任何常见拉丁字体都能画，查一遍纯属浪费，
-而面板是**每帧重绘**的（`PaintPanel` 每次重建字体，见 AGENTS §5.1 关于"字体每帧重建"的教训）。
+而面板是**每帧重绘**的（`PaintPanel` 每次重建字体，见
+[invariants/text-measurement.md](invariants/text-measurement.md) 第 4 条"不缓存省略号宽度"的教训；索引 AGENTS §5.1）。
 
 所以本设计的第一条规则是**成本闸门**：
 
@@ -78,7 +79,8 @@
 
 容错（**硬要求**）：拼错、未闭合、族名超过 `kMaxFontFamilyChars`、族名没装、超过
 `kMaxFontChains` 条链的标签**当作普通文本绘制**，并记一次有界日志。**绝不允许因为标签问题让整行消失**
-——AGENTS §5.1 的第一条教训就是"一行算成 0 宽会让 GDI+ 把整行裁掉"。
+——[invariants/text-measurement.md](invariants/text-measurement.md) 第 5 条的第一条教训就是
+"一行算成 0 宽会让 GDI+ 把整行裁掉"（索引 AGENTS §5.1）。
 落地时这一条抓到过一个真实实现错误：第一版在"链没注册"时也 `p = close + 2`（消费掉标签但不产出
 标记），于是 typo 的标签连同文字一起消失——断言 `tag is stripped, text survives` 当场变红。
 **判据是"未注册的标签必须原样留在文本里"**，不是"别崩"。
@@ -221,7 +223,7 @@
 | 内容 | 落点 |
 | :-- | :-- |
 | 用户怎么用（设置项、标签、容错行为） | `README.md`（「字体：全局回退与逐段覆盖」一节） |
-| 不变量与成本闸门（"未配置就不走这条通路"） | `AGENTS.md` §5.7 |
+| 不变量与成本闸门（"未配置就不走这条通路"） | [invariants/fonts.md](invariants/fonts.md)（索引：`AGENTS.md` §5.7） |
 | 缺陷与对应断言 | `docs/state-and-handover.md` §13 |
 | 变更说明 | `CHANGELOG.md` 的"未发布" |
 | 现场指标（`glyphq=`） | `README.md` 的排查一节 |

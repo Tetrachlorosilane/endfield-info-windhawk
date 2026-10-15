@@ -170,7 +170,8 @@ frames`）。
 所以由同一个函数给出，卡片就不能「画成一个尺寸、点击按另一个尺寸接受」。
 
 卡片离开后宽度立刻回到面板自己的解析值，并且**在同一帧内**先改窗口再画
-（`width` 已经回到解析值 → `PlaceWindow` → 位图）。这是 AGENTS §5.4 那条
+（`width` 已经回到解析值 → `PlaceWindow` → 位图）。这是 [invariants/animation.md](invariants/animation.md)
+（索引 AGENTS §5.4）那条
 「窗口尺寸的变化必须与它提交的位图在同一帧内一致」在宽度方向上的同一句话。
 
 ---
