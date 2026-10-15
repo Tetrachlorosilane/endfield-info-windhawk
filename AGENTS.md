@@ -49,24 +49,29 @@ endfield-info-windhawk/
 │   ├── platform-notes.md              GDI+ 导出名/常量、头文件顺序、NVML 加载缺陷（原 AGENTS §8）
 │   ├── panel-width-design.md          设计：面板宽度（Fixed / Fit content、三条不变量、负对照清单）
 │   ├── inline-markup-design.md        设计：行内图标 + 留白/对齐（**§7 第 3、4、5 步均已实现**）+ 一次性编译（**已实现**）
+│   ├── netease-lyric-source-design.md 设计：桥的歌词/位置只有一条来源（黑胶页 CDP）· 改桥前读
 │   └── state-and-handover.md          验证状态、真机更正、犯错档案、待办
 │
 ├── 开发工具（不随 mod 交付）——**每个都有自己的 .md**（怎么跑/要什么/坑在哪）
 │   ├── build.ps1              + build.md              编译（唯一"怎么构建"入口，故留在根）
-│   ├── _netease-*.ps1（4 个）+ 各自 .md              桥运行期按 `$PSScriptRoot` 调用，不能搬
+│   ├── _netease-bridge.ps1    + .md                   发布器（桥）本体
+│   ├── _netease-lyric-probe.ps1 + .md                 只读探路：歌词字段在客户端升级后有没有变
 │   └── .tool/                 其余工具按用途分组；都从**自身位置**解析仓库根
 │       ├── checks/   _settings.py（设置块）· _logfmt.py（宽格式日志）· _deadcode.py（死代码）
 │       ├── regress/  test-layout.cpp                  回归宿主：打桩 Windhawk API + `#include "../../产品"`
 │       ├── preview/  _preview.py                      版面预览（**需要 Pillow**），写 assets/panel-preview.png
 │       ├── probe/    test-gdiplus-scale.cpp           缩放探针：`<图片路径>` 为参数
+│       ├── investigations/  .gitignore 掉的一次性转储（CDP 页面摘录、采样脚本）
 │       └── pipe/     _extclient.py + _extclient.ps1   外部管道冒烟客户端（共用一个 .md）
 │       （例：`python .tool/checks/_settings.py`；三个 checks 只要 Python 标准库）
 └── assets/panel-preview.png           版面预览（README 引用）
 ```
 
 删工具前先给两个证据：`git grep -n <文件名>` 在**被跟踪**文件里全无引用，且功能有**替代者**；
-缺一就留着。`_netease-position.ps1` / `_netease-lyric-scan.ps1` **不适用这条**——桥在运行期
-调用它们，删了会静默降级。删除用 `git mv` 进 `.Trash/`。
+缺一就留着。删除用 `git mv` 进 `.Trash/`。
+（`_netease-position.ps1` / `_netease-lyric-scan.ps1` 曾经是"运行期被桥调用"的例外，
+**2026-10-15 起不再是**：位置与歌词改由黑胶页一条来源给出，它们已按上面这条规则进 `.Trash/`。
+判断依据仍然是"被跟踪文件里全无引用" —— `git grep -n _netease-position` 一把就能复核。）
 
 分工：**README 讲用户怎么用**，**脚本的 `.md` 讲这个脚本怎么跑**，**AGENTS（本文）讲实现、
 不变量与踩过的坑**，**`docs/invariants/` 讲某个子系统的规范条文**。同一个事实不要在多处各写一遍
@@ -301,7 +306,9 @@ python .tool/preview/_preview.py
 `MinimumRowHeightForFont` / `ParseInlineSize` / `MaxInlineRunSize` ·
 `ExtParseLine` · `ExtSanitize` · `ExtParseNumber` · `ExtLookup` · `ExtNextDeadline` ·
 `ExtEvictIndex` · `ExtProviderAllowed` · `ExtReplyTimeoutsAfter` · `IslandEnqueue` / `StepIsland` / `IslandHitTest` /
-`IslandClickActionFor` · `Select-StoreLineIndex` / `Select-SongTitle` / `Get-LeadMs`（脚本侧）
+`IslandClickActionFor` · `Select-StoreLineIndex` / `Select-SongTitle` / `Get-LeadMs` /
+`Split-VinylParagraphs` / `ConvertFrom-VinylSeconds` / `Test-VinylLineUsable` /
+`Test-StoreLyricUsable` / `Resolve-TrackIdentity` / `Get-Vinyl*Candidates`（脚本侧）
 
 **新增绘制逻辑时照此办理。** 如果一段逻辑无法在测试里调用，它就无法被守住。
 反过来，**测试不应该自己复刻一份产品逻辑**（复刻出来的那份测不到产品）；
@@ -420,6 +427,16 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   （`RowNeedsFontPath(rowHasTag, hasGlobalChain)`，**在配置期**判定）。
 - **纯 ASCII 的段不查覆盖**：全英文面板即使配了回退链也不付代价（`[perf]` 的 `glyphq=` 量它）。
 - **坏标签绝不吞文字**：族名拼错/没装/超过 6 条链，以及画不出来的 `[[ring:…]]`，一律**原样留在文本里**。
+
+### 5.8 网易云桥（`_netease-bridge.ps1`）
+
+**改桥的取数路径前 → 读 [docs/netease-lyric-source-design.md](docs/netease-lyric-source-design.md)。**
+
+- **入口不许依赖"前台有窗口"。** 早先曲名只从可见顶层窗口标题里读，于是"关掉前台窗口"
+  （托盘模式，真机实测 4 个 cloudmusic 窗口全部 `IsWindowVisible=0`）让 `$now` 为空、
+  整个发布块被跳过 → 歌词和曲名**一起静默消失**。现在身份/位置/歌词都来自 CDP 页面。
+- **一条来源只给一次值；失值时置空并响亮上报，绝不拿冻结值顶上。** 这来源的守卫是
+  `Test-VinylLineUsable`（往回走 / 往前跳太多 / 连读同一个数 = 判陈旧）。
 
 ---
 

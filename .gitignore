@@ -6,6 +6,10 @@ _extclient-last.txt
 # Local notes about where to look for answers. Kept out of the repository on purpose:
 # they name paths on this machine, and the maintainer's own notes are not the project's.
 *.local.md
+# One-off investigation output: live DOM excerpts, CDP dumps, throwaway probes. The
+# *conclusions* from them go into docs/netease-lyric-source-design.md; the raw dumps are
+# machine-specific and stay local (same reasoning as *.local.md above).
+.tool/investigations/
 # Release packaging output (built locally, uploaded as a release asset).
 dist/
 # The project's own trash. Deleting a tool is a `git mv` into this folder so its

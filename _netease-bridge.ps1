@@ -6,13 +6,21 @@
     这是一个**示例程序**，不是 mod 的一部分：它演示外部程序怎么用 EVENT/SET 把
     "现在在听什么"送到面板与灵动岛上。
 
-    它怎么拿到曲目：
-      1. 窗口标题。网易云 PC 版（Electron）的主窗口标题是「歌名 - 歌手」，
-         这是最省事也最稳的一条路——不需要注入、不需要调试端口。
-      2. 歌词：用歌名+歌手去调网易云自己的歌词接口（公开的 web 接口），
-         拿到 LRC 后按"这首歌被看到的时刻"推算当前行。
-         注意：推算出来的时间会漂——**暂停时会继续往前走**。要按真实播放位置
-         选行，需要 SMTC（Windows 媒体会话），那是下一步的事，见 README。
+    它怎么拿到曲目与歌词（2026-10-15 重写）：**只读客户端自己的黑胶页**（CDP 调试页面）——
+        · 当前行 = `li.line.current`（客户端自己维护的那一行，原文在第一个 `<p>`、
+          翻译在第二个；拖动进度条、暂停、切歌天然正确）；
+        · 位置   = 那个元素上的 `data-time`（秒，十分之一秒精度）；
+        · 曲名   = `span.title` 的 `title` 属性；歌手同法。
+    实测（见 docs/netease-lyric-source-design.md）：**这些字段与前台上有没有窗口无关**——
+    把窗口关到托盘、进程只剩后台在播时，页面照旧带着当前行与 data-time。
+    早先"关掉窗口后歌词和曲名一起没了"的原因不在 CDP，而在**曲名是从顶层窗口标题里读的**：
+    窗口一关就一个可见窗口都没有，`Get-PlayingTrack` 返回空，主循环整段被跳过。
+    所以现在**不再读窗口标题为主**（只在完全没有调试端口时当最后的兜底）。
+
+    它不做的事：**不注入、不挂钩、不读写客户端内存**。旧版有过三条别的路（内存差分扫描、
+    SMTC 媒体会话、接口 LRC + 推算时钟），它们都只为了"在拿不到 CDP 时猜一个位置"；
+    现在位置由客户端自己给，那三条已删除（脚本 `_netease-position.ps1` /
+    `_netease-lyric-scan.ps1` 随之退役）。
 
     它怎么发：
       只用协议 v1 的三条：`HELLO 1 <provider>` 握手，`SET <p> <key> <ttl|-> <text>`
@@ -31,7 +39,7 @@
     pwsh -File _netease-bridge.ps1 -Event -Ttl 600000
 
 .EXAMPLE
-    # 不联网也能验证 LRC 解析与选行
+    # 不连管道、不读页面也能验证纯函数（候选表顺序、段切分、新鲜度判定）
     pwsh -File _netease-bridge.ps1 -SelfTest
 #>
 [CmdletBinding()]
@@ -42,7 +50,7 @@ param(
     [int]$IntervalMs = 1000,
     # 推过去的值的寿命：歌一直在播，所以给得长一点，避免行里闪 --
     [int]$TtlMs = 600000,
-    # 进程名匹配（网易云 PC 版：cloudmusic）
+    # 进程名匹配（网易云 PC 版：cloudmusic）。**只在没有调试端口时**用于最后的标题兜底。
     [string]$ProcessName = 'cloudmusic',
     # 换歌时发一条 EVENT，让灵动岛弹一次
     [switch]$Event,
@@ -50,52 +58,27 @@ param(
     # 早先两处都发 $TtlMs，于是每张卡片在屏幕上待 10 分钟：队列只有 8 格，两张卡就能把
     # 岛堵住几十分钟，歌词密集的歌看起来就像坏了。
     [int]$EventTtlMs = 6000,
-    # 两条岛事件之间的最小间隔（毫秒）：歌词很密的歌、或窗口标题抖动时不许刷屏。
+    # 两条岛事件之间的最小间隔（毫秒）：歌词很密时不许刷屏。
     [int]$EventMinIntervalMs = 4000,
     # 只打印要发的帧，不连管道
     [switch]$DryRun,
-    # 打印拿到的 JSON 片段，方便接口形状变了时自己改
-    [switch]$DumpJson,
-    # 离线自检：LRC 解析 + 选行 + 帧格式
+    # 离线自检：候选表顺序 + 段切分 + data-time 解析 + 新鲜度判定 + 帧格式
     [switch]$SelfTest,
     # 跑一轮就退出
     [switch]$Once,
-    # 直接指定歌曲 id（跳过搜索），用于接口查不到时手工兜底。id 是 64 位的
-    [long]$SongId = 0,
-    # 取不到歌词时多久重试一次。只在启动时查一次的话，接口抖一下整首歌就都没有歌词
-    [int]$LyricRetryMs = 20000,
-    # 位置来源：memory = 从客户端内存读播放位置（毫秒 int32，差分发现）；
-    # media = 媒体会话（SMTC，真实位置）；clock = 推算时钟；
-    # cdp = 通过调试端口读页面里的实际播放时间（需要用户自己给快捷方式加调试参数）；
-    # **auto 的实际顺序**（见主循环）：迷你条 DOM 的真 currentTime → store 当前行的起始时间
-    # → CDP 其它位置 → 内存差分 → 媒体会话 → 推算时钟。每一步失败就静默降级，
-    # 所以"到底用了哪个"由发出去的 `pos` key 回答（`{ext.netease.pos}`）。
-    [ValidateSet('auto', 'memory', 'cdp', 'media', 'clock')]
-    [string]$PositionSource = 'auto',
-    # 内存发现时两次采样的间隔（秒）——这段时间里必须在播放
-    [int]$MemoryGapSeconds = 12,
-    # 只探一次 CDP（不读位置）：列出端口与调试目标，供下一步确定取值表达式
+    # 只探一次 CDP：列出端口与调试目标（托盘模式也照列）
     [switch]$ProbeCdp,
     # 依次尝试的 CDP 端口（两个成熟项目分别用 9229 / 9223，9222 是通用默认）
     [int[]]$CdpPorts = @(9229, 9223, 9222),
-    # 歌词来源：auto = 先用 CDP store（若开着调试端口）再退回"LRC + 位置选行"；
-    # store = 只用 CDP store（精确到客户端自己的当前行 ✓）；lrc = 只用接口 LRC + 位置
-    [ValidateSet('auto', 'store', 'lrc')]
-    [string]$LyricSource = 'auto',
-    # 位置扫描器路径，缺省用同目录的 _netease-lyric-scan.ps1
-    [string]$ScannerPath = '',
-    # 位置助手脚本，缺省用同目录的 _netease-position.ps1
-    [string]$PositionHelper = '',
-    # 超过这么久没有新采样就当成不可用（毫秒）
-    [int]$PositionStaleMs = 3000,
-    # 歌词行的"负延迟"：把**选行用的位置**提早这么多毫秒（默认 -1 = 按来源自动）。
-    # 用户报告"歌词滞后约 1 秒"，来源就是两处系统性滞后：DOM 只给「分:秒」（位置向下取整
-    # 到秒，平均落后 0.5 s）+ 桥每 IntervalMs 才轮询一次（平均再落后半个周期）。
-    # auto = 半个周期，DOM 来源再补 0.5 s（默认合计 1000 ms）；0 = 关掉；给正数就用自己的值。
+    # 歌词行的"负延迟"：把**选行用的位置**提早这么多毫秒（默认 -1 = 自动）。
+    # 位置与歌词行同出于黑胶页，所以这里只有一个系统性滞后：桥每 IntervalMs 才轮询一次
+    # （平均落后半个周期）。`data-time` 是**十分之一秒**，没有"分:秒"那种取整偏差，
+    # 所以 auto = 半个周期（不再额外补 500 ms）。0 = 关掉；给正数就用自己的值。
     [int]$LeadMs = -1,
-    # 只探一次位置来源并打印结论
-    [switch]$ProbePosition,
-    # 只读诊断：把"按位置算出来的行"和"客户端自己认为的行"并排打出来（见下）
+    # 只读诊断：黑胶页的候选命中、data-time 新鲜度判定、与 store 的身份是否一致。
+    # **托盘模式（前台窗口已关）唯一一条能说清"歌词为什么没了"的探针**。
+    [switch]$ProbeVinyl,
+    # 只读诊断：把黑胶页的当前行与 store 自己报的行并排打出来（核对两者是否同一行）
     [switch]$ProbeStore,
     # 探针轮数
     [int]$ProbeRounds = 10
@@ -104,63 +87,67 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # ---------------------------------------------------------------------------
-# LRC：解析与选行（纯函数，-SelfTest 覆盖的就是它们）
+# 曲目身份：黑胶页 → store → 顶层窗口标题（兜底）
+#
+# 身份有什么用：`title` 要发出去；换歌检测与缓存失效也要一个键。**早先它只有一条路
+# ——顶层窗口标题**，而那正是"关掉窗口后曲名和歌词一起没了"的成因：窗口一关，真机实测
+# 一个 `IsWindowVisible=1` 的网易云窗口都没有了，`Get-PlayingTrack` 返回空，主循环
+# 里 `if ($now) { … }` 整段被跳过。现在顺序反过来：
+#
+#   ① 黑胶页 `span.title` 的 `title` 属性（托盘模式也有 —— 它不依赖窗口）
+#   ② store 的 `playing.resourceName` + `resourceArtists[].name`
+#   ③ 顶层窗口标题（**只在完全没有调试端口时**才可能命中；保留它是因为那是"没开 CDP"
+#      的机器上唯一能拿到歌手的地方）
+#
+# ②的歌手列实测是 `Mili, 塞壬唱片-MSR`，用 ' / ' 拼起来与①的属性值、与窗口标题里的
+# 歌手**逐字一致**（真机 `title="Mili / 塞壬唱片-MSR"`，窗口标题 `铁花飞 - Mili/塞壬唱片-MSR`
+# 只差一个空格）——所以换来源不会让 `title` 那一行抖动。
 # ---------------------------------------------------------------------------
-function ConvertFrom-Lrc {
-    param([string]$Text)
-    $out = New-Object System.Collections.ArrayList
-    if (-not $Text) { return @() }
 
-    foreach ($raw in ($Text -split "`r?`n")) {
-        # 一行可以有多个时间标签；长度可能是 .xx 或 .xxx
-        $tags = [regex]::Matches($raw, '\[(\d+):(\d+)(?:[.:](\d+))?\]')
-        if ($tags.Count -eq 0) { continue }
-        $line = ([regex]::Replace($raw, '\[[^\]]*\]', '')).Trim()
-        if ($line -eq '') { continue }        # 纯时间戳 / 元信息行
+# 纯函数：把歌手列表拼成发布的形态（纯函数，-SelfTest 覆盖）。' / ' 与客户端自己的一致。
+function Join-ArtistNames {
+    param([string[]]$Names)
+    if (-not $Names) { return '' }
+    $ok = @()
+    foreach ($n in $Names) {
+        if ($null -eq $n) { continue }
+        $t = ('' + $n).Trim()
+        if ($t) { $ok += $t }
+    }
+    return ($ok -join ' / ')
+}
 
-        foreach ($tag in $tags) {
-            $fracMs = 0
-            if ($tag.Groups[3].Success) {
-                $frac = $tag.Groups[3].Value
-                switch ($frac.Length) {
-                    1 { $fracMs = [int]$frac * 100 }
-                    2 { $fracMs = [int]$frac * 10 }
-                    default { $fracMs = [int]$frac }
-                }
+# 纯函数：身份最终取值与"它来自哪一条来源"（-SelfTest 覆盖）。
+# 参数按优先级传入；空串 = 这一来源没有值。返回 Title / Artist / Source，三个都不缺才可用。
+function Resolve-TrackIdentity {
+    param([string]$VinylTitle, [string]$VinylArtist,
+          [string]$StoreTitle, [string]$StoreArtist,
+          [string]$WindowTitle)
+    if ($VinylTitle) {
+        return [pscustomobject]@{ Title = $VinylTitle; Artist = $VinylArtist; Source = 'vinyl' }
+    }
+    if ($StoreTitle) {
+        return [pscustomobject]@{ Title = $StoreTitle; Artist = $StoreArtist; Source = 'store' }
+    }
+    if ($WindowTitle) {
+        $sep = $WindowTitle.LastIndexOf(' - ')
+        if ($sep -ge 1) {
+            return [pscustomobject]@{
+                Title  = $WindowTitle.Substring(0, $sep).Trim()
+                Artist = $WindowTitle.Substring($sep + 3).Trim()
+                Source = 'window'
             }
-            $minutes = [int]$tag.Groups[1].Value
-            $seconds = [int]$tag.Groups[2].Value
-            [void]$out.Add([pscustomobject]@{
-                    At   = ($minutes * 60 + $seconds) * 1000 + $fracMs
-                    Text = $line
-                })
         }
+        return [pscustomobject]@{ Title = $WindowTitle.Trim(); Artist = ''; Source = 'window' }
     }
-    @($out | Sort-Object At)
+    return $null
 }
 
-function Select-LrcLine {
-    param($Lines, [int]$PositionMs)
-    if (-not $Lines -or $Lines.Count -eq 0) { return '' }
-    $current = $Lines[0].Text
-    foreach ($l in $Lines) {
-        if ($l.At -le $PositionMs) { $current = $l.Text } else { break }
-    }
-    $current
-}
-
-# ---------------------------------------------------------------------------
-# 曲目：从窗口标题拿「歌名 - 歌手」
+# 兜底③用的窗口枚举（**只在没有调试端口时才可能被用到**）。保留的理由与代价见上面的注释：
+# 没开 CDP 的机器上，歌手只有窗口标题里有。
 #
-# **不能用 Process.MainWindowTitle**。2026-10-14 真机实测：网易云开着「桌面歌词」时，
-# cloudmusic.exe 的 MainWindowTitle 是**「桌面歌词」**，带歌名的那个顶层窗口反而不是
-# 主窗口（`Get-Process -Id 15824` → `MainWindowTitle: 桌面歌词`，而同一个 pid 的另一个
-# 顶层窗口标题是「下等马 - 洛天依Official/ChiliChill乐团」）。于是按 MainWindowTitle
-# 取标题永远拿不到「 - 」，`Get-PlayingTrack` 判为"没有可用窗口"，桥**一直停在等待
-# 循环里、从不连接管道**——面板上 title 与 lyric 两行就永远是 `--`。
-#
-# 所以自己枚举该进程的顶层窗口，挑标题里有「 - 」的那个。
-# ---------------------------------------------------------------------------
+# 按**窗口所属进程名**判定，而不是"先列出所有进程、再筛 pid"：进程**列表**在受限环境里
+# 可能只给一部分（实测：沙箱里 `Get-Process` 只返回 22 个进程，而按 pid 单查是可靠的）。
 if (-not ('Endfield.Win32' -as [type])) {
     Add-Type -Namespace Endfield -Name Win32 -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, System.IntPtr lParam);
@@ -174,6 +161,8 @@ public delegate bool EnumWindowsProc(System.IntPtr hWnd, System.IntPtr lParam);
 
 # 纯函数：从一组窗口标题里挑出曲目标题。没有「 - 」就没有曲目（没在播时标题是产品名，
 # 桌面歌词窗口的标题也是产品名之外的东西）。多个候选取**最长**的——完整标题比截断的长。
+# **注意它的可见性边界**：它只看得见**可见**的顶层窗口，所以托盘模式下它必然返回空；
+# 它现在只服务兜底③（见 `Get-WindowTrackTitle` 的注释）。
 function Select-SongTitle {
     param([string[]]$Titles)
     $best = $null
@@ -187,11 +176,6 @@ function Select-SongTitle {
 }
 
 # 该进程（名字匹配 `*$ProcessName*`）所有**可见且有标题**的顶层窗口标题。
-#
-# 按**窗口所属进程名**判定，而不是"先列出所有进程、再筛 pid"：进程**列表**在受限环境里
-# 可能只给一部分（实测：沙箱里 `Get-Process` 只返回 13 个进程，而按 pid 单查是可靠的）。
-# 所以这里枚举窗口、取每个窗口的 pid、再按 pid 查进程名；每次调用只为**去重后的几个
-# pid** 各查一次（有标题的顶层窗口通常不到 20 个）。
 function Get-NeteaseWindowTitles {
     $titles = New-Object System.Collections.ArrayList
     $ownerNames = @{}
@@ -218,131 +202,16 @@ function Get-NeteaseWindowTitles {
     return $titles.ToArray()
 }
 
-function Get-PlayingTrack {
+# 兜底③：窗口标题里那个「歌名 - 歌手」。**它只在"没有 CDP 或页面读不到"时才有机会命中**，
+# 因为托盘模式下没有可见窗口（真机实测：4 个窗口全部 IsWindowVisible=0）。
+function Get-WindowTrackTitle {
     $title = Select-SongTitle (Get-NeteaseWindowTitles)
-    if (-not $title) {
-        # 兜底：枚举拿不到东西时退回主窗口标题（有的客户端/版本里主窗口就是曲目标题）
-        $procs = @(Get-Process -ErrorAction SilentlyContinue |
-            Where-Object { $_.ProcessName -like "*$ProcessName*" -and $_.MainWindowTitle })
-        if ($procs.Count -gt 0) { $title = Select-SongTitle @($procs[0].MainWindowTitle) }
-    }
-    if (-not $title) { return $null }
-
-    $sep = $title.LastIndexOf(' - ')
-    if ($sep -lt 1) { return $null }
-
-    [pscustomobject]@{
-        Raw    = $title
-        Title  = $title.Substring(0, $sep).Trim()
-        Artist = $title.Substring($sep + 3).Trim()
-    }
-}
-
-# ---------------------------------------------------------------------------
-# 歌词：先用歌名+歌手查 id，再取 LRC。id 按曲目缓存，换歌才查一次。
-# ---------------------------------------------------------------------------
-$script:LyricCache = @{}
-
-# 网易云对"不像浏览器的请求"会给风控（code=-460）或干脆空结果，所以带上 UA 与 Referer。
-$script:Headers = @{
-    Referer      = 'https://music.163.com/'
-    'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-}
-# 诊断说三次就够，之后安静重试（有界计数器，不刷屏）
-$script:DiagLeft = 3
-
-function Write-Diag {
-    param([string]$Text)
-    if ($script:DiagLeft -le 0) { return }
-    $script:DiagLeft--
-    Write-Host "  ! $Text"
-}
-
-function Get-Brief {
-    param($Value, [int]$Max = 180)
-    if ($null -eq $Value) { return '<null>' }
-    $s = ($Value | ConvertTo-Json -Depth 4 -Compress)
-    if ($null -eq $s) { return '<empty>' }
-    $s = $s -replace '\s+', ' '
-    if ($s.Length -gt $Max) { return $s.Substring(0, $Max) + '…' }
-    $s
-}
-
-function Get-SongId {
-    param([string]$Title, [string]$Artist)
-    $query = [uri]::EscapeDataString("$Title $Artist")
-    # 两个已知端点都试：老接口与新 web 接口在某些网络下表现不同
-    $urls = @(
-        "https://music.163.com/api/search/get/web?s=$query&type=1&offset=0&limit=1",
-        "https://music.163.com/api/search/get?s=$query&type=1&offset=0&limit=1"
-    )
-    $lastBrief = '<无响应>'
-    $lastCode = 0
-    foreach ($url in $urls) {
-        try {
-            $json = Invoke-RestMethod -Uri $url -TimeoutSec 8 -Headers $script:Headers
-        }
-        catch {
-            Write-Diag ("搜索请求抛错：{0}" -f $_.Exception.Message)
-            continue
-        }
-        if ($DumpJson) { Write-Host "search -> $($json | ConvertTo-Json -Depth 4 -Compress)" }
-
-        $songs = $null
-        if ($json.result -and $json.result.songs) { $songs = $json.result.songs }
-        elseif ($json.result -and $json.result.song) { $songs = $json.result.song }
-        # id 是 64 位的：3342981041 这种一放进 [int] 就抛异常（而搜索其实是成功的）
-        if ($songs -and $songs.Count -gt 0) { return [long]$songs[0].id }
-
-        $lastBrief = Get-Brief $json
-        $lastCode = $json.code
-    }
-    # 所有端点都没给出可用列表时说清楚长什么样，别让它看起来像"歌词的问题"
-    Write-Diag ("搜索在所有端点上都没命中：code={0} 响应={1}" -f $lastCode, $lastBrief)
-    if ($lastBrief -match '"abroad":true') {
-        Write-Diag "响应带 abroad=true（加密载荷），改用 -SongId 手工指定最省事"
-    }
-    0
-}
-
-function Get-LyricLines {
-    param([string]$Title, [string]$Artist)
-    if ($SongId -gt 0) { $id = $SongId }
-    else { $id = Get-SongId -Title $Title -Artist $Artist }
-    if ($id -le 0) { return @() }
-
-    $urls = @(
-        "https://music.163.com/api/song/lyric?id=$id&lv=-1&kv=-1&tv=-1",
-        "https://music.163.com/api/song/lyric?os=pc&id=$id&lv=-1&kv=-1&tv=-1"
-    )
-    foreach ($url in $urls) {
-        try {
-            $json = Invoke-RestMethod -Uri $url -TimeoutSec 8 -Headers $script:Headers
-        }
-        catch {
-            Write-Diag ("歌词请求抛错：{0}" -f $_.Exception.Message)
-            continue
-        }
-        if ($DumpJson) { Write-Host "lyric -> $($json | ConvertTo-Json -Depth 3 -Compress)" }
-        if ($json.lrc -and $json.lrc.lyric) {
-            $parsed = @(ConvertFrom-Lrc -Text ([string]$json.lrc.lyric))
-            # 纯音乐：接口在 lrc 里放的是「作曲/编曲」这类制作信息 + 一句「纯音乐，请欣赏」。
-            # 把制作信息当歌词滚动是错的，所以只留那最后一句（没有就用末行兜底）。
-            if ($json.pureMusic) {
-                Write-Diag ("这是纯音乐曲目（pureMusic=true），只显示最后一行的说明")
-                $pure = @($parsed | Where-Object { $_.Text -match '纯音乐' })
-                if ($pure.Count -gt 0) { return $pure }
-                if ($parsed.Count -gt 0) { return @($parsed[-1]) }
-            }
-            return $parsed
-        }
-
-        Write-Diag ("歌词返回里没有 lrc.lyric：id={0} code={1} 有 lrc={2} 有 tlyric={3} " +
-            "nolyric={4} uncollected={5} pureMusic={6} 响应={7}" -f $id, $json.code,
-            ($null -ne $json.lrc), ($null -ne $json.tlyric), ($null -ne $json.nolyric),
-            ($null -ne $json.uncollected), ($null -ne $json.pureMusic), (Get-Brief $json))
-    }
-    @()
+    if ($title) { return $title }
+    # 再从主窗口标题试一次（有的客户端/版本里主窗口就是曲目标题）
+    $procs = @(Get-Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.ProcessName -like "*$ProcessName*" -and $_.MainWindowTitle })
+    if ($procs.Count -gt 0) { return (Select-SongTitle @($procs[0].MainWindowTitle)) }
+    return $null
 }
 
 # ---------------------------------------------------------------------------
@@ -455,298 +324,47 @@ function Write-IslandEvent {
 }
 
 # ---------------------------------------------------------------------------
-# 播放位置：媒体会话（真实位置）优先，推算时钟兜底
+# 位置：**客户端自己给的**，不再有降级链
 # ---------------------------------------------------------------------------
-# 为什么是"助手进程 + 文件"而不是管道：SMTC 是 WinRT，只有 Windows PowerShell 5.1 读得到
-# （pwsh 7 不行），所以位置必须由另一个宿主进程产生；而在 PowerShell 里做事件式异步读
-# 很容易把两边一起卡死——写文件、读最后一行、再加上新鲜度判定，简单且不会互相阻塞。
-function ConvertFrom-PositionLine {
-    param([string]$Line)
-    if (-not $Line) { return $null }
-    $m = [regex]::Match($Line.Trim(), '^position=(-?\d+(?:\.\d+)?|-) status=(\w+)$')
-    if (-not $m.Success) { return $null }
-    if ($m.Groups[1].Value -eq '-') { return $null }          # 没有会话
-    [pscustomobject]@{ Position = [double]$m.Groups[1].Value; Status = $m.Groups[2].Value }
-}
-
-function Test-PositionFresh {
-    param($Sample, [datetime]$WrittenAt, [datetime]$Now, [int]$StaleMs)
-    if (-not $Sample) { return $false }
-    return (($Now - $WrittenAt).TotalMilliseconds -le $StaleMs)
-}
-
-# 暂停/缓冲时不推进——这正是"暂停"和"拖动后停住"能被跟上的原因；
-# 播放时按采样年龄外推，保证两次采样之间也是连续的。
-function Get-PositionMs {
-    param($Sample, [double]$AgeSeconds)
-    if (-not $Sample) { return $null }
-    $seconds = $Sample.Position
-    if ($Sample.Status -eq 'Playing') { $seconds += $AgeSeconds }
-    [int]([math]::Max(0.0, $seconds) * 1000)
-}
-
-# 位置来源的标签（纯函数，-SelfTest 覆盖）。**这一行的"当前歌词"是算出来的**——用位置在
-# 行时间戳上选行——所以"位置是哪来的"就是它准不准的全部答案。以前这个只能靠猜：链路上
-# 每一步都可能失败并静默降级。现在把它当一个 key 发出去，面板上写 `{ext.netease.pos}`
-# 就能看到（`dom 41.3s` = 迷你条的真 currentTime；`storeline 29.5s` = store 当前行的起始
-# 时间（按行跳变）；`mem`/`cdp` = 内存差分 / CDP 其它位置；`clock` = 推算时钟，会漂）。
+# 位置与歌词行同出于一处（黑胶页当前行上的 `data-time`），所以这一节只剩两个纯函数：
+# 一个把来源名格式化成面板上的标签，一个算"换行提早多少毫秒"。
+#
+# **这里曾经是一整条降级链**（迷你条 DOM → store 行时间 → CDP 其它位置 → 内存差分 →
+# SMTC 媒体会话 → 推算时钟），三层硬件/进程技巧（读客户端内存、WinRT 媒体会话、按"第一
+# 次看到这首歌"推算时钟）只为了在拿不到 CDP 时**猜**一个位置。真机结论是那条链的每一级
+# 都比客户端自己给的 `data-time` 差，而且各有各的失效形状（内存地址随 ASLR 变、SMTC
+# 根本没注册——`-ProbePosition` 实测 `PROBE none`、推算时钟暂停时照样往前走）。
+# 现在全部删除，见 docs/netease-lyric-source-design.md 的"删掉的东西"一节。
 function Format-PositionSource {
     param([string]$Source, [int]$PositionMs, [int]$LeadMs = 0)
+    # 有位置就必须有名有姓：面板上 `{ext.netease.pos}` 显示的就是这一串。认得出来的来源
+    # 照实写，认不出来的写成 `n/a`（**不要**悄悄当成 clock —— 那条来源已经不存在了，
+    # 把未知来源显示成"推算时钟"会让人以为还有一条时钟在兜底）。
     $name = switch ($Source) {
-        'media' { 'media' }
+        'vinyl' { 'vinyl' }
         'dom' { 'dom' }
-        'storeline' { 'storeline' }
-        'cdp' { 'cdp' }
-        'memory' { 'mem' }
-        default { 'clock' }
+        'vinyldt' { 'vinyldt' }
+        default { 'n/a' }
     }
     $leadText = if ($LeadMs -gt 0) { " +$($LeadMs)ms" } else { '' }
-    return ("{0} {1:0.0}s{2}" -f $name, ($PositionMs / 1000.0), $leadText)
+    # 秒数**截断**到 0.1 s（与客户端自己显示的形态一致）：22.95 s 显示 `22.9s`，
+    # 而不是四舍五入成 `23.0s`——`pos` 是给人对时间的，四舍五入会让 `-LeadMs` 的
+    # 效果和显示出来的数对不上（22950 + 500 提前量看起来像 23.0 s 的提前，其实不是）。
+    $sec = [math]::Floor($PositionMs / 100.0) / 10.0
+    return ("{0} {1:0.0}s{2}" -f $name, $sec, $leadText)
 }
 
-# 提早换行多少毫秒（纯函数，-SelfTest 覆盖）。**为什么要提早**——位置有两个系统性滞后：
-#   · 迷你条 DOM 只给「分:秒」，位置是**向下取整到秒**的（真实 90.9 s 报 90）→ 平均落后 0.5 s、
-#     最坏 1 s；
-#   · 桥每 -IntervalMs（默认 1000 ms）才轮询一次 → 平均再落后半个周期。
-# 所以 auto = 半个轮询周期，DOM 来源再补 0.5 s 的取整偏差（默认合计 1 s）。被提早的只是
-# **选行用的位置**：发出去的 `pos` 仍是原始位置并标出提早量（`dom 90.0s +1000ms`），
-# 所以"提早了多少、有没有过头"看得见。`-LeadMs 0` 关掉，`-LeadMs N` 用自己的值。
+# 提早换行多少毫秒（纯函数，-SelfTest 覆盖）。**为什么要提早**：桥每 -IntervalMs
+# （默认 1000 ms）才轮询一次 → 平均落后半个周期。位置与"当前行"是**同一次读**拿到的
+# （都在黑胶页那一个元素上），所以位置本身没有第二条滞后 —— `data-time` 是**十分之一秒**
+# （真机 `22.95`），不存在迷你条"分:秒"那种向下取整到秒的偏差，**所以不再额外补 500 ms**。
+# 被提早的只是**选行用的位置**：发出去的 `pos` 仍是原始位置并标出提早量
+# （`vinyl 22.9s +500ms`），所以"提早了多少、有没有过头"看得见。
+# `-LeadMs 0` 关掉，`-LeadMs N` 用自己的值。
 function Get-LeadMs {
     param([string]$Source, [int]$IntervalMs, [int]$OverrideMs = -1)
     if ($OverrideMs -ge 0) { return $OverrideMs }
-    $lead = [int][math]::Round($IntervalMs / 2.0)
-    if ($Source -eq 'dom') { $lead += 500 }
-    return $lead
-}
-
-$script:PositionProc = $null
-$script:PositionFile = Join-Path ([System.IO.Path]::GetTempPath()) 'endfield-netease-position.txt'
-
-function Get-PowerShell51 {
-    $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    if (Test-Path $exe) { return $exe }
-    return 'powershell.exe'
-}
-
-function Start-PositionHelper {
-    if (-not $PositionHelper) { $PositionHelper = Join-Path $PSScriptRoot '_netease-position.ps1' }
-    if (-not (Test-Path $PositionHelper)) { return $false }
-    Remove-Item $script:PositionFile -ErrorAction SilentlyContinue
-    try {
-        $script:PositionProc = Start-Process -FilePath (Get-PowerShell51) -WindowStyle Hidden -PassThru `
-            -RedirectStandardOutput $script:PositionFile `
-            -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PositionHelper,
-                            '-IntervalMs', '500')
-    }
-    catch {
-        Write-Host ("  ! 位置助手启动失败：{0}" -f $_.Exception.Message)
-        return $false
-    }
-    return $true
-}
-
-function Stop-PositionHelper {
-    if ($script:PositionProc) {
-        try { if (-not $script:PositionProc.HasExited) { $script:PositionProc.Kill() } } catch { }
-        $script:PositionProc = $null
-    }
-}
-
-function Get-PositionSample {
-    if (-not (Test-Path $script:PositionFile)) { return $null }
-    try {
-        $info = Get-Item $script:PositionFile
-        $line = Get-Content $script:PositionFile -Tail 1 -ErrorAction Stop
-    }
-    catch { return $null }
-    $sample = ConvertFrom-PositionLine -Line $line
-    if (-not (Test-PositionFresh -Sample $sample -WrittenAt $info.LastWriteTime -Now (Get-Date) `
-                -StaleMs $PositionStaleMs)) { return $null }
-    $sample | Add-Member -NotePropertyName At -NotePropertyValue $info.LastWriteTime -Force
-    $sample
-}
-
-# ---------------------------------------------------------------------------
-# 位置来源「memory」：从客户端内存读播放位置（毫秒 int32）
-# ---------------------------------------------------------------------------
-# 依据（真机实测，见 docs/state-and-handover.md 的验证状态一节；原 AGENTS §10）：客户端把文本存成 UTF-8；"当前歌词行"不是会变化的字符串
-# （文本差分原理上无效）；而**播放位置是 int32 毫秒**，可以用"两次采样恰好增加一个间隔"的
-# 差分扫描定位。地址是绝对的、受 ASLR 影响 → 所以：**先试缓存地址、不成立才重新发现**，
-# 绝不写死地址。只读（PROCESS_QUERY_INFORMATION | PROCESS_VM_READ）。
-$script:PosAddrFile = Join-Path ([System.IO.Path]::GetTempPath()) 'endfield-netease-posaddr.txt'
-$script:MemReaderReady = $false
-
-function Enable-MemReader {
-    if ($script:MemReaderReady) { return $true }
-    try {
-        Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public class NpMem {
-    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(int a, bool i, int pid);
-    [DllImport("kernel32.dll", SetLastError = true)] static extern bool ReadProcessMemory(IntPtr h, IntPtr a, byte[] b, IntPtr n, out IntPtr r);
-    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
-    const int QI = 0x0400, VM = 0x0010;
-    // 返回十进制字符串；失败返回 "-" 或 "err<码>"（把错误码带出来，便于判别）
-    public static string ReadOne(int pid, long addr) {
-        IntPtr h = OpenProcess(QI | VM, false, pid);
-        if (h == IntPtr.Zero) return "err" + Marshal.GetLastWin32Error();
-        byte[] b = new byte[4];
-        IntPtr read;
-        bool ok = ReadProcessMemory(h, (IntPtr)addr, b, (IntPtr)4, out read) && (long)read == 4;
-        CloseHandle(h);
-        if (!ok) return "-";
-        return (b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)).ToString();
-    }
-}
-"@
-        $script:MemReaderReady = $true
-        return $true
-    }
-    catch {
-        Write-Host ("  ! 内存读取器编译失败：{0}" -f $_.Exception.Message)
-        return $false
-    }
-}
-
-function Get-NeteasePid {
-    $p = Get-Process -Name cloudmusic -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $p) {
-        $p = Get-Process -ErrorAction SilentlyContinue |
-             Where-Object { $_.ProcessName -like '*cloudmusic*' } | Select-Object -First 1
-    }
-    if ($p) { return $p.Id }
-    return 0
-}
-
-# 纯函数：解析扫描器给出的一行候选（`0x…|int32ms|51800 -> 67070  (+15270ms)`）
-function ConvertFrom-ScanCandidate {
-    param([string]$Line)
-    if (-not $Line) { return $null }
-    $m = [regex]::Match($Line, '^\s*(0x[0-9A-Fa-f]+)\|int32ms\|\s*(\d+)\s*->\s*(\d+)')
-    if (-not $m.Success) { return $null }
-    [pscustomobject]@{
-        Addr   = $m.Groups[1].Value
-        Before = [int]$m.Groups[2].Value
-        After  = [int]$m.Groups[3].Value
-    }
-}
-
-# 纯函数：用两拍读数判断"是否在播放"（增长≈两拍间隔 → 播放；几乎不动 → 暂停）
-function Test-Playing {
-    param([int]$Prev, [int]$Now, [double]$ElapsedSeconds, [int]$ToleranceMs = 1500)
-    $d = $Now - $Prev
-    return ($d -ge ([int]($ElapsedSeconds * 1000) - $ToleranceMs))
-}
-
-# 进程身份：pid + 进程启动时间。地址是堆地址、受 ASLR 影响，**客户端一重启就变**（已实测：
-# 老地址重启后不可访问）。所以缓存必须以"进程实例"为键，重启即自然作废。
-function Get-NeteaseProcInfo {
-    $p = Get-Process -Name cloudmusic -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $p) {
-        $p = Get-Process -ErrorAction SilentlyContinue |
-             Where-Object { $_.ProcessName -like '*cloudmusic*' } | Select-Object -First 1
-    }
-    if (-not $p) { return $null }
-    $start = 0
-    try { $start = $p.StartTime.Ticks } catch { $start = 0 }
-    return [pscustomobject]@{ Pid = $p.Id; Start = $start }
-}
-
-function Read-PosCache {
-    param($Proc)
-    if (-not $Proc -or -not (Test-Path $script:PosAddrFile)) { return 0 }
-    $s = Get-Content $script:PosAddrFile -First 1 -ErrorAction SilentlyContinue
-    if (-not $s) { return 0 }
-    $m = [regex]::Match($s.Trim(), '^(\d+)\|(\d+)\|(0x[0-9A-Fa-f]{4,15})$')
-    if (-not $m.Success) { return 0 }
-    if ([int]$m.Groups[1].Value -ne $Proc.Pid) { return 0 }
-    if ([int64]$m.Groups[2].Value -ne $Proc.Start) { return 0 }    # 换了进程实例 → 作废
-    try {
-        $u = [System.Convert]::ToUInt64($m.Groups[3].Value.Substring(2), 16)
-        return [System.BitConverter]::ToInt64([System.BitConverter]::GetBytes($u), 0)
-    }
-    catch { return 0 }
-}
-
-function Write-PosCache {
-    param($Proc, [int64]$Addr)
-    if (-not $Proc -or $Addr -eq 0) { return }
-    try {
-        ('{0}|{1}|0x{2:X}' -f $Proc.Pid, $Proc.Start, $Addr) |
-            Set-Content -Path $script:PosAddrFile -Encoding ascii -ErrorAction Stop
-    }
-    catch { }
-}
-
-# 读一次原始值；不可用返回 $null
-function Get-PosValue {
-    param([int]$Pid, [int64]$Addr)
-    if ($Pid -le 0 -or $Addr -eq 0) { return $null }
-    $s = [NpMem]::ReadOne($Pid, $Addr)
-    if ($s -notmatch '^\d+$') { return $null }
-    return [int]$s
-}
-
-# 纯函数：切歌时的"粗校验"——曲名变了，位置应当回落到开头或明显跳变（而不是继续原样累加）
-function Test-PosAfterTrackChange {
-    param([int]$Prev, [int]$Now)
-    if ($Now -lt $Prev) { return $true }                    # 归零/回落 ✓
-    if ([math]::Abs($Now - $Prev) -gt 3000) { return $true } # 明显跳变 ✓
-    return $false                                            # 几乎原样 → 可疑 ✗
-}
-
-function Test-PosAddrAlive {
-    param([int]$Pid, [int64]$Addr)
-    $a = Get-PosValue -Pid $Pid -Addr $Addr
-    if ($null -eq $a -or $a -lt 1000) { return $false }
-    Start-Sleep -Milliseconds 1000
-    $b = Get-PosValue -Pid $Pid -Addr $Addr
-    if ($null -eq $b) { return $false }
-    return (Test-Playing -Prev $a -Now $b -ElapsedSeconds 1.0 -ToleranceMs 700)
-}
-
-# 差分发现：调用扫描器（发现逻辑只有那一处实现）。**有界**：每个客户端进程实例最多 3 次，
-# 只在"确实在播放"时做，两次之间至少隔 60 秒；**绝不因为"值不再增长"而重扫**（用户定的策略：
-# 进程活着就不要轻易全局扫描，值停住先靠切歌粗校验）。
-$script:PosAttempts = 0
-$script:PosLastAttempt = [datetime]::MinValue
-$script:PosAttemptMax = 3
-$script:PosAttemptSpacingSec = 60
-$script:PosDisabled = $false
-
-function Find-PosAddr {
-    param($Proc, [switch]$TrackPlaying)
-    if ($script:PosDisabled -or -not $Proc) { return 0 }
-    if (-not $TrackPlaying) { return 0 }         # 没在播就没法差分（增长是判据），留到下次
-    if ($script:PosAttempts -ge $script:PosAttemptMax) { return 0 }
-    if (((Get-Date) - $script:PosLastAttempt).TotalSeconds -lt $script:PosAttemptSpacingSec) { return 0 }
-    if (-not $ScannerPath) { $ScannerPath = Join-Path $PSScriptRoot '_netease-lyric-scan.ps1' }
-    if (-not (Test-Path $ScannerPath)) { Write-Host '  ! 找不到位置扫描器，内存来源不可用'; return 0 }
-
-    $script:PosAttempts++
-    $script:PosLastAttempt = Get-Date
-    Write-Host ("  内存位置：第 {0}/{1} 次差分发现（间隔 {2} 秒，请保持播放）…" -f `
-            $script:PosAttempts, $script:PosAttemptMax, $MemoryGapSeconds)
-
-    $out = & pwsh -NoProfile -ExecutionPolicy Bypass -File $ScannerPath `
-        -WholeProcess -FindClock -GapSeconds $MemoryGapSeconds -MaxMb 512 -TargetPid $Proc.Pid 2>&1
-    foreach ($line in $out) {
-        $c = ConvertFrom-ScanCandidate $line
-        if (-not $c) { continue }
-        $addr = 0
-        try {
-            $addr = [System.BitConverter]::ToInt64(
-                [System.BitConverter]::GetBytes([System.Convert]::ToUInt64($c.Addr.Substring(2), 16)), 0)
-        }
-        catch { continue }
-        if ($addr -ne 0 -and (Test-PosAddrAlive -Pid $Proc.Pid -Addr $addr)) {
-            Write-PosCache -Proc $Proc -Addr $addr
-            return $addr
-        }
-    }
-    Write-Host '  ! 这一轮没找到可用的位置地址（保持播放、稍后会再试一次；期间用推算时钟）'
-    return 0
+    return [int][math]::Round($IntervalMs / 2.0)
 }
 
 # CDP 探测：只列端口与目标，**不读位置**（取值表达式要先在你机器上看清客户端暴露了什么，
@@ -829,45 +447,15 @@ function Invoke-CdpExpression {
     finally { if ($ws) { try { $ws.Dispose() } catch { } } }
 }
 
-# CDP 位置：读页面里 audio/video 元素的 currentTime。
-# 刻意用"通用锚点"而不是猜出来的私有选择器：-ProbeCdp 已把页面里有什么打印出来，真正的表达式
-# 等那份输出回来再固化；在那之前这条能取到就用、取不到就返回 $null 继续降级 ✓。
-function Get-CdpPositionMs {
-    if (-not (Get-CdpTab)) { return $null }
-    $expr = "(function(){var a=document.querySelector('audio,video');" +
-            "if(!a||isNaN(a.currentTime))return '';" +
-            "return JSON.stringify({t:a.currentTime,d:a.duration,p:a.paused});})()"
-    $raw = Invoke-CdpExpression -Expression $expr
-    if (-not $raw) { return $null }
-    $m = [regex]::Match($raw, '"value"\s*:\s*"(\{.*?\})"')
-    if (-not $m.Success) { return $null }
-    $o = $null
-    try { $o = ($m.Groups[1].Value -replace '\\"', '"') | ConvertFrom-Json } catch { return $null }
-    if ($null -eq $o -or $null -eq $o.t) { return $null }
-    try { return [int]([double]$o.t * 1000) } catch { return $null }
-}
-
 # ---------------------------------------------------------------------------
-# CDP store：首选歌词来源（真机结论 2026-10-13）
+# store 的歌词数组（**兜底**：黑胶页那一拍没给出当前行时才用）
 # ---------------------------------------------------------------------------
-# 当前行 = `async:lyric.lyricLines[playing.playingLyricLineNumber]` ✓✓
-# —— 客户端自己维护的行号，**拖动进度条 / 暂停 / 切歌天然正确** ✓，不需要位置、不需要时间推算 ✓。
-# 访问方式照 cloudmusic-desktop-mcp 的做法（server.py:283-287）：往 webpackJsonp 塞一个模块，
-# 把 webpack 的 `require` 存到 window 上，再 `getStore()`（**不调 getState** ✓，见 server.py:339-346）。
-#
-# **规则化的探查**（用户要求保留）：模块 id **随客户端版本变** ✗（这台是 11，MCP 钉的是 12），
-# 所以这里**不写死 id** ✓ —— 运行期扫 webpack 的**缓存** `req.c`（只含已实例化模块 ✓，**不执行任何模块** ✗）
-# 找导出里带 `getStore` 的那个 ✓，并把结果缓存在页面上（`window.__ei_store_id__` ✓），
-# 客户端升级后若失效会自己再找一次 ✓ -ProbeCdp 同样走这条自寻址的路 ✓。
-# 单位陷阱（同一首歌、同一切片里三种单位 ✗）：`lyricLines[i].time` 是**秒** ✓、
-# `curTrack.duration` 是**毫秒** ✓、`playing.resourceDuration` 是**秒** ✓。
-# 迷你条上的"已播 / 总长"（mm:ss / mm:ss）—— 这是客户端**自己显示**的真 currentTime。
-# 真机实测（2026-10-13，用户在 DevTools 里找到的控件）：
-#   #page_pc_mini_bar … div.curtime-thumb … span.cmd-button-content  ->  "02:58 / 03:06"
-# **不锚带哈希的类名**（TimeWarpper_t1eityq1 / SpaceContainer_s8o78dm 会随构建变），
-# 只锚 "#page_pc_mini_bar + 文本形状 m:ss / m:ss"；并顺带读进度柄比例做交叉校验。
-# 取**整条时间数组**（秒）—— 只在换歌时调一次。**只搬数字**（2000 行也才约 8 KB），
+# 取**整条时间数组**（秒）—— 只在这条兜底路径上按需调一次。**只搬数字**（2000 行也才约 8 KB），
 # 因此不需要假设长度；超出安全上限时**如实上报** truncated，而不是悄悄截断。
+# 为什么留着它：黑胶页的选择器一旦在客户端升级后落空（`li.line.current` 换了名字），客户端
+# **自己的歌词数组**还在，用它 + `data-time` 选一行比"什么都不发"好；而它选出来的行必然与
+# 位置自洽（同一个数组、同一个位置），所以不会引入"冻结值遮住活值"那种形状。
+# 准入判据是 `Test-StoreLyricUsable`（store 报的曲目 id 必须与这一轮的身份一致），-SelfTest 覆盖。
 function Get-CdpStoreLyricTimes {
     if (-not (Get-CdpTab)) { return $null }
     $expr = @"
@@ -931,37 +519,6 @@ function Get-CdpStoreLyricLine {
     if (-not $m.Success) { return $null }
     try { return (('"' + $m.Groups[1].Value + '"') | ConvertFrom-Json) | ConvertFrom-Json } catch { return $null }
 }
-function Get-CdpDomTime {
-    if (-not (Get-CdpTab)) { return $null }
-    $expr = @"
-(function(){
-  try{
-    var root = document.querySelector('#page_pc_mini_bar') || document;
-    var nodes = root.querySelectorAll('span,div');
-    var re = /^\s*(\d{1,3}):(\d{2})\s*\/\s*(\d{1,3}):(\d{2})\s*$/;
-    for (var i = 0; i < nodes.length && i < 4000; i++) {
-      var t = (nodes[i].textContent || '').trim(), m = re.exec(t);
-      if (m) {
-        var ratio = null;
-        try {
-          var th = root.querySelector('[class*=curtime], [class*=TimeWarpper], [class*=thumb]');
-          var st = th ? (th.getAttribute('style') || '') : '';
-          var lm = /left:\s*([\d.]+)%/.exec(st);
-          if (lm) ratio = (+lm[1]) / 100;
-        } catch (e2) { }
-        return JSON.stringify({ ok:true, curS:(+m[1])*60+(+m[2]), totalS:(+m[3])*60+(+m[4]), ratio:ratio, raw:t });
-      }
-    }
-    return JSON.stringify({ ok:false, why:'no mm:ss / mm:ss inside #page_pc_mini_bar' });
-  }catch(x){ return JSON.stringify({ ok:false, why:''+x }); }
-})()
-"@
-    $raw = Invoke-CdpExpression -Expression $expr
-    if (-not $raw) { return $null }
-    $m = [regex]::Match($raw, '"value"\s*:\s*"((?:[^"\\]|\\.)*)"', 'Singleline')
-    if (-not $m.Success) { return $null }
-    try { return (('"' + $m.Groups[1].Value + '"') | ConvertFrom-Json) | ConvertFrom-Json } catch { return $null }
-}
 
 # 纯函数：在 times（**秒**，注意单位）上按位置（**毫秒**）选行；返回索引，-1 = 无法判定。
 # **不假设长度**（同一客户端上实测见过 64 行与 67 行）；跳过 null 时间戳；越界钳位到末行。
@@ -979,87 +536,23 @@ function Select-StoreLineIndex {
     return $idx
 }
 
-# 纯函数：这一拍要不要**重新读** store 的行时间表（缓存判定，-SelfTest 覆盖）。
+# ---------------------------------------------------------------------------
+# CDP store：**只提供身份**（曲名 / 歌手 / 曲目 id / 播放状态）
+# ---------------------------------------------------------------------------
+# 访问方式照 cloudmusic-desktop-mcp 的做法（server.py:283-287）：往 webpackJsonp 塞一个模块，
+# 把 webpack 的 `require` 存到 window 上，再 `getStore()`（**不调 getState** ✓，见 server.py:339-346）。
 #
-# 换歌时主循环显式清空缓存（$script:StoreTimes = $null），这里确认那确实会触发重读：
-# `-not $null` 为真 → stale ✓，所以"清了以后没人再读"这条猜想不成立（清空后**下一拍**就读）。
-# 另一条同源的语言事实：PowerShell 里**空数组是假的**，所以"表读回来了但只有零行"
-# （换歌瞬间 async:lyric 还没填）也会走同一个分支、每拍重读一次，直到表真的有行 ✓。
+# **规则化的探查**（用户要求保留）：模块 id **随客户端版本变** ✗（这台是 11，MCP 钉的是 12），
+# 所以这里**不写死 id** ✓ —— 运行期扫 webpack 的**缓存** `req.c`（只含已实例化模块 ✓，**不执行任何模块** ✗）
+# 找导出里带 `getStore` 的那个 ✓，并把结果缓存在页面上（`window.__ei_store_id__` ✓），
+# 客户端升级后若失效会自己再找一次 ✓。
 #
-# 第二把尺子是**行数**，不是曲目 id。id 来自 store 的 playing 切片，而 times 来自
-# async:lyric 切片——两者是同一个 state 里**各自更新**的两块，切歌那一拍 playing 已经是新歌、
-# lyric 还是旧的（这正是 135c069 让"换歌就重读"发生的那一拍）。于是缓存里可能存着一张
-# **上一首歌的时间表**、却被新歌的 id 打了标 → 之后永远不会重读，选行索引按旧表走到头就被钳位，
-# 歌词停在那里。判据：表里的行数必须等于 store 现在这份数组的行数。
-function Test-StoreTimesStale {
-    param([object[]]$Cached, [string]$CachedTrack, [int]$CachedLines,
-          [string]$StoreTrack, [int]$StoreLines)
-    # 只回答"重不重读"（`Get-StoreTimesVerdict` 的 `.ReRead`）。保留这个薄壳是因为它的名字
-    # 就是这个问题，而判定本身（以及**为什么**）在下面那个函数里——行数那一把尺子不收敛的
-    # 形状见那里的注释。
-    return (Get-StoreTimesVerdict -Cached $Cached -CachedTrack $CachedTrack `
-            -CachedLines $CachedLines -StoreTrack $StoreTrack -StoreLines $StoreLines).ReRead
-}
-# 纯函数：**为什么**要（或不要）重读行时间表，以及这次判定是不是最后一句（-SelfTest 覆盖）。
-#
-# `Test-StoreTimesStale` 只回答"重不重读"，而它的行数那一把尺子有一个**不收敛**的形状：
-# 缓存里的行数与 store 报的行数来自**两次不同的读**（缓存行数来自读表那一拍，store 行数来自
-# 这一拍的 state），所以只要两者对不上，它就会**每一拍都判过期**——每次重读又把新读到的行数
-# 写回缓存，下一拍再对不上，如此往复。表永远"过期"，选行的缓存行号被反复清掉，歌词就停住
-# （真机 `-ProbeStore` 报 `table=stale` 就是它）。判据必须**收敛**，所以拆成三件事：
-#
-#   1. 没表 / 别的曲目 → `Track` 或 `Empty`，**立刻重读**（这两条永远是真的，不会来回摆）。
-#   2. store 报的行数未知（0）→ **不重读**：不能拿一个不知道的数去逼重读（否则每拍一次 CDP）。
-#   3. 行数对得上 → **不重读**：这份表就是现在这份数组的。
-#   4. 行数对不上 → 看"这份表是不是已经为**这个行数**读过一次了"（`AcceptedLines`）。
-#      没读过 → `Lines`，重读（并记下 `AcceptedLines` = 这一拍观察到的行数）；
-#      读过   → 不重读，**用这份表**。
-#
-# 第 4 条里的 `AcceptedLines` 是**观察到的行数**，不是数次数——这一点是整个收敛性的关键：
-# 行数**又变了**（`AcceptedLines -ne StoreLines`）就等于"新信息到了"，于是又允许重读一次。
-# 换歌时 `async:lyric` 切片一格格追上来（26 → 27 → 28）正是这个形状：每一格都会让表重读一次，
-# 而**任何一格都不会永远挡住使用**——最坏情况是"每格多读一次"，不是"永远不读旧表也不更新"。
-# 于是 `b97f403` 要防的那件事（上一首的表被打上新 id）在第一格就被读掉，而选行缓存也不会
-# 被无休止清空。
-#
-# 换句话说：**id 判"这份表属于谁"；行数是"要不要再读一次"的触发器，而触发器只在行数真的变化时复位。**
-function Get-StoreTimesVerdict {
-    param([object[]]$Cached, [string]$CachedTrack, [int]$CachedLines,
-          [string]$StoreTrack, [int]$StoreLines, [int]$AcceptedLines = -1)
-    $v = @{ Stale = $false; Reason = 'Fresh'; ReRead = $false }
-    if (-not $Cached) {
-        $v.Stale = $true; $v.Reason = 'Empty'; $v.ReRead = $true
-        return $v
-    }
-    if ($CachedTrack -ne $StoreTrack) {
-        $v.Stale = $true; $v.Reason = 'Track'; $v.ReRead = $true
-        return $v
-    }
-    if ($StoreLines -le 0) { return $v }                     # 行数未知 → 不重读
-    if ($CachedLines -eq $StoreLines) { return $v }           # 对得上 → 这份表就是现在这份数组的
-    if ($AcceptedLines -eq $StoreLines) { return $v }          # 已经为**这个行数**读过一次 → 不再读
-    $v.Stale = $true; $v.Reason = 'Lines'; $v.ReRead = $true
-    return $v
-}
-
-# 纯函数：store 的"当前行起始时间"能不能当**位置**用（-SelfTest 覆盖）。
-#
-# 这个数是 `playingLyricLineNumber` 那一行的起始时间，而**那个行号实测会冻结**
-# （2026-10-14 两次实测：82 行的歌一直报第 10 行；26 行的歌位置从 167 s 走到 177 s，它一直报第 10 行
-#  → 行时间恒为 29.5 s）。把它当位置用是**同义反复**：用"第 k 行的起始时间"去选行，选回来的
-# 必然还是第 k 行——它一步也推不动选行。所以它只能当**一次**引导值（它确实是位置的下界：
-# 这一行已经开始了），之后只有在**往前走**的时候才允许再用（那时它真的带回了新信息）。
-#
-# 为什么必须有这条：位置降级链里 storeline 排在 memory / media / 推算时钟**之前**，而它是
-# 唯一一个不随真实时间前进的来源。它一旦冻结，就等于把下面那些会前进的来源全部遮住
-# （`$positionMs` 不再是 $null，链就停了）→ 换歌后的某一个瞬间只要迷你条 DOM 读失败一次，
-# 位置就永远停在 29.5 s、歌词永远停在同一行 = 用户报的"切歌后歌词不动"。memory 那条来源
-# 早就有同性质的守卫（Test-PosAfterTrackChange：切歌后没跳变就判它失效），storeline 没有。
-function Test-StoreLineUsable {
-    param([int]$PrevMs, [int]$NowMs)
-    if ($PrevMs -lt 0) { return $true }        # 第一次见到它：当一次引导值
-    return ($NowMs -gt $PrevMs)                # 没往前走（或往回走）= 这一行不会推着歌词走
-}
+# 它**不再提供当前行与位置**：那两样现在都来自黑胶页（见下面那一节）。这里剩下的字段是
+# 身份与判活：`resourceName` / `resourceArtists[].name`（歌手列实测是 `Mili, 塞壬唱片-MSR`，
+# 用 ' / ' 拼起来与黑胶页 `title="Mili / 塞壬唱片-MSR"` 逐字一致）/ `resourceTrackId` /
+# `playId`（换歌会变）/ `playingState`（2 = 播放中，真机更正见 docs/state-and-handover.md）。
+# 单位陷阱（同一个 state 里三种单位 ✗）：`curTrack.duration` 是**毫秒** ✓、
+# `playing.resourceDuration` 是**秒** ✓ —— 这里只搬 durationMs，别混。
 function Get-CdpStoreState {
     if (-not (Get-CdpTab)) { return $null }
     $expr = @'
@@ -1083,13 +576,13 @@ function Get-CdpStoreState {
     var h=[cache[id].exports,cache[id].exports.a,cache[id].exports.default].filter(function(x){return x&&typeof x.getStore==='function';})[0];
     var g=h.getStore(), st=(g&&typeof g.getState==='function')?g.getState():g;
     var p=(st&&st.playing)||{}, a=(st&&st['async:lyric'])||{};
-    var L=a.lyricLines||[], T=a.tlyricLines||[], i=p.playingLyricLineNumber;
-    var ok=(typeof i==='number'&&i>=0&&i<L.length);
+    var A=p.resourceArtists||[];
+    var names=[];
+    for(var j=0;j<A.length;j++){ var n=A[j]&&A[j].name; if(n) names.push(''+n); }
     return JSON.stringify({ok:true,moduleId:id,name:p.resourceName||'',trackId:p.resourceTrackId||'',
+      playId:p.playId||'',artists:names.join(' / '),
       state:p.playingState,durationMs:(p.curTrack&&p.curTrack.duration)||0,
-      lines:L.length,index:i,offset:a.offset,usedLyric:a.currentUsedLyric,
-      line:ok?(L[i].lyric||L[i].text||''):'',lineTimeSec:ok?L[i].time:null,
-      trans:(typeof i==='number'&&i>=0&&i<T.length)?(T[i].lyric||T[i].text||''):''});
+      lines:(a.lyricLines||[]).length,tlines:(a.tlyricLines||[]).length});
   }catch(x){ return JSON.stringify({ok:false,why:''+x}); }
 })()
 '@
@@ -1100,6 +593,282 @@ function Get-CdpStoreState {
     # 双层解析：CDP 把返回值当**字符串**给出来，里面才是 JSON ✓（上一版手工替换转义引号把它弄坏过 ✗）
     try { return (('"' + $m.Groups[1].Value + '"') | ConvertFrom-Json) | ConvertFrom-Json }
     catch { return $null }
+}
+
+# ---------------------------------------------------------------------------
+# 黑胶页（vinyl）：**托盘模式的歌词与曲名来源**（真机 2026-10-15）
+# ---------------------------------------------------------------------------
+# 为什么需要它：早先曲名只从"顶层窗口标题"来（`Get-NeteaseWindowTitles` → `Select-SongTitle`），
+# 而用户把前台窗口关掉（播放转到托盘）之后**一个可见的网易云顶层窗口都没有** —— 真机实测：
+# 4 个窗口（`铁花飞 - Mili/塞壬唱片-MSR` ×2、`桌面歌词`、`迷你播放器`）**全部 IsWindowVisible=0**。
+# 于是 `Get-PlayingTrack` 返回 `$null`，主循环那个 `if ($now) { … }` 整段被跳过 →
+# **歌词与曲名一起没了**。这就是"关掉窗口后全都失效"的机制（与 CDP 死没死无关）。
+#
+# 而 CDP 那边一切照旧：`li.line.current` 上有客户端自己维护的**当前行**（原文 + 翻译）与
+# `data-time`（真实位置，十分之一秒），标题在 `span.title` 的 `title` 属性里。所以新来源
+# **不经过任何窗口**：只读页面。
+#
+# 选择器纪律（这是"通用准确"的胜负手）：**绝不锚带哈希的类名**——`ClassicPageContainer_c1h09pwc`、
+# `VinylPageLayoutContainer_vwagppq`、`TrackTitleContainer_t1s72en4`、`TypographyWrapper_tca8bac`
+# 都是构建产物，客户端一升级就变。按稳定性排序，每一条候选都记下"命中/未命中"：
+#   ① 稳定 id（`VINYL_COVER_ELEMENT_ID` —— 名字就像故意留的锚）
+#   ② 语义类名（`.line` / `.current` / `.title`）
+#   ③ 属性与 data-*（`[data-testid=tid_tracktitle_container]`、`title="…"`、`data-time`）
+# `-ProbeVinyl` 与主循环都会打印**是哪一条候选命中的**（本项目规矩：打判别性数值，
+# 不打"失败了"）。
+
+# 候选表（纯数据；-SelfTest 断言的是**顺序**，也就是优先级本身）。
+# 这里**不写进 -SelfTest 单独维护的第二份**：断言直接遍历这两个数组，改了顺序也会一起被抓。
+function Get-VinylRootCandidates {
+    return @(
+        '#VINYL_COVER_ELEMENT_ID'
+        '[id=VINYL_COVER_ELEMENT_ID]'
+        'div.display'
+    )
+}
+function Get-VinylLineCandidates {
+    return @(
+        '#VINYL_COVER_ELEMENT_ID li.line.current'
+        'li.line.current'
+        'li[class~="line"][class~="current"]'
+        'li[data-time].current'
+    )
+}
+function Get-VinylTitleCandidates {
+    # 属性优先（干净值），元素文本兜底。两跳之间**只差命名空间**，不是两种"猜法"。
+    return @(
+        '[data-testid=tid_tracktitle_container] span.title'
+        '#VINYL_COVER_ELEMENT_ID span.title'
+        'span.cmd-typography.title'
+    )
+}
+function Get-VinylArtistCandidates {
+    # 歌手那一行是 `li.artist`，值在**内层 span 的 title 属性**上（`title="Mili / 塞壬唱片-MSR"`）——
+    # 直接取 `li` 的 textContent 会带上"歌手："前缀，所以要先取属性。
+    return @(
+        '[data-testid=tid_tracktitle_artist] span[title]'
+        '[data-testid=tid_tracktitle_artist]'
+        '#VINYL_COVER_ELEMENT_ID li.info.artist span[title]'
+    )
+}
+
+# 纯函数：把 `data-time`（字符串，秒）解成毫秒。解不出返回 -1（**不是 0**：0 s 是真值，
+# 用 0 当"不知道"会让第一行与读失败长得一样）。
+function ConvertFrom-VinylSeconds {
+    param([string]$Text)
+    if (-not $Text) { return -1 }
+    $t = $Text.Trim()
+    if ($t -notmatch '^\d+(\.\d+)?$') { return -1 }
+    $v = 0.0
+    if (-not [double]::TryParse($t, [ref]$v)) { return -1 }
+    if ($v -lt 0) { return -1 }
+    if ($v -gt 86400) { return -1 }          # 一天的秒数：超出就是解析错了，不是位置
+    return [int][math]::Round($v * 1000.0)
+}
+
+# 纯函数：把当前行的 `<p>` 数组切成原文 / 翻译（-SelfTest 覆盖，客户端的真实 HTML 是夹具）。
+#
+# 真机形状（2026-10-15 实测，64 行全部一致）：**第一个 `<p>` 是原文，第二个是翻译**；
+# 而 store 的 `tlyricLines[i].lyric` 与第二个 `<p>` 的 textContent **64/64 逐行相等** ——
+# 所以这不是猜的。没有翻译的行**仍然有第二个 `<p>`**，只是内容为空（"作词: …" 那两行、
+# 以及当前这首的 64 行里有 29 行翻译非空）。
+#
+# 兜底：只有一个 `<p>` 时它就是原文、翻译为空（`-SelfTest` 有一条专门喂单 `<p>`）。
+# 两个都为空 → 原文为空（调用方据此判"这一拍没有可用行"）。
+function Split-VinylParagraphs {
+    param([string[]]$Paragraphs)
+    $orig = ''
+    $xlat = ''
+    if ($Paragraphs -and $Paragraphs.Count -gt 0 -and $null -ne $Paragraphs[0]) { $orig = ('' + $Paragraphs[0]).Trim() }
+    if ($Paragraphs -and $Paragraphs.Count -gt 1 -and $null -ne $Paragraphs[1]) { $xlat = ('' + $Paragraphs[1]).Trim() }
+    # 首段为空、次段非空：只有一种成因说得通——这一行是"翻译单独成段"，那时次段才是原文。
+    # （真机上没见过，但把两个字段都留空去丢一行歌词是更糟的失败方式。）
+    if (-not $orig -and $xlat) { return @{ Original = $xlat; Translation = '' } }
+    return @{ Original = $orig; Translation = $xlat }
+}
+
+# 纯函数：一条被选中的行（命中的候选 + 属性 + 段数组）→ 规范化的读数（-SelfTest 覆盖）。
+# 命中的候选名原样带出去（`Hit`），探针与主循环都把它打印出来。
+function ConvertFrom-VinylLineSpec {
+    param($Spec)
+    if (-not $Spec) { return $null }
+    $paras = @()
+    if ($null -ne $Spec.paras) { $paras = @($Spec.paras | ForEach-Object { '' + $_ }) }
+    $split = Split-VinylParagraphs -Paragraphs $paras
+    [pscustomobject]@{
+        Hit      = '' + $Spec.hit
+        DataTime = '' + $Spec.dataTime
+        TimeMs   = ConvertFrom-VinylSeconds -Text ('' + $Spec.dataTime)
+        Original = $split.Original
+        Translation = $split.Translation
+        ParaCount = $paras.Count
+    }
+}
+
+# 纯函数：标题取值——`title` **属性**优先，元素文本兜底（-SelfTest 覆盖）。
+# 为什么要防文本：`span.title` 里面嵌着两个空 `<div class="label">`，它们的 textContent
+# 本身是空的（所以本机拿到的文本恰好也是干净的 `铁花飞`），但那只说明**现在**它们是空的；
+# 属性是客户端自己写的干净值，不依赖子节点长什么样。
+# 空白（空属性 / 纯空白文本）**不算命中**，要继续往下试候选。
+function Get-VinylTitleFromSpec {
+    param($Spec)
+    if (-not $Spec) { return $null }
+    if ($Spec.attr) {
+        $a = ('' + $Spec.attr).Trim()
+        if ($a) { return $a }
+    }
+    if ($null -ne $Spec.text) {
+        $t = ('' + $Spec.text).Trim()
+        if ($t) { return $t }
+    }
+    return $null
+}
+
+# 纯函数：歌手那一行。先取内层 span 的 `title` 属性（干净：`Mili / 塞壬唱片-MSR`），
+# 再退回 li 的文本并**剥掉"歌手："前缀**（本地化前缀会变，所以这是兜底而非常态）。
+function Get-VinylArtistFromSpec {
+    param($Spec)
+    if (-not $Spec) { return $null }
+    if ($Spec.attr) {
+        $a = ('' + $Spec.attr).Trim()
+        if ($a) { return $a }
+    }
+    $t = ('' + $Spec.text).Trim()
+    if (-not $t) { return $null }
+    $t = $t -replace '^\s*[^：:]{1,8}[：:]\s*', ''    # "歌手："这类前缀：以冒号结尾的最多 8 个字
+    $t = $t.Trim()
+    if ($t) { return $t }
+    return $null
+}
+
+# 纯函数：**黑胶页这一拍的读数还能不能用**（-SelfTest 覆盖）。这是这个来源的"进/不进链子"闸门。
+#
+# 它为什么必须存在：本项目有两次真实的缺陷都是**冻结的来源把会前进的来源遮住**
+# （`playingLyricLineNumber` 冻结在 10、`storeline` 因此把 memory/media/时钟全挡住）。
+# 现在的位置只有这一条来源，所以"读到一个不动的数"必须能被指出来 —— 否则界面上是"歌词
+# 停在这一句"，而看不出是**播放器本来就停着**还是**页面不更新了**（两者修法相反）。
+#
+# 判据（四条，各对应一个真机形状；阈值都是**实测**定的，见 docs 的设计说明）：
+#   ① 没有当前行 → 不可用（窗口关了、页面还没挂载、选择器失效）——调用方在别处判，这里看 time
+#   ② `data-time` 解析不出（< 0）→ 不可用
+#   ③ **往回走超过 `BackToleranceMs`** → 不可用。真机实测：切歌当拍读到过 data-time="1"，
+#      而那一声明的位置还在上一首的 240 s 上 —— 用它当位置会把面板钉在新歌第 0 行。
+#      1 s 的容差是给"同一行边界上的抖动"留的（页面按 0.1 s 粒度更新）。
+#   ④ **往前跳超过 `ForwardToleranceMs`** → 不可用（读到的是上一轮/上一首的陈旧节点）。
+#      阈值 30 s 不是随手取的：**真机实测这一首的相邻句间隔 2.6 s ~ 26.7 s**（音乐段落之间
+#      本来就有长间奏），所以 5 s 那种"看起来谨慎"的上界会把正常换行也判死。判据宁松勿误杀：
+#      这里要挡的是"几百秒的跳变"，不是"这句唱得久"。
+#   ⑤ **连续 `RepeatLimit` 次读到完全相同的数** → 不可用（**这一条才是"冻结"的真正形状**）。
+#      注意"两拍相同"本身是正常的（暂停时位置与行一起不动，那是自洽的），所以不判它；
+#      只有"一直同一个数"才是页面不更新。真机反例：选择器命中了别处一个恒为 29.5 s 的
+#      `data-time` 节点 —— 那时每一拍都会"可用"，界面上就是永远停在那一句。
+# 注意判据③④**都不**判暂停：暂停时 data-time 不动、位置也不动，那是自洽的。
+function Test-VinylLineUsable {
+    param([int]$PrevTimeMs, [int]$NowTimeMs,
+          [int]$BackToleranceMs = 1000, [int]$ForwardToleranceMs = 30000,
+          [int]$SameReads = 0, [int]$RepeatLimit = 3)
+    if ($NowTimeMs -lt 0) { return $false }
+    if ($SameReads -ge $RepeatLimit) { return $false }
+    if ($PrevTimeMs -lt 0) { return $true }                      # 第一次见到：当引导值
+    if ($NowTimeMs -ge $PrevTimeMs) {
+        return (($NowTimeMs - $PrevTimeMs) -le $ForwardToleranceMs)
+    }
+    return (($PrevTimeMs - $NowTimeMs) -le $BackToleranceMs)
+}
+
+# 纯函数：store 那一套（曲目 id → 行号 → 该行文本/翻译）在这一拍能不能信（-SelfTest 覆盖）。
+# 需要它是因为新来源**自己发文本**：黑胶页给的是"当前行"，而 store 给的是"按 times 选出来的
+# 第 idx 行"。两者在**切歌当拍**会错配（store 还是上一首的数组，而位置已经属于新歌），
+# 于是上一个来源的翻译会被贴在这一句上。判据只有两条，都是硬事实：
+#   · store 报的曲目 id 与这一轮的曲目 id 一致；
+#   · 行号落在数组范围内。
+# `-SelfTest` 的负对照就是把"曲目 id 必须相等"这一条拿掉，看它是否变红。
+function Test-StoreLyricUsable {
+    param([string]$StoreTrack, [string]$CurrentTrack, [int]$Index, [int]$Lines)
+    if (-not $StoreTrack) { return $false }
+    if ($StoreTrack -ne $CurrentTrack) { return $false }
+    if ($Index -lt 0) { return $false }
+    return ($Index -lt $Lines)
+}
+
+# 纯函数：把一组候选的命中情况拼成一行判别性日志（如 `#VINYL_COVER_ELEMENT_ID li.line.current`）。
+# 它就是"报告哪一条候选命中了"的落点；没命中时给 '(none)'，而不是空字符串。
+function Format-VinylHit {
+    param([string]$Hit)
+    if (-not $Hit) { return '(none)' }
+    return $Hit
+}
+
+# **一轮只做一次**的小求值：一个紧凑 JSON 对象（不是整页 DOM dump）。
+# 页面里没有 audio/video 元素（真机结论 2026-10-13），所以位置只能来自 DOM 自己维护的
+# `data-time`；这条表达式同时回答"有没有当前行 / 原文与翻译是什么 / 标题与歌手是谁"。
+$script:VinylExpression = @'
+(function(){
+  function pick(list){
+    for (var i=0;i<list.length;i++){ try{ var e=document.querySelector(list[i]); if(e) return {e:e,hit:list[i]}; }catch(x){} }
+    return {e:null,hit:''};
+  }
+  function txt(e){ return e?(''+e.textContent):''; }
+  var o={};
+  try{
+    var roots=__ROOTS__, lines=__LINES__, titles=__TITLES__, artists=__ARTISTS__;
+    var r=pick(roots);
+    o.root = r.hit;
+    var l=pick(lines);
+    o.lineHit = l.hit;
+    if(l.e){
+      o.dataTime = l.e.getAttribute('data-time');
+      var ps=l.e.querySelectorAll('p');
+      o.paras=[];
+      for(var i=0;i<ps.length && i<4;i++){ o.paras.push(txt(ps[i])); }
+      o.liCount = document.querySelectorAll('li.line').length;
+    }
+    var t=pick(titles);
+    o.titleHit = t.hit;
+    if(t.e){ o.title=(t.e.getAttribute('title')||''); o.titleText=txt(t.e); }
+    var a=pick(artists);
+    o.artistHit = a.hit;
+    if(a.e){ o.artist=(a.e.getAttribute('title')||''); o.artistText=txt(a.e); }
+  }catch(x){ o.err=''+x; }
+  return JSON.stringify(o);
+})()
+'@
+
+# 把候选表装进上面那条表达式（只装一次；候选表是纯数据，见 Get-Vinyl*Candidates）。
+function Initialize-VinylExpression {
+    $script:VinylExpression = $script:VinylExpression.
+        Replace('__ROOTS__', (Get-VinylRootCandidates | ConvertTo-Json -Compress)).
+        Replace('__LINES__', (Get-VinylLineCandidates | ConvertTo-Json -Compress)).
+        Replace('__TITLES__', (Get-VinylTitleCandidates | ConvertTo-Json -Compress)).
+        Replace('__ARTISTS__', (Get-VinylArtistCandidates | ConvertTo-Json -Compress))
+}
+Initialize-VinylExpression
+
+# 读黑胶页这一拍。失败/页面不在就返回 $null —— **调用方必须原样继续降级**（新来源是额外的
+# 一条路，不是替代：没有 CDP 时前台那套照旧工作）。
+function Get-CdpVinyl {
+    if (-not (Get-CdpTab)) { return $null }
+    $raw = Invoke-CdpExpression -Expression $script:VinylExpression
+    if (-not $raw) { return $null }
+    $m = [regex]::Match($raw, '"value"\s*:\s*"((?:[^"\\]|\\.)*)"', 'Singleline')
+    if (-not $m.Success) { return $null }
+    $o = $null
+    try { $o = (('"' + $m.Groups[1].Value + '"') | ConvertFrom-Json) | ConvertFrom-Json } catch { return $null }
+    if ($null -eq $o) { return $null }
+    $line = ConvertFrom-VinylLineSpec -Spec ([pscustomobject]@{
+        hit = $o.lineHit; dataTime = $o.dataTime; paras = $o.paras })
+    [pscustomobject]@{
+        RootHit   = '' + $o.root
+        Root      = [bool]$o.root
+        LineHit   = Format-VinylHit -Hit $o.lineHit
+        Line      = $line                                 # $null 或规范化的行读数
+        LiCount   = if ($null -ne $o.liCount) { [int]$o.liCount } else { 0 }
+        TitleHit  = '' + $o.titleHit
+        Title     = Get-VinylTitleFromSpec -Spec ([pscustomobject]@{ attr = $o.title; text = $o.titleText })
+        ArtistHit = '' + $o.artistHit
+        Artist    = Get-VinylArtistFromSpec -Spec ([pscustomobject]@{ attr = $o.artist; text = $o.artistText })
+        Why       = '' + $o.err
+    }
 }
 
 # 探测表达式：只读、无副作用，一次把"页面里有什么"尽量问全，避免来回猜。
@@ -1300,329 +1069,240 @@ $script:CdpProbeExpression = @'
 if ($ProbeCdp) {
     Write-Host '探测 CDP（需要客户端是"带调试端口的快捷方式"启动的）：'
     if (-not (Invoke-CdpProbe)) {
-        Write-Host '  没找到 CDP 端口 —— 说明客户端不是带调试参数启动的。'
-        # 注意顺序：这个分支在文件里执行得较早，Show-CdpShortcutGuidance 可能还没定义
-        # （PowerShell 自上而下执行）。真正的降级路径（内存失败时）在文件后段调用它，那里已定义。
-        if (Get-Command Show-CdpShortcutGuidance -ErrorAction SilentlyContinue) {
-            Show-CdpShortcutGuidance
-        }
-        else {
-            Write-Host '  改快捷方式的步骤：右键快捷方式 → 属性 → 「目标」→ 在引号内 exe 路径后追加'
-            Write-Host '  --remote-debugging-port=9229 → 保存 → 完全退出客户端再启动 → 重跑 -ProbeCdp'
-            Write-Host '  （本插件不会替你启动或重启音乐软件。）'
-        }
+        Write-Host '  没找到 CDP 端口 —— 说明客户端不是带调试参数启动的，**歌词与曲名都不会工作**。'
+        Write-Host '  改快捷方式的步骤：右键快捷方式 → 属性 → 「目标」→ 在引号内 exe 路径后追加'
+        Write-Host '  --remote-debugging-port=9229 → 保存 → 完全退出客户端再启动 → 重跑 -ProbeCdp'
+        Write-Host '  （本插件不会替你启动或重启音乐软件。）'
     }
     else {
-        Write-Host '  端口可用 ✓。下面用一条**只读探测表达式**问一下页面里有什么'
-        Write-Host '  （页面标题、audio/video 的 currentTime 与时长、若干候选节点的文本）：'
-        $res = Invoke-CdpExpression -Expression $script:CdpProbeExpression
-        if ($res) {
-            Write-Host ''
-            Write-Host ('  ' + $res)
-            Write-Host ''
-            Write-Host '  把上面这行发我：据此固化"取位置与当前歌词行"的表达式，接成 -PositionSource cdp ✓'
+        Write-Host '  端口可用 ✓。下面是黑胶页那一拍的读数（`-ProbeVinyl` 的简化版）：'
+        Write-Host ("    root={0}" -f (@(Get-VinylRootCandidates) -join ' | '))
+        Write-Host ("    line={0}" -f (@(Get-VinylLineCandidates) -join ' | '))
+        $v = Get-CdpVinyl
+        if ($v) {
+            Write-Host ("    命中：root='{0}' line='{1}' title='{2}' artist='{3}'" -f `
+                $v.RootHit, $v.LineHit, $v.TitleHit, $v.ArtistHit)
+            Write-Host ("    读数：title='{0}' artist='{1}' data-time='{2}' → {3}ms  行数={4}" -f `
+                $v.Title, $v.Artist, $(if ($v.Line) { $v.Line.DataTime } else { '' }), `
+                $(if ($v.Line) { $v.Line.TimeMs } else { -1 }), $v.LiCount)
+            Write-Host ("    当前行：原文='{0}' | 翻译='{1}'" -f `
+                $(if ($v.Line) { $v.Line.Original } else { '' }), $(if ($v.Line) { $v.Line.Translation } else { '' }))
+            Write-Host '    要多看几拍（判"值有没有往前走"）就跑 -ProbeVinyl ✓'
         }
         else {
             Write-Host '  求值失败 ✗（页面可能不接受 Runtime.evaluate，或调试目标是别的东西）。'
             Write-Host '  把上面 target 的输出发我，我按它挑目标重试 ✓'
         }
+        # 兜底的"页面里有什么"：黑胶页读不到时（客户端升级换了结构），这条**不带任何选择器**
+        # 的枚举能回答"现在页面上长什么样"。正常运行时不需要看它，所以只在 vinyl 读失败时打，
+        # 免得把几 KB 的 JSON 糊满屏幕。
+        if (-not $v) {
+            Write-Host '  再问一遍"页面里有什么"（无选择器的枚举，升级后重新定锚点用）：'
+            Write-Host ('  ' + $script:CdpProbeExpression)
+            $res = Invoke-CdpExpression -Expression $script:CdpProbeExpression
+            if ($res) { Write-Host ('  实际返回：' + $res) }
+        }
     }
     exit 0
 }
 
-if ($ProbePosition) {
-
-
-    if (-not $PositionHelper) { $PositionHelper = Join-Path $PSScriptRoot '_netease-position.ps1' }
-    $exe = Get-PowerShell51
-    Write-Host ("探测位置来源：{0} -Probe" -f $PositionHelper)
-    & $exe -NoProfile -ExecutionPolicy Bypass -File $PositionHelper -Probe
-    exit $LASTEXITCODE
-}
-
 # ---------------------------------------------------------------------------
-# 位置来源「memory」的对外入口 + 「cdp」的手动启动指导
+# 离线自检
 # ---------------------------------------------------------------------------
-# 设计取舍（用户明确要求）：**插件绝不自己启动音乐软件**。CDP 只在客户端"已经被用户用
-# 带调试端口的快捷方式启动"时才可用；我们要做的是**把怎么改快捷方式讲清楚**，而不是替他启动。
-function Show-CdpShortcutGuidance {
-    Write-Host ''
-    Write-Host '  想要精确同步（拖动进度条、暂停都能跟上），有两条路，任选其一：'
-    Write-Host '  ① 内存位置（默认）：本脚本会在客户端进程启动后自动发现一次，无需你做任何事；'
-    Write-Host '  ② CDP（当内存读取被安全软件拦下、或你想彻底不碰内存时）：需要你手动给快捷方式加一个参数——'
-    Write-Host '     · 右键网易云音乐的快捷方式 → 属性 → 「目标」'
-    Write-Host '     · 在引号中的 exe 路径后面追加一个空格和：--remote-debugging-port=9229'
-    Write-Host '       例如："D:\Program Files\NetEase\CloudMusic\cloudmusic.exe" --remote-debugging-port=9229'
-    Write-Host '     · 保存后完全退出客户端再启动（改完第一次需要重启客户端才生效）'
-    Write-Host '     · 之后跑一次：pwsh -File _netease-bridge.ps1 -ProbeCdp  验证端口可用'
-    Write-Host '  说明：本插件**不会**替你启动或重启音乐软件（那属于改动你的使用习惯），只读取状态。'
-    Write-Host ''
+# 夹具是**客户端真实吐出来的 HTML**（2026-10-15 从活着的 9229 页面抄下来，原文见
+# .tool/investigations/cdp-vinyl-evidence.txt 与 docs/netease-lyric-source-design.md）：
+# 哈希类名、`_nk`、`data-testid`、两个空 `<span class="label">` 全都原样保留 ——
+# AGENTS §7.9 的规矩：**喂真输入的形状**。上一轮正是"喂了不带换行的假输入"才让两条
+# 断言长期全绿却什么也没守住。
+$script:VinylLineFixture = '<li class="line current" data-time="22.95" _nk="iArvpjX41"><p class="cmd-typography cmd-typography-paragraph cmd-typography-primary cmd-typography-normal cmd-typography-userselect TypographyWrapper_tca8bac" _nk="vpjX51">Such a beautiful vibrancy</p><p class="cmd-typography cmd-typography-paragraph cmd-typography-primary cmd-typography-normal cmd-typography-userselect TypographyWrapper_tca8bac" _nk="vpjX52">多么美丽的盎然生机啊</p></li>'
+# 真机上"没有翻译的行"仍然有第二个 `<p>`，内容为空（实测 64 行里 29 行翻译非空）。
+$script:VinylLineNoTransFixture = '<li class="line current" data-time="230.29" _nk="iArvpjX41"><p class="cmd-typography cmd-typography-paragraph" _nk="vpjX51">身世境遇不由人选择</p><p class="cmd-typography cmd-typography-paragraph" _nk="vpjX52"></p></li>'
+# 单 `<p>`：真机这一首 64 行全是两段，所以这是**形状防御**（客户端换版本时不再崩，
+# 而是退化成"没有翻译"）。断言写在这里，免得下次有人把它当成真实形状。
+$script:VinylLineSinglePFix = '<li class="line current" data-time="9.19" _nk="iArvpjX41"><p class="cmd-typography cmd-typography-paragraph">A calloused hand</p></li>'
+$script:VinylTitleFixture = '<span class="cmd-typography title cmd-typography-primary cmd-typography-normal cmd-typography-userselect TypographyWrapper_tca8bac" title="铁花飞" _nk="MeGN63"><div class="label" _nk="MeGN54"></div>铁花飞<span class="label" _nk="MeGN71"></span></span>'
+$script:VinylArtistFixture = '<span title="Mili / 塞壬唱片-MSR" _nk="MeGN73"><span _nk="MeGN74"></span><span class="link" _nk="MeGN75">Mili</span><span _nk="MeGN74"> / </span><span class="link" _nk="MeGN75">塞壬唱片-MSR</span></span>'
+
+# 很笨的 HTML 取属性/取 `<p>` 文本：**只够解析上面那三段夹具**（真机上的解析在页面里，
+# 由 Get-CdpVinyl 的表达式做）。写在这里是为了让"夹具 → 纯函数"这条链在离线自检里真的
+# 跑一遍，而不是让断言自己造一个 `paras` 数组——那样测的就是断言自己的假设。
+function Read-FixtureAttr {
+    param([string]$Html, [string]$Name)
+    $m = [regex]::Match($Html, ('\b{0}="([^"]*)"' -f [regex]::Escape($Name)))
+    if ($m.Success) { return $m.Groups[1].Value }
+    return $null
 }
-
-# 内存位置：返回毫秒；不可用返回 $null（调用方会继续往下降级）
-$script:PosAddr = 0
-$script:PosPid = 0
-$script:PosStart = 0
-$script:PosLastValue = $null
-$script:PosLastAt = $null
-$script:PosLastTitle = ''
-$script:PosWarned = $false
-
-function Get-MemoryPosition {
-    param($Now)
-    if ($script:PosDisabled) { return $null }
-    if (-not (Enable-MemReader)) { return $null }
-    $info = Get-NeteaseProcInfo
-    if (-not $info) { return $null }
-
-    # 进程实例换了（客户端重启）→ 缓存与地址一起作废，本生命周期重新发现一次
-    if ($info.Pid -ne $script:PosPid -or $info.Start -ne $script:PosStart) {
-        $script:PosPid = $info.Pid
-        $script:PosStart = $info.Start
-        $script:PosAddr = Read-PosCache -Proc $info
-        $script:PosLastValue = $null
-        $script:PosLastAt = $null
-        $script:PosLastTitle = ''
-        $script:PosAttempts = 0
-        $script:PosDisabled = $false
-        if ($script:PosAddr -ne 0) { Write-Host ('  位置：内存（沿用本进程实例的缓存地址 0x{0:X}）' -f $script:PosAddr) }
-    }
-    if ($script:PosAddr -eq 0) {
-        # 只在"确实在播放"时发现（差分需要增长）；有界重试，绝不因为"值不增"而重扫
-        $script:PosAddr = Find-PosAddr -Proc $info -TrackPlaying:($null -ne $Now)
-        if ($script:PosAddr -ne 0) { Write-Host ('  位置：内存（发现成功，地址 0x{0:X}；本进程实例内不再扫描）' -f $script:PosAddr) }
-        else { return $null }
-    }
-
-    $v = Get-PosValue -Pid $info.Pid -Addr $script:PosAddr
-    if ($null -eq $v) {
-        if (-not $script:PosWarned) {
-            $script:PosWarned = $true
-            Write-Host '  ! 内存位置读取失败（地址已失效或被安全软件拦下）——本次生命周期不再扫描，改用降级来源'
-            Show-CdpShortcutGuidance
-        }
-        $script:PosDisabled = $true
-        return $null
-    }
-
-    # 切歌粗校验：曲名变了，位置应当回落或明显跳变；否则判该地址失效（只禁用，不重扫）
-    if ($Now -and $script:PosLastTitle -and $Now.Title -ne $script:PosLastTitle -and $null -ne $script:PosLastValue) {
-        if (-not (Test-PosAfterTrackChange -Prev $script:PosLastValue -Now $v)) {
-            Write-Host '  ! 切歌后位置未重置或未跳变——内存来源判定失效，本次生命周期改用降级来源'
-            $script:PosDisabled = $true
-            $script:PosAddr = 0
-            return $null
-        }
-    }
-    if ($Now) { $script:PosLastTitle = $Now.Title }
-
-    # 暂停判定：两拍之间几乎不动 → 位置冻结（不推进）
-    if ($null -ne $script:PosLastValue -and $null -ne $script:PosLastAt) {
-        $elapsed = ((Get-Date) - $script:PosLastAt).TotalSeconds
-        if (-not (Test-Playing -Prev $script:PosLastValue -Now $v -ElapsedSeconds $elapsed -ToleranceMs 900)) {
-            $script:PosLastValue = $v
-            $script:PosLastAt = Get-Date
-            return [int]$v          # 暂停：直接给当前值，不外推
-        }
-    }
-    $script:PosLastValue = $v
-    $script:PosLastAt = Get-Date
-    return [int]$v
+function Read-FixtureParagraphs {
+    param([string]$Html)
+    $out = @()
+    foreach ($m in [regex]::Matches($Html, '<p\b[^>]*>(.*?)</p>', 'Singleline')) { $out += $m.Groups[1].Value }
+    return $out
 }
-
 
 if ($SelfTest) {
-    # --- Select-StoreLineIndex（选行纯函数）：**不假设长度**（实测同一客户端见过 64 行与 67 行）---
-    $irr = [object[]]@(0..79 | ForEach-Object { [double]($_ * 2.5) })   # object[]：才能真正放 null
-    $irr[3] = $null                      # 元信息行没有时间戳 → 必须跳过
-    $idxCases = @(
-        @{ m = 0;       want = 0;    d = 'position 0 -> line 0 (intro)' },
-        @{ m = 2500;    want = 1;    d = 'exact line start -> that line (closed interval)' },
-        @{ m = 2501;    want = 1;    d = 'between lines -> previous line' },
-        @{ m = 5000;    want = 2;    d = 'a null timestamp is skipped, no crash' },
-        @{ m = 999999;  want = 79;   d = 'past the last line -> clamped to last' },
-        @{ m = 1000;    want = -1;   d = 'empty array -> -1 (caller falls back to LRC)'; empty = $true },
-        @{ m = 100;     want = 0;    d = 'single line array -> 0'; one = $true },
-        @{ m = 1500500; want = 1499; d = '2000-line array -> the 1500th second = index 1499'; big = $true }
-    )
-    foreach ($c in $idxCases) {
-        $ts = if ($c.empty) { [double[]]@() } elseif ($c.one) { [double[]]@(5) } elseif ($c.big) { [double[]](1..2000 | ForEach-Object { [double]$_ }) } else { $irr }
-        $got = Select-StoreLineIndex -TimesSec $ts -PositionMs $c.m
-        if ($got -ne $c.want) { $bad++; Write-Host ("  FAIL Select-StoreLineIndex: {0} (got {1}, want {2})" -f $c.d, $got, $c.want) }
-        else { Write-Host ("  OK   Select-StoreLineIndex: {0}" -f $c.d) }
-    }
-    $fixture = @"
-[ti:示例]
-[00:00.00]第一句
-[00:12.50]第二句
-[01:05.001]第三句
-[99:99.99]
-"@
-    # 一个固定时刻，给"两拍之间过了多久"这类断言用（不依赖真实时钟）。
-    $stamp = [datetime]::new(2026, 10, 14, 12, 0, 0, [DateTimeKind]::Local)
-    $lines = ConvertFrom-Lrc -Text $fixture
+    $stamp = [datetime]::new(2026, 10, 15, 12, 0, 0, [DateTimeKind]::Local)
 
-    # --- 行时间表的判定必须**收敛**：照主循环的规则跑一台小状态机 --------------------------
-    #
-    # 真机 `table=stale` 就是"判过期 → 重读 → 下一拍还是过期"这个形状。单条纯函数断言看不出
-    # 它（要**多拍**才看得出来），所以这里把主循环那三行（判 → 重读 → 记 accepted/id）原样
-    # 搬进一个模型，让它跑若干拍，断言"最后必须是 fresh"以及"总共只重读了几次"。
-    # 观察序列就是每拍 store 报的 (id, 行数)。
-    function Invoke-StoreTableModel {
-        param([string[]]$Ids, [int[]]$Lines, [int]$Cap = 12)
-        $m = @{ Cache = $null; Track = ''; Lines = 0; AcceptedLines = -1; IdSeen = ''; Reads = 0
-                Verdicts = @(); Round = -1 }
-        for ($r = 0; $r -lt [Math]::Min($Ids.Count, $Cap); $r++) {
-            $v = Get-StoreTimesVerdict -Cached $m.Cache -CachedTrack $m.Track -CachedLines $m.Lines `
-                -StoreTrack $Ids[$r] -StoreLines $Lines[$r] -AcceptedLines $m.AcceptedLines
-            $v | Add-Member -NotePropertyName Round -NotePropertyValue $r -Force
-            $m.Verdicts += $v
-            if ($v.ReRead) {
-                # 括号**必须**包住整个右侧：`$x = @(0) * [Math]::Max($a, 1)` 里的乘法先算，
-                # 结果是 $null（"op_乘"拿到一个方法调用），缓存根本没被写进去。
-                $m.Cache = @(0) * ([Math]::Max($Lines[$r], 1))   # 重读读到的是**这一拍**的行数
-                $m.Track = $Ids[$r]
-                $m.Lines = $Lines[$r]
-                $m.AcceptedLines = $Lines[$r]
-                $m.Reads++
-            }
-            $m.Round = $r
-        }
-        return $m
+    # --- 候选表：**顺序本身就是优先级**，所以断言顺序（不是"有没有"）------------------
+    # 锚点稳定性排序（这是"通用准确"的胜负手，见 docs/netease-lyric-source-design.md）：
+    # ① 稳定 id（VINYL_COVER_ELEMENT_ID）→ ② 语义类名/属性（line/current/title、
+    # [data-testid=…]）→ ③ 元素文本兜底。**一处带哈希的类名都不许出现在候选表里**。
+    $script:RootCands = @(Get-VinylRootCandidates)
+    $script:LineCands = @(Get-VinylLineCandidates)
+    $script:TitleCands = @(Get-VinylTitleCandidates)
+    $script:ArtistCands = @(Get-VinylArtistCandidates)
+    # 负对照①（逐字可复现）：把"稳定 id 在最前"这条拿掉——候选表变成"li.line.current 优先"。
+    # 断言会红在"根候选第一条是稳定 id"。真机上的代价：一个带哈希的祖先类名被写进候选表时
+    # 客户端升级就整条失效，而 id 是页面作者刻意留的锚。
+    $script:MutatedRootCands = @('div.display', '#VINYL_COVER_ELEMENT_ID', '[id=VINYL_COVER_ELEMENT_ID]')
+
+    # --- data-time → 毫秒（真机 `22.95`）--------------------------------------------
+    $script:SecondsCases = @(
+        @{ T = '22.95'; Want = 22950; D = '真机形状 22.95 → 22950' }
+        @{ T = '0'; Want = 0; D = '0 s 是**真值**，不能被当成"读失败"' }
+        @{ T = '189.74'; Want = 189740; D = '整数秒 + 两位小数' }
+        @{ T = '7.5'; Want = 7500; D = '一位小数' }
+        @{ T = ''; Want = -1; D = '空串 = 不知道（-1，不是 0）' }
+        @{ T = $null; Want = -1; D = 'null = 不知道' }
+        @{ T = 'abc'; Want = -1; D = '垃圾 = 不知道' }
+        @{ T = '-3'; Want = -1; D = '负数 = 不知道' }
+        @{ T = '999999'; Want = -1; D = '超过一天 = 解析错了，不是位置' }
+    )
+
+    # --- 段切分 / 标题 / 歌手：真机 HTML 直接喂进去 ------------------------------------
+    $script:LineSpecReal = [pscustomobject]@{
+        hit = $script:LineCands[0]
+        dataTime = Read-FixtureAttr -Html $script:VinylLineFixture -Name 'data-time'
+        paras = Read-FixtureParagraphs -Html $script:VinylLineFixture
     }
-    $script:V02Ok = $false; $script:V03Ok = $false; $script:V04Ok = $false
-    $script:V05Ok = $false; $script:V06Ok = $false; $script:V07Ok = $false; $script:V08Ok = $false
-    # ①（这条在旧代码上是**红**的）同一首、id 不变，行数一路在变 —— 旧判定每拍都 stale，
-    #    新判定每来一个新的行数只多读一次，随后就 fresh。
-    #    模型从**空缓存**起步，所以第 0 拍本身就是一次重读（正常的冷启动）。
-    $m1 = Invoke-StoreTableModel -Ids @('A', 'A', 'A', 'A', 'A') -Lines @(10, 26, 26, 26, 26)
-    $script:V02Ok = ($m1.Verdicts[0].Stale -and $m1.Verdicts[0].Reason -eq 'Empty' -and
-                    $m1.Verdicts[1].Stale -and $m1.Verdicts[1].Reason -eq 'Lines' -and
-                    -not $m1.Verdicts[2].Stale -and -not $m1.Verdicts[3].Stale -and
-                    -not $m1.Verdicts[4].Stale -and $m1.Reads -eq 2)
-    # ② 只换曲目 id（第 0 拍是冷启动的重读）。
-    $m2 = Invoke-StoreTableModel -Ids @('A', 'B', 'B') -Lines @(10, 20, 20)
-    $script:V03Ok = ($m2.Verdicts[1].Stale -and $m2.Verdicts[1].Reason -eq 'Track' -and
-                    -not $m2.Verdicts[2].Stale -and $m2.Reads -eq 2)
-    # ③ 同一首、只换行数：读一次后就该用它（旧代码在这里会再判过期一次）。
-    $m3 = Invoke-StoreTableModel -Ids @('A', 'A', 'A') -Lines @(10, 40, 40)
-    $script:V04Ok = ($m3.Verdicts[1].Stale -and $m3.Verdicts[1].Reason -eq 'Lines' -and
-                    -not $m3.Verdicts[2].Stale -and $m3.Reads -eq 2)
-    # ④ 行数未知（store 给 0）：未知不是"过期的证据"，所以除了冷启动那一次不再重读。
-    #    注意**空数组在 PowerShell 里是假的**，而行数为 0 时重读回来的表就是空数组
-    #    （@(0) * 0 = @()）——所以 store 一直报 0 时缓存等于没建起来。那是"还没有行"的
-    #    真实形状（换歌瞬间 async:lyric 还没填），主循环会一直重读到有行为止，这里就照着测。
-    $m4 = Invoke-StoreTableModel -Ids @('A', 'A', 'A') -Lines @(0, 0, 0)
-    $script:V05Ok = ($m4.Reads -ge 1 -and $m4.Round -eq 2)
-    # ⑤ 这正是 b97f403 要防的那件：缓存里是**上一首的表**、id 已经是新歌。
-    $m5 = Invoke-StoreTableModel -Ids @('OLD', 'NEW', 'NEW', 'NEW') -Lines @(10, 26, 26, 26)
-    $script:V06Ok = ($m5.Verdicts[1].Stale -and $m5.Verdicts[1].Reason -eq 'Track' -and
-                    -not $m5.Verdicts[2].Stale -and -not $m5.Verdicts[3].Stale -and
-                    $m5.Reads -eq 2)
-    # ⑥ 换歌那一拍缓存被显式清空 → 下一拍必须重读（"清了却没人读"不成立）。
-    $v6 = Get-StoreTimesVerdict -Cached $null -CachedTrack '' -CachedLines 0 -StoreTrack 'A' -StoreLines 26
-    $script:V07Ok = ($v6.Stale -and $v6.Reason -eq 'Empty' -and $v6.ReRead)
-    # ⑦ 两个切片互相追：行数一格格涨上来（26 → 27 → 28），每一格多读一次，**每一格也都用得上**
-    #    （旧代码的形状是"过期之后永远过期"）。冷启动 + 两次追 = 三次读。
-    $m7 = Invoke-StoreTableModel -Ids @('A', 'A', 'A') -Lines @(26, 27, 28)
-    $script:V08Ok = ($m7.Verdicts[1].Stale -and $m7.Verdicts[1].Reason -eq 'Lines' -and
-                    $m7.Verdicts[2].Stale -and $m7.Verdicts[2].Reason -eq 'Lines' -and
-                    $m7.Reads -eq 3 -and $m7.Cache.Count -eq 28)
+    $script:LineReal = ConvertFrom-VinylLineSpec -Spec $script:LineSpecReal
+    $script:LineNoTrans = ConvertFrom-VinylLineSpec -Spec ([pscustomobject]@{
+        hit = $script:LineCands[1]; dataTime = '230.29'
+        paras = Read-FixtureParagraphs -Html $script:VinylLineNoTransFixture })
+    $script:LineSingleP = ConvertFrom-VinylLineSpec -Spec ([pscustomobject]@{
+        hit = $script:LineCands[1]; dataTime = '9.19'
+        paras = Read-FixtureParagraphs -Html $script:VinylLineSinglePFix })
+    $script:TitleReal = Get-VinylTitleFromSpec -Spec ([pscustomobject]@{
+        attr = Read-FixtureAttr -Html $script:VinylTitleFixture -Name 'title'
+        text = ([regex]::Replace($script:VinylTitleFixture, '<[^>]*>', '')) })
+    $script:ArtistReal = Get-VinylArtistFromSpec -Spec ([pscustomobject]@{
+        attr = Read-FixtureAttr -Html $script:VinylArtistFixture -Name 'title'
+        text = ([regex]::Replace($script:VinylArtistFixture, '<[^>]*>', '')) })
+    # 标题那个 `title` 属性为空时**必须**回退到元素文本；两个都空 → $null（不要发空标题）
+    $script:TitleFromText = Get-VinylTitleFromSpec -Spec ([pscustomobject]@{ attr = ''; text = ' 铁花飞 ' })
+
+    # --- 新鲜度 / 合理性判定：照主循环的规则跑一台小状态机 ------------------------------
+    # 单条纯函数断言答不了"它会不会**一直**把同一个数当新的"——那要**多拍**才看得出来
+    # （这正是上一版 storeline 守卫的教训：`Test-StoreLineUsable` 也是纯函数，但它的失败
+    #  形状是"每一拍都判可用"，只有连跑几拍才露出来）。所以这里连喂一串真机采样序列，
+    # 并像主循环那样**记住连续读到同一个数的次数**（`sameReads`）。
+    function Invoke-VinylGuardModel {
+        param([int[]]$TimesMs)
+        $prev = -1; $same = 0; $used = @()
+        foreach ($t in $TimesMs) {
+            if (Test-VinylLineUsable -PrevTimeMs $prev -NowTimeMs $t -SameReads $same) {
+                $used += $t
+                if ($prev -ge 0 -and $t -eq $prev) { $same++ } else { $same = 0 }
+                $prev = $t
+            }
+        }
+        return $used
+    }
+    # 真机实测序列（01:04:01 → 01:04:35，每 1.5 s 采样一次；中间有暂停）：
+    #   195.92 → 202.91 → 202.91（暂停）→ 226.99 → 226.99 → 230.29 → 233.36 → 234.96
+    # 暂停那两拍**必须仍然可用**（位置与行一起不动，是自洽的），跳变那几拍是真实换行
+    # —— 实测这一首的相邻句间隔 2.6 s ~ 26.7 s，所以上界必须比 5 s 宽得多。
+    $script:GuardRealSeq = Invoke-VinylGuardModel -TimesMs @(195920, 202910, 202910, 226990, 226990, 230290, 233360, 234960)
+    # 真机**长间奏**（26.7 s 一跳）也必须算可用：这是"阈值别定太紧"的直接证据。
+    $script:GuardLongGap = Invoke-VinylGuardModel -TimesMs @(195500, 222200)
+    # 反例序列：冻结住的读数（选择器命中了别处一个恒为 29.5 s 的节点）——
+    # 前两拍"可用"是正常的（和暂停长得一样），**第三拍起必须判不可用**。
+    $script:GuardFrozenSeq = Invoke-VinylGuardModel -TimesMs @(29500, 29500, 29500, 29500, 29500)
+    # 反例序列：切歌当拍读到新歌第一行（1 s），而位置还在上一首的 240 s 上 → 往回走太多。
+    $script:GuardBackJumpSeq = Invoke-VinylGuardModel -TimesMs @(240000, 1000)
+    # 反例序列：几百秒的跳变（读到上一首的陈旧节点）→ 不可用。
+    $script:GuardStaleJumpSeq = Invoke-VinylGuardModel -TimesMs @(10000, 400000)
 
     $checks = @(
-        @{ Name = '解析出 3 行（元信息与纯时间戳行被丢掉）'; Ok = ($lines.Count -eq 3) }
-        @{ Name = '首行时间 0ms'; Ok = ($lines[0].At -eq 0) }
-        @{ Name = '第二行 12500ms（两位小数）'; Ok = ($lines[1].At -eq 12500) }
-        @{ Name = '第三行 65001ms（三位小数）'; Ok = ($lines[2].At -eq 65001) }
-        @{ Name = '0ms 选第一句'; Ok = ((Select-LrcLine $lines 0) -eq '第一句') }
-        @{ Name = '12.6s 选第二句'; Ok = ((Select-LrcLine $lines 12600) -eq '第二句') }
-        @{ Name = '65.5s 选第三句'; Ok = ((Select-LrcLine $lines 65500) -eq '第三句') }
-        @{ Name = '早于首行时也给第一句'; Ok = ((Select-LrcLine $lines -5000) -eq '第一句') }
-        @{ Name = '空歌词给空串'; Ok = ((Select-LrcLine @() 1000) -eq '') }
-        @{ Name = '位置行：正常采样'; Ok = ((ConvertFrom-PositionLine 'position=12.34 status=Playing').Position -eq 12.34) }
-        @{ Name = '位置行：暂停状态可读'; Ok = ((ConvertFrom-PositionLine 'position=0 status=Paused').Status -eq 'Paused') }
-        @{ Name = '位置行：无会话/垃圾/空一律不可用'; Ok = (-not (ConvertFrom-PositionLine 'position=- status=none')) -and (-not (ConvertFrom-PositionLine 'garbage')) -and (-not (ConvertFrom-PositionLine '')) }
-        @{ Name = '暂停时位置不推进（拖完停住也不会漂）'; Ok = ((Get-PositionMs -Sample (ConvertFrom-PositionLine 'position=30 status=Paused') -AgeSeconds 5) -eq 30000) }
-        @{ Name = '播放时按采样年龄外推'; Ok = ((Get-PositionMs -Sample (ConvertFrom-PositionLine 'position=30 status=Playing') -AgeSeconds 0.5) -eq 30500) }
-        @{ Name = '采样过旧视为不可用'; Ok = (-not (Test-PositionFresh -Sample (ConvertFrom-PositionLine 'position=1 status=Playing') -WrittenAt (Get-Date).AddSeconds(-10) -Now (Get-Date) -StaleMs 3000)) }
-        @{ Name = '采样新鲜则可用'; Ok = (Test-PositionFresh -Sample (ConvertFrom-PositionLine 'position=1 status=Playing') -WrittenAt (Get-Date) -Now (Get-Date) -StaleMs 3000) }
-        @{ Name = '位置候选行：正常'; Ok = ((ConvertFrom-ScanCandidate '  0x80014BFB08|int32ms|51800 -> 67070  (+15270ms)').Addr -eq '0x80014BFB08') }
-        @{ Name = '位置候选行：垃圾与空一律不可用'; Ok = (-not (ConvertFrom-ScanCandidate 'nonsense')) -and (-not (ConvertFrom-ScanCandidate '')) }
-        @{ Name = '两拍判定：增长≈间隔 = 播放'; Ok = (Test-Playing -Prev 1000 -Now 2000 -ElapsedSeconds 1.0 -ToleranceMs 400) }
-        @{ Name = '两拍判定：几乎不动 = 暂停'; Ok = (-not (Test-Playing -Prev 1000 -Now 1000 -ElapsedSeconds 1.0 -ToleranceMs 400)) }
-        @{ Name = '切歌粗校验：回落或明显跳变 = 有效'; Ok = (Test-PosAfterTrackChange -Prev 60000 -Now 1200) -and (Test-PosAfterTrackChange -Prev 60000 -Now 20000) }
-        @{ Name = '切歌粗校验：几乎原样 = 可疑'; Ok = (-not (Test-PosAfterTrackChange -Prev 60000 -Now 60200)) }
+        # ---- 候选表顺序（"通用准确"的胜负手）--------------------------------------------
+        @{ Name = '黑胶页根候选：**第一条必须是稳定 id**（真机实测它就是 #VINYL_COVER_ELEMENT_ID）'; Ok = ($script:RootCands[0] -eq '#VINYL_COVER_ELEMENT_ID') }
+        @{ Name = '黑胶页根候选：负对照（把稳定 id 挪后）会红'; Ok = ($script:MutatedRootCands[0] -ne '#VINYL_COVER_ELEMENT_ID') }
+        @{ Name = '当前行候选：**第一条必须同时锚稳定 id 与语义类**（#VINYL_COVER_ELEMENT_ID li.line.current）'; Ok = ($script:LineCands[0] -eq '#VINYL_COVER_ELEMENT_ID li.line.current') }
+        @{ Name = '当前行候选：第二条退到纯语义类（li.line.current，不依赖 id）'; Ok = ($script:LineCands[1] -eq 'li.line.current') }
+        @{ Name = '标题候选：第一条用 data-testid（属性锚，不是类名）'; Ok = ($script:TitleCands[0] -eq '[data-testid=tid_tracktitle_container] span.title') }
+        @{ Name = '标题候选：文案取值只锚语义类 title（属性 title= 优先，见下面的取值断言）'; Ok = ($script:TitleCands[1] -eq '#VINYL_COVER_ELEMENT_ID span.title') }
+        @{ Name = '歌手候选：第一条锚 data-testid 且**取属性**（textContent 会带"歌手："前缀）'; Ok = ($script:ArtistCands[0] -eq '[data-testid=tid_tracktitle_artist] span[title]') }
+        @{ Name = '候选表里没有任何带哈希的类名（_c1h09pwc / _vwagppq / _t1s72en4 / _tca8bac 都是构建产物）'; Ok = (-not (@($script:RootCands + $script:LineCands + $script:TitleCands + $script:ArtistCands) -match '_[a-z][0-9a-z]{5}[0-9]')) }
+        @{ Name = '候选表非空且互不重复（重复的候选只会白跑一次 querySelector）'; Ok = (@($script:RootCands).Count -ge 2 -and (@($script:RootCands | Select-Object -Unique).Count -eq $script:RootCands.Count) -and (@($script:LineCands | Select-Object -Unique).Count -eq $script:LineCands.Count)) }
+        # ---- data-time → 毫秒 ------------------------------------------------------------
+        @{ Name = ('data-time：{0}' -f $script:SecondsCases[0].D); Ok = ((ConvertFrom-VinylSeconds -Text $script:SecondsCases[0].T) -eq $script:SecondsCases[0].Want) }
+        @{ Name = ('data-time：{0}' -f $script:SecondsCases[1].D); Ok = ((ConvertFrom-VinylSeconds -Text $script:SecondsCases[1].T) -eq 0) }
+        @{ Name = ('data-time：{0}' -f $script:SecondsCases[2].D); Ok = ((ConvertFrom-VinylSeconds -Text $script:SecondsCases[2].T) -eq $script:SecondsCases[2].Want) }
+        @{ Name = ('data-time：{0}' -f $script:SecondsCases[3].D); Ok = ((ConvertFrom-VinylSeconds -Text $script:SecondsCases[3].T) -eq $script:SecondsCases[3].Want) }
+        @{ Name = 'data-time：空 / null / 垃圾 / 负数 / 超一天 一律返回 -1（"不知道"，不是 0）'; Ok = (@(-1, -1, -1, -1, -1) -join ',' ) -eq (@($script:SecondsCases[4..8] | ForEach-Object { ConvertFrom-VinylSeconds -Text $_.T }) -join ',') }
+        # ---- 原文 / 翻译 切分（真机 HTML）------------------------------------------------
+        @{ Name = '段切分：真机两段 → 第一个 <p> 是原文（Such a beautiful vibrancy）'; Ok = ($script:LineReal.Original -eq 'Such a beautiful vibrancy') }
+        @{ Name = '段切分：第二个 <p> 是翻译（多么美丽的盎然生机啊）—— 与 store 的 tlyricLines 逐行相等'; Ok = ($script:LineReal.Translation -eq '多么美丽的盎然生机啊') }
+        @{ Name = '段切分：data-time 22.95 → 22950 ms（从同一段夹具里取）'; Ok = ($script:LineReal.TimeMs -eq 22950) }
+        @{ Name = '段切分：没有翻译的行有**空的**第二段 → 翻译为空串（不是上一行的残留）'; Ok = ($script:LineNoTrans.Original -eq '身世境遇不由人选择' -and $script:LineNoTrans.Translation -eq '') }
+        @{ Name = '段切分：只有一个 <p> 时它是原文、翻译为空（形状防御，真机 64 行全是两段）'; Ok = ($script:LineSingleP.Original -eq 'A calloused hand' -and $script:LineSingleP.Translation -eq '' -and $script:LineSingleP.ParaCount -eq 1) }
+        @{ Name = '段切分：负对照（拿第二段当原文）会红'; Ok = ($script:LineReal.Original -ne $script:LineReal.Translation) }
+        @{ Name = '段切分：命中过的候选被原样带出来（探针靠它点名）'; Ok = ($script:LineReal.Hit -eq $script:LineCands[0]) }
+        # ---- 标题：属性优先，文本兜底，两级空值都不算命中 ---------------------------------
+        @{ Name = '标题：真机 HTML → 铁花飞（取 title 属性）'; Ok = ($script:TitleReal -eq '铁花飞') }
+        @{ Name = '标题：属性为空时回退到元素文本并去掉空白（夹具里两个空 <span class="label"> 不会污染）'; Ok = ($script:TitleFromText -eq '铁花飞') }
+        @{ Name = '标题：属性与文本都为空 → $null（宁可不发，也不发一个空标题）'; Ok = ($null -eq (Get-VinylTitleFromSpec -Spec ([pscustomobject]@{ attr = '   '; text = '' }))) -and ($null -eq (Get-VinylTitleFromSpec -Spec $null)) }
+        @{ Name = '歌手：真机 HTML → Mili / 塞壬唱片-MSR（取内层 span 的 title 属性，不带"歌手："）'; Ok = ($script:ArtistReal -eq 'Mili / 塞壬唱片-MSR') }
+        @{ Name = '歌手：没有属性时剥掉"歌手："前缀'; Ok = ((Get-VinylArtistFromSpec -Spec ([pscustomobject]@{ attr = ''; text = '歌手：Mili / 塞壬唱片-MSR' })) -eq 'Mili / 塞壬唱片-MSR') }
+        @{ Name = '歌手拼接：与客户端自己的形态一致（斜杠分隔，且跳过空名字）'; Ok = ((Join-ArtistNames @('Mili', '塞壬唱片-MSR')) -eq 'Mili / 塞壬唱片-MSR') -and ((Join-ArtistNames @('Mili', '', '  ', $null)) -eq 'Mili') -and ((Join-ArtistNames @()) -eq '') }
+        # ---- 身份来源优先级（托盘模式的关键：窗口那条排最后）------------------------------
+        @{ Name = '身份：黑胶页有标题时用它（托盘模式走的就是这条）'; Ok = ((Resolve-TrackIdentity -VinylTitle '铁花飞' -VinylArtist 'Mili / 塞壬唱片-MSR' -StoreTitle '铁花飞' -StoreArtist 'Mili / 塞壬唱片-MSR' -WindowTitle '').Source -eq 'vinyl') }
+        @{ Name = '身份：黑胶页没有时退到 store，并用 resourceArtists 拼歌手'; Ok = ((Resolve-TrackIdentity -StoreTitle '铁花飞' -StoreArtist 'Mili / 塞壬唱片-MSR' -WindowTitle '').Artist -eq 'Mili / 塞壬唱片-MSR') }
+        @{ Name = '身份：没有调试端口时用窗口标题，且按**最后一个**「 - 」切（歌名里可能有「 - 」）'; Ok = ((Resolve-TrackIdentity -WindowTitle 'A - B - C').Title -eq 'A - B') }
+        @{ Name = '身份：三条来源都空 → $null（主循环据此走"响亮失败"那条路，而不是发一个空标题）'; Ok = ($null -eq (Resolve-TrackIdentity -VinylTitle '' -StoreTitle '' -WindowTitle '')) }
+        # ---- 新鲜度判定：多拍序列（这是"不许拿冻结值遮住会前进的来源"那条不变量的落点）----
+        @{ Name = '新鲜度：真机采样序列（195.9→234.96，含暂停两拍）**每一拍都可用**'; Ok = ($script:GuardRealSeq.Count -eq 8) }
+        @{ Name = '新鲜度：真机长间奏 26.7 s 一跳也算可用（阈值宁松勿误杀）'; Ok = ($script:GuardLongGap.Count -eq 2) }
+        @{ Name = '新鲜度：冻结的读数最多被采用 RepeatLimit 拍（与暂停无从区分），之后判不可用'; Ok = ($script:GuardFrozenSeq.Count -eq 4) }
+        @{ Name = '新鲜度：切歌当拍往回跳太多（240 s → 1 s）= 不可用（否则位置被钉在新歌第 0 行）'; Ok = ($script:GuardBackJumpSeq.Count -eq 1) }
+        @{ Name = '新鲜度：几百秒的跳变（上一首的陈旧节点）= 不可用'; Ok = ($script:GuardStaleJumpSeq.Count -eq 1) }
+        @{ Name = '新鲜度：连续读到同一个数达到 RepeatLimit(3) 就不可用（**冻结的真正形状**）'; Ok = (-not (Test-VinylLineUsable -PrevTimeMs 29500 -NowTimeMs 29500 -SameReads 3)) -and (Test-VinylLineUsable -PrevTimeMs 29500 -NowTimeMs 29500 -SameReads 1) }
+        @{ Name = '新鲜度：第一次见到就当引导值（prev=-1）'; Ok = (Test-VinylLineUsable -PrevTimeMs -1 -NowTimeMs 29500) }
+        @{ Name = '新鲜度：小回退（选中同一行的相邻读数）可用；大回退不可用'; Ok = ((Test-VinylLineUsable -PrevTimeMs 10000 -NowTimeMs 9500)) -and (-not (Test-VinylLineUsable -PrevTimeMs 10000 -NowTimeMs 1000)) }
+        @{ Name = '新鲜度：往前跳一点点可用；跳超过 30 s（陈旧节点）不可用'; Ok = ((Test-VinylLineUsable -PrevTimeMs 10000 -NowTimeMs 14000)) -and (-not (Test-VinylLineUsable -PrevTimeMs 10000 -NowTimeMs 60000)) }
+        @{ Name = '新鲜度：解不出 time（-1）= 不可用'; Ok = (-not (Test-VinylLineUsable -PrevTimeMs -1 -NowTimeMs -1)) }
+        # store 那套（曲目 id → 行号 → 文本）只在**没有黑胶页**时兜底：切歌当拍它还是上一首的数组，
+        # 拿它的文本贴到这一句上就是"翻译串行"。判据就是曲目 id。
+        @{ Name = 'store 兜底：曲目 id 一致且在范围内才可用'; Ok = (Test-StoreLyricUsable -StoreTrack '3342981041' -CurrentTrack '3342981041' -Index 4 -Lines 64) }
+        @{ Name = 'store 兜底：曲目 id 对不上（切歌当拍）= 不可用'; Ok = (-not (Test-StoreLyricUsable -StoreTrack '111' -CurrentTrack '3342981041' -Index 4 -Lines 64)) }
+        @{ Name = 'store 兜底：id 为空 / 行号越界 = 不可用'; Ok = (-not (Test-StoreLyricUsable -StoreTrack '' -CurrentTrack 'x' -Index 0 -Lines 5)) -and (-not (Test-StoreLyricUsable -StoreTrack 'x' -CurrentTrack 'x' -Index 5 -Lines 5)) -and (-not (Test-StoreLyricUsable -StoreTrack 'x' -CurrentTrack 'x' -Index -1 -Lines 5)) }
+        # ---- 位置标签与负延迟（改动后 pos 只剩 vinyl 一级）--------------------------------
+        @{ Name = '位置来源标签：黑胶页 data-time（真机 22950ms）→ vinyl 22.9s'; Ok = ((Format-PositionSource -Source vinyl -PositionMs 22950) -eq 'vinyl 22.9s') }
+        @{ Name = '位置来源标签：认不出来的来源写 n/a（**不再**显示成 clock —— 那条来源已删除）'; Ok = ((Format-PositionSource -Source nonsense -PositionMs 500) -eq 'n/a 0.5s') }
+        @{ Name = '负延迟：只看半个轮询周期（data-time 是十分之一秒，没有"分:秒"取整偏差）'; Ok = ((Get-LeadMs -Source vinyl -IntervalMs 1000) -eq 500) }
+        @{ Name = '负延迟：周期变了自动值跟着变（400 ms → 200 ms）'; Ok = ((Get-LeadMs -Source vinyl -IntervalMs 400) -eq 200) }
+        @{ Name = '负延迟：显式值覆盖自动值（0 = 关掉）'; Ok = ((Get-LeadMs -Source vinyl -IntervalMs 1000 -OverrideMs 0) -eq 0) -and ((Get-LeadMs -Source vinyl -IntervalMs 1000 -OverrideMs 1500) -eq 1500) }
+        @{ Name = 'pos 标签带出提早量'; Ok = ((Format-PositionSource -Source vinyl -PositionMs 22950 -LeadMs 500) -eq 'vinyl 22.9s +500ms') -and ((Format-PositionSource -Source vinyl -PositionMs 22950) -eq 'vinyl 22.9s') }
+        @{ Name = '命中的候选名可读（空 = (none)，探针与主循环共用一个格式化）'; Ok = ((Format-VinylHit -Hit '') -eq '(none)') -and ((Format-VinylHit -Hit 'li.line.current') -eq 'li.line.current') }
+        # ---- 协议与管道（与改前一样，一行都没动）----------------------------------------
         @{ Name = '连不上管道时返回空值（不抛异常）'; Ok = ($null -eq (Connect-PipeClient -Pipe ("endfield-info-windhawk-selftest-{0}" -f [guid]::NewGuid().ToString('N')) -TimeoutMs 200 -WaitSeconds 0)) }
-        # 岛事件的节流。歌词密时事件会来得比卡片能展示的快得多，所以"不要发那么多"是桥的责任，
-        # mod 侧丢弃过旧事件只是兜底（两边都改了 ✓）。
         @{ Name = '岛事件：首次（从未发过）总是允许'; Ok = (Test-EventAllowed -Now $stamp -LastAt ([datetime]::MinValue) -MinMs 4000) }
         @{ Name = '岛事件：间隔不足时不发（密集歌词不刷屏）'; Ok = (-not (Test-EventAllowed -Now $stamp.AddMilliseconds(3999) -LastAt $stamp -MinMs 4000)) }
         @{ Name = '岛事件：达到最小间隔才发'; Ok = (Test-EventAllowed -Now $stamp.AddMilliseconds(4000) -LastAt $stamp -MinMs 4000) }
         @{ Name = '岛事件：间隔设为 0 表示不节流'; Ok = (Test-EventAllowed -Now $stamp -LastAt $stamp -MinMs 0) }
-        # 曲目标题的判定。真机形状：同一进程里既有「桌面歌词」也有「歌名 - 歌手」，
-        # 而后者不是 MainWindowTitle（2026-10-14 实测，见 Get-PlayingTrack 的注释）。
-        @{ Name = '曲目标题：桌面歌词窗口不算曲目'; Ok = ($null -eq (Select-SongTitle @('桌面歌词', '网易云音乐'))) }
-        @{ Name = '曲目标题：从多窗口里挑出带「 - 」的那个'; Ok = ((Select-SongTitle @('桌面歌词', '下等马 - 洛天依Official/ChiliChill乐团', '网易云音乐')) -eq '下等马 - 洛天依Official/ChiliChill乐团') }
-        @{ Name = '曲目标题：多个候选取最长的'; Ok = ((Select-SongTitle @('A - B', '下等马 - 洛天依Official/ChiliChill乐团')) -eq '下等马 - 洛天依Official/ChiliChill乐团') }
-        @{ Name = '曲目标题：空标题与空数组都不算'; Ok = ($null -eq (Select-SongTitle @('', '   ')) -and $null -eq (Select-SongTitle @())) }
-        # 活的枚举：网易云在跑就必须至少看到一个顶层窗口（不在跑则这条无意义，视为通过）
-        @{ Name = '窗口枚举：网易云在跑时能看到它的顶层窗口'; Ok = ((@(Get-NeteaseWindowTitles).Count -gt 0) -or (-not (Get-NeteasePid))) }
-        # 位置来源标签：面板上的"当前歌词"是算出来的，所以这一行必须能说清位置是哪来的
-        @{ Name = '位置来源标签：迷你条 DOM（真 currentTime）'; Ok = ((Format-PositionSource -Source dom -PositionMs 41300) -eq 'dom 41.3s') }
-        @{ Name = '位置来源标签：store 当前行起始时间'; Ok = ((Format-PositionSource -Source storeline -PositionMs 29521) -eq 'storeline 29.5s') }
-        @{ Name = '位置来源标签：内存差分 / 媒体会话'; Ok = ((Format-PositionSource -Source memory -PositionMs 1000) -eq 'mem 1.0s') -and ((Format-PositionSource -Source media -PositionMs 0) -eq 'media 0.0s') }
-        @{ Name = '位置来源标签：未知来源按推算时钟算'; Ok = ((Format-PositionSource -Source nonsense -PositionMs 500) -eq 'clock 0.5s') }
-        # 负延迟：位置有两个系统性滞后（DOM 向下取整到秒 + 每周期才轮询一次），按来源补偿
-        @{ Name = '负延迟：DOM 来源 = 半周期 + 0.5s 取整偏差'; Ok = ((Get-LeadMs -Source dom -IntervalMs 1000) -eq 1000) }
-        @{ Name = '负延迟：精确来源只补半个周期'; Ok = ((Get-LeadMs -Source media -IntervalMs 1000) -eq 500) -and ((Get-LeadMs -Source memory -IntervalMs 1000) -eq 500) }
-        @{ Name = '负延迟：周期变了自动值跟着变'; Ok = ((Get-LeadMs -Source dom -IntervalMs 400) -eq 700) }
-        @{ Name = '负延迟：显式值覆盖自动值（0 = 关掉）'; Ok = ((Get-LeadMs -Source dom -IntervalMs 1000 -OverrideMs 0) -eq 0) -and ((Get-LeadMs -Source dom -IntervalMs 1000 -OverrideMs 1500) -eq 1500) }
-        @{ Name = 'pos 标签带出提早量'; Ok = ((Format-PositionSource -Source dom -PositionMs 90000 -LeadMs 1000) -eq 'dom 90.0s +1000ms') -and ((Format-PositionSource -Source dom -PositionMs 90000) -eq 'dom 90.0s') }
-        # 一轮的发布计划。真机缺陷就在这个形状上：同一个 key 有两个发布者时，面板会在两个值
-        # 之间闪 —— store 的 resourceName 没有作者、store 的当前行来自会冻结的行号，两者都曾
-        # 直接 Publish，与最后拼好的值抢同一个 key（2026-10-14 实测 storeIndex 冻结在 10，
-        # 而位置已经走到第 21 行以上）。有序字典让重复键在结构上不可能，这里钉住形状。
         @{ Name = '发布计划：标题带作者'; Ok = ((Get-PublishPlan -Title 'A' -Artist 'B' -Line 'x' -Translation '' -Pos 'p')['title'] -eq 'A - B') }
         @{ Name = '发布计划：没有作者时不留下悬空的分隔符'; Ok = ((Get-PublishPlan -Title 'A' -Artist '' -Line 'x' -Translation '' -Pos 'p')['title'] -eq 'A') }
-        @{ Name = '发布计划：整轮恰好 title/lyric/translation/pos 四个 key'; Ok = (((Get-PublishPlan -Title 'A' -Artist 'B' -Line 'x' -Translation 't' -Pos 'p').Keys -join ',') -eq 'title,lyric,translation,pos') }
+        @{ Name = '发布计划：整轮恰好 title/lyric/translation/pos 四个 key（协议没变）'; Ok = (((Get-PublishPlan -Title 'A' -Artist 'B' -Line 'x' -Translation 't' -Pos 'p').Keys -join ',') -eq 'title,lyric,translation,pos') }
         @{ Name = '发布计划：取不到歌词时不发 lyric（而不是发空串盖掉上一行）'; Ok = (-not (Get-PublishPlan -Title 'A' -Artist 'B' -Line '' -Translation '' -Pos 'p').Contains('lyric')) }
         @{ Name = '发布计划：翻译总是出现（空串 = 这一行没有翻译，清掉上一行的）'; Ok = ((Get-PublishPlan -Title 'A' -Artist 'B' -Line 'x' -Translation '' -Pos '').Contains('translation')) }
         @{ Name = '发布计划：没有位置时不发 pos'; Ok = (-not (Get-PublishPlan -Title 'A' -Artist 'B' -Line 'x' -Translation '' -Pos '').Contains('pos')) }
-        # 组合起来的效果：同一个行边界（10 s），不加提早量时 9.9 s 仍是第 0 行，
-        # 加 1 s 后（=10.9 s）已经是第 1 行 —— 换行确实提前了 1 秒。
-        @{ Name = '负延迟确实把换行提早（9.9s 仍是 0 行，+1s 后是 1 行）'; Ok = (((Select-StoreLineIndex -TimesSec @(0, 10, 20, 30) -PositionMs 9900) -eq 0) -and ((Select-StoreLineIndex -TimesSec @(0, 10, 20, 30) -PositionMs (9900 + 1000)) -eq 1)) }
-        # 行时间表的缓存判定。"换歌时清空缓存"之后必须**当拍就重读**——清了却没人读，正是
-        # "手动切歌后歌词不动"最容易被怀疑的成因，这条断言就是用来否掉它的。
-        @{ Name = '时间表缓存：清空后立刻判为过期（换歌当拍就重读）'; Ok = (Test-StoreTimesStale -Cached $null -CachedTrack '' -CachedLines 0 -StoreTrack 'x' -StoreLines 26) }
-        @{ Name = '时间表缓存：空表也算过期（PowerShell 空数组为假，所以会一直重读到有行为止）'; Ok = (Test-StoreTimesStale -Cached ([object[]]@()) -CachedTrack 'x' -CachedLines 0 -StoreTrack 'x' -StoreLines 26) }
-        @{ Name = '时间表缓存：同曲目同长度 = 可用（不会每拍白读一次）'; Ok = (-not (Test-StoreTimesStale -Cached @(0, 1, 2) -CachedTrack 'x' -CachedLines 3 -StoreTrack 'x' -StoreLines 3)) }
-        @{ Name = '时间表缓存：曲目变了 = 过期'; Ok = (Test-StoreTimesStale -Cached @(0, 1, 2) -CachedTrack 'x' -CachedLines 3 -StoreTrack 'y' -StoreLines 3) }
-        @{ Name = '时间表缓存：曲目 id 相同但行数变了 = 过期（表不是现在这份数组的）'; Ok = (Test-StoreTimesStale -Cached @(0, 1, 2) -CachedTrack 'x' -CachedLines 3 -StoreTrack 'x' -StoreLines 26) }
-        @{ Name = '时间表缓存：行数未知（0）时不重读，免得变成每拍一次 CDP'; Ok = (-not (Test-StoreTimesStale -Cached @(0, 1, 2) -CachedTrack 'x' -CachedLines 3 -StoreTrack 'x' -StoreLines 0)) }
-        # --- 判定必须**收敛**（真机 `table=stale` 报的就是它不收敛）-----------------------------
-        #
-        # 下面这几条不是"再问一次纯函数"，而是**照主循环的规则跑一台状态机**：缓存 + accepted
-        # 标记，每拍判一次，判要重读就重读（把观察到的行数写进缓存）。于是它们回答的正是
-        # "念了过期之后到底能不能变新鲜"——`Test-StoreTimesStale` 单独一条断言答不了这个，
-        # 因为不收敛的形状要**多拍**才看得出来。`.Reason` 一个字都不能改：探针就是靠它点名。
-        @{ Name = '时间表缓存：行数对不上 → 判 stale(Lines)，重读一拍后就 fresh（不再永远过期）'; Ok = $script:V02Ok }
-        @{ Name = '时间表缓存：只换曲目 id → 判 stale(Track)，重读后 fresh'; Ok = $script:V03Ok }
-        @{ Name = '时间表缓存：只换行数（同一首）→ 判 stale(Lines)，重读后 fresh'; Ok = $script:V04Ok }
-        @{ Name = '时间表缓存：行数未知（store 给 0）→ 不把"未知"当过期（空表则继续读，直到有行）'; Ok = $script:V05Ok }
-        @{ Name = '时间表缓存：上一首的表被打上新 id → 第一拍就 stale(Track)，重读后 fresh，且不会每拍都读'; Ok = $script:V06Ok }
-        @{ Name = '时间表缓存：清空缓存 → 下一拍 stale(Empty) 并重读（"清了却没人读"不成立）'; Ok = $script:V07Ok }
-        @{ Name = '时间表缓存：两个切片互相追（id 与行数一起变）→ 最多两拍收敛'; Ok = $script:V08Ok }
-        # store 行时间当位置的判定。实测：那个行号会冻结（行时间恒为 29.5 s），而它排在
-        # memory/media/推算时钟之前——不判它，换歌后歌词就永远停在同一行。
-        @{ Name = 'store 行时间：第一次见到它时可用（当一次引导值）'; Ok = (Test-StoreLineUsable -PrevMs -1 -NowMs 29500) }
-        @{ Name = 'store 行时间：冻结不动 = 不可用（歌词不会被它钉住）'; Ok = (-not (Test-StoreLineUsable -PrevMs 29500 -NowMs 29500)) }
-        @{ Name = 'store 行时间：往前走了 = 可用（行号没冻结时这条来源照常工作）'; Ok = (Test-StoreLineUsable -PrevMs 29500 -NowMs 42000) }
-        @{ Name = 'store 行时间：往回走 = 不可用（换歌/回退，别用它当位置）'; Ok = (-not (Test-StoreLineUsable -PrevMs 29500 -NowMs 0)) }
+        @{ Name = '发布计划：每个 key 只出现一次（同一轮一个 key 一个发布者）'; Ok = ((Get-PublishPlan -Title 'A' -Artist 'B' -Line 'x' -Translation 't' -Pos 'p').Count -eq (((Get-PublishPlan -Title 'A' -Artist 'B' -Line 'x' -Translation 't' -Pos 'p').Keys | Select-Object -Unique).Count)) }
     )
     $bad = 0
-    # 活体证据：判定用的是这一份窗口列表，打出来省得下一个人再猜一次
+    # 活体证据：**窗口枚举现在只服务兜底③**，所以它空着不再是"桥坏了"的信号——托盘模式
+    # 本来就该是空的。打出来免得下一个人看到 0 个窗口以为出了问题（真机实测托盘模式下
+    # 4 个 cloudmusic 窗口全部 IsWindowVisible=0）。
     $liveWindows = @(Get-NeteaseWindowTitles)
-    Write-Host ("网易云顶层窗口（{0} 个）：{1}" -f $liveWindows.Count, (($liveWindows | ForEach-Object { "[$_]" }) -join ' '))
+    Write-Host ("网易云可见顶层窗口（{0} 个，托盘模式下为 0 是正常的）：{1}" -f $liveWindows.Count, (($liveWindows | ForEach-Object { "[$_]" }) -join ' '))
     foreach ($c in $checks) {
         if ($c.Ok) { Write-Host ("  OK   {0}" -f $c.Name) } else { Write-Host ("  FAIL {0}" -f $c.Name); $bad++ }
     }
@@ -1631,156 +1311,94 @@ if ($SelfTest) {
 }
 
 # ---------------------------------------------------------------------------
-# 主循环
+# 只读探针：`-ProbeVinyl`（黑胶页）与 `-ProbeStore`（身份）
 # ---------------------------------------------------------------------------
-if ($ProbeStore) {
-    # 只读探针：歌词"算在哪一行"（位置 + store 的行时间表）与"客户端自己认为在哪一行"
-    # （playingLyricLineNumber）并排打出来。两者不一致、或者后者长时间不动，就是
-    # "歌词对不准真实位置"的直接证据——所以**值绝不能用后者发布**（真机 2026-10-14）。
-    #
-    # ⚠ 这个探针**不许**在开头读一次表然后拿它跟每一轮的 store 比：那样"表过期"只说明
-    # **探针开头那一拍与现在不是同一份数组**（换歌了、或数组还在填），与主循环的判定无关，
-    # 于是 `table=stale` 会一直打下去而没有任何东西会去重读它——**这正是它上次误导人的形状**
-    # （用户看到的 `table=stale` 就是这么来的）。现在它**跟着主循环的判定走**：
-    # 判 stale 就重读一次，并打出**是哪一个子条件**判的（Track / Lines / Empty）与重读前后的
-    # 三个数，所以一次运行就能回答"表到底能不能变新鲜"。
-    Write-Host ("store 探针：{0} 轮，每 {1} ms 一轮" -f $ProbeRounds, $IntervalMs)
-    $stx = Get-CdpStoreLyricTimes
-    $tableLines = if ($stx -and $stx.ok -and $null -ne $stx.lineCount) { [int]$stx.lineCount } else { 0 }
-    $tblTrack = if ($stx) { '' + $stx.trackId } else { '' }
-    $tblCount = if ($stx -and $stx.times) { @($stx.times).Count } else { 0 }
-    $tblAcceptedLines = -1
-    Write-Host ("行时间表（开盘）：ok={0} 数组行数={1} lineCount={2} trackId='{3}' text='{4}'" -f `
-        $(if ($stx) { $stx.ok } else { 'n/a' }), $tblCount, $tableLines, $tblTrack, `
-        $(if ($stx) { $stx.name } else { '' }))
-    # 每一轮要能回答"歌词为什么不动"，所以除了客户端自己报的行号，还要打出**主循环这一拍会用的
-    # 位置**与**判定的理由**（判据与主循环同一对纯函数）：
-    #   pos=n/a + lineMs 不变 + table=fresh → 迷你条 DOM 读不到，位置会退到会冻结的 store 行时间；
-    #   table=stale(Track/Lines/Empty)      → 表不是现在这份数组的（选行会按旧表走到头然后钳位），
-    #                                        括号里就是**哪一个子条件**判的；同一轮会重读一次，
-    #                                        下一轮若还是 stale 就看 `cached=`/`store=` 两个数。
-    #   pos 在走 + byPosition 在走          → 位置与选行都没问题，问题在取行文本那一环。
-    $prevLineMs = -1
+# 这两个探针回答的是同一个问题的两半："这一拍到底读到了什么、是哪一条候选命中的、
+# 值有没有往前走"。托盘模式（前台窗口已关）下**只有它们**能说清"歌词为什么没了"——
+# 因为界面上一片空白，而可能的原因有四个：端口没了 / 目标没了 / 选择器全没命中 /
+# 命中了但读数是冻结的。四个原因指向四种修法，所以每一轮都把四个都打出来。
+#
+# ⚠ 探针里**不许**有自己的一套判据：位置是否可用与主循环是同一个 `Test-VinylLineUsable`，
+# 否则探针说"没问题"而主循环在丢弃它（或反过来），就是又一次自己测自己（AGENTS §7.8）。
+if ($ProbeVinyl -or $ProbeStore) {
+    $ports = @($CdpPorts)
+    Write-Host ("CDP 探针：端口 {0}；{1} 轮，每 {2} ms 一轮" -f ($ports -join '/'), $ProbeRounds, $IntervalMs)
+    # 端口与目标先逐条打出来：`-ProbeVinyl` 的输出要能**整段贴进问题报告**，
+    # 里面必须自带"有没有端口、目标长什么样"这两件事。
+    foreach ($port in $ports) {
+        try {
+            $v = Invoke-RestMethod -Uri "http://127.0.0.1:$port/json/version" -TimeoutSec 2 -ErrorAction Stop
+            Write-Host ("  端口 {0} 是 CDP：{1}" -f $port, ('' + $v.Browser -replace '\s+', ' '))
+            $tl = @(Invoke-RestMethod -Uri "http://127.0.0.1:$port/json/list" -TimeoutSec 2 -ErrorAction Stop)
+            if ($tl.Count -eq 0) { Write-Host '    （/json/list 为空）' }
+            foreach ($t in $tl) {
+                Write-Host ("    target: type={0} title='{1}' url={2}" -f $t.type, $t.title, $t.url)
+                Write-Host ("            ws={0}" -f $t.webSocketDebuggerUrl)
+            }
+        }
+        catch { Write-Host ("  端口 {0} 无响应（{1}）" -f $port, ('' + $_.Exception.Message -replace '\s+', ' ')) }
+    }
+    Write-Host ("  候选：root={0}" -f (@(Get-VinylRootCandidates) -join ' | '))
+    Write-Host ("        line={0}" -f (@(Get-VinylLineCandidates) -join ' | '))
+    Write-Host ("        title={0}" -f (@(Get-VinylTitleCandidates) -join ' | '))
+    Write-Host ("        artist={0}" -f (@(Get-VinylArtistCandidates) -join ' | '))
+    Write-Host ''
+    Write-Host ("  {0,2} {1,-9} {2,-11} {3,-9} {4,-9} {5,-8} {6,-9} {7,-9} {8,-22} {9}" -f `
+        '#', 'at', 'root', 'lineHit', 'time', 'guard', 'lines', 'titleHit', 'title/artist', '原文 | 翻译')
+    $prevTimeMs = -1
+    $sameTimeMs = 0
     for ($i = 1; $i -le $ProbeRounds; $i++) {
-        $dom = Get-CdpDomTime
+        $v = Get-CdpVinyl
         $ss = Get-CdpStoreState
-        $domOk = [bool]($dom -and $dom.ok)
-        $domMs = if ($domOk) { [int]$dom.curS * 1000 } else { $null }
-        $lineMs = if ($ss -and $ss.ok -and $null -ne $ss.lineTimeSec) { [int]([double]$ss.lineTimeSec * 1000) } else { $null }
-        # 各来源能不能用（与主循环同一批判据）：一次运行就能点名是哪一级断了。
-        $srcDom = if ($domOk) { 'ok' } elseif ($dom) { "no($($dom.why))" } else { 'n/a' }
-        $srcStore = if ($null -ne $lineMs) {
-            if (Test-StoreLineUsable -PrevMs $prevLineMs -NowMs $lineMs) { 'ok' } else { 'frozen→下一级' }
-        } else { 'n/a' }
-        $origin = 'n/a'
-        $posMs = $null
-        if ($null -ne $domMs) { $posMs = $domMs; $origin = 'dom' }
-        elseif ($null -ne $lineMs) {
-            if (Test-StoreLineUsable -PrevMs $prevLineMs -NowMs $lineMs) {
-                $posMs = $lineMs; $origin = 'storeline'
-            } else { $origin = 'storeline冻结→下一级(mem/media/clock)' }
+        if (-not $v) {
+            Write-Host ("  {0,2} {1,-9} **Get-CdpVinyl 返回空**（端口/目标/求值三处之一失败 —— 见上面逐条目标）" -f `
+                $i, (Get-Date).ToString('HH:mm:ss'))
         }
-        if ($null -ne $lineMs) { $prevLineMs = $lineMs }
-        $trackNow = if ($ss -and $ss.ok) { '' + $ss.trackId } else { '' }
-        $linesNow = if ($ss -and $ss.ok -and $null -ne $ss.lines) { [int]$ss.lines } else { 0 }
-        # 这一拍的表还配不配得上 store 现在这份数组？**判据与主循环同一个函数**，
-        # 并且和主循环一样：判要重读就重读一次（否则探针只会重复报告一个没人处理的结论）。
-        $tv = Get-StoreTimesVerdict -Cached $(if ($stx -and $stx.times) { [object[]]$stx.times } else { $null }) `
-            -CachedTrack $tblTrack -CachedLines $tableLines `
-            -StoreTrack $trackNow -StoreLines $linesNow -AcceptedLines $tblAcceptedLines
-        $table = if ($tv.Stale) { "stale($($tv.Reason))" } else { 'fresh' }
-        if ($tv.ReRead) {
-            $again = Get-CdpStoreLyricTimes
-            if ($again -and $again.ok) {
-                $stx = $again
-                $tableLines = if ($null -ne $again.lineCount) { [int]$again.lineCount } else { 0 }
-                $tblTrack = '' + $again.trackId
-                $tblCount = if ($again.times) { @($again.times).Count } else { 0 }
-                $tblAcceptedLines = $linesNow
-                $table = "$table→已重读"
-            } else { $table = "$table→重读失败" }
+        else {
+            $timeMs = if ($v.Line) { [int]$v.Line.TimeMs } else { -1 }
+            $usable = if ($v.Line) { [bool](Test-VinylLineUsable -PrevTimeMs $prevTimeMs -NowTimeMs $timeMs -SameReads $sameTimeMs) } else { $false }
+            $guard = if (-not $v.Line) { 'no-line' } elseif ($usable) { 'ok' } else { 'stale→不用' }
+            $titleText = if ($v.Title -or $v.Artist) { "$($v.Title) / $($v.Artist)" } elseif ($ss -and $ss.ok) { "$($ss.name) - $($ss.artists)" } else { '(none)' }
+            $lineText = if ($v.Line) { "$($v.Line.Original) | $($v.Line.Translation)" } else { '' }
+            Write-Host ("  {0,2} {1,-9} {2,-11} {3,-9} {4,-9} {5,-8} {6,-9} {7,-9} {8,-22} {9}" -f `
+                $i, (Get-Date).ToString('HH:mm:ss'), $(if ($v.Root) { $v.RootHit } else { '(miss)' }), `
+                $v.LineHit, $(if ($v.Line) { $v.Line.DataTime } else { '-' }), $guard, $v.LiCount, `
+                $(if ($v.Title) { $v.TitleHit } else { '(miss)' }), $titleText, $lineText)
+            if ($v.Line -and $usable) {
+                if ($prevTimeMs -ge 0 -and $timeMs -eq $prevTimeMs) { $sameTimeMs++ } else { $sameTimeMs = 0 }
+                $prevTimeMs = $timeMs
+            }
+            if ($i -eq 1) {
+                Write-Host ("      store: ok={0} trackId='{1}' playId='{2}' state={3} lines={4} tlines={5} dur={6}ms" -f `
+                    $(if ($ss) { $ss.ok } else { 'n/a' }), $(if ($ss) { $ss.trackId } else { '' }), `
+                    $(if ($ss) { $ss.playId } else { '' }), $(if ($ss) { $ss.state } else { '' }), `
+                    $(if ($ss) { $ss.lines } else { '' }), $(if ($ss) { $ss.tlines } else { '' }), `
+                    $(if ($ss) { $ss.durationMs } else { '' }))
+                Write-Host ("      line 候选输出：{0}" -f $(if ($v) { Format-VinylHit -Hit $v.LineHit } else { '(none)' }))
+            }
         }
-        $sel = -2
-        if ($stx -and $stx.ok -and $null -ne $posMs) {
-            $sel = Select-StoreLineIndex -TimesSec ([object[]]$stx.times) -PositionMs $posMs
-        }
-        $storeIdx = if ($ss -and $ss.ok -and $null -ne $ss.index) { [int]$ss.index } else { -2 }
-        # 两个切片"自己说"的行数在一起，才看得出哪一个在动（这一列就是判定用的尺子）。
-        $ssLines = if ($ss -and $ss.ok -and $null -ne $ss.lines) { [int]$ss.lines } else { -1 }
-        if ($i -eq 1 -and $stx -and $stx.times) {
-            Write-Host ("      times[0..3] = {0}" -f ((@($stx.times) | Select-Object -First 4) -join ','))
-        }
-        Write-Host ("  {0,2}. pos={1,-8} origin={2,-34} lineMs={3,-8} table={4,-22} storeIndex={5,-4} byPosition={6,-4} times={7,-5} offset={8,-6} used={9,-14} storeLine='{10}'" -f `
-            $i, $(if ($null -eq $domMs) { 'n/a' } else { "$($domMs)ms" }), $origin, `
-            $(if ($null -eq $lineMs) { 'n/a' } else { "$($lineMs)ms" }), $table, $storeIdx, $sel, `
-            $tblCount, `
-            $(if ($ss) { $ss.offset } else { '' }), $(if ($ss) { $ss.usedLyric } else { '' }), `
-            $(if ($ss) { $ss.line } else { '' }))
-        # 判定的三个输入并排：`cached` 是表里记着的行数、`store` 是这一拍 store 报的行数、
-        # `id=` 两边各是谁。**哪一边在动**一眼就能看出来（不必再猜）。
-        Write-Host ("      table-in: cached={0} store={1} id(cached)='{2}' id(store)='{3}' acceptedLines={4} | src dom={5} storeline={6} | store.ok={7} lines={8} index={9}" -f `
-            $tableLines, $linesNow, $tblTrack, $trackNow, $tblAcceptedLines, $srcDom, $srcStore, `
-            $(if ($ss) { $ss.ok } else { 'n/a' }), $ssLines, $storeIdx)
         if ($i -lt $ProbeRounds) { Start-Sleep -Milliseconds $IntervalMs }
     }
     exit 0
 }
 
-$track = Get-PlayingTrack
-if (-not $track) {
-    # 发布器是被 mod 长期托管的（看门狗 / 作业对象负责收尾），所以"暂时没有窗口"不是退出理由：
-    # 早先这里直接 exit 2，于是 mod 在 18 秒里把它启动了 5 次然后判定失败（真机日志 2026-10-13）。
-    Write-Host ("暂时没有可用的网易云窗口（进程名匹配 '*{0}*'，某个顶层窗口标题里要有「 - 」）。" -f $ProcessName)
-    Write-Host "每 5 秒重试；窗口出现就继续。若一直不出现，用 -ProcessName 指定真实进程名。"
-    Write-Host "网易云进程的顶层窗口（这就是判定用的那一份；主窗口标题不算数）："
-    $winTitles = @(Get-NeteaseWindowTitles)
-    if ($winTitles.Count -eq 0) {
-        Write-Host "  （一个都没看到——进程名不对，或者窗口还没建出来）"
-    } else {
-        $winTitles | ForEach-Object { Write-Host ("  [{0}]" -f $_) }
-    }
-    while (-not $track) {
-        Start-Sleep -Seconds 5
-        $track = Get-PlayingTrack
-    }
-    Write-Host ("已找到窗口：{0}" -f $track.Title)
-}
+# ---------------------------------------------------------------------------
+# 主循环
+# ---------------------------------------------------------------------------
+# 一条数据来源（黑胶页），一个失败方式：**读不到就不发**。早先这里是一条六级降级链
+# （CDP 迷你条 → store 行时间 → 内存差分 → SMTC → 推算时钟），每一级都有自己的失效形状，
+# 而其中最坏的是"给一个冻结的值"——它会把后面会前进的来源全部遮住，界面上看不出是"读不到"
+# 还是"停在那一句"。现在没有降级链：读到了就发，读不到就**响亮地**说读不到（下面那行
+# `Write-Diag` 打的是判别性数值：哪一个候选落空、time 解成了什么、位置往回/往前多少），
+# 并且不发任何值 —— 面板上留 `--` 比钉在错误的一行上诚实。
+$script:VinylMisses = 0
 
-Write-Host ("曲目：{0} — {1}" -f $track.Title, $track.Artist)
-$lyricLines = @()
-$lyricNote = '（未取到歌词）'
-try {
-    $lyricLines = @(Get-LyricLines -Title $track.Title -Artist $track.Artist)
-    if ($lyricLines.Count -gt 0) {
-        $lyricNote = "（{0} 行 LRC）" -f $lyricLines.Count
-    }
-    else { $lyricNote = '（接口没给歌词，或用 -SongId 手工指定）' }
-}
-catch { $lyricNote = "（歌词接口失败：$($_.Exception.Message)）" }
-Write-Host ("歌词：{0}" -f $lyricNote)
+Write-Host '位置与歌词：只读客户端自己的黑胶页（CDP 的 `li.line.current` + `data-time`）'
+Write-Host '  · 它与前台上有没有窗口**无关**（窗口关到托盘时字段照旧存在）'
+Write-Host '  · 所以需要客户端带 --remote-debugging-port=9229 启动（见 -ProbeCdp 打印的步骤）'
+Write-Host '  · 读不到就不发（面板留 `--`），绝不拿一个冻结的值顶上'
 
 $writer = $null
-$positionMode = 'clock'
-
-# 位置来源：先试媒体会话（真实位置），拿不到就退回推算时钟
-if ($PositionSource -ne 'clock') {
-    if (Start-PositionHelper) {
-        $deadline = (Get-Date).AddSeconds(3)
-        while ((Get-Date) -lt $deadline -and -not (Get-PositionSample)) { Start-Sleep -Milliseconds 200 }
-        if (Get-PositionSample) { $positionMode = 'media' }
-    }
-    if ($positionMode -eq 'media') {
-        Write-Host '位置：媒体会话（真实位置——拖动进度条、暂停都跟得上）'
-    }
-    elseif ($PositionSource -eq 'media') {
-        Write-Host '位置：媒体会话不可用，且已要求只用它——歌词不会推进（先跑 -ProbePosition 看原因）'
-        Stop-PositionHelper
-    }
-    else {
-        Write-Host '位置：媒体会话不可用，退回推算时钟（手动拖动进度条后会失准，暂停时它也会继续走）'
-        Stop-PositionHelper
-    }
-}
 if (-not $DryRun) {
     $client = Connect-PipeClient -Pipe $Pipe
     if (-not $client) {
@@ -1795,229 +1413,128 @@ if (-not $DryRun) {
     Write-Host ("已连上管道 {0}" -f $Pipe)
 }
 
-# 这首歌的起点：用「第一次看到它」当作 0 秒。LRC 行按这个时钟推进。
-$started = Get-Date
-$lastRaw = $track.Raw
+# 换歌检测用**曲目身份**（标题 + 歌手），不再用窗口标题：托盘模式下窗口标题根本没有值。
+# 上一轮见到的当前行 data-time（毫秒，-1 = 还没见到）——`Test-VinylLineUsable` 的输入。
+$lastRaw = ''
 $announced = $false
-# 上一条岛事件的时间。初值取最小时间，于是"从未发过"永远允许第一条 ✓。
 $script:LastEventAt = [datetime]::MinValue
-# store（客户端自己的状态）缓存：曲目 id、行时间表、当前行号/文本/翻译。显式初始化一次，
-# 免得"读到没赋值过的变量"看起来像有默认值。
-$script:StoreTimes = $null
-$script:StoreTimesTrack = ''
-# 读回 times 时 store 那份数组的行数。缓存表"还配不配得上现在这份数组"就是靠它判的
-# （Get-StoreTimesVerdict）：只看曲目 id 会漏掉"id 已经换了、歌词数组还没换"的那一拍。
-$script:StoreTimesLines = 0
-# 这份表**已经为哪个行数**重读过一次了（见 Get-StoreTimesVerdict 第 4 条）：-1 = 还没读过。
-# 它是"观察到的 store 行数"，所以行数一变就自动允许再读一次——这就是收敛与"永不重读"的分界。
-$script:StoreTimesAcceptedLines = -1
-$script:StoreLineIndex = -1
-$script:StoreLineText = ''
-$script:StoreLineTrans = ''
-# 上一次见到的 store 当前行起始时间（毫秒），-1 = 还没见过。**换歌时不清**：store 那个行号
-# 会冻结，所以这个来源整条生命周期只允许当一次引导值（见 Test-StoreLineUsable）。
-$script:StoreLineMs = -1
-$lyricAttemptAt = Get-Date
-$lyricMisses = 0
+$prevLineMs = -1
+# 连续读到**同一个** data-time 的次数（见 Test-VinylLineUsable 判据⑤）。暂停时它会涨，
+# 但那时"行不动"是事实；涨到 RepeatLimit 只是让桥**不再发新的位置/歌词**，不会造假值。
+$sameLineMs = 0
 
 try {
     while ($true) {
         Start-Sleep -Milliseconds $IntervalMs
         # 逐轮清空：同一轮里同一个 key 出现两次是缺陷，Publish 会点名（见那里的注释）。
         $script:IterationKeys.Clear()
-        $now = Get-PlayingTrack
 
-        if ($now -and $now.Raw -ne $lastRaw) {
-            # 换歌：重新取歌词，并（可选）弹一次岛
-            $track = $now
-            $lastRaw = $now.Raw
-            $started = Get-Date
-            $script:Sent.Clear()
-            # 换歌时 store 的缓存一起作废。不清的话，新歌第一拍若拿不到行时间表，
-            # 选行就会用**上一首**的时间表、而 `$idx -ne $StoreLineIndex` 的判断还可能
-            # 正好命中，于是上一首的最后一句被当成新歌的当前行发出去。
-            $script:StoreTimes = $null
-            $script:StoreTimesTrack = ''
-            $script:StoreTimesLines = 0
-            $script:StoreTimesAcceptedLines = -1
-            $script:StoreLineIndex = -1
-            $script:StoreLineText = ''
-            $script:StoreLineTrans = ''
-            $lyricAttemptAt = Get-Date
-            $lyricMisses = 0
-            try { $lyricLines = @(Get-LyricLines -Title $track.Title -Artist $track.Artist) }
-            catch { $lyricLines = @() }
-            Write-Host ("换歌：{0} — {1}（{2} 行 LRC）" -f $track.Title, $track.Artist, $lyricLines.Count)
-            if ($Event) {
-                $first = Select-LrcLine $lyricLines 0
-                [void](Write-IslandEvent -Writer $writer -Provider $Provider -CardMs $EventTtlMs `
-                        -Title ("{0} - {1}" -f $track.Title, $track.Artist) -Body $first)
-            }
-            $announced = $true
+        # ---- 这一拍的唯一数据来源 -------------------------------------------------------
+        $vinyl = Get-CdpVinyl
+        # store：身份（曲名/歌手）与判活。**不提供位置、不提供当前行**（那是黑胶页的事）。
+        $store = Get-CdpStoreState
+        $windowTitle = if (-not ($vinyl -and $vinyl.Title) -and -not ($store -and $store.ok -and $store.name)) {
+            '' + (Get-WindowTrackTitle)      # 只在完全没有页面时才会真的去枚举窗口
+        } else { '' }
+        $ident = Resolve-TrackIdentity `
+            -VinylTitle $(if ($vinyl) { '' + $vinyl.Title } else { '' }) `
+            -VinylArtist $(if ($vinyl) { '' + $vinyl.Artist } else { '' }) `
+            -StoreTitle $(if ($store -and $store.ok) { '' + $store.name } else { '' }) `
+            -StoreArtist $(if ($store -and $store.ok) { '' + $store.artists } else { '' }) `
+            -WindowTitle $windowTitle
+
+        if (-not $ident) {
+            # 响亮失败：说清**是哪一环**断的（端口/目标/候选），而不是"失败了"。
+            $script:VinylMisses++
+            $target = if (Get-CdpTab) { '有目标（见 -ProbeVinyl / -ProbeCdp 的逐条目标）' } else { '没有可用的 CDP 目标：端口 ' + ($CdpPorts -join '/') }
+            Write-Host ("[{0}] 读不到曲目（第 {1} 次）：{2}；根候选='{3}' 行候选='{4}' 标题候选='{5}' —— 本拍不发任何值" -f `
+                (Get-Date).ToString('HH:mm:ss'), $script:VinylMisses, $target, `
+                $(if ($vinyl) { $vinyl.RootHit } else { '(求值失败)' }), `
+                $(if ($vinyl) { $vinyl.LineHit } else { '-' }), `
+                $(if ($vinyl) { $vinyl.TitleHit } else { '-' }))
         }
+        else {
+            $trackRaw = '{0} - {1}' -f $ident.Title, $ident.Artist
+            if ($trackRaw -ne $lastRaw) {
+                # 换歌：清掉"已经发过"的缓存，位置守卫的基准也一起复位（新歌从 0 开始）。
+                $lastRaw = $trackRaw
+                $script:Sent.Clear()
+                $prevLineMs = -1
+                $sameLineMs = 0
+                Write-Host ("换歌：{0}（身份来源 {1}）" -f $trackRaw, $ident.Source)
+            }
 
-        if ($now) {
-            # 没有歌词就隔一会儿再试。只在启动时查一次的话，接口抖动一下、或者网易云
-            # 刚起来网络还没就绪，整首歌都会没有歌词——行里就一直是 --，而且看不出原因。
-            if ($lyricLines.Count -eq 0 -and
-                ((Get-Date) - $lyricAttemptAt).TotalMilliseconds -ge $LyricRetryMs) {
-                $lyricAttemptAt = Get-Date
-                try {
-                    $lyricLines = @(Get-LyricLines -Title $now.Title -Artist $now.Artist)
-                    if ($lyricLines.Count -gt 0) {
-                        $lyricMisses = 0
-                        Write-Host ("取到歌词：{0} 行" -f $lyricLines.Count)
-                    }
-                    elseif ($lyricMisses -lt 3) {
-                        # 有界：说三次就够，之后安静重试，不刷屏
-                        $lyricMisses++
-                        Write-Host "（接口没给歌词，继续重试；用 -DumpJson 看原始返回、-SongId 手工指定）"
-                    }
-                }
-                catch {
-                    if ($lyricMisses -lt 3) {
-                        $lyricMisses++
-                        Write-Host ("（歌词接口失败：{0}）" -f $_.Exception.Message)
-                    }
-                }
-            }
-            # 首选位置来源：迷你条 DOM 的"已播 / 总长" —— 客户端**自己显示**的真 currentTime
-            # （用户在 DevTools 里找到的控件；不锚哈希类名，理由见 Get-CdpDomTime 的注释）
+            # 位置与当前行：**同一次读**（都在 li.line.current 上）。
             $positionMs = $null
-            $posSrc = 'clock'
-            if ($PositionSource -in 'auto', 'cdp') {
-                $domTime = Get-CdpDomTime
-                if ($domTime -and $domTime.ok) {
-                    $positionMs = [int]$domTime.curS * 1000
-                    $posSrc = 'dom'
+            $line = ''
+            $translation = ''
+            $posSrc = 'vinyl'
+            $why = ''
+            if (-not $vinyl) {
+                $why = 'CDP 求值失败（端口活着但 Runtime.evaluate 没回值）'
+            }
+            elseif (-not $vinyl.Line) {
+                $why = "行候选全部落空（root='$($vinyl.RootHit)' 命中但 li.line.current 不在里面）"
+            }
+            else {
+                $timeMs = [int]$vinyl.Line.TimeMs
+                if (Test-VinylLineUsable -PrevTimeMs $prevLineMs -NowTimeMs $timeMs -SameReads $sameLineMs) {
+                    if ($prevLineMs -ge 0 -and $timeMs -eq $prevLineMs) { $sameLineMs++ } else { $sameLineMs = 0 }
+                    $prevLineMs = $timeMs
+                    $positionMs = $timeMs
+                    $line = $vinyl.Line.Original
+                    $translation = $vinyl.Line.Translation
                 }
-            }            # 首选来源：CDP store —— 精确到客户端自己的当前行 ✓；它的行时间顺便当位置 ✓
-            # （用户实测：内存扫描极不稳定 ✗ → CDP/store 优先 ✓、内存降为次选 ✓。
-            #   注意：store 的 lineTimeSec 是**行起始时间** ✓，会按行跳变；要连续毫秒仍需内存/SMTC ✓）
-            # ⚠ 下面这行 `$positionMs = $null` **必须留在 DOM 那一段之前**：它后面再出现一次，
-            #   就会把刚取到的真 currentTime 清掉，位置只能退回 store 的行起始时间（= 冻结的
-            #   playingLyricLineNumber 那一行），歌词于是永远停在同一行 ✗（2026-10-14 修）。
-            # ⚠ store 是**数据来源**，不是发布者：这里只把它的值读进变量，这一轮的最后统一发一次
-            #   （见 Get-PublishPlan）。这里曾经有三个 Publish('title'/'lyric'/'translation')，
-            #   它们和最后那批发布抢同一个 key：store 的 resourceName 没有作者，于是面板在
-            #   "歌名"与"歌名 - 作者"之间闪（作者忽隐忽现）；store 的当前行来自会冻结的
-            #   playingLyricLineNumber，于是歌词隔一拍就跳回旧行（2026-10-14 -DryRun 实测）。
-            $storeLine = $null
-            if ($LyricSource -in 'auto', 'store') {
-                $ss = Get-CdpStoreState
-                if ($ss -and $ss.ok) {
-                    # 只在按位置选行的通路不可用时当兜底（见下面 $line 的拼装）；
-                    # 绝不在这里发布，也不把 store 的翻译当值——它属于 store 自己那一行。
-                    if ($ss.line) { $storeLine = '' + $ss.line }
-                    # store 自己那一行的起始时间能不能当**位置**用，归 Test-StoreLineUsable 判：
-                    # 它来自会冻结的 playingLyricLineNumber，而这一级排在 memory/media/时钟**之前**，
-                    # 不判就会把会前进的来源全遮住（2026-10-15 用户报"手动切歌后歌词不动"）。
-                    if ($null -eq $positionMs -and $null -ne $ss.lineTimeSec) {
-                        $lineMs = [int]([double]$ss.lineTimeSec * 1000)
-                        if (Test-StoreLineUsable -PrevMs $script:StoreLineMs -NowMs $lineMs) {
-                            $positionMs = $lineMs
-                            $posSrc = 'storeline'
+                else {
+                    $why = "data-time 不可用：prev=${prevLineMs}ms now=${timeMs}ms 连续相同=${sameLineMs}（往回走/往前跳太多/一直不动 → 判陈旧）"
+                }
+            }
+
+            # 兜底：黑胶页那一拍没给出当前行时，用 store 的歌词数组按这个曲目自己选一行。
+            # **只在 store 报的曲目 id 与这一轮身份的曲目一致时**才允许（切歌当拍 store 还是
+            # 上一首的数组，用它就会把上一句贴上这一首的翻译）。判据是纯函数，-SelfTest 覆盖。
+            if (-not $line -and $store -and $store.ok -and $null -ne $positionMs) {
+                $stx = Get-CdpStoreLyricTimes
+                if ($stx -and $stx.ok) {
+                    $idx = Select-StoreLineIndex -TimesSec ([object[]]$stx.times) -PositionMs $positionMs
+                    if (Test-StoreLyricUsable -StoreTrack ('' + $stx.trackId) -CurrentTrack ('' + $store.trackId) `
+                            -Index $idx -Lines ([int]$stx.lineCount)) {
+                        $ln = Get-CdpStoreLyricLine -Index $idx
+                        if ($ln -and $ln.ok) {
+                            $line = '' + $ln.text
+                            $translation = if ($ln.trans) { '' + $ln.trans } else { '' }
+                            $posSrc = 'store'
+                            Write-Host ("  （黑胶页没给当前行，用 store 兜底：id={0} index={1}）" -f $stx.trackId, $idx)
                         }
-                        $script:StoreLineMs = $lineMs
                     }
                 }
             }
-            # 位置降级链：cdp → memory → media → clock（store 没给出位置才往下走 ✓）
-            if ($null -eq $positionMs -and $PositionSource -in 'auto', 'cdp') {
-                $positionMs = Get-CdpPositionMs
-                if ($null -ne $positionMs) { $posSrc = 'cdp' }
+
+            if ($why) {
+                $script:VinylMisses++
+                Write-Host ("[{0}] {1} —— 本拍不发位置/歌词（第 {2} 次）" -f (Get-Date).ToString('HH:mm:ss'), $why, $script:VinylMisses)
             }
-            if ($null -eq $positionMs -and $PositionSource -in 'auto', 'memory') {
-                $positionMs = Get-MemoryPosition -Now $now
-                if ($null -ne $positionMs) { $posSrc = 'memory' }
-            }
-            if ($null -eq $positionMs -and $PositionSource -in 'auto', 'cdp') {
-                $positionMs = Get-CdpPositionMs
-                if ($null -ne $positionMs) { $posSrc = 'cdp' }
-            }
-            if ($null -eq $positionMs -and $positionMode -eq 'media') {
-                $sample = Get-PositionSample
-                if ($sample) {
-                    $positionMs = Get-PositionMs -Sample $sample `
-                        -AgeSeconds ((Get-Date) - $sample.At).TotalSeconds
-                    if ($null -ne $positionMs) { $posSrc = 'media' }
-                }
-            }
-            if ($null -eq $positionMs) {
-                $positionMs = [int]((Get-Date) - $started).TotalMilliseconds
-                $posSrc = 'clock'
-            }
+
             # 换行的"负延迟"（见 Get-LeadMs）。⚠ 变量名**不能**叫 $leadMs：PowerShell 变量名
             # 大小写不敏感，那会覆盖 -LeadMs 参数本身，自动值就永远停在第一次算出来的数。
             $leadApply = Get-LeadMs -Source $posSrc -IntervalMs $IntervalMs -OverrideMs $LeadMs
-            # 当前行：用位置在 store 的 times 上选（不再用那个冻结的 playingLyricLineNumber）
-            # times 只在换歌时取一次（纯数字）；文本/翻译只在行号变化时按需取。
-            if ($LyricSource -in 'auto', 'store') {
-                $trackNow = if ($ss -and $ss.ok) { '' + $ss.trackId } else { '' }
-                # store 现在这份歌词数组有多少行（判定缓存表还配不配得上它，见 Get-StoreTimesVerdict）
-                $linesNow = if ($ss -and $ss.ok -and $null -ne $ss.lines) { [int]$ss.lines } else { 0 }
-                $tv = Get-StoreTimesVerdict -Cached $script:StoreTimes `
-                    -CachedTrack $script:StoreTimesTrack -CachedLines $script:StoreTimesLines `
-                    -StoreTrack $trackNow -StoreLines $linesNow `
-                    -AcceptedLines $script:StoreTimesAcceptedLines
-                if ($tv.ReRead) {
-                    $stx = Get-CdpStoreLyricTimes
-                    if ($stx -and $stx.ok) {
-                        $script:StoreTimes = [object[]]$stx.times
-                        $script:StoreTimesTrack = '' + $stx.trackId
-                        $script:StoreTimesLines = if ($null -ne $stx.lineCount) { [int]$stx.lineCount } else { 0 }
-                        # 这一份表已经为**这个行数**读过一次了（见 Get-StoreTimesVerdict 第 4 条）：
-                        # 只要 store 报的行数还是这个数就不再重读，否则"表永远过期"会把选行缓存
-                        # 反复清掉——那正是真机 `table=stale` 的死循环。行数**再变**（两个切片在追）
-                        # 就等于新信息到了，又会允许重读一次。
-                        $script:StoreTimesAcceptedLines = $linesNow
-                        $script:StoreLineIndex = -1
-                        $script:StoreLineText = ''
-                        $script:StoreLineTrans = ''
-                    }
-                }
-                if ($script:StoreTimes -and $null -ne $positionMs) {
-                    # 选行用**提早后**的位置（见 Get-LeadMs）：只影响换行的时刻，
-                    # 发出去的 pos 仍是原始位置。
-                    $idx = Select-StoreLineIndex -TimesSec $script:StoreTimes `
-                        -PositionMs ([int]$positionMs + $leadApply)
-                    if ($idx -ge 0 -and $idx -ne $script:StoreLineIndex) {
-                        $ln = Get-CdpStoreLyricLine -Index $idx
-                        if ($ln -and $ln.ok) {
-                            $script:StoreLineIndex = $idx
-                            $script:StoreLineText = '' + $ln.text
-                            # 翻译跟着**这一行**走：新行没有翻译就清空，不能留着上一行的
-                            # （它是同一个 key，留着的表现就是"翻译和歌词对不上"）。
-                            $script:StoreLineTrans = if ($ln.trans) { '' + $ln.trans } else { '' }
-                        }
-                    }
-                    if ($script:StoreLineText) { $storeLine = $script:StoreLineText }
-                }
-            }
-            # 兜底：接口 LRC + 位置选行（store 不可用时才走这条 ✓）
-            $line = if ($storeLine) { $storeLine } else { Select-LrcLine $lyricLines ([int]$positionMs + $leadApply) }
-
             # 一轮的帧只在这里生成：每个 key 恰好一条（见 Get-PublishPlan）。
-            $plan = Get-PublishPlan -Title $now.Title -Artist $now.Artist -Line $line `
-                -Translation $script:StoreLineTrans -Pos $(if ($null -ne $positionMs) {
-                    Format-PositionSource -Source $posSrc -PositionMs ([int]$positionMs) `
-                        -LeadMs $leadApply
+            $plan = Get-PublishPlan -Title $ident.Title -Artist $ident.Artist -Line $line `
+                -Translation $translation -Pos $(if ($null -ne $positionMs) {
+                    Format-PositionSource -Source $posSrc -PositionMs ([int]$positionMs) -LeadMs $leadApply
                 } else { '' })
             foreach ($key in $plan.Keys) { [void](Publish $writer $key $plan[$key]) }
             if ($Event -and -not $announced) {
                 # 只有真的发出去了才算"播报过"：被节流掉的话，下一拍还有机会。
                 if (Write-IslandEvent -Writer $writer -Provider $Provider -CardMs $EventTtlMs `
-                        -Title ("{0} - {1}" -f $now.Title, $now.Artist) -Body $line) {
+                        -Title $trackRaw -Body $line) {
                     $announced = $true
                 }
             }
         }
-
-        if ($Once) { break }
     }
 }
 finally {
-    Stop-PositionHelper
     if ($writer) {
         Write-Frame $writer 'BYE'
         $writer.Dispose()
