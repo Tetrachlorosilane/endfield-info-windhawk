@@ -55,6 +55,10 @@ endfield-info-windhawk/
 └── assets/panel-preview.png           版面预览（README 引用）
 ```
 
+删工具前先给两个证据：`git grep -n <文件名>` 在**被跟踪**文件里全无引用，且功能有**替代者**；
+缺一就留着。`_netease-position.ps1` / `_netease-lyric-scan.ps1` **不适用这条**——桥在运行期
+调用它们，删了会静默降级。删除用 `git mv` 进 `.Trash/`。
+
 分工：**README 讲用户怎么用**，**脚本的 `.md` 讲这个脚本怎么跑**，**AGENTS（本文）讲实现、
 不变量与踩过的坑**。同一个事实不要在三处各写一遍——写在你改代码时需要看到的那一处。
 
@@ -62,8 +66,7 @@ endfield-info-windhawk/
 `_settings.py` / `_logfmt.py` / `_deadcode.py` 只要 Python 标准库；**需要 Pillow 的是 `_preview.py`**
 （它自己重画一遍版面）。
 
-> 本机 `python` 解析到的是 Windows Store 的占位程序，不一定真的能执行。
-> 如果 `python` 打开的是应用商店，用 DSH 运行时自带的解释器：
+> 本机 `python` 可能是 Windows Store 的占位程序；真跑不了就用 DSH 运行时的解释器：
 > `C:\Users\HP\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe`
 
 ---
@@ -190,8 +193,7 @@ $wc = 'D:\Program Files\Windhawk\Compiler'
 python _deadcode.py
 ```
 
-编译器只管**符号**（`-Wunused-function` / `-Wunused-variable` / `-Wunused-macros` 都在 build.ps1 里，
-mod 现在只剩 1 条已知警告）。它管不了的三类是：
+编译器只管**符号**（`build.ps1` 已开 `-Wunused-function` 等）。它管不了的三类是：
 
 - **只写不读的结构体字段**（每帧算一遍然后扔掉的量、重构留下的字段），以及**完全没被碰过**的字段；
 - **`#if 0`**；

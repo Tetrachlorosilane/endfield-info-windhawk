@@ -65,10 +65,10 @@ text rather than silently changing the typeface. The same applies to a
 
 ## Row sizes
 
-Rows do not have to match. `Row N font size` and `Row N height` give one row its
-own metrics (`0` inherits `Font size` / `Row height`), and a tag at the *start* of
-the row's text overrides the setting: `[[size:18]]` and `[[h:44]]`, in any order
-and repeatable (the last one wins). The panel is as tall as its rows add up to,
+Rows do not have to match. Per row, `Row N font size` and `Row N height` set the
+metrics on their own (`0` inherits `Font size` / `Row height`), and a tag at the
+*start* of the row's text overrides the setting: `[[size:18]]` and `[[h:44]]`, in any
+order and repeatable (the last one wins). The panel is as tall as its rows add up to,
 and a row is never shorter than its own font needs - growing a font grows the row
 rather than letting the glyphs spill into the next one.
 
@@ -79,6 +79,29 @@ anywhere but the very start it applies to the text it wraps, closed by
 not nest: `[[/size]]` returns to the row's own size. The row's height floor follows
 the largest text in it. A tag written anywhere but the
 start is ordinary text and is drawn as such.
+
+## Gaps and alignment
+
+`[[gap:N]]` is blank space, and the way you write it decides the unit: `[[gap:1.5]]`
+is 1.5x the font size in effect at that point, so it grows with the row, while
+`[[gap:12px]]` is 12 absolute pixels whatever the font does. `[[gap:0]]` is legal (a
+zero-width step) and anything above 99 px is clamped to 99 px; only a gap that cannot
+be read at all is left standing as ordinary text.
+
+`[[left]]...[[/left]]`, `[[center]]...[[/center]]` and `[[right]]...[[/right]]` place
+a whole run: its contents are measured as one group, and the group is then put at the
+left, middle or right of that row's text column. Any content can go inside - text,
+`[[icon:...]]`, `[[gap:...]]`, `[[ring:...]]`. Groups do not nest: a second opening
+tag ends the first group and starts another, and a missing closing tag runs to the end
+of the row.
+
+## Panel width
+
+`Panel sizing` chooses between a width you fix (`Fixed`, taken from `Panel width`) and
+one that follows the content (`Fit content`): the panel is then as wide as its widest
+row needs, held between `Panel minimum width` and `Panel maximum width`, and never
+further than the screen allows. One state always resolves to one width - it does not
+drift from frame to frame.
 
 ## Icons
 
@@ -94,8 +117,8 @@ also the shortest way to see how a name is written. Erase the tag to lose the ic
 
 ## Rings, icons and themes
 
-* Ring gauges are drawn where you write them: right-docked by default, or inline
-  after text.
+* Ring gauges are drawn where you write them: a gauge that starts the row, or has the
+  row to itself, is right-docked; one written after text sits inline on that row.
 * Icons are inline elements: a built-in glyph (`CPU`, `Memory`, `Disk`,
   `Network`, `GPU`) or your own image file, placed wherever you write the tag.
 * Three colour presets plus a `Custom` theme that unlocks the colour fields.

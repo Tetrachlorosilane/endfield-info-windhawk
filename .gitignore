@@ -8,3 +8,6 @@ _extclient-last.txt
 *.local.md
 # Release packaging output (built locally, uploaded as a release asset).
 dist/
+# The project's own trash. Deleting a tool is a `git mv` into this folder so its
+# history follows, and this rule keeps the folder itself out of the diff.
+.Trash/
