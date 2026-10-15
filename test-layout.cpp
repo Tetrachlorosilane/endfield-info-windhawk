@@ -3384,7 +3384,16 @@ int main() {
             g_rowState = staged2;
             g_publishedRows = 1;
             g_layoutEpoch++;
-            return EnsureRowPlan(graphics, font, format, 0, 1, rowW, fontPx, rowH, false);
+            // The row's main font has to be the one for *this* row size: `BuildRowPlan` is told
+            // `rowFontSizePx` and uses the passed font for every run that does not carry its own
+            // `[[size:NN]]`. Handing it the fixture's 15 px font while claiming 16 px makes the
+            // plan measure and draw at 15 while its own metadata says 16, which shows up as a
+            // "the plan disagrees with a fresh measurement" failure that is about the fixture, not
+            // the product. The product never has this problem: `PaintPanel` builds the row's font
+            // from the row's own size.
+            GpFont *rowFont = fontPx == 15 ? font : AcquireRowFont(graphics, L"Segoe UI", fontPx);
+            if (!rowFont) rowFont = font;
+            return EnsureRowPlan(graphics, rowFont, format, 0, 1, rowW, fontPx, rowH, false);
         };
         // The row's text column, from the product: the left edge every group is placed against
         // and the right edge no run may cross. Re-deriving these here would be testing a copy.
@@ -3483,12 +3492,17 @@ int main() {
             const RowSegmentPlan &gapSeg = plan->segments[1];
             const RowSegmentPlan &text = plan->segments[2];
             printf("    icon+gap+text: group x=%.2f w=%.2f (icon %.2f at %.2f, gap %.2f, "
-                   "text %.2f at %.2f)\n",
+                   "text %.2f at %.2f) textSlice=\"%ls\" skip=%d segs=%d\n",
                    (double)plan->groups[0].x, (double)plan->groups[0].width, (double)diameter,
-                   (double)icon.x, (double)gapSeg.advance, (double)text.advance, (double)text.x);
+                   (double)icon.x, (double)gapSeg.advance, (double)text.advance, (double)text.x,
+                   text.slice, (int)text.skip, plan->segmentCount);
             // Measured from the parts the plan draws, not from the group's own field: the two
-            // must agree, and the field is what a stale derivation would have got wrong.
-            const float drawnWidth = icon.advance + gapSeg.advance + text.advance;
+            // must agree, and the field is what a stale derivation would have got wrong. A text
+            // run counts as the width of its *ink* (what GDI+ will draw), an element as its own
+            // advance -- which is the same rule the plan builds the group's width from.
+            const float textDrawn =
+                MeasureDrawnWidth(graphics, font, format, text.slice, rowH, (float)text.fontSize);
+            const float drawnWidth = icon.advance + gapSeg.advance + textDrawn;
             Check(plan->alignCount == 1 && plan->groups[0].kind == kAlignSegLeft,
                   "the row has one left-aligned group");
             Check(diameter > 5.0f, "the icon has a real diameter to account for");
@@ -3712,6 +3726,374 @@ int main() {
             }
         }
 
+        // (12b) The user's second report: the alignment group is still not fixed on the real
+        // machine.
+        //
+        //   * one character in the group -> it is drawn off its position (偏离原位);
+        //   * more than one             -> the last character is not drawn at all, CJK and ASCII
+        //                                  alike;
+        //   * appending a space to the text fixes it, in both languages;
+        //   * exact example `[[h:100]] [[center]]你好[[/center]]` draws only `你`;
+        //   * static and dynamic rows alike, and tag parsing is not involved.
+        //
+        // The width of an alignment group was the sum of its parts' pen advances, and the layout box
+        // the painter hands GDI+ was that same advance. The two are not the same number: GDI+
+        // reports a string's width as the extent of its *inked* glyphs, and the last glyph's ink
+        // reaches past where the pen stops (its right side bearing). Two facts, both measured below
+        // with the real font at 15 px:
+        //
+        //   * the pen advance of "W" is 14.43 px while GDI+ reports 19.43 px for the same string,
+        //     a 5.00 px difference that stays 5.00 for "WW" and "WWW" because only the trailing
+        //     glyph contributes;
+        //   * drawing "WWW" in a box of exactly its pen advance (43.29) puts only two of the three
+        //     glyphs on the bitmap, while a box of the drawn width (48.29) keeps all three.
+        //
+        // GDI+ does not overflow the box, it *drops* what does not fit -- so a layout box of the
+        // advance width loses the last glyph of the run. The budget and the box therefore have to
+        // be at least the **drawn width**, which is the number `MeasureDrawnWidth` owns: the pen
+        // advance, or the extent GDI+ reports, whichever is larger. A group whose last run is
+        // clipped loses its last character (the user's "more than one" case); with a single
+        // character the clipped box is narrower than the ink while the group is still placed by the
+        // pen advance, which is the "off its position" case. A trailing space hides both, because
+        // it adds pen advance *after* the last inked glyph and so moves the clip edge past the ink.
+        //
+        // `MeasureAdvance` is not wrong and does not change: it is the pen advance, and the flow
+        // cursor, the group's placement and the natural width all want exactly that. What was wrong
+        // is using it as the layout box. `MeasureDrawnWidth` is the second and only other number,
+        // and the two call sites that need it (the box, and the group's width) both ask it.
+        {
+            // The independently obtained quantity: what GDI+ itself reports for the string, asked
+            // in a box far wider than anything the panel can produce, so no clipping can be
+            // involved in obtaining it.
+            auto reportedWidth = [&](GpFont *f, const WCHAR *text) -> float {
+                RectF box(0.0f, 0.0f, 4000.0f, rowH), bounds = {};
+                INT cp = 0, lines = 0;
+                g_gdiplus.MeasureString(graphics, text, -1, f, &box, format, &bounds, &cp, &lines);
+                return bounds.Width;
+            };
+
+            // (a) The measurement the whole thing rests on: the width a run is given for its layout
+            // box is never less than the width GDI+ reports for the same text. Red on the committed
+            // tree, where the box was the pen advance alone -- the gap is the trailing glyph's
+            // right side bearing (5.00 px at 15 px for `W`, and it grows with the size).
+            {
+                int worstSize = -1;
+                float worstGap = 0.0f;
+                const WCHAR *probe[5] = {L"W", L"WWW", L"\x4F60", L"\x4F60\x597D",
+                                         L"\x4F60\x597D\x4E16"};
+                for (int fs = 10; fs <= 30; fs++) {
+                    GpFont *f = AcquireRowFont(graphics, L"Segoe UI", fs);
+                    if (!f) continue;
+                    for (int i = 0; i < 5; i++) {
+                        const float gap =
+                            reportedWidth(f, probe[i]) -
+                            MeasureDrawnWidth(graphics, f, format, probe[i], rowH, (float)fs);
+                        if (gap > worstGap) {
+                            worstGap = gap;
+                            worstSize = fs;
+                        }
+                    }
+                }
+                printf("    the drawn width falls short of what GDI+ reports by up to %.4f px "
+                       "(at %d px)\n",
+                       (double)worstGap, worstSize);
+                Check(worstGap <= 0.01f,
+                      "a run's layout box is at least as wide as the text GDI+ draws in it");
+            }
+
+            // (b) The same thing in pixels, because pixels are the user's evidence. `penAdvance`
+            // is computed here with the sentinel trick alone -- the number the old measurement
+            // returned -- so the two boxes below are "the box the old code built" and "the box the
+            // code builds now", for the same string. Two of the three glyphs against three.
+            {
+                const int W = 300, H = 40;
+                BITMAPINFO bmi = {};
+                bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                bmi.bmiHeader.biWidth = W;
+                bmi.bmiHeader.biHeight = -H;
+                bmi.bmiHeader.biPlanes = 1;
+                bmi.bmiHeader.biBitCount = 32;
+                bmi.bmiHeader.biCompression = BI_RGB;
+                void *bits = nullptr;
+                HBITMAP dib = CreateDIBSection(nullptr, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+                GpBitmap *bmp = nullptr;
+                GpGraphics *g2 = nullptr;
+                GpSolidFill *solid = nullptr;
+                g_gdiplus.CreateSolidFill(0xFFFFFFFF, &solid);
+                bool ready = false;
+                if (dib && bits && solid &&
+                    g_gdiplus.CreateBitmapFromScan0(W, H, W * 4, kPixelFormat32bppPARGB,
+                                                    (BYTE *)bits, &bmp) == 0 &&
+                    g_gdiplus.GetImageGraphicsContext((GpImage *)bmp, &g2) == 0 && g2) {
+                    g_gdiplus.SetTextRenderingHint(g2, kTextHintAntiAliasGridFit);
+                    ready = true;
+                }
+                if (ready) {
+                    GpFont *f = AcquireRowFont(graphics, L"Segoe UI", 15);
+                    auto inkColumns = [&](const WCHAR *text, float boxW) {
+                        memset(bits, 0, (size_t)W * H * 4);
+                        RectF layout(0.0f, 0.0f, boxW, rowH);
+                        g_gdiplus.DrawString(g2, text, -1, f, &layout, format, (GpBrush *)solid);
+                        int last = -1;
+                        const DWORD *px = (const DWORD *)bits;
+                        for (int x = 0; x < W; x++) {
+                            for (int y = 0; y < H; y++) {
+                                if ((px[y * W + x] & 0x00FFFFFFu) != 0) {
+                                    last = x;
+                                    break;
+                                }
+                            }
+                        }
+                        return last;
+                    };
+                    // The pen advance on its own, for a given font: the string plus the sentinel,
+                    // minus the sentinel. This is exactly what the product measured before the fix,
+                    // so the two boxes below are "the box the old code built" against "the box the
+                    // code builds now", for the same string and the same font.
+                    auto penAdvanceFor = [&](GpFont *pf, const WCHAR *text) {
+                        WCHAR withSentinel[64];
+                        swprintf(withSentinel, 64, L"%ls\x2502", text);
+                        return reportedWidth(pf, withSentinel) - reportedWidth(pf, L"\x2502");
+                    };
+                    // `WWW` is three glyphs of one advance each, so "the ink reaches about two
+                    // advances in" is exactly "the third glyph is still there".
+                    const WCHAR *three = L"WWW";
+                    const float pen = penAdvanceFor(f, three);
+                    const float onePen = penAdvanceFor(f, L"W");
+                    const float measured = MeasureDrawnWidth(graphics, f, format, three, rowH, 15.0f);
+                    const int tight = inkColumns(three, pen);
+                    const int wide = inkColumns(three, measured);
+                    printf("    fs=15 \"W\": pen=%.4f reported=%.4f | \"WWW\": pen=%.4f measured="
+                           "%.4f -> ink columns %d (box=pen) / %d (box=measured)\n",
+                           (double)onePen, (double)reportedWidth(f, L"W"), (double)pen,
+                           (double)measured, tight, wide);
+                    Check(tight < (int)(pen * 2.0f),
+                          "a box of the pen advance alone really does drop the last glyph (this is "
+                          "the reported symptom)");
+                    // "The last glyph is back" is about *ink*, not about a column count: the box
+                    // that holds the drawn width has to put materially more of the run on the
+                    // bitmap than the box that holds only the advance. (An exact column count
+                    // would be a font-metric assertion, not a layout one.)
+                    Check(wide >= tight + 2 && wide >= (int)(measured * 0.9f),
+                          "while a box of the drawn width keeps every glyph of the run");
+                    Check(measured + 0.5f >= reportedWidth(f, three),
+                          "and the drawn width is at least what GDI+ reports for the string");
+                } else {
+                    Skip("the ink probe bitmap could be created (real-text checks)");
+                }
+                if (solid) g_gdiplus.DeleteBrush((GpBrush *)solid);
+                if (g2) g_gdiplus.DeleteGraphics(g2);
+                if (bmp) g_gdiplus.DisposeImage((GpImage *)bmp);
+                if (dib) DeleteObject(dib);
+            }
+
+            // (c) The layout, over the whole matrix the report describes: CJK and ASCII, one / two
+            // / many characters, all three alignments, the group at the start / middle / end of
+            // the row, with and without the trailing space. The plan has to draw exactly the
+            // characters between the tags, the group has to be as wide as what it draws, no run
+            // may have a box narrower than the text GDI+ will put in it, and a centred group has
+            // to be centred on its own text.
+            {
+                const WCHAR *names[3] = {L"left", L"center", L"right"};
+                const WCHAR *content[6] = {
+                    L"W", L"WWW", L"ABCDEFGHIJ", L"\x4F60", L"\x4F60\x597D",
+                    L"\x4F60\x597D\x4E16\x754C\x4E5F\x597D",
+                };
+                const WCHAR *where[3] = {L"at row start", L"in the middle", L"at row end"};
+                int lost = 0, shallow = 0, clipped = 0, offCentre = 0;
+                int lastBadSize = 0;
+                for (int fs = 10; fs <= 30; fs += 2) {
+                    for (int a = 0; a < 3; a++) {
+                        for (int c = 0; c < 6; c++) {
+                            for (int w = 0; w < 3; w++) {
+                                for (int sp = 0; sp < 2; sp++) {
+                                    WCHAR row[256];
+                                    WCHAR body[160];
+                                    swprintf(body, 160, L"[[%ls]]%ls%ls[[/%ls]]", names[a],
+                                             content[c], sp ? L" " : L"", names[a]);
+                                    if (w == 0) swprintf(row, 256, L"%ls", body);
+                                    else if (w == 1) swprintf(row, 256, L"x%lsy", body);
+                                    else swprintf(row, 256, L"xy%ls", body);
+                                    const RowLayoutPlan *plan = ensureRow(row, fs);
+                                    const int gi = groupIndexOf(plan, kAlignSegLeft + a);
+                                    WCHAR seen[256];
+                                    seen[0] = L'\0';
+                                    if (gi >= 0) groupText(plan, gi, seen, 256);
+                                    WCHAR want[160];
+                                    swprintf(want, 160, L"%ls%ls", content[c], sp ? L" " : L"");
+                                    if (wcscmp(seen, want) != 0) {
+                                        lost++;
+                                        lastBadSize = fs;
+                                        if (lost <= 3) {
+                                            printf("      LOST at %d px: [[%ls]] %ls \"%ls\" -> "
+                                                   "\"%ls\" (segs=%d align=%d)\n",
+                                                   fs, names[a], where[w], content[c], seen,
+                                                   plan->segmentCount, plan->alignCount);
+                                        }
+                                        if (lost <= 3) {
+                                            for (int s = 0; s < plan->segmentCount; s++) {
+                                                const RowSegmentPlan &e = plan->segments[s];
+                                                printf("        seg%d grp=%d skip=%d ring=%d icon=%d "
+                                                       "gap=%d fs=%d x=%.2f adv=%.2f box=%.2f "
+                                                       "fitted=%d sliceLen=%d\n",
+                                                       s, e.group, (int)e.skip, (int)e.isRing,
+                                                       (int)e.isIcon, (int)e.isGap, e.fontSize,
+                                                       (double)e.x, (double)e.advance,
+                                                       (double)e.boxWidth, (int)e.fitted,
+                                                       (int)wcslen(e.slice));
+                                            }
+                                        }
+                                    }
+                                    if (gi < 0) continue;
+                                    const AlignGroupPlan &gr = plan->groups[gi];
+                                    float drawn = 0.0f;
+                                    for (int s = gr.firstSegment; s <= gr.lastSegment; s++) {
+                                        const RowSegmentPlan &e = plan->segments[s];
+                                        if (e.skip || e.isRing || e.isIcon || e.isGap) continue;
+                                        GpFont *rf = AcquireRowFont(
+                                            graphics, e.family[0] ? e.family : L"Segoe UI",
+                                            e.fontSize);
+                                        if (!rf) rf = font;
+                                        const float need = MeasureDrawnWidth(
+                                            graphics, rf, format, e.slice, rowH, (float)e.fontSize);
+                                        drawn += need;
+                                        if (e.boxWidth + 0.01f < need) {
+                                            clipped++;
+                                            lastBadSize = fs;
+                                            if (clipped <= 3) {
+                                                printf("      CLIPPED at %d px: [[%ls]] \"%ls\" "
+                                                       "box=%.3f drawn=%.3f (seg fs=%d adv=%.3f, "
+                                                       "remeasured=%.3f, planRowFs=%d)\n",
+                                                       fs, names[a], e.slice, (double)e.boxWidth,
+                                                       (double)need, e.fontSize,
+                                                       (double)e.advance,
+                                                       (double)MeasureAdvance(graphics, rf, format,
+                                                                              e.slice, rowH),
+                                                       plan->rowFontSize);
+                                            }
+                                        }
+                                    }
+                                    if (gr.width + 0.01f < drawn) {
+                                        shallow++;
+                                        lastBadSize = fs;
+                                        if (shallow <= 3) {
+                                            printf("      SHALLOW at %d px: [[%ls]] %ls w=%.3f "
+                                                   "drawn=%.3f\n",
+                                                   fs, names[a], where[w], (double)gr.width,
+                                                   (double)drawn);
+                                        }
+                                    }
+                                    if (a == 1 && drawn > 0.0f) {
+                                        // A group's own bounds are what it is centred within; the
+                                        // acceptance here is a couple of pixels, because the ink
+                                        // box and the advance differ by the trailing glyph's side
+                                        // bearing and a sub-pixel box difference is not the
+                                        // "drawn off its position" the report is about.
+                                        const float textCentre =
+                                            kRowTextLeftInset + column.textWidth / 2.0f;
+                                        const float drawnCentre = gr.x + drawn / 2.0f;
+                                        if (drawnCentre < textCentre - 2.5f ||
+                                            drawnCentre > textCentre + 2.5f) {
+                                            offCentre++;
+                                            lastBadSize = fs;
+                                            if (offCentre <= 3) {
+                                                printf("      OFF-CENTRE at %d px: \"%ls\" centre="
+                                                       "%.3f want=%.3f\n",
+                                                       fs, content[c], (double)drawnCentre,
+                                                       (double)textCentre);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                printf("    layout matrix 10..30 px: lost=%d shallow=%d clipped=%d offCentre=%d "
+                       "(last bad at %d px)\n",
+                       lost, shallow, clipped, offCentre, lastBadSize);
+                Check(lost == 0,
+                      "the group draws every character between its tags, at every font size and "
+                      "both scripts");
+                Check(shallow == 0,
+                      "and the group is as wide as the text it draws (so it is centred where that "
+                      "text is)");
+                Check(clipped == 0,
+                      "and no run is given a box narrower than the text GDI+ draws in it");
+                Check(offCentre == 0, "and a centred group is centred on its own text");
+            }
+
+            // (d) The exact strings from the report, with the raw numbers printed so a failure
+            // names the shape, plus the variants the report calls out (the trailing space, a group
+            // at the row's start with text after it, and a [[size:24]] run in the same row).
+            {
+                struct UserCase {
+                    const WCHAR *row;
+                    const WCHAR *want;
+                    const char *label;
+                };
+                const UserCase cases[] = {
+                    {L"[[h:100]] [[center]]\x4F60\x597D[[/center]]", L"\x4F60\x597D",
+                     "the reported row (h:100 + leading space + centre CJK)"},
+                    {L"[[h:100]] [[center]]hello[[/center]]", L"hello", "the same row in ASCII"},
+                    {L"[[h:100]] [[center]]\x4F60[[/center]]", L"\x4F60", "one CJK character"},
+                    {L"[[h:100]] [[center]]W[[/center]]", L"W", "one ASCII character"},
+                    {L"[[h:100]] [[center]]\x4F60\x597D [[/center]]", L"\x4F60\x597D ",
+                     "the reported row with the trailing space that fixes it"},
+                    {L"[[h:100]] [[center]]\x4F60\x597D[[/center]] [[after]]",
+                     L"\x4F60\x597D", "a group at the row's start with text after it"},
+                    {L"[[h:100]] [[size:24]]\x4F60\x597D[[/size]][[center]]x[[/center]]",
+                     L"x", "a [[size:24]] run in the same row as the group"},
+                };
+                for (const UserCase &uc : cases) {
+                    const RowLayoutPlan *plan = ensureRow(uc.row, 15);
+                    WCHAR seen[128];
+                    seen[0] = L'\0';
+                    int gi = -1;
+                    for (int g = 0; g < plan->alignCount; g++) {
+                        if (plan->groups[g].kind == kAlignSegCenter) gi = g;
+                    }
+                    if (gi < 0 && plan->alignCount > 0) gi = 0;
+                    Check(gi >= 0, "the reported row's group is in the plan at all");
+                    if (gi < 0) continue;
+                    groupText(plan, gi, seen, 128);
+                    const AlignGroupPlan &gr = plan->groups[gi];
+                    GpFont *f = AcquireRowFont(graphics, L"Segoe UI", 15);
+                    float pen = 0.0f;
+                    for (int s = gr.firstSegment; s <= gr.lastSegment; s++) {
+                        const RowSegmentPlan &e = plan->segments[s];
+                        if (e.skip || e.isRing || e.isIcon || e.isGap) continue;
+                        GpFont *rf = AcquireRowFont(graphics,
+                                                    e.family[0] ? e.family : L"Segoe UI",
+                                                    e.fontSize);
+                        if (!rf) rf = f;
+                        pen += MeasureAdvance(graphics, rf, format, e.slice, rowH);
+                    }
+                    printf("    %s\n      drawn \"%ls\" want \"%ls\" | group x=%.2f w=%.2f pen=%.2f "
+                           "| column %.2f..%.2f\n",
+                           uc.label, seen, uc.want, (double)gr.x, (double)gr.width, (double)pen,
+                           (double)kRowTextLeftInset, (double)column.textRight);
+                    Check(wcscmp(seen, uc.want) == 0,
+                          "the reported row's group draws its whole text, and nothing else");
+                    Check(gr.width + 0.01f >= pen, "and its width is at least what it draws");
+                    Check(gr.x + gr.width <= column.textRight + 0.5f,
+                          "and the group still ends inside the panel's text column");
+                    for (int s = gr.firstSegment; s <= gr.lastSegment; s++) {
+                        const RowSegmentPlan &e = plan->segments[s];
+                        if (e.skip || e.isRing || e.isIcon || e.isGap) continue;
+                        GpFont *rf = AcquireRowFont(graphics,
+                                                    e.family[0] ? e.family : L"Segoe UI",
+                                                    e.fontSize);
+                        if (!rf) rf = f;
+                        Check(e.boxWidth + 0.01f >=
+                                  MeasureDrawnWidth(graphics, rf, format, e.slice, rowH,
+                                                    (float)e.fontSize),
+                              "and every run of it has a box wide enough for its own glyphs");
+                    }
+                }
+            }
+        }
+
         // (13) The reported bug: a group is placed by its own tags, so a run *inside* one must
         // never be fitted against wherever the row's flow happened to leave the cursor.
         //
@@ -3779,9 +4161,16 @@ int main() {
             // alignment tags removed. A stray `[[/left]]` vanishes (that is the documented rule)
             // and a well-formed tag that is never honoured would draw as text -- the grammar is
             // only the six tags, so "removed" is what every one of them must be.
+            //
+            // The pieces include CJK: the defect this net sits under is a measurement one, and a
+            // net made only of ASCII would not exercise the glyphs whose ink and advance differ
+            // most. `[[size:24]]` is in there for the same reason: a run's own size changes which
+            // font measures and draws it.
             const WCHAR *pieces[] = {
                 L"A", L"BC", L"xy", L" ", L"[[left]]", L"[[/left]]", L"[[center]]",
                 L"[[/center]]", L"[[right]]", L"[[/right]]", L"Q", L"[[left]]", L"[[/center]]",
+                L"\x4F60", L"\x597D", L"\x4F60\x597D", L"\x4E16\x754C", L"[[size:24]]",
+                L"[[/size]]",
             };
             const int pieceCount = (int)(sizeof(pieces) / sizeof(pieces[0]));
             unsigned seed = 12345u;
@@ -3808,11 +4197,17 @@ int main() {
                 for (const WCHAR *q = row; *q && eused + 1 < 256;) {
                     int matched = 0;
                     if (*q == L'[' && q[1] == L'[') {
+                        // Every **inline** marker the pieces can produce is removed from the
+                        // expected text, because that is what the layout does with them: they are
+                        // markup, not characters. The six alignment tags are the ones this net is
+                        // about; the two `[[size:…]]` markers are here because a run's own size is
+                        // what makes it measure and draw in a different font, which is the code
+                        // path the net above exists to exercise.
                         static const WCHAR *const tags[] = {
                             L"[[left]]", L"[[/left]]", L"[[center]]", L"[[/center]]",
-                            L"[[right]]", L"[[/right]]",
+                            L"[[right]]", L"[[/right]]", L"[[size:24]]", L"[[/size]]",
                         };
-                        for (int t = 0; t < 6; t++) {
+                        for (int t = 0; t < 8; t++) {
                             const int len = (int)wcslen(tags[t]);
                             if (wcsncmp(q, tags[t], len) == 0) {
                                 q += len;

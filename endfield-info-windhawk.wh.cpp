@@ -4535,17 +4535,25 @@ static DWORD ResolveRingColor(const RingSpec &ring, const ModSettings &settings)
     return settings.border;
 }
 
-// Width of a text run, in pixels, including its trailing spaces.
+// Width of a text run, in pixels, including its trailing spaces: **where the pen ends up**.
 //
-// GDI+ MeasureString deliberately ignores trailing spaces (normal typographic
-// behaviour), which is wrong for a layout that positions a gauge immediately
-// after the text: "9%  " must advance by the two spaces or the gauge lands on
-// top of the '%'. Appending a sentinel glyph and subtracting its own width is
-// the portable way to get the true advance.
+// GDI+ MeasureString deliberately ignores trailing spaces (normal typographic behaviour), which is
+// wrong for a layout that positions a gauge immediately after the text: "9%  " must advance by the
+// two spaces or the gauge lands on top of the '%'. Appending a sentinel glyph and subtracting its
+// own width is the portable way to get the true advance.
 //
-// The sentinel is U+2502 BOX DRAWINGS LIGHT VERTICAL, chosen because it is
-// effectively never present in a status row and is not whitespace, so it
-// terminates the trailing-space run that GDI+ would otherwise trim.
+// The sentinel is U+2502 BOX DRAWINGS LIGHT VERTICAL, chosen because it is effectively never
+// present in a status row and is not whitespace, so it terminates the trailing-space run that GDI+
+// would otherwise trim.
+//
+// This is the number the **flow** wants: the cursor, a group's placement and a row's natural width
+// are all questions about where the pen goes. It is *not* the number a layout box wants -- for that
+// see `MeasureDrawnWidth`, which is the larger of this and the extent GDI+ reports, because
+// `GdipDrawString` drops a glyph whose ink does not fit the box and a glyph with a right side
+// bearing reaches past this advance. Keeping the two apart is what makes both right: with them
+// conflated, a layout box built from the drawn extent is right but the run's advance is over-stated
+// (which over-trims: a full-width glyph's ink can be wider than its advance creates room for), and
+// with only this one, the box is a hair too narrow and the last glyph is dropped.
 //
 // exactLength >= 0 measures that prefix and stops there, ignoring anything after it.
 // FitTextToWidth needs this: measuring a prefix by copying it into a shorter buffer
@@ -4570,6 +4578,8 @@ static float MeasureAdvance(GpGraphics *graphics, GpFont *font, GpStringFormat *
     probe[length] = kSentinel;
     probe[length + 1] = L'\0';
 
+    // A box far wider than any panel, so a measurement can never be affected by the clipping
+    // this function exists to prevent.
     RectF box(0.0f, 0.0f, 4000.0f, boxHeight);
     RectF bounds = {};
     INT codepoints = 0, lines = 0;
@@ -4590,6 +4600,50 @@ static float MeasureAdvance(GpGraphics *graphics, GpFont *font, GpStringFormat *
     float advance = withSentinel - sentinelOnly;
     if (advance < 0.0f) advance = 0.0f;
     return advance;
+}
+
+// The width a run's **layout box** has to be: the extent GDI+ needs in order to keep every one of
+// the run's glyphs.
+//
+// `GdipDrawString` does not overflow its box -- a glyph that does not fit is **dropped**, which is
+// the reported "the last character is not drawn" -- and the ink of the last glyph is not bounded by
+// the pen's end position: a glyph with a right side bearing reaches past its own advance. So the
+// box has to be at least the larger of the two, and this is the one function that says so.
+//
+// Measured with the real font at 15 px: `MeasureAdvance("W") = 14.43` while GDI+ reports `19.43`
+// for the same string, and drawing `WWW` in a box of its advance (43.29) inks columns 2..30 -- two
+// of the three glyphs -- against 2..44 at the reported width. The report's "appending a space fixes
+// it" is the same fact from the other side: the space adds advance after the last inked glyph, so
+// the clip edge moves past the ink.
+//
+// The reported width is asked about the same `exactLength` prefix `MeasureAdvance` measured, so the
+// two always describe the same string and the trim search can rely on them together.
+static float MeasureDrawnWidth(GpGraphics *graphics, GpFont *font, GpStringFormat *format,
+                               const WCHAR *text, float boxHeight, int exactLength = -1) {
+    const float advance = MeasureAdvance(graphics, font, format, text, boxHeight, exactLength);
+    if (!graphics || !font || !format || !text) return advance;
+
+    int length = exactLength >= 0 ? exactLength : (int)wcslen(text);
+    if (length > 640) length = 640;
+    if (length <= 0) return advance;
+
+    WCHAR plain[644];
+    wcsncpy(plain, text, length);
+    plain[length] = L'\0';
+
+    // A box far wider than any panel, so the answer cannot be affected by the clipping this
+    // function exists to prevent.
+    RectF box(0.0f, 0.0f, 4000.0f, boxHeight);
+    RectF bounds = {};
+    INT codepoints = 0, lines = 0;
+    g_measureCalls++;
+    if (g_gdiplus.MeasureString(graphics, plain, -1, font, &box, format, &bounds, &codepoints,
+                                &lines) != 0) {
+        return advance;
+    }
+    // Never smaller than the advance: the pen can end past the ink of the last glyph (a left side
+    // bearing), and the box only has to be the larger of the two questions.
+    return bounds.Width > advance ? bounds.Width : advance;
 }
 
 // How many characters of a run fit inside `budget` pixels.
@@ -6625,8 +6679,7 @@ struct RowSegmentPlan {
     bool isIcon = false;    // an inline icon: `x` is its left edge, `diameter` its box
     bool isGap = false;     // empty space: `x` is where the space begins, `advance` its width
     bool skip = false;      // nothing to draw (empty run)
-    // Which alignment group this segment belongs to: `kAlignSegFlow` (0) for the row's own flow,
-    // otherwise the group's marker digit (1..3), exactly as `TextSeg::group` carries it. Element
+    // Which alignment group this segment belongs to: `kAlignSegFlow` (0) for the row's own flow,    // otherwise the group's marker digit (1..3), exactly as `TextSeg::group` carries it. Element
     // segments are placed by the same rules wherever they sit, so the painter never has to know
     // -- but the *tests* do, because "the group's width is the sum of its parts" and "a run's
     // budget comes from the group's right edge" are both statements about this grouping.
@@ -6645,6 +6698,13 @@ struct RowSegmentPlan {
     float x = 0.0f;         // left edge (text, icon) / centre (ring)
     float boxWidth = 0.0f;  // the layout box the text is drawn in
     float advance = 0.0f;   // how far an inline cursor moves on
+    // How wide the ink of this segment is, which is not always its advance: GDI+ reports a text
+    // run's extent as its glyphs' inked box, and the last glyph's right side bearing reaches past
+    // the pen's end position. A group is as wide as this, not as wide as its parts' advances (see
+    // phase B), so that the number the group is *placed* by and the number its runs are *fitted*
+    // against both describe what will be on the panel. Zero for an element, which sets `advance`
+    // itself and has no glyph box.
+    float drawnWidth = 0.0f;
     // An inline icon. The image path is resolved here, once per publish, for the same reason
     // the text is fitted here: the frame must not trim a user path or reach into a compiled
     // program. `diameter` is this element's own size (see IconDiameterForFontSize).
@@ -6873,6 +6933,10 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
                 entry.x = regionCursor;
             }
             entry.advance = elementAdvance;
+            // An element has no glyph box: its ink is its advance (a gauge's box, an icon's disc, a
+            // gap's space). A group's width is the sum of its parts' drawn widths, so leaving this
+            // at zero would make the group as narrow as its text runs alone.
+            entry.drawnWidth = elementAdvance;
             regionCursor += elementAdvance;
             continue;
         }
@@ -6954,8 +7018,23 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
         }
         entry.x = regionCursor;
         entry.advance = advance;
-        entry.boxWidth =
-            (inlineFlow || seg.group != kAlignSegFlow) ? LayoutWidthFloor(advance) : budget;
+        // Default: a segment's ink is as wide as its advance. An element (a gauge's box, an icon's
+        // disc, a gap's space) has no glyph box and is exactly this; a text run is then measured
+        // for its own ink below.
+        entry.drawnWidth = advance;
+        entry.boxWidth = (inlineFlow || seg.group != kAlignSegFlow)
+                             ? LayoutWidthFloor(MeasureDrawnWidth(graphics, runFont, format,
+                                                                  entry.slice, rowHeight))
+                             : budget;
+        // The width of the *ink* this run will put on the panel, which is what a group is as wide
+        // as (see phase B): the group's width is both where it is placed and the budget phase C
+        // re-fits it against, and a group measured by pen advances alone is handed a budget a
+        // fraction under its own ink -- GDI+ then drops the glyph that does not fit, which is the
+        // missing last character in the report. Taken here, from the same fitted slice and the same
+        // font the box above uses, so the group's width cannot disagree with what is drawn.
+        if (inlineFlow || seg.group != kAlignSegFlow) {
+            entry.drawnWidth = MeasureDrawnWidth(graphics, runFont, format, entry.slice, rowHeight);
+        }
         regionCursor += advance;
     }
 
@@ -6996,14 +7075,21 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
         AlignGroupPlan &group = plan.groups[g];
         // Every group has at least one segment (it is created *from* one), so firstSegment ..
         // lastSegment is always a valid, non-empty range -- there is no empty-group case to guard.
-        // The width is the sum of the parts' advances, and the parts were placed by the flow
-        // above, so nothing here can disagree with it. (Deriving it from the last part's right edge
-        // minus the first part's left edge reads the same and is not: the segments have already
-        // been shifted by the time this runs for a later group, and the subtraction then measures
-        // the distance from the shift, not the content.)
+        // The width is the sum of the parts' *drawn* widths, and the parts were measured by the
+        // flow above, so nothing here can disagree with what will be painted. (Deriving it from the
+        // last part's right edge minus the first part's left edge reads the same and is not: the
+        // segments have already been shifted by the time this runs for a later group, and the
+        // subtraction then measures the distance from the shift, not the content.)
         float width = 0.0f;
         for (int s = group.firstSegment; s <= group.lastSegment; s++) {
-            width += plan.segments[s].advance;
+            // The drawn width, not the advance. A group's width is where the group is placed *and*
+            // the right edge phase C re-fits its runs against, so a group summed from advances
+            // alone hands its runs a budget a fraction under their own ink -- and GDI+ drops the
+            // glyph that does not fit, which is the missing last character this group is named
+            // after. A run's two numbers differ by its trailing glyph's right side bearing (for
+            // `W` at 15 px: an advance of 14.43 against a drawn 19.43); elements set only their
+            // advance, which is their box by construction.
+            width += plan.segments[s].drawnWidth;
         }
         group.width = width;
         float x = kRowTextLeftInset;
@@ -7047,13 +7133,14 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
                                    : AcquireRowFont(graphics, g_settings.fontFamily,
                                                     entry.fontSize));
         if (!runFont) return;
+        const float refitBudget = LayoutWidthFloor(budget);
 
         WCHAR original[640];
         wcsncpy(original, entry.slice, 639);
         original[639] = L'\0';
         if (FitTextToWidth(graphics, runFont, format, entry.slice,
-                           (int)(sizeof(entry.slice) / sizeof(entry.slice[0])),
-                           LayoutWidthFloor(budget), rowHeight)) {
+                           (int)(sizeof(entry.slice) / sizeof(entry.slice[0])), refitBudget,
+                           rowHeight)) {
             entry.fitted = true;
             entry.advance = MeasureAdvance(graphics, runFont, format, entry.slice, rowHeight);
         }
@@ -7066,11 +7153,32 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
         // are placed against. A parked run's box is still the rest of the row's text column: the
         // format is left-aligned, so a wider box draws the same glyphs in the same place, and the
         // parked path has always sized its box that way.
-        entry.boxWidth = flowing ? LayoutWidthFloor(entry.advance) : budget;
+        //
+        // A flowing (or grouped) run's box is its own measured width, which is what the elements
+        // after it are placed against. A parked run's box is still the rest of the row's text
+        // column: the format is left-aligned, so a wider box draws the same glyphs in the same
+        // place, and the parked path has always sized its box that way.
+        //
+        // It is `MeasureDrawnWidth` rather than the advance, and rather than the budget: the
+        // budget is what the run *may* use, while the box is what GDI+ will fit glyphs into, and a
+        // box of the advance width drops the run's last glyph (the reported symptom). The measured
+        // width already includes the trailing glyph's ink, so it is also the floor the budget
+        // cannot go below without cutting a glyph the panel has room for.
+        entry.boxWidth = flowing ? LayoutWidthFloor(MeasureDrawnWidth(graphics, runFont, format,
+                                                                     entry.slice, rowHeight))
+                                 : budget;
+        entry.drawnWidth = flowing ? MeasureDrawnWidth(graphics, runFont, format, entry.slice,
+                                                       rowHeight)
+                                   : entry.advance;
     };
 
     for (int g = 0; g < plan.alignCount; g++) {
         const AlignGroupPlan &group = plan.groups[g];
+        // One shift for the whole group: every part of it moves to panel coordinates together,
+        // elements included. A text run's x was set by the flow in phase A, so it needs the shift
+        // to be drawn in the right place; an element's x is the *group's* own frame until it is
+        // placed here, and the budget below is measured from it against the group's right edge, so
+        // leaving it behind would measure the two in different frames.
         const float shift = group.x - plan.segments[group.firstSegment].x;
         for (int s = group.firstSegment; s <= group.lastSegment; s++) plan.segments[s].x += shift;
 
@@ -7081,6 +7189,12 @@ static void BuildRowPlan(GpGraphics *graphics, GpFont *rowMainFont, GpStringForm
             for (int k = s + 1; k < plan.segmentCount; k++) {
                 if (g_rowState.segments[row][k].offset == kRingSegOffset) ringsAfter++;
             }
+            // Every part of the group is in panel coordinates by now -- the shift above moved the
+            // text runs, and this moves the elements with them -- so the cursor and the edge it is
+            // measured against are in the same frame by construction. Mixing them was a real bug
+            // twice over: an element left in the group's own frame made the right edge look like it
+            // was *behind* the cursor (a negative budget, so the run was trimmed to nothing), and
+            // it is also why "the group's own frame" was needed in phase A at all.
             const float budget =
                 FlowTextLimit(right, plan.segments[s].x, ringsAfter, g_settings.ringSize);
             refitRun(s, group.lastSegment, budget, true);
