@@ -380,7 +380,7 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 - `{cpu.ghz}`：用户确认显示**正确**，标称取电源 API 的 **2.20 GHz**（注册表 2.42 被正确忽略）。⚠️ 但**保存过任何设置之后**它曾回退到注册表值（2026-10-14 修，见 §10.y 头条 1）。
 - 看门狗：日志出现 `EXT publisher: started pid=…`，命令行按 `CreateProcessW` 约定正确拆分。
 - 歌词来源（部分打通）：`async:lyric.lyricLines`（实测 **64 / 67** 行）与 `tlyricLines`；**真 currentTime** 来自 `#page_pc_mini_bar` 的 `mm:ss / mm:ss`。
-- bridge 自检 **66 项**（含 8 项 Select-StoreLineIndex、6 项行时间表缓存、4 项 store 行时间当位置的判定，与 5 项窗口/曲名判定，都不假设长度或环境）全绿。
+- bridge 自检 **74 项**（含 8 项 Select-StoreLineIndex、6 项行时间表缓存、9 项收敛判定、4 项 store 行时间当位置的判定，与 5 项窗口/曲名判定，都不假设长度或环境）全绿。
 - 图标全局覆盖（Custom icon file）与 None 语义：2026-10-14 实现并断言（第四批，见 §10.y）。
 - **曲名来源（真机定论，2026-10-14）**：网易云开着「桌面歌词」时 `cloudmusic` 的 `MainWindowTitle`
   **就是「桌面歌词」**，带歌名的窗口是同一 pid 的**另一个顶层窗口**
@@ -391,15 +391,55 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 
 **未验证 / 待办（按优先级）**：
 
-1. **手动切歌之后歌词是否真的继续走**（2026-10-15 用户报"切歌后歌词不动"；本机没有网易云在跑、
-   也没有 CDP 端口，**没能真机复现**）。已经做掉的：把位置降级链里"会冻结的 store 行时间"这条
-   来源加上前进判据（`Test-StoreLineUsable`），并让行时间表缓存多一把"行数"的尺子
-   （`Test-StoreTimesStale`）；`-ProbeStore` 每轮新增 `origin=` / `lineMs=` / `table=` 三列。
-   **还缺的证据**（一次运行就能定性）：手播一次歌，同时看
+0. ~~**对齐组吃掉最后一个字符**~~ —— **2026-10-15 已在宿主复现并修掉**（真机症状：组里一个
+   字符时"偏离原位"、多个字符时**最后一个不画**（中英文皆然）、末尾**加一个空格**就好）。
+   根因是两个数被当成一个：组的宽度与 `DrawString` 的 layout 框用的是 `MeasureAdvance`
+   （**笔的推进**），而 GDI+ 需要的框宽是**墨迹范围**——最后一个字形的右侧边距会超出笔的终点
+   （15 px `Segoe UI` 的 `W`：笔进 14.43 / GDI+ 报 19.43，`WW`/`WWW` 同为 5.00；
+   把 `WWW` 画进 43.29 的框只出来**两个字**，48.29 才三个）。**GDI+ 不溢出框、它丢掉放不下的字形**，
+   所以框窄一丁点儿就是"最后一个字不显示"；一个字符时表现为位置偏一点；末尾空格"有推进、无墨迹"，
+   正好补上差值——三个症状同源。另外相位 C 有一处坐标架混用（元素仍在组的局部坐标、右边缘是面板
+   坐标，续段预算算成负数、整段被截没）。
+   修法：`MeasureAdvance` 仍是笔的推进（行流游标/定位/自然宽度），新增 `MeasureDrawnWidth`
+   （两者取大）作为**框与组宽度**的唯一来源；相位 C 把组内元素一起平移到面板坐标。
+   断言：`a run's layout box is at least as wide as the text GDI+ draws in it`、
+   `text drawn in a box as wide as its advance keeps all of its glyphs`、
+   `the group draws every character between its tags, at every font size and both scripts`、
+   `and the group is as wide as the text it draws (so it is centred where that text is)`、
+   `and no run is given a box narrower than the text GDI+ draws in it`、
+   `and a centred group is centred on its own text`，外加用户原串
+   `[[h:100]] [[center]]你好[[/center]]` 的直接断言（10..30 px × 三种对齐 × 三种位置 × 有无尾随空格
+   × 中英文 × 1/2/多字符 × 行内有 `[[size:24]]` 的全矩阵，`lost/shallow/clipped/offCentre` 全 0）。
+   负对照：① `MeasureDrawnWidth` 退回笔推进 → 5 条红（含 `a run's layout box is at least as wide...`
+   与 `and a centred group is centred on its own text`）；② 组的相位 A 预算退回行流游标 →
+   `a group's content survives a long flow run before it (all three alignments)` 等 6 条红。
+   两条都已还原（SHA-256 与改动前一致）。
+   ⚠️ 教训：上一版断言只扫 `'W' × 0..40` **一个字号**，而那个字号恰好没有这个差值——
+   **断言要在真实的字号范围上扫，不能只扫一种字号**（与 §7 第 9 条"喂真输入"同源）。
+1. **手动切歌之后歌词是否真的继续走**（2026-10-15 用户报"切歌后歌词不动"）。口径已改：
+   把位置降级链里"会冻结的 store 行时间"这条来源加上前进判据（`Test-StoreLineUsable`）；
+   `-ProbeStore` 每轮新增 `origin=` / `lineMs=` / `table=` 三列。
+   **2026-10-15 拿到了用户跑出来的探针输出：`table=stale`** —— 那指向 `b97f403` 加的第二把尺子
+   （行数），而它的**不收敛形状**已经改掉：旧判定拿**两次不同的读**去比相等（缓存行数来自
+   读表那一拍、store 行数来自这一拍），只要对不上就每拍都判过期、每拍都重读，表永远"过期"、
+   选行缓存被反复清掉。现在 `Get-StoreTimesVerdict` 把 **id 当"这份表属于谁"的判据、
+   行数当"要不要再读一次"的触发器**（这个行数没读过 → 读一次并记下；同一个行数再来 → 就用
+   这份表；行数再变 → 再允许读一次），所以每个 (id, 行数) 组合最多多读一次、**任何情况下都收敛**，
+   而"上一首的表被打上新 id"仍然在第一格就被读掉。`-ProbeStore` 改成跟着主循环的判定走
+   （判过期就重读一次）并**点名子条件**（`stale(Track)` / `stale(Lines)` / `stale(Empty)`），
+   再加一行 `table-in:`（`cached=` / `store=` / 两个 id / `acceptedLines=`）与每个位置来源
+   各自的新鲜度；bridge 自检 66 → **74 项**（含 9 项收敛判定的状态机断言）。
+   负对照：把行数触发器去掉（行数对不上也放行）→ `时间表缓存：行数对不上 → 判 stale(Lines)，
+   重读一拍后就 fresh（不再永远过期）` 等 4 条红；已还原（SHA-256 与改动前一致）。
+   **还缺的证据**：真机跑一次
    `pwsh -ExecutionPolicy Bypass -File _netease-bridge.ps1 -ProbeStore -ProbeRounds 30`
-   的 `pos` / `lineMs` / `table` 三列，以及面板上 `{ext.netease.pos}` 的**来源名**：
+   并手播一次歌，看 `table=stale(<子条件>)` 会不会在**下一轮**变成 `fresh`。
+   （本机 2026-10-15 实测的一首歌是 `table=fresh`、`cached=2`、`store=2`、两个 id 相同——
+   即这个形状在本机没有触发；探针开盘还打印 `times[0..3]` 便于核对那把尺子。）
+   仍然可能的三条判读：
    · `pos=n/a` 且 `lineMs` 一直不变 → 迷你条 DOM 读不到、位置会退到 store 行时间（已修的那条）；
-   · `table=stale`（或 `times` 与 store 的 `lines` 不一致）→ 表是上一份数组的（第二把尺子那条）；
+   · `table=stale(Lines)` 且下一轮还是它，而 `table-in:` 的 `cached=`/`store=` **卡住不动** →
+     store 报的行数与表里记着的行数不是同一把尺子（例如歌词数组比 2000 行上限还长）；
    · `pos` 与 `byPosition` 都在走、而面板歌词不动 → 问题在取行文本那一环（`Get-CdpStoreLyricLine`），
      目前**没有**任何证据指向这一条。
    ⚠️ 2026-10-14：`$positionMs = $null` 被写了两遍、第二遍把 DOM 的真 currentTime 清掉（已修，见 §10.y 头条 3）。
@@ -476,6 +516,8 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 | sampler 的 join 超时被忽略 | 超时后仍 `DeleteCriticalSection(&g_valuesLock)`：另一条线程可能还握着它，未定义行为 | `a sampler that did not stop leaves its lock alone`、`and so does a failed wait` |
 | 自定义图片不参与入场缩放 | 图片只淡入、不随盘子长大（内置字形那条路径一直会） | `and follows the intro as it scales the plate in`、`while the intro still scales it down` |
 | PDH 的 GPU 数组读只认 `ERROR_SUCCESS` | 计数器刚建好时的第一个采样（`NEW_DATA`）被丢掉 → GPU 读数晚一拍 | `and so is a counter's first sample (new data)` |
+| 对齐组里最后一个字符不显示 / 位置偏一点 | 组里一个字符时"偏离原位"、多个字符时**最后一个不画**（中英文皆然），末尾加一个空格就好 | 组宽度与 layout 框曾用"笔的推进"（`MeasureAdvance`），而 GDI+ 要的是**墨迹范围**：15 px `W` 笔进 14.43 / 报 19.43；`WWW` 放进 43.29 的框只出**两个字**。GDI+ **丢弃**放不下的字形。断言 `a run's layout box is at least as wide as the text GDI+ draws in it`、`the group draws every character between its tags, at every font size and both scripts`、`and a centred group is centred on its own text`（10..30 px 全扫，含用户原串） |
+| 行时间表缓存"行数必须相等"把表判成永久过期 | 真机 `-ProbeStore` 报 `table=stale`，歌词不动：每拍都判过期 → 每拍都重读 → 选行缓存被反复清掉 | 缓存行数与 store 行数来自**两次不同的读**，比相等就永远不成立。现在 id 是"这份表属于谁"的判据、行数是"要不要再读一次"的触发器（这个行数没读过才读，读过就用；行数再变再读一次）。断言：`时间表缓存：行数对不上 → 判 stale(Lines)，重读一拍后就 fresh（不再永远过期）`、`…只换曲目 id → …`、`…两个切片互相追…最多两拍收敛`（照主循环跑状态机），探针点名 `stale(Track/Lines/Empty)` |
 | bridge 的 `$client.Connect(3000)` 无保护 | 瞬时连不上变成未处理异常、脚本当场死掉，mod 看门狗再拉起它——重启预算烧在"再等一秒就能连上"上 | 自检 `连不上管道时返回空值（不抛异常）`；对照（裸 Connect）实测未捕获异常 + exit 1 |
 | bridge 用 `Process.MainWindowTitle` 取曲名 | **开着「桌面歌词」时 `MainWindowTitle` 就是「桌面歌词」**（真机实测 2026-10-14：`Get-Process -Id 15824` → `cloudmusic / 桌面歌词`，而同一 pid 另一个顶层窗口才是「下等马 - 洛天依…」）→ 标题里永远没有「 - 」→ 桥一直停在"没有可用窗口"的等待循环里、**从不连接**，面板 title/lyric 两行永远 `--` | 自检 `曲目标题：桌面歌词窗口不算曲目`、`曲目标题：从多窗口里挑出带「 - 」的那个`、`曲目标题：多个候选取最长的`、`窗口枚举：网易云在跑时能看到它的顶层窗口`；活体输出 `网易云顶层窗口（2 个）：[桌面歌词] [下等马 - …]` |
 | 推送把采样器整个叫醒 | **系统信息刷新跟着发布器节奏变快**（与配置的刷新间隔无关，NVML 也被拖到同一频率）；重复的推送值与没变的采样还会白重绘 | `SamplerWakeIsLight` 的 5 条策略断言、`a pushed value costs no system sample`（对照 `while a scheduled sample does re-read the counters`）、`publishing the same values again is not (so it is not repainted)`；现场证据是 `[perf]` 的 `samples=` / `republish=` |

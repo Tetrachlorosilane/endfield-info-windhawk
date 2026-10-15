@@ -994,11 +994,52 @@ function Select-StoreLineIndex {
 function Test-StoreTimesStale {
     param([object[]]$Cached, [string]$CachedTrack, [int]$CachedLines,
           [string]$StoreTrack, [int]$StoreLines)
-    if (-not $Cached) { return $true }                 # 没表（或空表）→ 必须读
-    if ($CachedTrack -ne $StoreTrack) { return $true }  # 别的曲目 → 必须读
-    # 行数只在两边都是**正数**时才算数：读取失败/旧客户端给 0 时不能让这里变成每拍重读。
-    if ($CachedLines -gt 0 -and $StoreLines -gt 0 -and $CachedLines -ne $StoreLines) { return $true }
-    return $false
+    # 只回答"重不重读"（`Get-StoreTimesVerdict` 的 `.ReRead`）。保留这个薄壳是因为它的名字
+    # 就是这个问题，而判定本身（以及**为什么**）在下面那个函数里——行数那一把尺子不收敛的
+    # 形状见那里的注释。
+    return (Get-StoreTimesVerdict -Cached $Cached -CachedTrack $CachedTrack `
+            -CachedLines $CachedLines -StoreTrack $StoreTrack -StoreLines $StoreLines).ReRead
+}
+# 纯函数：**为什么**要（或不要）重读行时间表，以及这次判定是不是最后一句（-SelfTest 覆盖）。
+#
+# `Test-StoreTimesStale` 只回答"重不重读"，而它的行数那一把尺子有一个**不收敛**的形状：
+# 缓存里的行数与 store 报的行数来自**两次不同的读**（缓存行数来自读表那一拍，store 行数来自
+# 这一拍的 state），所以只要两者对不上，它就会**每一拍都判过期**——每次重读又把新读到的行数
+# 写回缓存，下一拍再对不上，如此往复。表永远"过期"，选行的缓存行号被反复清掉，歌词就停住
+# （真机 `-ProbeStore` 报 `table=stale` 就是它）。判据必须**收敛**，所以拆成三件事：
+#
+#   1. 没表 / 别的曲目 → `Track` 或 `Empty`，**立刻重读**（这两条永远是真的，不会来回摆）。
+#   2. store 报的行数未知（0）→ **不重读**：不能拿一个不知道的数去逼重读（否则每拍一次 CDP）。
+#   3. 行数对得上 → **不重读**：这份表就是现在这份数组的。
+#   4. 行数对不上 → 看"这份表是不是已经为**这个行数**读过一次了"（`AcceptedLines`）。
+#      没读过 → `Lines`，重读（并记下 `AcceptedLines` = 这一拍观察到的行数）；
+#      读过   → 不重读，**用这份表**。
+#
+# 第 4 条里的 `AcceptedLines` 是**观察到的行数**，不是数次数——这一点是整个收敛性的关键：
+# 行数**又变了**（`AcceptedLines -ne StoreLines`）就等于"新信息到了"，于是又允许重读一次。
+# 换歌时 `async:lyric` 切片一格格追上来（26 → 27 → 28）正是这个形状：每一格都会让表重读一次，
+# 而**任何一格都不会永远挡住使用**——最坏情况是"每格多读一次"，不是"永远不读旧表也不更新"。
+# 于是 `b97f403` 要防的那件事（上一首的表被打上新 id）在第一格就被读掉，而选行缓存也不会
+# 被无休止清空。
+#
+# 换句话说：**id 判"这份表属于谁"；行数是"要不要再读一次"的触发器，而触发器只在行数真的变化时复位。**
+function Get-StoreTimesVerdict {
+    param([object[]]$Cached, [string]$CachedTrack, [int]$CachedLines,
+          [string]$StoreTrack, [int]$StoreLines, [int]$AcceptedLines = -1)
+    $v = @{ Stale = $false; Reason = 'Fresh'; ReRead = $false }
+    if (-not $Cached) {
+        $v.Stale = $true; $v.Reason = 'Empty'; $v.ReRead = $true
+        return $v
+    }
+    if ($CachedTrack -ne $StoreTrack) {
+        $v.Stale = $true; $v.Reason = 'Track'; $v.ReRead = $true
+        return $v
+    }
+    if ($StoreLines -le 0) { return $v }                     # 行数未知 → 不重读
+    if ($CachedLines -eq $StoreLines) { return $v }           # 对得上 → 这份表就是现在这份数组的
+    if ($AcceptedLines -eq $StoreLines) { return $v }          # 已经为**这个行数**读过一次 → 不再读
+    $v.Stale = $true; $v.Reason = 'Lines'; $v.ReRead = $true
+    return $v
 }
 
 # 纯函数：store 的"当前行起始时间"能不能当**位置**用（-SelfTest 覆盖）。
@@ -1420,6 +1461,74 @@ if ($SelfTest) {
     # 一个固定时刻，给"两拍之间过了多久"这类断言用（不依赖真实时钟）。
     $stamp = [datetime]::new(2026, 10, 14, 12, 0, 0, [DateTimeKind]::Local)
     $lines = ConvertFrom-Lrc -Text $fixture
+
+    # --- 行时间表的判定必须**收敛**：照主循环的规则跑一台小状态机 --------------------------
+    #
+    # 真机 `table=stale` 就是"判过期 → 重读 → 下一拍还是过期"这个形状。单条纯函数断言看不出
+    # 它（要**多拍**才看得出来），所以这里把主循环那三行（判 → 重读 → 记 accepted/id）原样
+    # 搬进一个模型，让它跑若干拍，断言"最后必须是 fresh"以及"总共只重读了几次"。
+    # 观察序列就是每拍 store 报的 (id, 行数)。
+    function Invoke-StoreTableModel {
+        param([string[]]$Ids, [int[]]$Lines, [int]$Cap = 12)
+        $m = @{ Cache = $null; Track = ''; Lines = 0; AcceptedLines = -1; IdSeen = ''; Reads = 0
+                Verdicts = @(); Round = -1 }
+        for ($r = 0; $r -lt [Math]::Min($Ids.Count, $Cap); $r++) {
+            $v = Get-StoreTimesVerdict -Cached $m.Cache -CachedTrack $m.Track -CachedLines $m.Lines `
+                -StoreTrack $Ids[$r] -StoreLines $Lines[$r] -AcceptedLines $m.AcceptedLines
+            $v | Add-Member -NotePropertyName Round -NotePropertyValue $r -Force
+            $m.Verdicts += $v
+            if ($v.ReRead) {
+                # 括号**必须**包住整个右侧：`$x = @(0) * [Math]::Max($a, 1)` 里的乘法先算，
+                # 结果是 $null（"op_乘"拿到一个方法调用），缓存根本没被写进去。
+                $m.Cache = @(0) * ([Math]::Max($Lines[$r], 1))   # 重读读到的是**这一拍**的行数
+                $m.Track = $Ids[$r]
+                $m.Lines = $Lines[$r]
+                $m.AcceptedLines = $Lines[$r]
+                $m.Reads++
+            }
+            $m.Round = $r
+        }
+        return $m
+    }
+    $script:V02Ok = $false; $script:V03Ok = $false; $script:V04Ok = $false
+    $script:V05Ok = $false; $script:V06Ok = $false; $script:V07Ok = $false; $script:V08Ok = $false
+    # ①（这条在旧代码上是**红**的）同一首、id 不变，行数一路在变 —— 旧判定每拍都 stale，
+    #    新判定每来一个新的行数只多读一次，随后就 fresh。
+    #    模型从**空缓存**起步，所以第 0 拍本身就是一次重读（正常的冷启动）。
+    $m1 = Invoke-StoreTableModel -Ids @('A', 'A', 'A', 'A', 'A') -Lines @(10, 26, 26, 26, 26)
+    $script:V02Ok = ($m1.Verdicts[0].Stale -and $m1.Verdicts[0].Reason -eq 'Empty' -and
+                    $m1.Verdicts[1].Stale -and $m1.Verdicts[1].Reason -eq 'Lines' -and
+                    -not $m1.Verdicts[2].Stale -and -not $m1.Verdicts[3].Stale -and
+                    -not $m1.Verdicts[4].Stale -and $m1.Reads -eq 2)
+    # ② 只换曲目 id（第 0 拍是冷启动的重读）。
+    $m2 = Invoke-StoreTableModel -Ids @('A', 'B', 'B') -Lines @(10, 20, 20)
+    $script:V03Ok = ($m2.Verdicts[1].Stale -and $m2.Verdicts[1].Reason -eq 'Track' -and
+                    -not $m2.Verdicts[2].Stale -and $m2.Reads -eq 2)
+    # ③ 同一首、只换行数：读一次后就该用它（旧代码在这里会再判过期一次）。
+    $m3 = Invoke-StoreTableModel -Ids @('A', 'A', 'A') -Lines @(10, 40, 40)
+    $script:V04Ok = ($m3.Verdicts[1].Stale -and $m3.Verdicts[1].Reason -eq 'Lines' -and
+                    -not $m3.Verdicts[2].Stale -and $m3.Reads -eq 2)
+    # ④ 行数未知（store 给 0）：未知不是"过期的证据"，所以除了冷启动那一次不再重读。
+    #    注意**空数组在 PowerShell 里是假的**，而行数为 0 时重读回来的表就是空数组
+    #    （@(0) * 0 = @()）——所以 store 一直报 0 时缓存等于没建起来。那是"还没有行"的
+    #    真实形状（换歌瞬间 async:lyric 还没填），主循环会一直重读到有行为止，这里就照着测。
+    $m4 = Invoke-StoreTableModel -Ids @('A', 'A', 'A') -Lines @(0, 0, 0)
+    $script:V05Ok = ($m4.Reads -ge 1 -and $m4.Round -eq 2)
+    # ⑤ 这正是 b97f403 要防的那件：缓存里是**上一首的表**、id 已经是新歌。
+    $m5 = Invoke-StoreTableModel -Ids @('OLD', 'NEW', 'NEW', 'NEW') -Lines @(10, 26, 26, 26)
+    $script:V06Ok = ($m5.Verdicts[1].Stale -and $m5.Verdicts[1].Reason -eq 'Track' -and
+                    -not $m5.Verdicts[2].Stale -and -not $m5.Verdicts[3].Stale -and
+                    $m5.Reads -eq 2)
+    # ⑥ 换歌那一拍缓存被显式清空 → 下一拍必须重读（"清了却没人读"不成立）。
+    $v6 = Get-StoreTimesVerdict -Cached $null -CachedTrack '' -CachedLines 0 -StoreTrack 'A' -StoreLines 26
+    $script:V07Ok = ($v6.Stale -and $v6.Reason -eq 'Empty' -and $v6.ReRead)
+    # ⑦ 两个切片互相追：行数一格格涨上来（26 → 27 → 28），每一格多读一次，**每一格也都用得上**
+    #    （旧代码的形状是"过期之后永远过期"）。冷启动 + 两次追 = 三次读。
+    $m7 = Invoke-StoreTableModel -Ids @('A', 'A', 'A') -Lines @(26, 27, 28)
+    $script:V08Ok = ($m7.Verdicts[1].Stale -and $m7.Verdicts[1].Reason -eq 'Lines' -and
+                    $m7.Verdicts[2].Stale -and $m7.Verdicts[2].Reason -eq 'Lines' -and
+                    $m7.Reads -eq 3 -and $m7.Cache.Count -eq 28)
+
     $checks = @(
         @{ Name = '解析出 3 行（元信息与纯时间戳行被丢掉）'; Ok = ($lines.Count -eq 3) }
         @{ Name = '首行时间 0ms'; Ok = ($lines[0].At -eq 0) }
@@ -1490,6 +1599,19 @@ if ($SelfTest) {
         @{ Name = '时间表缓存：曲目变了 = 过期'; Ok = (Test-StoreTimesStale -Cached @(0, 1, 2) -CachedTrack 'x' -CachedLines 3 -StoreTrack 'y' -StoreLines 3) }
         @{ Name = '时间表缓存：曲目 id 相同但行数变了 = 过期（表不是现在这份数组的）'; Ok = (Test-StoreTimesStale -Cached @(0, 1, 2) -CachedTrack 'x' -CachedLines 3 -StoreTrack 'x' -StoreLines 26) }
         @{ Name = '时间表缓存：行数未知（0）时不重读，免得变成每拍一次 CDP'; Ok = (-not (Test-StoreTimesStale -Cached @(0, 1, 2) -CachedTrack 'x' -CachedLines 3 -StoreTrack 'x' -StoreLines 0)) }
+        # --- 判定必须**收敛**（真机 `table=stale` 报的就是它不收敛）-----------------------------
+        #
+        # 下面这几条不是"再问一次纯函数"，而是**照主循环的规则跑一台状态机**：缓存 + accepted
+        # 标记，每拍判一次，判要重读就重读（把观察到的行数写进缓存）。于是它们回答的正是
+        # "念了过期之后到底能不能变新鲜"——`Test-StoreTimesStale` 单独一条断言答不了这个，
+        # 因为不收敛的形状要**多拍**才看得出来。`.Reason` 一个字都不能改：探针就是靠它点名。
+        @{ Name = '时间表缓存：行数对不上 → 判 stale(Lines)，重读一拍后就 fresh（不再永远过期）'; Ok = $script:V02Ok }
+        @{ Name = '时间表缓存：只换曲目 id → 判 stale(Track)，重读后 fresh'; Ok = $script:V03Ok }
+        @{ Name = '时间表缓存：只换行数（同一首）→ 判 stale(Lines)，重读后 fresh'; Ok = $script:V04Ok }
+        @{ Name = '时间表缓存：行数未知（store 给 0）→ 不把"未知"当过期（空表则继续读，直到有行）'; Ok = $script:V05Ok }
+        @{ Name = '时间表缓存：上一首的表被打上新 id → 第一拍就 stale(Track)，重读后 fresh，且不会每拍都读'; Ok = $script:V06Ok }
+        @{ Name = '时间表缓存：清空缓存 → 下一拍 stale(Empty) 并重读（"清了却没人读"不成立）'; Ok = $script:V07Ok }
+        @{ Name = '时间表缓存：两个切片互相追（id 与行数一起变）→ 最多两拍收敛'; Ok = $script:V08Ok }
         # store 行时间当位置的判定。实测：那个行号会冻结（行时间恒为 29.5 s），而它排在
         # memory/media/推算时钟之前——不判它，换歌后歌词就永远停在同一行。
         @{ Name = 'store 行时间：第一次见到它时可用（当一次引导值）'; Ok = (Test-StoreLineUsable -PrevMs -1 -NowMs 29500) }
@@ -1515,24 +1637,41 @@ if ($ProbeStore) {
     # 只读探针：歌词"算在哪一行"（位置 + store 的行时间表）与"客户端自己认为在哪一行"
     # （playingLyricLineNumber）并排打出来。两者不一致、或者后者长时间不动，就是
     # "歌词对不准真实位置"的直接证据——所以**值绝不能用后者发布**（真机 2026-10-14）。
+    #
+    # ⚠ 这个探针**不许**在开头读一次表然后拿它跟每一轮的 store 比：那样"表过期"只说明
+    # **探针开头那一拍与现在不是同一份数组**（换歌了、或数组还在填），与主循环的判定无关，
+    # 于是 `table=stale` 会一直打下去而没有任何东西会去重读它——**这正是它上次误导人的形状**
+    # （用户看到的 `table=stale` 就是这么来的）。现在它**跟着主循环的判定走**：
+    # 判 stale 就重读一次，并打出**是哪一个子条件**判的（Track / Lines / Empty）与重读前后的
+    # 三个数，所以一次运行就能回答"表到底能不能变新鲜"。
     Write-Host ("store 探针：{0} 轮，每 {1} ms 一轮" -f $ProbeRounds, $IntervalMs)
     $stx = Get-CdpStoreLyricTimes
     $tableLines = if ($stx -and $stx.ok -and $null -ne $stx.lineCount) { [int]$stx.lineCount } else { 0 }
-    Write-Host ("行时间表：ok={0} 行数={1} trackId={2}" -f `
-        $(if ($stx) { $stx.ok } else { 'n/a' }), `
-        $(if ($stx -and $stx.times) { @($stx.times).Count } else { 0 }), `
-        $(if ($stx) { $stx.trackId } else { '' }))
-    # 每轮要能回答"歌词为什么不动"，所以除了客户端自己报的行号，还要打出**主循环这一拍会用的
-    # 位置**与**缓存表还配不配得上现在这份歌词数组**（判据与主循环是同一对纯函数）：
+    $tblTrack = if ($stx) { '' + $stx.trackId } else { '' }
+    $tblCount = if ($stx -and $stx.times) { @($stx.times).Count } else { 0 }
+    $tblAcceptedLines = -1
+    Write-Host ("行时间表（开盘）：ok={0} 数组行数={1} lineCount={2} trackId='{3}' text='{4}'" -f `
+        $(if ($stx) { $stx.ok } else { 'n/a' }), $tblCount, $tableLines, $tblTrack, `
+        $(if ($stx) { $stx.name } else { '' }))
+    # 每一轮要能回答"歌词为什么不动"，所以除了客户端自己报的行号，还要打出**主循环这一拍会用的
+    # 位置**与**判定的理由**（判据与主循环同一对纯函数）：
     #   pos=n/a + lineMs 不变 + table=fresh → 迷你条 DOM 读不到，位置会退到会冻结的 store 行时间；
-    #   table=stale                        → 表是上一份数组的（选行会按旧表走到头然后钳位）；
+    #   table=stale(Track/Lines/Empty)      → 表不是现在这份数组的（选行会按旧表走到头然后钳位），
+    #                                        括号里就是**哪一个子条件**判的；同一轮会重读一次，
+    #                                        下一轮若还是 stale 就看 `cached=`/`store=` 两个数。
     #   pos 在走 + byPosition 在走          → 位置与选行都没问题，问题在取行文本那一环。
     $prevLineMs = -1
     for ($i = 1; $i -le $ProbeRounds; $i++) {
         $dom = Get-CdpDomTime
         $ss = Get-CdpStoreState
-        $domMs = if ($dom -and $dom.ok) { [int]$dom.curS * 1000 } else { $null }
+        $domOk = [bool]($dom -and $dom.ok)
+        $domMs = if ($domOk) { [int]$dom.curS * 1000 } else { $null }
         $lineMs = if ($ss -and $ss.ok -and $null -ne $ss.lineTimeSec) { [int]([double]$ss.lineTimeSec * 1000) } else { $null }
+        # 各来源能不能用（与主循环同一批判据）：一次运行就能点名是哪一级断了。
+        $srcDom = if ($domOk) { 'ok' } elseif ($dom) { "no($($dom.why))" } else { 'n/a' }
+        $srcStore = if ($null -ne $lineMs) {
+            if (Test-StoreLineUsable -PrevMs $prevLineMs -NowMs $lineMs) { 'ok' } else { 'frozen→下一级' }
+        } else { 'n/a' }
         $origin = 'n/a'
         $posMs = $null
         if ($null -ne $domMs) { $posMs = $domMs; $origin = 'dom' }
@@ -1542,23 +1681,46 @@ if ($ProbeStore) {
             } else { $origin = 'storeline冻结→下一级(mem/media/clock)' }
         }
         if ($null -ne $lineMs) { $prevLineMs = $lineMs }
+        $trackNow = if ($ss -and $ss.ok) { '' + $ss.trackId } else { '' }
         $linesNow = if ($ss -and $ss.ok -and $null -ne $ss.lines) { [int]$ss.lines } else { 0 }
-        # 这一拍的表（= 探针开头读回来的那份）还配不配得上 store 现在这份数组？判据与主循环同一个函数。
-        $table = if (Test-StoreTimesStale -Cached $(if ($stx -and $stx.times) { [object[]]$stx.times } else { $null }) `
-                -CachedTrack $(if ($stx) { '' + $stx.trackId } else { '' }) -CachedLines $tableLines `
-                -StoreTrack $(if ($ss -and $ss.ok) { '' + $ss.trackId } else { '' }) `
-                -StoreLines $linesNow) { 'stale' } else { 'fresh' }
+        # 这一拍的表还配不配得上 store 现在这份数组？**判据与主循环同一个函数**，
+        # 并且和主循环一样：判要重读就重读一次（否则探针只会重复报告一个没人处理的结论）。
+        $tv = Get-StoreTimesVerdict -Cached $(if ($stx -and $stx.times) { [object[]]$stx.times } else { $null }) `
+            -CachedTrack $tblTrack -CachedLines $tableLines `
+            -StoreTrack $trackNow -StoreLines $linesNow -AcceptedLines $tblAcceptedLines
+        $table = if ($tv.Stale) { "stale($($tv.Reason))" } else { 'fresh' }
+        if ($tv.ReRead) {
+            $again = Get-CdpStoreLyricTimes
+            if ($again -and $again.ok) {
+                $stx = $again
+                $tableLines = if ($null -ne $again.lineCount) { [int]$again.lineCount } else { 0 }
+                $tblTrack = '' + $again.trackId
+                $tblCount = if ($again.times) { @($again.times).Count } else { 0 }
+                $tblAcceptedLines = $linesNow
+                $table = "$table→已重读"
+            } else { $table = "$table→重读失败" }
+        }
         $sel = -2
         if ($stx -and $stx.ok -and $null -ne $posMs) {
             $sel = Select-StoreLineIndex -TimesSec ([object[]]$stx.times) -PositionMs $posMs
         }
         $storeIdx = if ($ss -and $ss.ok -and $null -ne $ss.index) { [int]$ss.index } else { -2 }
-        Write-Host ("  {0,2}. pos={1,-8} origin={2,-34} lineMs={3,-8} table={4,-6} storeIndex={5,-4} byPosition={6,-4} times={7,-5} offset={8,-6} used={9,-14} storeLine='{10}'" -f `
+        # 两个切片"自己说"的行数在一起，才看得出哪一个在动（这一列就是判定用的尺子）。
+        $ssLines = if ($ss -and $ss.ok -and $null -ne $ss.lines) { [int]$ss.lines } else { -1 }
+        if ($i -eq 1 -and $stx -and $stx.times) {
+            Write-Host ("      times[0..3] = {0}" -f ((@($stx.times) | Select-Object -First 4) -join ','))
+        }
+        Write-Host ("  {0,2}. pos={1,-8} origin={2,-34} lineMs={3,-8} table={4,-22} storeIndex={5,-4} byPosition={6,-4} times={7,-5} offset={8,-6} used={9,-14} storeLine='{10}'" -f `
             $i, $(if ($null -eq $domMs) { 'n/a' } else { "$($domMs)ms" }), $origin, `
             $(if ($null -eq $lineMs) { 'n/a' } else { "$($lineMs)ms" }), $table, $storeIdx, $sel, `
-            $(if ($stx -and $stx.times) { @($stx.times).Count } else { 0 }), `
+            $tblCount, `
             $(if ($ss) { $ss.offset } else { '' }), $(if ($ss) { $ss.usedLyric } else { '' }), `
             $(if ($ss) { $ss.line } else { '' }))
+        # 判定的三个输入并排：`cached` 是表里记着的行数、`store` 是这一拍 store 报的行数、
+        # `id=` 两边各是谁。**哪一边在动**一眼就能看出来（不必再猜）。
+        Write-Host ("      table-in: cached={0} store={1} id(cached)='{2}' id(store)='{3}' acceptedLines={4} | src dom={5} storeline={6} | store.ok={7} lines={8} index={9}" -f `
+            $tableLines, $linesNow, $tblTrack, $trackNow, $tblAcceptedLines, $srcDom, $srcStore, `
+            $(if ($ss) { $ss.ok } else { 'n/a' }), $ssLines, $storeIdx)
         if ($i -lt $ProbeRounds) { Start-Sleep -Milliseconds $IntervalMs }
     }
     exit 0
@@ -1644,8 +1806,11 @@ $script:LastEventAt = [datetime]::MinValue
 $script:StoreTimes = $null
 $script:StoreTimesTrack = ''
 # 读回 times 时 store 那份数组的行数。缓存表"还配不配得上现在这份数组"就是靠它判的
-# （Test-StoreTimesStale）：只看曲目 id 会漏掉"id 已经换了、歌词数组还没换"的那一拍。
+# （Get-StoreTimesVerdict）：只看曲目 id 会漏掉"id 已经换了、歌词数组还没换"的那一拍。
 $script:StoreTimesLines = 0
+# 这份表**已经为哪个行数**重读过一次了（见 Get-StoreTimesVerdict 第 4 条）：-1 = 还没读过。
+# 它是"观察到的 store 行数"，所以行数一变就自动允许再读一次——这就是收敛与"永不重读"的分界。
+$script:StoreTimesAcceptedLines = -1
 $script:StoreLineIndex = -1
 $script:StoreLineText = ''
 $script:StoreLineTrans = ''
@@ -1674,6 +1839,7 @@ try {
             $script:StoreTimes = $null
             $script:StoreTimesTrack = ''
             $script:StoreTimesLines = 0
+            $script:StoreTimesAcceptedLines = -1
             $script:StoreLineIndex = -1
             $script:StoreLineText = ''
             $script:StoreLineTrans = ''
@@ -1788,16 +1954,23 @@ try {
             # times 只在换歌时取一次（纯数字）；文本/翻译只在行号变化时按需取。
             if ($LyricSource -in 'auto', 'store') {
                 $trackNow = if ($ss -and $ss.ok) { '' + $ss.trackId } else { '' }
-                # store 现在这份歌词数组有多少行（判定缓存表还配不配得上它，见 Test-StoreTimesStale）
+                # store 现在这份歌词数组有多少行（判定缓存表还配不配得上它，见 Get-StoreTimesVerdict）
                 $linesNow = if ($ss -and $ss.ok -and $null -ne $ss.lines) { [int]$ss.lines } else { 0 }
-                if (Test-StoreTimesStale -Cached $script:StoreTimes `
-                        -CachedTrack $script:StoreTimesTrack -CachedLines $script:StoreTimesLines `
-                        -StoreTrack $trackNow -StoreLines $linesNow) {
+                $tv = Get-StoreTimesVerdict -Cached $script:StoreTimes `
+                    -CachedTrack $script:StoreTimesTrack -CachedLines $script:StoreTimesLines `
+                    -StoreTrack $trackNow -StoreLines $linesNow `
+                    -AcceptedLines $script:StoreTimesAcceptedLines
+                if ($tv.ReRead) {
                     $stx = Get-CdpStoreLyricTimes
                     if ($stx -and $stx.ok) {
                         $script:StoreTimes = [object[]]$stx.times
                         $script:StoreTimesTrack = '' + $stx.trackId
                         $script:StoreTimesLines = if ($null -ne $stx.lineCount) { [int]$stx.lineCount } else { 0 }
+                        # 这一份表已经为**这个行数**读过一次了（见 Get-StoreTimesVerdict 第 4 条）：
+                        # 只要 store 报的行数还是这个数就不再重读，否则"表永远过期"会把选行缓存
+                        # 反复清掉——那正是真机 `table=stale` 的死循环。行数**再变**（两个切片在追）
+                        # 就等于新信息到了，又会允许重读一次。
+                        $script:StoreTimesAcceptedLines = $linesNow
                         $script:StoreLineIndex = -1
                         $script:StoreLineText = ''
                         $script:StoreLineTrans = ''
