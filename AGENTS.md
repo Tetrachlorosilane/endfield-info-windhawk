@@ -208,12 +208,17 @@ $wc = 'D:\Program Files\Windhawk\Compiler'
 python .tool/checks/_deadcode.py
 ```
 
-编译器只管**符号**（`build.ps1` 已开 `-Wunused-function` 等）。它管不了的三类是：
+编译器只管**符号**（`build.ps1` 已开 `-Wunused-function` 等）。它管不了的四类是：
 
 - **只写不读的结构体字段**（每帧算一遍然后扔掉的量、重构留下的字段），以及**完全没被碰过**的字段；
 - **`#if 0`**；
 - **注释掉的代码**（要求注释以 `;` / `{` / `}` 结尾，否则散文会被误报）；
-- **脚本里定义了却没人引用的函数**（PowerShell / Python 都没有编译器看它们）。
+- **脚本里定义了却没人引用的函数**（PowerShell / Python 都没有编译器看它们），
+  以及**同一文件里定义了两次的名字**——两份都"有人引用"（调用方绑到后面那份），
+  所以前面那份永不执行却看不出来；`_netease-bridge.ps1` 的 `Test-VinylJumpPlausible`
+  就是这样（`e141514` 删掉第一份，而旧检查器在**它修好之前**也说"没有死代码"）。
+  这一条只认第 0 列的 PowerShell 定义与"同缩进同作用域链"的 Python 定义，
+  条件分支里的合法重定义（导入回退 / `if`-`else`）刻意放行，详见 [_deadcode.md](.tool/checks/_deadcode.md)。
 
 三条刻意的限制，否则一次"干净"没有意义：读计数**跨所有 C++ 文件**（宿主 `#include` 了 mod，
 会读 mod 只写的字段——按单文件扫会误报 `DownscalePlan.steps`）；**先剥注释再统计**（只在注释里
@@ -604,7 +609,7 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 ```powershell
 python .tool/checks/_settings.py     # 设置块结构（改了设置项就必须跑）
 python .tool/checks/_logfmt.py       # 宽格式日志的元数与错型（编译器一条都查不了）
-python .tool/checks/_deadcode.py     # 死代码：只写不读的字段、#if 0、注释掉的代码、脚本死函数
+python .tool/checks/_deadcode.py     # 死代码：只写不读的字段、#if 0、注释掉的代码、脚本死函数、同文件重复定义
 ```
 
 **改了结构体字段尤其要跑第三条**：删掉一个字段的写者之后，它可能变成"从没被碰过"，

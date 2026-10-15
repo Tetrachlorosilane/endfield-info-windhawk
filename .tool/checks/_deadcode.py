@@ -14,12 +14,45 @@ What is left is the part no C++ compiler warns about:
     for years). Prose comments are not reported: the comment has to end like a
     statement, with `;`, `{` or `}`;
   * functions defined in the **scripts** (PowerShell / Python) that nothing
-    references -- no compiler looks at those at all.
+    references -- no compiler looks at those at all;
+  * a name **defined twice in one script file**. The reference rule above cannot
+    see this shape at all: the name *is* referenced (the callers bind to the
+    later definition), so both copies look alive while the earlier one can never
+    run. `_netease-bridge.ps1` carried two byte-identical copies of
+    `Test-VinylJumpPlausible` (the first removed in e141514) and this script said
+    "no dead code found" on exactly that revision. When the two copies *differ*,
+    the earlier one is still unreachable and the two have silently diverged --
+    at least as dangerous, so it is reported with a different verdict line.
 
 Deliberate limits, so a clean run means something: reads are counted across all
 C++ files given (the regression host includes the mod and reads fields the mod
 only writes), comments are stripped before anything is counted, and a short
 allowlist covers fields that something *outside* this repository reads.
+
+The duplicate-definition rule is deliberately narrow; what it does *not* see:
+
+  * C++ -- a duplicate function/class definition there does not compile, so the
+    compiler is already the judge and this rule stays out of the way;
+  * PowerShell definitions that are **not at column 0** (nested `function`s, and
+    the JavaScript functions that live inside the here-strings this file embeds
+    and sends to the page) -- a nested function is only visible once its parent
+    ran, so "the later one shadows the earlier one" is not true of it. Here-strings
+    are masked out first, using PowerShell's own rule that the closing marker must
+    start at column 0;
+  * Python definitions in *different* arms of one conditional (`try:`/`except`,
+    `if`/`else`) -- that is the legitimate "import fallback" redefinition, and it
+    is left alone. Two definitions in the *same* branch (same chain of enclosing
+    statements) are reported even when that branch is an `if`, because same-branch
+    is exactly the unreachable shape;
+  * two definitions of one name in different files, and names bound by anything
+    other than `function`/`filter`/`workflow` (PowerShell) or `def`/`class`
+    (Python) -- `Set-Alias`, `$x = { ... }`, `x = lambda`, re-imports.
+
+Where the parse is uncertain the rule errs toward *reporting*, never toward silence:
+a multi-line condition head (`if (` alone on its line) reads as "not a head", so such a
+pair is reported even when it is a legitimate fallback. That is the deliberate direction
+-- a missed duplicate is the bug this rule exists for, and the legitimate shapes above
+are what keep it from crying wolf.
 
 Usage:  python .tool/checks/_deadcode.py [paths...]   (default: this repository)
 Exit:   0 = nothing found, 1 = at least one finding.
@@ -63,6 +96,20 @@ FIELD_RE = re.compile(
 
 PS_FUNC_RE = re.compile(r"^\s*function\s+([A-Za-z0-9_-]+)", re.M)
 PY_DEF_RE = re.compile(r"^(?:def|class)\s+([A-Za-z_]\w*)", re.M)
+
+# --- duplicate definitions within one file -----------------------------------
+# PowerShell: `function Name {` / `function Name() {` / `filter` / `workflow`. Only
+# column 0 counts (see the module docstring): the bridge keeps JavaScript functions
+# inside here-strings, and `^function` would otherwise claim those as PowerShell ones.
+PS_DEF_RE = re.compile(r"^(function|filter|workflow)\s+([A-Za-z0-9_-]+)", re.I | re.M)
+# Python: any indentation -- same-indentation duplicates are the shape that matters,
+# and the enclosing-condition check below is what keeps the legitimate ones quiet.
+PY_DEF2_RE = re.compile(r"^([ \t]*)(def|class)\s+([A-Za-z_]\w*)")
+# Heads that make two same-named definitions in *different* branches legitimate: a
+# try/except import fallback, or an `if`/`else` that picks an implementation. `with`,
+# `for` and `while` are deliberately absent -- they are not alternative branches, so a
+# redefinition inside one of them is still an unreachable earlier copy.
+PY_CONDITIONAL_HEADS = ("if", "elif", "else", "try", "except", "finally")
 
 # A commented-out *statement*: the `//` is followed by code-shaped text that ends with
 # `;`, `{` or `}`. The terminator is what keeps prose out.
@@ -181,6 +228,226 @@ def check_script(path, findings, func_re, label):
             findings.append(f"unreferenced {label}")
 
 
+def mask_ps_here_strings(raw):
+    """Blank out PowerShell here-string bodies, keeping every newline.
+
+    `$x = @'` ... `'@` (and the `@"` ... `"@` form) usually carries JavaScript, and
+    JavaScript has `function` declarations too. Without this, an embedded `function pick`
+    looks like a PowerShell definition; with a nested `function` inside a *real*
+    PowerShell function, two such hits would even pair up into a bogus duplicate.
+    The closing marker must sit at column 0 (PowerShell's rule), so searching for a line
+    that *starts* with it is the same test the parser makes.
+    """
+    lines = raw.split("\n")
+    out, opener = [], None
+    for line in lines:
+        if opener is not None:
+            if line.startswith(opener):
+                opener = None
+            out.append("")
+            continue
+        out.append(line)
+        for m in re.finditer(r'@"|@\'', line):
+            if not line[m.end():].strip():
+                opener = '"@' if m.group(0) == '@"' else "'@"
+                break
+    return "\n".join(out)
+
+
+def ps_definitions(raw):
+    """Yield (line, name, body) for every column-0 PowerShell definition.
+
+    `body` is the text from the signature's opening `{` to its matching `}`, so two
+    definitions can be compared byte for byte (modulo per-line indentation) without
+    comparing their comments. Brace matching skips quoted strings -- `'}'` and `"}"` are
+    common in this bridge's scripts and would otherwise truncate the body.
+    """
+    code = mask_ps_here_strings(raw)
+    for m in PS_DEF_RE.finditer(code):
+        line = code[: m.start()].count("\n") + 1
+        depth, i, start = 0, m.end(), None
+        while i < len(code):
+            ch = code[i]
+            if ch in "\"'":
+                quote, j = ch, i + 1
+                while j < len(code):
+                    if code[j] == "`" and quote == '"':
+                        j += 2
+                        continue
+                    if code[j] == quote:
+                        if j + 1 < len(code) and code[j + 1] == quote:   # '' / "" escape
+                            j += 2
+                            continue
+                        break
+                    j += 1
+                i = j + 1
+            elif ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+                i += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0 and start is not None:
+                    yield line, m.group(2), _dedent(code[start: i + 1])
+                    break
+                i += 1
+            else:
+                i += 1
+
+
+def _dedent(text):
+    """Drop the common leading indentation, so per-line indent is not a body difference."""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return text
+    pad = min(len(ln) - len(ln.lstrip()) for ln in lines[1:])
+    return "\n".join([lines[0]] + [ln[pad:] if len(ln) > pad else ln.strip() for ln in lines[1:]])
+
+
+def py_code_part(line):
+    """The code on a line with any trailing `#` comment removed.
+
+    A head such as `if _HAS_FAST:   # noqa` still ends the *statement* with a colon; testing
+    the raw line for that would call it "not a condition head" and turn a legitimate
+    if/else pair into a reported duplicate. Quotes are skipped so a `#` inside a string
+    literal is not mistaken for a comment.
+    """
+    quote = None
+    for i, ch in enumerate(line):
+        if quote:
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "\"'":
+            quote = ch
+        elif ch == "#":
+            return line[:i]
+    return line
+
+
+def py_parent_chain(lines, index, indent):
+    """The chain of enclosing statements above a definition, innermost first.
+
+    Each entry is (line, is_a_condition_head). Walking outward is what lets the caller ask
+    "same conditional, different arm?" -- the key is the *set* of enclosing conditional
+    lines, so two `if`s that sit side by side (both at column 0) are two different
+    conditionals, not two arms of one.
+    """
+    chain, want = [], indent
+    for j in range(index - 1, -1, -1):
+        stripped = lines[j].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parent_indent = len(lines[j]) - len(lines[j].lstrip())
+        if parent_indent < want:
+            # The head is the first bare word only: `if _HAS_FAST:` must read as `if`, not
+            # as `_HAS_F` (a `\w*` here silently turned every conditional into "not a head"),
+            # and any trailing comment is cut first so the colon is still the last character.
+            statement = py_code_part(stripped).rstrip()
+            head = re.match(r"([A-Za-z_]+)", statement)
+            word = head.group(1) if head else ""
+            chain.append((j + 1, word in PY_CONDITIONAL_HEADS and statement.endswith(":")))
+            want = parent_indent
+            if not want:
+                break
+    return chain
+
+
+def py_definitions(raw):
+    """Yield (line, name, body, chain, indent) for every `def`/`class`.
+
+    The body is the signature plus every following line that is either blank or indented
+    more than the header; that is the block, by Python's own rule.
+    """
+    lines = raw.split("\n")
+    for i, line in enumerate(lines):
+        m = PY_DEF2_RE.match(line)
+        if not m:
+            continue
+        indent, name = len(m.group(1).expandtabs(4)), m.group(3)
+        sig, depth = [line], line.count("(") - line.count(")")
+        j = i
+        while depth > 0 and j + 1 < len(lines):
+            j += 1
+            sig.append(lines[j])
+            depth += lines[j].count("(") - lines[j].count(")")
+        body = list(sig)
+        while j + 1 < len(lines):
+            nxt = lines[j + 1]
+            if not nxt.strip() or (len(nxt) - len(nxt.lstrip())) > indent:
+                body.append(nxt)
+                j += 1
+            else:
+                break
+        yield i + 1, name, _dedent("\n".join(body)), py_parent_chain(lines, i, indent), indent
+
+
+def collect_definitions(path):
+    """Every same-file definition the duplicate rule considers, as (name, line, body, scope, indent).
+
+    `scope` is the key a duplicate has to share to be real: the chain of enclosing
+    statements for Python, or 0 for PowerShell (where only column-0 functions count, so
+    there is exactly one scope).
+    """
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    if path.suffix == ".ps1":
+        return [(name, line, body, 0, 0) for line, name, body in ps_definitions(raw)]
+    return [(name, line, body, tuple(chain), indent)
+            for line, name, body, chain, indent in py_definitions(raw)]
+
+
+def check_duplicate_definitions(paths, findings):
+    """Report a name defined more than once in one file -- the shape no other rule sees.
+
+    The point is not the count, it is *which* copy can run: PowerShell keeps the last
+    definition, so an earlier one is unreachable; when the bodies differ the two also
+    diverge silently, which is worse than the identical case, not better.
+    """
+    dups = 0
+    names = 0
+    for path in paths:
+        groups = {}
+        for name, line, body, scope, indent in collect_definitions(path):
+            groups.setdefault(name, []).append((line, body, scope, indent))
+        names += len(groups)
+        for name in sorted(groups):
+            defs = groups[name]
+            if len(defs) < 2:
+                continue
+            lines = [line for line, _b, _s, _i in defs]
+            # Different indentation = different scope: a nested redefinition is invisible
+            # from the outer one, so it is not a shadowing copy of it.
+            if len({indent for _l, _b, _s, indent in defs}) != 1:
+                continue
+            # Two definitions in *different* arms of one conditional is how a fallback is
+            # spelled (`try: import x except ImportError: import y as x`). That is the one
+            # legitimate shape, so it is left alone; a redefinition in the *same* branch
+            # (same chain) is reported even when it sits under an `if`.
+            scopes, all_conditional = [], True
+            for _l, _b, scope, _i in defs:
+                heads = scope if isinstance(scope, tuple) else ()
+                scopes.append(frozenset(heads))
+                all_conditional = all_conditional and any(cond for _ln, cond in heads)
+            if all_conditional and len({s for s in scopes}) == len(defs):
+                continue
+            dups += 1
+            identical = len({body for _l, body, _s, _i in defs}) == 1
+            try:
+                rel = path.relative_to(ROOT)
+            except ValueError:
+                rel = path
+            verdict = ("byte-identical bodies -- provably dead, only the last definition can run"
+                       if identical else
+                       "bodies differ -- the earlier definition can never run, and the two "
+                       "have silently diverged")
+            print(f"  {'duplicate definition':21} {rel}:{lines[0]}: {name} defined "
+                  f"{len(defs)}x at line(s) {', '.join(str(x) for x in lines)}")
+            print(f"  {'':21} {verdict}")
+            findings.append("duplicate definition")
+    return dups, names
+
+
 def discover():
     """Every .cpp / .ps1 / .py in the tree, once, skipping .git and byproduct folders.
 
@@ -220,11 +487,13 @@ def main(argv):
         check_script(p, findings, PS_FUNC_RE, "function")
     for p in py:
         check_script(p, findings, PY_DEF_RE, "def")
+    dups, names = check_duplicate_definitions(ps + py, findings)
 
     if findings:
         print(f"\n{len(findings)} finding(s): " + ", ".join(sorted(set(findings))))
         return 1
-    print("\nno dead code found (every field is read, no #if 0, every script function used)")
+    print("\nno dead code found (every field is read, no #if 0, every script function used, "
+          f"0 duplicate definitions among {names} script definition name(s))")
     return 0
 
 
