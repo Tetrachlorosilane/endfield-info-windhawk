@@ -763,17 +763,31 @@ function Get-VinylArtistFromSpec {
 #      只有"一直同一个数"才是页面不更新。真机反例：选择器命中了别处一个恒为 29.5 s 的
 #      `data-time` 节点 —— 那时每一拍都会"可用"，界面上就是永远停在那一句。
 # 注意判据③④**都不**判暂停：暂停时 data-time 不动、位置也不动，那是自洽的。
-function Test-VinylLineUsable {
-    param([int]$PrevTimeMs, [int]$NowTimeMs,
-          [int]$BackToleranceMs = 1000, [int]$ForwardToleranceMs = 30000,
-          [int]$SameReads = 0, [int]$RepeatLimit = 3)
-    if ($NowTimeMs -lt 0) { return $false }
-    if ($SameReads -ge $RepeatLimit) { return $false }
-    if ($PrevTimeMs -lt 0) { return $true }                      # 第一次见到：当引导值
-    if ($NowTimeMs -ge $PrevTimeMs) {
-        return (($NowTimeMs - $PrevTimeMs) -le $ForwardToleranceMs)
-    }
-    return (($PrevTimeMs - $NowTimeMs) -le $BackToleranceMs)
+#
+# 判据③④合起来是"这一个样本可不可信"（`Test-VinylJumpPlausible`），⑤是"页面还在不在动"
+# （由 `Resolve-VinylFrame` 单独分支处理）。**拆成两个名字是因为调用方要区别对待**：
+# ⑤ 要保住基准不动（否则冻结值会被反复当成"第一次见到"放行），而③④要**重新对基准**但
+# 这一拍不发——原因见 `Resolve-VinylFrame` 里那段"会永久卡住"的推导。
+function Test-VinylJumpPlausible {
+    param([int]$FromMs, [int]$ToMs, [int]$BackToleranceMs = 1000, [int]$ForwardToleranceMs = 30000)
+    if ($ToMs -lt 0) { return $false }
+    if ($FromMs -lt 0) { return $true }                      # 第一次见到：当引导值
+    if ($ToMs -ge $FromMs) { return (($ToMs - $FromMs) -le $ForwardToleranceMs) }
+    return (($FromMs - $ToMs) -le $BackToleranceMs)
+}
+function Test-VinylJumpPlausible {
+    param([int]$FromMs, [int]$ToMs, [int]$BackToleranceMs = 1000, [int]$ForwardToleranceMs = 30000)
+    if ($ToMs -lt 0) { return $false }
+    if ($FromMs -lt 0) { return $true }                      # 第一次见到：当引导值
+    if ($ToMs -ge $FromMs) { return (($ToMs - $FromMs) -le $ForwardToleranceMs) }
+    return (($FromMs - $ToMs) -le $BackToleranceMs)
+}
+# 纯函数：页面是不是**不再更新**了。判据只有"连续读到同一个数到顶"这一条，而调用方
+# **必须同时**确认"还是同一个数"（见 `Resolve-VinylFrame` 里的警告）——所以这里只管计数，
+# 不碰值：把它写成 `SameReads >= Limit` 而不管值，正是那条"永久卡住"缺陷的形状。
+function Test-VinylValueFrozen {
+    param([int]$SameReads, [int]$RepeatLimit = 3)
+    return ($SameReads -ge $RepeatLimit)
 }
 
 # 纯函数：store 那一套（曲目 id → 行号 → 该行文本/翻译）在这一拍能不能信（-SelfTest 覆盖）。
@@ -791,6 +805,76 @@ function Test-StoreLyricUsable {
     return ($Index -lt $Lines)
 }
 
+# 纯函数：把**一拍的读数**判成"这一拍发什么"（-SelfTest 覆盖）。**这是这条来源的闸门，
+# 也是"读不到就不发"这句承诺唯一被履行的地方**，所以它必须是纯的、可断言的：
+#
+#   输入：Get-CdpVinyl 的返回值（可能是 $null）+ 上一拍已被采用的时间 + 连续相同次数
+#   输出：PositionMs（$null = 这一拍没有位置）/ Line / Translation / Guard / Why
+#         + **更新后的** PrevTimeMs 与 SameReads（交给下一拍）
+#
+# 三个必须分清的结局（`Guard` 就是它们的名字，探针直接打这一列）：
+#   `ok`      → 位置与行都用这两拍读到的东西；调用方把 PrevTimeMs/SameReads 收好
+#   `no-line` → 当前行候选全落空（或整条求值失败）：**位置与歌词都不发**
+#   `stale`   → 读到了但判陈旧（页面不动 / 一步跳太远）：**位置与歌词也都不发**
+#
+# ⚠ **两种 `stale` 对基准的处理相反，这是这个函数最容易写错的地方**：
+#   · **页面不动了**（连续同一个数到 RepeatLimit）→ 基准与 `SameReads` **原样留着**。
+#     留着 `SameReads` 才会有"恢复"：位置一旦重新前进，`SameReads` 归零、立刻可用。
+#   · **一步跳太远**（往回拖进度条 / 长暂停后继续 / 切歌当拍）→ **把基准挪到这个新位置**
+#     （`PrevTimeMs = 当前值`、`SameReads = 0`）**但这一拍不发**。
+#     为什么必须挪：不挪的话「往回拖进度条」会让 `prev` 永远大于之后的每一个读数，
+#     于是**后面每一拍都判"往回走太多"→ 永久停住**，直到播放追上拖动前的位置为止；
+#     长暂停后继续（一跳 >30 s）同理——**那是一旦发生就再也回不来的状态**，而这条来源
+#     没有下级可以接手。挪基准 + 只丢一拍，换来的是"下一拍停在新位置附近就接受"，
+#     而**一次性**的坏样本（读一眼又回到原位）仍然会被它自己的下一拍判掉。
+# 抽成纯函数还消掉了一处真实的重复：主循环与 `-ProbeVinyl` 原先各写了一份"连续相同次数"
+# 的记账，两处**必须**一致却没有任何东西保证（探针说 ok 而主循环丢弃，或反过来）——
+# 现在两处都调这一个函数（AGENTS §7.8：不要自己复刻一份）。
+function Resolve-VinylFrame {
+    param($Vinyl, [int]$PrevTimeMs = -1, [int]$SameReads = 0, [int]$RepeatLimit = 3)
+    $r = [ordered]@{
+        PositionMs = $null; Line = ''; Translation = ''; Source = 'vinyl'
+        Guard = 'no-line'; Why = ''; LineHit = '(none)'; TimeMs = -1
+        PrevTimeMs = $PrevTimeMs; SameReads = $SameReads
+    }
+    if (-not $Vinyl) {
+        $r.Why = '页面读不到（没有调试端口 / 没有目标 / 回包解不出对象）'
+        return [pscustomobject]$r
+    }
+    $r.LineHit = Format-VinylHit -Hit $Vinyl.LineHit
+    if (-not $Vinyl.Line) {
+        # 页面自己报的错优先说出来（例如 DOM 结构变了导致表达式抛异常）——它比"落空"更有信息量
+        $r.Why = if ($Vinyl.Why) { "页面内报错：$($Vinyl.Why)" }
+                 else { "行候选全部落空（root='$(Format-VinylHit -Hit $Vinyl.RootHit)' 也一起看）" }
+        return [pscustomobject]$r
+    }
+    $timeMs = [int]$Vinyl.Line.TimeMs
+    $r.TimeMs = $timeMs
+    # ① 页面不动了：**必须同时满足"还是同一个数"**（理由见 `Test-VinylValueFrozen` 的注释：
+    #    只数次数会让"暂停很久之后位置又前进"永远判成冻结）。基准与计数**原样**留着，
+    #    这样位置一恢复前进就立刻可用（计数在下面被归零）。
+    if ($timeMs -eq $PrevTimeMs -and (Test-VinylValueFrozen -SameReads $SameReads -RepeatLimit $RepeatLimit)) {
+        $r.Guard = 'stale'
+        $r.Why = "data-time 一直不动：now=${timeMs}ms 连续相同=${SameReads}（页面没更新 / 播放器停着）"
+        return [pscustomobject]$r
+    }
+    # ② 一步跳太远：重新对基准但这一拍不发（见上面"会永久卡住"的推导）
+    if (-not (Test-VinylJumpPlausible -FromMs $PrevTimeMs -ToMs $timeMs)) {
+        $r.Guard = 'stale'
+        $r.PrevTimeMs = $timeMs
+        $r.SameReads = 0
+        $r.Why = "data-time 跳变：prev=${PrevTimeMs}ms now=${timeMs}ms（往回拖进度条 / 长暂停后继续 / 切歌当拍）→ 重新对基准，本拍不发"
+        return [pscustomobject]$r
+    }
+    if ($PrevTimeMs -ge 0 -and $timeMs -eq $PrevTimeMs) { $r.SameReads = $SameReads + 1 } else { $r.SameReads = 0 }
+    $r.PrevTimeMs = $timeMs
+    $r.Guard = 'ok'
+    $r.PositionMs = $timeMs
+    $r.Line = $Vinyl.Line.Original
+    $r.Translation = $Vinyl.Line.Translation
+    return [pscustomobject]$r
+}
+
 # 纯函数：把一组候选的命中情况拼成一行判别性日志（如 `#VINYL_COVER_ELEMENT_ID li.line.current`）。
 # 它就是"报告哪一条候选命中了"的落点；没命中时给 '(none)'，而不是空字符串。
 function Format-VinylHit {
@@ -802,7 +886,7 @@ function Format-VinylHit {
 # **一轮只做一次**的小求值：一个紧凑 JSON 对象（不是整页 DOM dump）。
 # 页面里没有 audio/video 元素（真机结论 2026-10-13），所以位置只能来自 DOM 自己维护的
 # `data-time`；这条表达式同时回答"有没有当前行 / 原文与翻译是什么 / 标题与歌手是谁"。
-$script:VinylExpression = @'
+$script:VinylExpressionTemplate = @'
 (function(){
   function pick(list){
     for (var i=0;i<list.length;i++){ try{ var e=document.querySelector(list[i]); if(e) return {e:e,hit:list[i]}; }catch(x){} }
@@ -834,27 +918,87 @@ $script:VinylExpression = @'
 })()
 '@
 
-# 把候选表装进上面那条表达式（只装一次；候选表是纯数据，见 Get-Vinyl*Candidates）。
+# 纯函数：把候选表装进模板（-SelfTest 覆盖）。**它是"表"与"真正发出去的 JS"之间唯一的桥**，
+# 所以这里的形状错了，症状是"所有候选都落空"（而不是某个选择器不准）——真机上看起来就是
+# 歌词突然全没了，且没有任何报错。
+#
+# ⚠ 必须用 `ConvertTo-Json -InputObject`，**不能**用管道：PowerShell 的管道会把数组**展开**，
+# 于是**只有一条**候选时 `@('a') | ConvertTo-Json` 给出的是 `"a"`（一个 JS **字符串**），
+# 发出去的 JS 就成了 `var roots="a"` —— `list.length` 变成字符串长度、`querySelector` 拿到
+# 单个字符，四条候选全部静默落空。四张表当前都 ≥2 条，所以用的是"以后某天删到只剩一条"
+# 才发作的潜伏缺陷；断言把它钉住（见 -SelfTest 的"候选表只有一条时"那组）。
+function New-VinylExpression {
+    param([string]$Template, [string[]]$Roots, [string[]]$Lines, [string[]]$Titles, [string[]]$Artists)
+    if (-not $Template) { return '' }
+    $e = $Template.Replace('__ROOTS__', (ConvertTo-Json -InputObject @($Roots) -Compress))
+    $e = $e.Replace('__LINES__', (ConvertTo-Json -InputObject @($Lines) -Compress))
+    $e = $e.Replace('__TITLES__', (ConvertTo-Json -InputObject @($Titles) -Compress))
+    $e = $e.Replace('__ARTISTS__', (ConvertTo-Json -InputObject @($Artists) -Compress))
+    return $e
+}
+
+# 把候选表装进模板（只装一次；候选表是纯数据，见 Get-Vinyl*Candidates）。
 function Initialize-VinylExpression {
-    $script:VinylExpression = $script:VinylExpression.
-        Replace('__ROOTS__', (Get-VinylRootCandidates | ConvertTo-Json -Compress)).
-        Replace('__LINES__', (Get-VinylLineCandidates | ConvertTo-Json -Compress)).
-        Replace('__TITLES__', (Get-VinylTitleCandidates | ConvertTo-Json -Compress)).
-        Replace('__ARTISTS__', (Get-VinylArtistCandidates | ConvertTo-Json -Compress))
+    $script:VinylExpression = New-VinylExpression -Template $script:VinylExpressionTemplate `
+        -Roots (Get-VinylRootCandidates) -Lines (Get-VinylLineCandidates) `
+        -Titles (Get-VinylTitleCandidates) -Artists (Get-VinylArtistCandidates)
 }
 Initialize-VinylExpression
 
-# 读黑胶页这一拍。失败/页面不在就返回 $null —— **调用方必须原样继续降级**（新来源是额外的
-# 一条路，不是替代：没有 CDP 时前台那套照旧工作）。
+# 纯函数：把一条 CDP `Runtime.evaluate` 的**原始回包**解成页面里那个对象，并说清**哪一步**失败。
+#
+# 为什么要它单独存在（而不是塞在 `Get-CdpVinyl` 里）：这一段的失败形状是"解析出空值、
+# 然后**静默**发布 `--`"——面板上看不出"页面读不到"和"这一句没有歌词"的区别，
+# 而两者的修法完全不同。抽出来以后 `-SelfTest` 能直接喂**真机原始回包**（含截断、缺
+# `result.value`、`value` 不是字符串、里层不是对象）并断言 `Why` 说的是哪一步。
+#
+# 回包形状（真机，2026-10-15，见 .tool/investigations/cdp-raw-reply.txt）：
+#   {"id":1,"result":{"result":{"type":"string","value":"{\"root\":\"…\",…}"}}}
+# 即**两层 JSON**：外层是 CDP 的协议壳，`result.result.value` 是页面返回值本身，
+# 而它又是一个**字符串**（我们的表达式 `JSON.stringify` 过），所以第二层才是真正的对象。
+function Get-CdpReplyVerdict {
+    param([string]$Raw)
+    $v = @{ Ok = $false; Value = $null; Why = '' }
+    if (-not $Raw) { $v.Why = '回包为空（连接被关掉 / 没读到帧）'; return [pscustomobject]$v }
+    # 只认**字符串**形态的 value：`"value":` 后面必须紧跟一个引号。于是 `"value":[…]`、
+    # `"value":{…}`、根本没有 value 的回包（例如 error 回包）一律在这里落空，
+    # 而不是被硬塞进第二层解析、变成一个"看着解析成功了"的错误对象。
+    $m = [regex]::Match($Raw, '"value"\s*:\s*"((?:[^"\\]|\\.)*)"', 'Singleline')
+    if (-not $m.Success) {
+        $tail = if ($Raw.Length -gt 60) { $Raw.Substring($Raw.Length - 60) } else { $Raw }
+        $v.Why = "回包里没有字符串形态的 result.value（{0}B，尾部 '{1}'）" -f $Raw.Length, ($tail -replace '\s+', ' ')
+        return [pscustomobject]$v
+    }
+    $text = $null
+    try { $text = ('"' + $m.Groups[1].Value + '"') | ConvertFrom-Json } catch { $text = $null }
+    if ($null -eq $text) { $v.Why = '第一层：result.value 不是合法的 JSON 字符串（截断？）'; return [pscustomobject]$v }
+    if ($text -isnot [string]) { $v.Why = "第一层：result.value 解出来是 $($text.GetType().Name)，不是字符串"; return [pscustomobject]$v }
+    $o = $null
+    try { $o = $text | ConvertFrom-Json } catch { $o = $null }
+    if ($null -eq $o) { $v.Why = "第二层：页面返回值不是合法 JSON（$($text.Length) 字符）"; return [pscustomobject]$v }
+    if ($o -isnot [System.Management.Automation.PSCustomObject]) {
+        $v.Why = "第二层：页面返回值是 $($o.GetType().Name)，不是对象（期望 {root,lineHit,dataTime,paras,…}）"
+        return [pscustomobject]$v
+    }
+    $v.Ok = $true; $v.Value = $o
+    return [pscustomobject]$v
+}
+
+# 读黑胶页这一拍。失败/页面不在就返回 $null —— 调用方**必须原样继续**（读不到就不发，
+# 见 Resolve-VinylFrame；绝不用一个不动的旧值顶上）。
+#
+# 返回的对象里 `Why` 有两种：**页面自己报的错**（表达式里的 `o.err`，例如 DOM 变了导致
+# `getAttribute` 抛异常）与**我们解不出来的原因**（`Get-CdpReplyVerdict` 的诊断）。
+# 两者都会一路带到探针与主循环的日志里，所以"读不到"永远带着判别性数值，不是一句"失败了"。
 function Get-CdpVinyl {
     if (-not (Get-CdpTab)) { return $null }
-    $raw = Invoke-CdpExpression -Expression $script:VinylExpression
-    if (-not $raw) { return $null }
-    $m = [regex]::Match($raw, '"value"\s*:\s*"((?:[^"\\]|\\.)*)"', 'Singleline')
-    if (-not $m.Success) { return $null }
-    $o = $null
-    try { $o = (('"' + $m.Groups[1].Value + '"') | ConvertFrom-Json) | ConvertFrom-Json } catch { return $null }
-    if ($null -eq $o) { return $null }
+    $verdict = Get-CdpReplyVerdict -Raw (Invoke-CdpExpression -Expression $script:VinylExpression)
+    if (-not $verdict.Ok) {
+        return [pscustomobject]@{ RootHit = ''; Root = $false; LineHit = ''; Line = $null
+            LiCount = 0; TitleHit = ''; Title = $null; ArtistHit = ''; Artist = $null
+            Why = '' + $verdict.Why }
+    }
+    $o = $verdict.Value
     $line = ConvertFrom-VinylLineSpec -Spec ([pscustomobject]@{
         hit = $o.lineHit; dataTime = $o.dataTime; paras = $o.paras })
     [pscustomobject]@{
@@ -1142,6 +1286,76 @@ function Read-FixtureParagraphs {
 if ($SelfTest) {
     $stamp = [datetime]::new(2026, 10, 15, 12, 0, 0, [DateTimeKind]::Local)
 
+    # 语法感知地切出 `var roots=[…], lines=[…], …` 里的某一项（候选里有 `[` `]` `"`，
+    # 正则的非贪婪会切错，所以自己扫括号；字符串里的方括号不算）。
+    # ⚠ 四个数组**共用一条 `var` 声明**（`var roots=…, lines=…`），所以只在第一项前面有
+    # `var` —— 匹配 `, lines=` 也要认。这条一开始写错，四条断言里只有 roots 通过。
+    function Get-JsArrayLiteral {
+        param([string]$Text, [string]$VarName)
+        $m = [regex]::Match($Text, ('(?:var\s+|,\s*)' + [regex]::Escape($VarName) + '\s*=\s*'))
+        if (-not $m.Success) { return $null }
+        $i = $m.Index + $m.Length
+        if ($i -ge $Text.Length -or $Text[$i] -ne '[') { return $null }   # 期望数组字面量，不是标量
+        $depth = 0; $inStr = $false; $esc = $false
+        for ($j = $i; $j -lt $Text.Length; $j++) {
+            $c = $Text[$j]
+            if ($inStr) {
+                if ($esc) { $esc = $false }
+                elseif ($c -eq '\') { $esc = $true }
+                elseif ($c -eq '"') { $inStr = $false }
+                continue
+            }
+            if ($c -eq '"') { $inStr = $true; continue }
+            if ($c -eq '[') { $depth++ }
+            elseif ($c -eq ']') { $depth--; if ($depth -eq 0) { return $Text.Substring($i, $j - $i + 1) } }
+        }
+        return $null
+    }
+
+    # --- 造读数 + 照主循环跑状态机（**调产品那一个函数**，不复制判定）----------------------
+    function New-VinylReading {
+        param([int]$TimeMs = 0, [string]$Original = 'line', [string]$Translation = '',
+              [string]$LineHit = '', [string]$RootHit = '#VINYL_COVER_ELEMENT_ID',
+              [string]$Why = '', [switch]$NoLine)
+        $line = if ($NoLine) { $null } else {
+            [pscustomobject]@{ Hit = $LineHit; DataTime = ('{0:0.00}' -f ($TimeMs / 1000.0))
+                TimeMs = $TimeMs; Original = $Original; Translation = $Translation; ParaCount = 2 } }
+        [pscustomobject]@{ RootHit = $RootHit; Root = [bool]$RootHit; LineHit = $LineHit
+            Line = $line; LiCount = 64; TitleHit = ''; Title = 'T'; ArtistHit = ''; Artist = 'A'; Why = $Why }
+    }
+    # 把 `Get-CdpVinyl` 的解包结果（verdict.Value）包成同一个形状——真机回包链的末端
+    function ConvertFrom-VinylReplyFixture {
+        param($Verdict)
+        if (-not $Verdict -or -not $Verdict.Ok) {
+            return [pscustomobject]@{ RootHit = ''; Root = $false; LineHit = ''; Line = $null
+                LiCount = 0; TitleHit = ''; Title = $null; ArtistHit = ''; Artist = $null
+                Why = '' + $(if ($Verdict) { $Verdict.Why } else { 'null verdict' }) }
+        }
+        $o = $Verdict.Value
+        [pscustomobject]@{ RootHit = '' + $o.root; Root = [bool]$o.root
+            LineHit = Format-VinylHit -Hit $o.lineHit
+            Line = ConvertFrom-VinylLineSpec -Spec ([pscustomobject]@{ hit = $o.lineHit; dataTime = $o.dataTime; paras = $o.paras })
+            LiCount = if ($null -ne $o.liCount) { [int]$o.liCount } else { 0 }
+            TitleHit = '' + $o.titleHit; Title = Get-VinylTitleFromSpec -Spec ([pscustomobject]@{ attr = $o.title; text = $o.titleText })
+            ArtistHit = '' + $o.artistHit; Artist = Get-VinylArtistFromSpec -Spec ([pscustomobject]@{ attr = $o.artist; text = $o.artistText })
+            Why = '' + $o.err }
+    }
+    function Invoke-VinylFrameModel {
+        param([object[]]$Readings)
+        $prev = -1; $same = 0; $frames = @()
+        foreach ($rd in $Readings) {
+            $fr = Resolve-VinylFrame -Vinyl $rd -PrevTimeMs $prev -SameReads $same
+            $frames += $fr
+            $prev = $fr.PrevTimeMs; $same = $fr.SameReads
+        }
+        return $frames
+    }
+    function New-VinylSeq {
+        param([int[]]$TimesMs)
+        return @($TimesMs | ForEach-Object { New-VinylReading -TimeMs $_ })
+    }
+
+
     # --- 候选表：**顺序本身就是优先级**，所以断言顺序（不是"有没有"）------------------
     # 锚点稳定性排序（这是"通用准确"的胜负手，见 docs/netease-lyric-source-design.md）：
     # ① 稳定 id（VINYL_COVER_ELEMENT_ID）→ ② 语义类名/属性（line/current/title、
@@ -1190,37 +1404,104 @@ if ($SelfTest) {
     # 标题那个 `title` 属性为空时**必须**回退到元素文本；两个都空 → $null（不要发空标题）
     $script:TitleFromText = Get-VinylTitleFromSpec -Spec ([pscustomobject]@{ attr = ''; text = ' 铁花飞 ' })
 
-    # --- 新鲜度 / 合理性判定：照主循环的规则跑一台小状态机 ------------------------------
-    # 单条纯函数断言答不了"它会不会**一直**把同一个数当新的"——那要**多拍**才看得出来
-    # （这正是上一版 storeline 守卫的教训：`Test-StoreLineUsable` 也是纯函数，但它的失败
-    #  形状是"每一拍都判可用"，只有连跑几拍才露出来）。所以这里连喂一串真机采样序列，
-    # 并像主循环那样**记住连续读到同一个数的次数**（`sameReads`）。
-    function Invoke-VinylGuardModel {
-        param([int[]]$TimesMs)
-        $prev = -1; $same = 0; $used = @()
-        foreach ($t in $TimesMs) {
-            if (Test-VinylLineUsable -PrevTimeMs $prev -NowTimeMs $t -SameReads $same) {
-                $used += $t
-                if ($prev -ge 0 -and $t -eq $prev) { $same++ } else { $same = 0 }
-                $prev = $t
-            }
-        }
-        return $used
+    # --- 真机原始回包（**逐字节**，不是手写的整齐 JSON）-------------------------------
+    # 这一段是 2026-10-15 从活着的 9229 页面抓下来的 `Runtime.evaluate` 回包**原文**
+    # （`.tool/investigations/cdp-raw-reply.txt`，抓取脚本用 AST 直接取产品自己的
+    # `New-VinylExpression`，所以它与桥真正发出去的那条一模一样）。形状：**两层 JSON**
+    # ——外层是 CDP 协议壳，`result.result.value` 是页面返回值，而它自己又是一个
+    # `JSON.stringify` 过的**字符串**。所以这里连 `\"` 转义、`\uXXXX` 中文与那个
+    # **空的翻译段**都是真机字节：手写一个整齐的 blob 会恰好绕过我们最该测的那一层的转义。
+    $script:RawReplyReal = @'
+{"id":1,"result":{"result":{"type":"string","value":"{\"root\":\"#VINYL_COVER_ELEMENT_ID\",\"lineHit\":\"#VINYL_COVER_ELEMENT_ID li.line.current\",\"dataTime\":\"95.82\",\"paras\":[\"\u56db\u9762\u695a\u6b4c\uff0c\u8fd9\u9897\u5fc3\u65e0\u60e7\u65e0\u754f\",\"\"],\"liCount\":64,\"titleHit\":\"[data-testid=tid_tracktitle_container] span.title\",\"title\":\"\u94c1\u82b1\u98de\",\"titleText\":\"\u94c1\u82b1\u98de\",\"artistHit\":\"[data-testid=tid_tracktitle_artist] span[title]\",\"artist\":\"Mili / \u585e\u58ec\u5531\u7247-MSR\",\"artistText\":\"Mili / \u585e\u58ec\u5531\u7247-MSR\"}"}}}
+'@
+    $script:ReplyReal = Get-CdpReplyVerdict -Raw $script:RawReplyReal
+    # 反例：回包被**截断**（WebSocket 断在半路）——连字符串的收尾引号都没有
+    $script:ReplyTruncated = Get-CdpReplyVerdict -Raw $script:RawReplyReal.Substring(0, 300)
+    # 反例：外层完整、**里层**被截断（有收尾引号，但页面返回的 JSON 本身不完整）。
+    # 切点取一个**固定锚点**（`"dataTime":"95.82"` 之后）而不是随手截 300 字符——
+    # 否则切点会落在转义序列中间、失败层就变成"第一层"，断言会变成跟着字节数走的脆弱测试。
+    $script:InnerCutAnchor = '"dataTime\":\"95.82\"'
+    $script:ReplyInnerCut = Get-CdpReplyVerdict -Raw (
+        $script:RawReplyReal.Substring(0, $script:RawReplyReal.IndexOf($script:InnerCutAnchor) + $script:InnerCutAnchor.Length) + '"}}}')
+    # 反例：CDP 的报错回包（没有 result.value）、以及 value 为 null 的回包
+    $script:ReplyErr = Get-CdpReplyVerdict -Raw '{"id":1,"error":{"code":-32601,"message":"''Runtime.evaluate'' wasn''t found"}}'
+    $script:ReplyNull = Get-CdpReplyVerdict -Raw '{"id":1,"result":{"result":{"type":"object","subtype":"null","value":null}}}'
+    # 反例：value 的**形状不对**（是数组本身、是别的 JSON 类型、或根本不是 JSON）
+    $script:ReplyArr = Get-CdpReplyVerdict -Raw '{"id":1,"result":{"result":{"type":"object","value":[1,2,3]}}}'
+    $script:ReplyInnerArr = Get-CdpReplyVerdict -Raw '{"id":1,"result":{"result":{"type":"string","value":"[1,2,3]"}}}'
+    $script:ReplyInnerStr = Get-CdpReplyVerdict -Raw '{"id":1,"result":{"result":{"type":"string","value":"\"hello\""}}}'
+    $script:ReplyInnerGarbage = Get-CdpReplyVerdict -Raw '{"id":1,"result":{"result":{"type":"string","value":"hello"}}}'
+    $script:ReplyEmpty = Get-CdpReplyVerdict -Raw ''
+    # 真机回包走完整条纯函数链：解析 → 行读数 → 拍判定（**空翻译段是真机的**，第 2 段为空）
+    $script:FrameFromRawReal = Resolve-VinylFrame -Vinyl (ConvertFrom-VinylReplyFixture -Verdict $script:ReplyReal)
+
+    # --- 候选表 ↔ 真正发出去的 JS：**唯一的桥** ----------------------------------------
+    # `New-VinylExpression` 是产品里把候选表装进模板的地方。这里断言两件事：
+    #   ① 装出来的东西**没有留下占位符**（`__ROOT__` 这种拼错会让 JS 抛 ReferenceError，
+    #      被表达式自己的 try/catch 吞掉 → o.err 有值、其余字段全空 → **静默发 `--`**）；
+    #   ② 把表达式里的四个数组**按 JS 语法切开再解析回来**，与候选表**逐条相等** ——
+    #      这才叫"表和发出去的 JS 不会漂移"（比"字符串里包含某条候选"强：候选本身带
+    #      `[` `]` `"`，包含式断言会被这些字符骗过去）。
+    $script:AllCands = [pscustomobject]@{
+        roots = @(Get-VinylRootCandidates); lines = @(Get-VinylLineCandidates)
+        titles = @(Get-VinylTitleCandidates); artists = @(Get-VinylArtistCandidates) }
+    $script:EmittedExpr = New-VinylExpression -Template $script:VinylExpressionTemplate `
+        -Roots $script:AllCands.roots -Lines $script:AllCands.lines `
+        -Titles $script:AllCands.titles -Artists $script:AllCands.artists
+    $script:EmittedArrays = @{}
+    $script:EmittedParseOk = $true
+    foreach ($n in @('roots', 'lines', 'titles', 'artists')) {
+        $lit = Get-JsArrayLiteral -Text $script:EmittedExpr -VarName $n
+        $script:EmittedArrays[$n] = $null
+        if (-not $lit) { $script:EmittedParseOk = $false; continue }
+        try { $script:EmittedArrays[$n] = @($lit | ConvertFrom-Json) } catch { $script:EmittedParseOk = $false }
     }
+    # 单条候选的表：`@('a') | ConvertTo-Json` 给出的是 `"a"`（**标量**，不是数组），
+    # 于是发出去的 JS 成了 `var roots="a"` —— `list.length` 变成字符串长度、querySelector
+    # 拿到单个字符、四条候选静默全落空。这是"以后某天删到只剩一条"才发作的潜伏缺陷，
+    # 所以用一条**单元素**表再装一次并断言它仍然是数组字面量。
+    $script:OneCandExpr = New-VinylExpression -Template $script:VinylExpressionTemplate `
+        -Roots @('#ONLY_ONE') -Lines @('li.line.current') -Titles @('span.title') -Artists @('span[title]')
+    $script:OneCandLit = Get-JsArrayLiteral -Text $script:OneCandExpr -VarName 'roots'
+    $script:OneCandRoundTrip = $null
+    if ($script:OneCandLit) { try { $script:OneCandRoundTrip = @($script:OneCandLit | ConvertFrom-Json) } catch { } }
+
+    # 语法感知地切出 `var <name>= [...]`（候选里有 `[` `]` `"`，正则的非贪婪会切错）
     # 真机实测序列（01:04:01 → 01:04:35，每 1.5 s 采样一次；中间有暂停）：
     #   195.92 → 202.91 → 202.91（暂停）→ 226.99 → 226.99 → 230.29 → 233.36 → 234.96
     # 暂停那两拍**必须仍然可用**（位置与行一起不动，是自洽的），跳变那几拍是真实换行
     # —— 实测这一首的相邻句间隔 2.6 s ~ 26.7 s，所以上界必须比 5 s 宽得多。
-    $script:GuardRealSeq = Invoke-VinylGuardModel -TimesMs @(195920, 202910, 202910, 226990, 226990, 230290, 233360, 234960)
+    $script:SeqReal = Invoke-VinylFrameModel -Readings (New-VinylSeq -TimesMs @(195920, 202910, 202910, 226990, 226990, 230290, 233360, 234960))
     # 真机**长间奏**（26.7 s 一跳）也必须算可用：这是"阈值别定太紧"的直接证据。
-    $script:GuardLongGap = Invoke-VinylGuardModel -TimesMs @(195500, 222200)
-    # 反例序列：冻结住的读数（选择器命中了别处一个恒为 29.5 s 的节点）——
-    # 前两拍"可用"是正常的（和暂停长得一样），**第三拍起必须判不可用**。
-    $script:GuardFrozenSeq = Invoke-VinylGuardModel -TimesMs @(29500, 29500, 29500, 29500, 29500)
-    # 反例序列：切歌当拍读到新歌第一行（1 s），而位置还在上一首的 240 s 上 → 往回走太多。
-    $script:GuardBackJumpSeq = Invoke-VinylGuardModel -TimesMs @(240000, 1000)
-    # 反例序列：几百秒的跳变（读到上一首的陈旧节点）→ 不可用。
-    $script:GuardStaleJumpSeq = Invoke-VinylGuardModel -TimesMs @(10000, 400000)
+    $script:SeqLongGap = Invoke-VinylFrameModel -Readings (New-VinylSeq -TimesMs @(195500, 222200))
+    # 反例：冻结住的读数（选择器命中了别处一个恒为 29.5 s 的节点）——
+    # 前四拍"可用"是正常的（和暂停长得一样），**第五拍起必须判不可用**。
+    $script:SeqFrozen = Invoke-VinylFrameModel -Readings (New-VinylSeq -TimesMs @(29500, 29500, 29500, 29500, 29500, 29500))
+    # 反例：切歌当拍读到新歌第一行（1 s），而位置还在上一首的 240 s 上。
+    $script:SeqBackJump = Invoke-VinylFrameModel -Readings (New-VinylSeq -TimesMs @(240000, 1000))
+    # 反例：几百秒的跳变（读到上一首的陈旧节点）。
+    $script:SeqStaleJump = Invoke-VinylFrameModel -Readings (New-VinylSeq -TimesMs @(10000, 400000))
+    # **恢复**（这条来源没有下级接手，所以"进去出不来"是致命的）：
+    #   ① 往回拖进度条：150 s → 50 s 之后的每一拍都曾是"往回走太多"→ 旧写法永久卡住；
+    #   ② 暂停四拍后继续：计数已经到顶，旧写法把"位置又前进了"也判成冻结 → 永久卡住。
+    $script:SeqSeekBack = Invoke-VinylFrameModel -Readings (New-VinylSeq -TimesMs @(100000, 150000, 50000, 50200, 51000))
+    $script:SeqPauseResume = Invoke-VinylFrameModel -Readings (New-VinylSeq -TimesMs @(29500, 29500, 29500, 29500, 150000, 152000, 154000))
+    # 候选全落空 / 无页面 / 页面内报错：三条都要"判不可用 + 说出判别性数值"
+    $script:ReadMissAll = New-VinylReading -NoLine -LineHit '' -RootHit ''
+    $script:ReadPageErr = New-VinylReading -NoLine -LineHit '' -RootHit '#VINYL_COVER_ELEMENT_ID' `
+        -Why 'TypeError: e.getAttribute is not a function'
+    $script:ReadStaleNode = New-VinylReading -TimeMs 29500 -LineHit 'li[data-time].current' `
+        -Original 'wrong line' -RootHit '(none)'
+    $script:FrameMissAll = Resolve-VinylFrame -Vinyl $script:ReadMissAll
+    $script:FramePageErr = Resolve-VinylFrame -Vinyl $script:ReadPageErr
+    $script:FrameNoPage = Resolve-VinylFrame -Vinyl $null
+    # 一个**命中第 2 条候选**的读数：日志必须点名是哪一条（不是"命中了一个选择器"）
+    $script:FrameSecondCand = Resolve-VinylFrame -Vinyl (New-VinylReading -TimeMs 22950 `
+        -Original 'Such a beautiful vibrancy' -Translation '多么美丽的盎然生机啊' -LineHit $script:LineCands[1])
+    # "不发"唯一能被断言的形式：**拼出来的发布计划**里没有 lyric、也没有 pos
+    $script:PlanMissAll = Get-PublishPlan -Title 'A' -Artist 'B' -Line $script:FrameMissAll.Line `
+        -Translation $script:FrameMissAll.Translation `
+        -Pos $(if ($null -ne $script:FrameMissAll.PositionMs) { 'p' } else { '' })
 
     $checks = @(
         # ---- 候选表顺序（"通用准确"的胜负手）--------------------------------------------
@@ -1259,17 +1540,63 @@ if ($SelfTest) {
         @{ Name = '身份：黑胶页没有时退到 store，并用 resourceArtists 拼歌手'; Ok = ((Resolve-TrackIdentity -StoreTitle '铁花飞' -StoreArtist 'Mili / 塞壬唱片-MSR' -WindowTitle '').Artist -eq 'Mili / 塞壬唱片-MSR') }
         @{ Name = '身份：没有调试端口时用窗口标题，且按**最后一个**「 - 」切（歌名里可能有「 - 」）'; Ok = ((Resolve-TrackIdentity -WindowTitle 'A - B - C').Title -eq 'A - B') }
         @{ Name = '身份：三条来源都空 → $null（主循环据此走"响亮失败"那条路，而不是发一个空标题）'; Ok = ($null -eq (Resolve-TrackIdentity -VinylTitle '' -StoreTitle '' -WindowTitle '')) }
-        # ---- 新鲜度判定：多拍序列（这是"不许拿冻结值遮住会前进的来源"那条不变量的落点）----
-        @{ Name = '新鲜度：真机采样序列（195.9→234.96，含暂停两拍）**每一拍都可用**'; Ok = ($script:GuardRealSeq.Count -eq 8) }
-        @{ Name = '新鲜度：真机长间奏 26.7 s 一跳也算可用（阈值宁松勿误杀）'; Ok = ($script:GuardLongGap.Count -eq 2) }
-        @{ Name = '新鲜度：冻结的读数最多被采用 RepeatLimit 拍（与暂停无从区分），之后判不可用'; Ok = ($script:GuardFrozenSeq.Count -eq 4) }
-        @{ Name = '新鲜度：切歌当拍往回跳太多（240 s → 1 s）= 不可用（否则位置被钉在新歌第 0 行）'; Ok = ($script:GuardBackJumpSeq.Count -eq 1) }
-        @{ Name = '新鲜度：几百秒的跳变（上一首的陈旧节点）= 不可用'; Ok = ($script:GuardStaleJumpSeq.Count -eq 1) }
-        @{ Name = '新鲜度：连续读到同一个数达到 RepeatLimit(3) 就不可用（**冻结的真正形状**）'; Ok = (-not (Test-VinylLineUsable -PrevTimeMs 29500 -NowTimeMs 29500 -SameReads 3)) -and (Test-VinylLineUsable -PrevTimeMs 29500 -NowTimeMs 29500 -SameReads 1) }
-        @{ Name = '新鲜度：第一次见到就当引导值（prev=-1）'; Ok = (Test-VinylLineUsable -PrevTimeMs -1 -NowTimeMs 29500) }
-        @{ Name = '新鲜度：小回退（选中同一行的相邻读数）可用；大回退不可用'; Ok = ((Test-VinylLineUsable -PrevTimeMs 10000 -NowTimeMs 9500)) -and (-not (Test-VinylLineUsable -PrevTimeMs 10000 -NowTimeMs 1000)) }
-        @{ Name = '新鲜度：往前跳一点点可用；跳超过 30 s（陈旧节点）不可用'; Ok = ((Test-VinylLineUsable -PrevTimeMs 10000 -NowTimeMs 14000)) -and (-not (Test-VinylLineUsable -PrevTimeMs 10000 -NowTimeMs 60000)) }
-        @{ Name = '新鲜度：解不出 time（-1）= 不可用'; Ok = (-not (Test-VinylLineUsable -PrevTimeMs -1 -NowTimeMs -1)) }
+        # ==== 组 1：CDP 回包的解析（**真机原始字节**，不是手写的整齐 JSON）================
+        # 这一组钉住的失效形状是"解析出空值、然后**静默**发 `--`"：面板上看不出
+        # "页面读不到"和"这一句没有歌词"的区别，而两者的修法完全不同。所以每条反例都
+        # **同时**断言两件事：`Ok` 为假，且 `Why` 说得清是**哪一层**失败的。
+        @{ Name = '回包：真机原始字节 → 解析成功（两层 JSON 的 `\"` 转义与 `\uXXXX` 中文都对）'; Ok = ($script:ReplyReal.Ok -and $script:ReplyReal.Value.dataTime -eq '95.82') }
+        @{ Name = '回包：真机原始字节 → paras 两段、第一段是真机原文、第二段为空（真机那一行没有翻译）'; Ok = ($script:ReplyReal.Value.paras.Count -eq 2) -and ($script:ReplyReal.Value.paras[0] -eq '四面楚歌，这颗心无惧无畏') -and ($script:ReplyReal.Value.paras[1] -eq '') }
+        @{ Name = '回包：真机原始字节 → lineHit/title/artist 逐字保留（后面要靠它点名候选）'; Ok = ($script:ReplyReal.Value.lineHit -eq $script:LineCands[0]) -and ($script:ReplyReal.Value.title -eq '铁花飞') -and ($script:ReplyReal.Value.artist -eq 'Mili / 塞壬唱片-MSR') }
+        @{ Name = '回包：真机原始字节走完整条链 → 拍判定 ok、位置 95820ms、原文与空翻译都对'; Ok = ($script:FrameFromRawReal.Guard -eq 'ok') -and ($script:FrameFromRawReal.PositionMs -eq 95820) -and ($script:FrameFromRawReal.Line -eq '四面楚歌，这颗心无惧无畏') -and ($script:FrameFromRawReal.Translation -eq '') }
+        @{ Name = '回包：被截断（字符串没有收尾引号）= 解析失败，且 Why 说"没有字符串形态的 result.value"并带字节数'; Ok = (-not $script:ReplyTruncated.Ok) -and ($script:ReplyTruncated.Why -like '*没有字符串形态的 result.value*') -and ($script:ReplyTruncated.Why -like '*300B*') }
+        @{ Name = '回包：外层的引号在、**里层** JSON 被截断 = 解析失败，且 Why 指到第二层'; Ok = (-not $script:ReplyInnerCut.Ok) -and ($script:ReplyInnerCut.Why -like '第二层：页面返回值不是合法 JSON*') }
+        @{ Name = '回包：CDP 报错回包（没有 result.value）= 解析失败并说出来'; Ok = (-not $script:ReplyErr.Ok) -and ($script:ReplyErr.Why -like '*没有字符串形态的 result.value*') }
+        @{ Name = '回包：value 为 null = 解析失败（不是"解析成功但字段为空"）'; Ok = (-not $script:ReplyNull.Ok) -and ($script:ReplyNull.Why -like '*没有字符串形态的 result.value*') }
+        @{ Name = '回包：value 是**数组本身**（不是字符串）= 解析失败（不能被硬塞进第二层）'; Ok = (-not $script:ReplyArr.Ok) -and ($script:ReplyArr.Why -like '*没有字符串形态的 result.value*') }
+        @{ Name = '回包：value 是"合法的 JSON 但不是对象"（[1,2,3] / "hello"）= 解析失败并说出类型'; Ok = (-not $script:ReplyInnerArr.Ok) -and ($script:ReplyInnerArr.Why -like '*不是对象*') -and (-not $script:ReplyInnerStr.Ok) -and ($script:ReplyInnerStr.Why -like '*不是对象*') }
+        @{ Name = '回包：value 根本不是 JSON（hello）= 解析失败'; Ok = (-not $script:ReplyInnerGarbage.Ok) -and ($script:ReplyInnerGarbage.Why -like '第二层：页面返回值不是合法 JSON*') }
+        @{ Name = '回包：空回包 = 解析失败并说"没读到帧"'; Ok = (-not $script:ReplyEmpty.Ok) -and ($script:ReplyEmpty.Why -like '*回包为空*') }
+        @{ Name = '回包：**十条反例每一条**都必须"Ok 为假 **且** Why 非空"（静默失败就是这一条要挡的形状）'; Ok = (@($script:ReplyTruncated, $script:ReplyInnerCut, $script:ReplyErr, $script:ReplyNull, $script:ReplyArr, $script:ReplyInnerArr, $script:ReplyInnerStr, $script:ReplyInnerGarbage, $script:ReplyEmpty) | Where-Object { $_.Ok -or -not $_.Why }).Count -eq 0 }
+        # ==== 组 2：候选表 ↔ 真正发出去的 JS（**唯一的桥**）==============================
+        @{ Name = '表达式：装出来后**没有任何占位符残留**（`__ROOT__` 拼错会让 JS 抛错被 try/catch 吞掉 → 静默空值）'; Ok = ($script:EmittedExpr -notmatch '__[A-Z]+__') }
+        @{ Name = '表达式：四个数组都能按 JS 语法切出来并解析回 JSON'; Ok = $script:EmittedParseOk }
+        @{ Name = '表达式：解析回来的 roots 与候选表**逐条相等**'; Ok = (($script:EmittedArrays['roots'] -join '|') -eq ($script:AllCands.roots -join '|')) }
+        @{ Name = '表达式：解析回来的 lines 与候选表逐条相等（顺序也在内）'; Ok = (($script:EmittedArrays['lines'] -join '|') -eq ($script:AllCands.lines -join '|')) }
+        @{ Name = '表达式：解析回来的 titles 与候选表逐条相等'; Ok = (($script:EmittedArrays['titles'] -join '|') -eq ($script:AllCands.titles -join '|')) }
+        @{ Name = '表达式：解析回来的 artists 与候选表逐条相等'; Ok = (($script:EmittedArrays['artists'] -join '|') -eq ($script:AllCands.artists -join '|')) }
+        @{ Name = '表达式：四张表**各自只被赋值一次**（有第二处硬编码的候选表就会各说一套）'; Ok = ([regex]::Matches($script:EmittedExpr, '\b(roots|lines|titles|artists)\s*=').Count -eq 4) }
+        @{ Name = '表达式：**只有一条候选**时仍然是数组字面量（`@(''a'') | ConvertTo-Json` 会给标量 `"a"`，那就是四条候选静默全落空）'; Ok = ($script:OneCandLit -eq '["#ONLY_ONE"]') }
+        @{ Name = '表达式：单元素数组解析回来是**一条**候选（不是把它拆成字符）'; Ok = ($script:OneCandRoundTrip.Count -eq 1) -and ($script:OneCandRoundTrip[0] -eq '#ONLY_ONE') }
+        @{ Name = '候选命中：日志点名**是哪一条**候选命中的（不是"命中了一个选择器"）'; Ok = ((Format-VinylHit -Hit $script:LineCands[1]) -eq $script:LineCands[1]) }
+        @{ Name = '候选命中：命中第 2 条候选时，拍判定里的 LineHit 就是**那一条的字面值**'; Ok = ($script:FrameSecondCand.Guard -eq 'ok') -and ($script:FrameSecondCand.LineHit -eq $script:LineCands[1]) -and ($script:FrameSecondCand.LineHit -ne $script:LineCands[0]) }
+        # ==== 组 3：候选全落空 / 无页面 / 陈旧 → **一律不发**（端到端，纯函数层）============
+        # 判据不是"读了几个字段"，而是**拼出来的发布计划里没有 lyric、也没有 pos** ——
+        # 那是"不发"唯一能被断言的形式（面板上留 `--` 而不是钉在一个旧值上）。
+        @{ Name = '落空：候选全落空 → Guard=no-line、位置为空、原文为空'; Ok = ($script:FrameMissAll.Guard -eq 'no-line') -and ($null -eq $script:FrameMissAll.PositionMs) -and ($script:FrameMissAll.Line -eq '') }
+        @{ Name = '落空：Why 里有判别性数值（指出根候选也是 (none)）'; Ok = ($script:FrameMissAll.Why -like '*行候选全部落空*') -and ($script:FrameMissAll.Why -like '*root=''*') -and ($script:FrameMissAll.LineHit -eq '(none)') }
+        @{ Name = '落空：候选全落空时**发布计划里没有 lyric、也没有 pos**（正是"不发"而不是发旧值）'; Ok = (-not $script:PlanMissAll.Contains('lyric')) -and (-not $script:PlanMissAll.Contains('pos')) }
+        @{ Name = '落空：候选全落空时 title/translation 照旧发（只有位置与歌词受影响，别把整行打没）'; Ok = ($script:PlanMissAll.Contains('title')) -and ($script:PlanMissAll.Contains('translation')) -and ($script:PlanMissAll['title'] -eq 'A - B') }
+        @{ Name = '落空：没有页面（Get-CdpVinyl 返回 $null）→ 同样 no-line 且不发'; Ok = ($script:FrameNoPage.Guard -eq 'no-line') -and ($null -eq $script:FrameNoPage.PositionMs) -and (-not (Get-PublishPlan -Title 'A' -Artist 'B' -Line $script:FrameNoPage.Line -Translation $script:FrameNoPage.Translation -Pos '').Contains('lyric')) }
+        @{ Name = '落空：页面内报错（DOM 变了导致表达式抛异常）时，**页面自己的错误文本被带出来**（比"落空"更有信息量）'; Ok = ($script:FramePageErr.Guard -eq 'no-line') -and ($script:FramePageErr.Why -like '*页面内报错*getAttribute*') }
+        @{ Name = '陈旧：命中了别的节点（恒为 29.5 s）时，判 stale 并且**不发那一句错的歌词**'; Ok = ($script:SeqFrozen[4].Guard -eq 'stale') -and ($null -eq $script:SeqFrozen[4].PositionMs) -and ($script:SeqFrozen[4].Line -eq '') }
+        @{ Name = '陈旧：stale 那一拍的 Why 带出 prev/now/连续次数三个数'; Ok = ($script:SeqFrozen[4].Why -like '*一直不动*') -and ($script:SeqFrozen[4].Why -like '*29500ms*') }
+        @{ Name = '陈旧：stale 那一拍的发布计划里没有 lyric、也没有 pos'; Ok = (-not (Get-PublishPlan -Title 'A' -Artist 'B' -Line $script:SeqFrozen[4].Line -Translation $script:SeqFrozen[4].Translation -Pos $(if ($null -ne $script:SeqFrozen[4].PositionMs) { 'p' } else { '' })).Contains('lyric')) }
+        # 恢复：这条来源**没有下级接手**，所以"进去出不来"是致命的。两个真实的进入方式各一条。
+        @{ Name = '恢复：往回拖进度条（150 s → 50 s）后，跳变拍不发、**下一拍停在新位置就恢复 ok**'; Ok = ($script:SeqSeekBack[2].Guard -eq 'stale') -and ($script:SeqSeekBack[3].Guard -eq 'ok') -and ($script:SeqSeekBack[3].PositionMs -eq 50200) -and ($script:SeqSeekBack[4].Guard -eq 'ok') }
+        @{ Name = '恢复：暂停四拍后位置又前进（计数已到顶）**必须恢复**（旧写法会把"又前进"也判成冻结 → 永久卡住）'; Ok = ($script:SeqPauseResume[4].Guard -eq 'stale') -and ($script:SeqPauseResume[5].Guard -eq 'ok') -and ($script:SeqPauseResume[5].PositionMs -eq 152000) -and ($script:SeqPauseResume[6].Guard -eq 'ok') }
+        @{ Name = '恢复：判"冻结"必须同时满足"还是同一个数"（值变了就归零）'; Ok = ($script:SeqPauseResume[4].SameReads -eq 0) -and ($script:SeqPauseResume[5].SameReads -eq 0) }
+        @{ Name = '跳变：基准会挪到新位置（否则 prev 永远大于之后的每个读数 → 永久停住）'; Ok = ($script:SeqSeekBack[2].PrevTimeMs -eq 50000) -and ($script:SeqStaleJump[1].PrevTimeMs -eq 400000) }
+        # ==== 组 4：新鲜度判据本身（两个谓词 + 多拍序列，都是产品走的那条路）==============
+        @{ Name = '新鲜度：真机采样序列（195.9→234.96，含暂停两拍）**每一拍都可用**'; Ok = (@($script:SeqReal | Where-Object { $_.Guard -eq 'ok' }).Count -eq 8) }
+        @{ Name = '新鲜度：真机长间奏 26.7 s 一跳也算可用（阈值宁松勿误杀）'; Ok = (@($script:SeqLongGap | Where-Object { $_.Guard -eq 'ok' }).Count -eq 2) }
+        @{ Name = '新鲜度：冻结的读数最多被采用 RepeatLimit 拍（与暂停无从区分），之后判不可用'; Ok = (@($script:SeqFrozen | Where-Object { $_.Guard -eq 'ok' }).Count -eq 4) }
+        @{ Name = '新鲜度：切歌当拍往回跳太多（240 s → 1 s）= 不可用（否则位置被钉在新歌第 0 行）'; Ok = (@($script:SeqBackJump | Where-Object { $_.Guard -eq 'ok' }).Count -eq 1) }
+        @{ Name = '新鲜度：几百秒的跳变（上一首的陈旧节点）= 不可用'; Ok = (@($script:SeqStaleJump | Where-Object { $_.Guard -eq 'ok' }).Count -eq 1) }
+        @{ Name = '新鲜度：计数到顶**且**还是同一个数 = 冻结（RepeatLimit 次）'; Ok = (Test-VinylValueFrozen -SameReads 3) -and ($script:SeqFrozen[4].Guard -eq 'stale') }
+        @{ Name = '新鲜度：第一次见到就当引导值（prev=-1）'; Ok = (Test-VinylJumpPlausible -FromMs -1 -ToMs 29500) }
+        @{ Name = '新鲜度：小回退（选中同一行的相邻读数）可用；大回退不可用'; Ok = (Test-VinylJumpPlausible -FromMs 10000 -ToMs 9500) -and (-not (Test-VinylJumpPlausible -FromMs 10000 -ToMs 1000)) }
+        @{ Name = '新鲜度：往前跳一点点可用；跳超过 30 s（陈旧节点）不可用'; Ok = (Test-VinylJumpPlausible -FromMs 10000 -ToMs 14000) -and (-not (Test-VinylJumpPlausible -FromMs 10000 -ToMs 60000)) }
+        @{ Name = '新鲜度：解不出 time（-1）= 不可用'; Ok = (-not (Test-VinylJumpPlausible -FromMs -1 -ToMs -1)) }
         # store 那套（曲目 id → 行号 → 文本）只在**没有黑胶页**时兜底：切歌当拍它还是上一首的数组，
         # 拿它的文本贴到这一句上就是"翻译串行"。判据就是曲目 id。
         @{ Name = 'store 兜底：曲目 id 一致且在范围内才可用'; Ok = (Test-StoreLyricUsable -StoreTrack '3342981041' -CurrentTrack '3342981041' -Index 4 -Lines 64) }
@@ -1318,7 +1645,7 @@ if ($SelfTest) {
 # 因为界面上一片空白，而可能的原因有四个：端口没了 / 目标没了 / 选择器全没命中 /
 # 命中了但读数是冻结的。四个原因指向四种修法，所以每一轮都把四个都打出来。
 #
-# ⚠ 探针里**不许**有自己的一套判据：位置是否可用与主循环是同一个 `Test-VinylLineUsable`，
+# ⚠ 探针里**不许**有自己的一套判据：它与主循环调的是**同一个** `Resolve-VinylFrame`，
 # 否则探针说"没问题"而主循环在丢弃它（或反过来），就是又一次自己测自己（AGENTS §7.8）。
 if ($ProbeVinyl -or $ProbeStore) {
     $ports = @($CdpPorts)
@@ -1350,31 +1677,33 @@ if ($ProbeVinyl -or $ProbeStore) {
     for ($i = 1; $i -le $ProbeRounds; $i++) {
         $v = Get-CdpVinyl
         $ss = Get-CdpStoreState
+        # 判据只有一处：`Resolve-VinylFrame`（与主循环同一个调用，见那里的注释）。
+        # 探针**不许**自己再写一份"连续相同次数"的记账——那样的两份必须一致却没人保证。
+        $fr = Resolve-VinylFrame -Vinyl $v -PrevTimeMs $prevTimeMs -SameReads $sameTimeMs
+        $prevTimeMs = $fr.PrevTimeMs
+        $sameTimeMs = $fr.SameReads
         if (-not $v) {
             Write-Host ("  {0,2} {1,-9} **Get-CdpVinyl 返回空**（端口/目标/求值三处之一失败 —— 见上面逐条目标）" -f `
                 $i, (Get-Date).ToString('HH:mm:ss'))
         }
         else {
-            $timeMs = if ($v.Line) { [int]$v.Line.TimeMs } else { -1 }
-            $usable = if ($v.Line) { [bool](Test-VinylLineUsable -PrevTimeMs $prevTimeMs -NowTimeMs $timeMs -SameReads $sameTimeMs) } else { $false }
-            $guard = if (-not $v.Line) { 'no-line' } elseif ($usable) { 'ok' } else { 'stale→不用' }
+            $guard = switch ($fr.Guard) { 'ok' { 'ok' } 'stale' { 'stale→不用' } default { 'no-line' } }
             $titleText = if ($v.Title -or $v.Artist) { "$($v.Title) / $($v.Artist)" } elseif ($ss -and $ss.ok) { "$($ss.name) - $($ss.artists)" } else { '(none)' }
             $lineText = if ($v.Line) { "$($v.Line.Original) | $($v.Line.Translation)" } else { '' }
             Write-Host ("  {0,2} {1,-9} {2,-11} {3,-9} {4,-9} {5,-8} {6,-9} {7,-9} {8,-22} {9}" -f `
                 $i, (Get-Date).ToString('HH:mm:ss'), $(if ($v.Root) { $v.RootHit } else { '(miss)' }), `
-                $v.LineHit, $(if ($v.Line) { $v.Line.DataTime } else { '-' }), $guard, $v.LiCount, `
+                $fr.LineHit, $(if ($v.Line) { $v.Line.DataTime } else { '-' }), $guard, $v.LiCount, `
                 $(if ($v.Title) { $v.TitleHit } else { '(miss)' }), $titleText, $lineText)
-            if ($v.Line -and $usable) {
-                if ($prevTimeMs -ge 0 -and $timeMs -eq $prevTimeMs) { $sameTimeMs++ } else { $sameTimeMs = 0 }
-                $prevTimeMs = $timeMs
-            }
+            # 判成不可用时把**原因**打出来（判别性数值：哪个候选落空、prev/now/连续次数）；
+            # 这就是"读不到"与"这一句没有歌词"在输出上不再长得一样的地方。
+            if ($fr.Why) { Write-Host ("      ! {0}" -f $fr.Why) }
             if ($i -eq 1) {
                 Write-Host ("      store: ok={0} trackId='{1}' playId='{2}' state={3} lines={4} tlines={5} dur={6}ms" -f `
                     $(if ($ss) { $ss.ok } else { 'n/a' }), $(if ($ss) { $ss.trackId } else { '' }), `
                     $(if ($ss) { $ss.playId } else { '' }), $(if ($ss) { $ss.state } else { '' }), `
                     $(if ($ss) { $ss.lines } else { '' }), $(if ($ss) { $ss.tlines } else { '' }), `
                     $(if ($ss) { $ss.durationMs } else { '' }))
-                Write-Host ("      line 候选输出：{0}" -f $(if ($v) { Format-VinylHit -Hit $v.LineHit } else { '(none)' }))
+                Write-Host ("      line 候选输出：{0}" -f $fr.LineHit)
             }
         }
         if ($i -lt $ProbeRounds) { Start-Sleep -Milliseconds $IntervalMs }
@@ -1414,12 +1743,12 @@ if (-not $DryRun) {
 }
 
 # 换歌检测用**曲目身份**（标题 + 歌手），不再用窗口标题：托盘模式下窗口标题根本没有值。
-# 上一轮见到的当前行 data-time（毫秒，-1 = 还没见到）——`Test-VinylLineUsable` 的输入。
+# 上一轮见到的当前行 data-time（毫秒，-1 = 还没见到）——`Resolve-VinylFrame` 的输入。
 $lastRaw = ''
 $announced = $false
 $script:LastEventAt = [datetime]::MinValue
 $prevLineMs = -1
-# 连续读到**同一个** data-time 的次数（见 Test-VinylLineUsable 判据⑤）。暂停时它会涨，
+# 连续读到**同一个** data-time 的次数（见 `Test-VinylValueFrozen`）。暂停时它会涨，
 # 但那时"行不动"是事实；涨到 RepeatLimit 只是让桥**不再发新的位置/歌词**，不会造假值。
 $sameLineMs = 0
 
@@ -1464,31 +1793,17 @@ try {
                 Write-Host ("换歌：{0}（身份来源 {1}）" -f $trackRaw, $ident.Source)
             }
 
-            # 位置与当前行：**同一次读**（都在 li.line.current 上）。
-            $positionMs = $null
-            $line = ''
-            $translation = ''
-            $posSrc = 'vinyl'
-            $why = ''
-            if (-not $vinyl) {
-                $why = 'CDP 求值失败（端口活着但 Runtime.evaluate 没回值）'
-            }
-            elseif (-not $vinyl.Line) {
-                $why = "行候选全部落空（root='$($vinyl.RootHit)' 命中但 li.line.current 不在里面）"
-            }
-            else {
-                $timeMs = [int]$vinyl.Line.TimeMs
-                if (Test-VinylLineUsable -PrevTimeMs $prevLineMs -NowTimeMs $timeMs -SameReads $sameLineMs) {
-                    if ($prevLineMs -ge 0 -and $timeMs -eq $prevLineMs) { $sameLineMs++ } else { $sameLineMs = 0 }
-                    $prevLineMs = $timeMs
-                    $positionMs = $timeMs
-                    $line = $vinyl.Line.Original
-                    $translation = $vinyl.Line.Translation
-                }
-                else {
-                    $why = "data-time 不可用：prev=${prevLineMs}ms now=${timeMs}ms 连续相同=${sameLineMs}（往回走/往前跳太多/一直不动 → 判陈旧）"
-                }
-            }
+            # 位置与当前行：**同一次读**（都在 li.line.current 上），判定只在
+            # `Resolve-VinylFrame` 一处（纯函数，-SelfTest 覆盖）。判成 no-line / stale 时
+            # 位置与歌词都**不发**——这一个函数就是"读不到就不发"这句承诺的落点。
+            $frame = Resolve-VinylFrame -Vinyl $vinyl -PrevTimeMs $prevLineMs -SameReads $sameLineMs
+            $prevLineMs = $frame.PrevTimeMs
+            $sameLineMs = $frame.SameReads
+            $positionMs = $frame.PositionMs
+            $line = $frame.Line
+            $translation = $frame.Translation
+            $posSrc = $frame.Source
+            $why = $frame.Why
 
             # 兜底：黑胶页那一拍没给出当前行时，用 store 的歌词数组按这个曲目自己选一行。
             # **只在 store 报的曲目 id 与这一轮身份的曲目一致时**才允许（切歌当拍 store 还是

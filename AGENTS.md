@@ -307,8 +307,10 @@ python .tool/preview/_preview.py
 `ExtParseLine` · `ExtSanitize` · `ExtParseNumber` · `ExtLookup` · `ExtNextDeadline` ·
 `ExtEvictIndex` · `ExtProviderAllowed` · `ExtReplyTimeoutsAfter` · `IslandEnqueue` / `StepIsland` / `IslandHitTest` /
 `IslandClickActionFor` · `Select-StoreLineIndex` / `Select-SongTitle` / `Get-LeadMs` /
-`Split-VinylParagraphs` / `ConvertFrom-VinylSeconds` / `Test-VinylLineUsable` /
-`Test-StoreLyricUsable` / `Resolve-TrackIdentity` / `Get-Vinyl*Candidates`（脚本侧）
+`Split-VinylParagraphs` / `ConvertFrom-VinylSeconds` / `Test-VinylJumpPlausible` /
+`Test-VinylValueFrozen` / `Resolve-VinylFrame` / `Resolve-TrackIdentity` /
+`Get-CdpReplyVerdict` / `New-VinylExpression` / `Test-StoreLyricUsable` /
+`Get-Vinyl*Candidates`（脚本侧）
 
 **新增绘制逻辑时照此办理。** 如果一段逻辑无法在测试里调用，它就无法被守住。
 反过来，**测试不应该自己复刻一份产品逻辑**（复刻出来的那份测不到产品）；
@@ -436,7 +438,8 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   （托盘模式，真机实测 4 个 cloudmusic 窗口全部 `IsWindowVisible=0`）让 `$now` 为空、
   整个发布块被跳过 → 歌词和曲名**一起静默消失**。现在身份/位置/歌词都来自 CDP 页面。
 - **一条来源只给一次值；失值时置空并响亮上报，绝不拿冻结值顶上。** 这来源的守卫是
-  `Test-VinylLineUsable`（往回走 / 往前跳太多 / 连读同一个数 = 判陈旧）。
+  `Test-VinylJumpPlausible`（往回走 / 往前跳太多 / 解不出值）+ `Test-VinylValueFrozen`
+  （连读同一个数到顶），两者在 `Resolve-VinylFrame` 里合成一句"发还是不发"。
 
 ---
 
