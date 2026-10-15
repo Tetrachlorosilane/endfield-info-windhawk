@@ -9284,7 +9284,7 @@ static bool SamplerIteration() {
         // also closes the job object, so it runs on every pass either way; the log line
         // is emitted only when there really was a process. No assertion can cover this
         // (it is a real CreateProcess), so the log is the defence -- same as the
-        // nMaxInstances case in AGENTS §6.
+        // nMaxInstances case in docs/state-and-handover.md §13.
         if (ExtPublisherAlive()) {
             Wh_Log(L"EXT publisher: nothing consumes {ext.*} any more; stopping it");
         }
