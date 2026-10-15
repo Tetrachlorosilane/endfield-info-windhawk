@@ -30,7 +30,7 @@ What it checks
 
 Usage
 -----
-    python _logfmt.py [path-to-.wh.cpp]
+    python .tool/checks/_logfmt.py [path-to-.wh.cpp]
 
 Exit code 0 = nothing found, 1 = at least one mismatch.
 """
@@ -39,7 +39,9 @@ import re
 import sys
 from pathlib import Path
 
-DEFAULT_SRC = Path(__file__).with_name("endfield-info-windhawk.wh.cpp")
+# The product sits at the repository root, two levels above .tool/checks/, so the default
+# target is resolved from this file rather than from the current directory.
+DEFAULT_SRC = Path(__file__).resolve().parents[2] / "endfield-info-windhawk.wh.cpp"
 CALLS = ("Wh_Log", "DBG", "CpuClockLog")
 
 INT_CASTS = ("int", "unsigned", "DWORD", "UINT", "ULONG", "LONG", "BOOL", "bool",

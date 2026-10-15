@@ -6,10 +6,10 @@
 ## 怎么跑
 
 ```powershell
-python _preview.py
+python .tool/preview/_preview.py
 ```
 
-没有参数。输出固定写到脚本同目录的 `assets\panel-preview.png`（会覆盖旧图）。
+没有参数。输出固定写到**仓库根**的 `assets\panel-preview.png`（按 `__file__` 往上两级定位，会覆盖旧图）。
 版面数据是写死的：`ROWS`，每行给「**带 `[[icon:…]]` 标签的（已展开 token 的）文本**
 + [(比例, 颜色)] + 是否内联」。
 
@@ -66,7 +66,7 @@ Python 与 **Pillow**（`from PIL import Image, ImageDraw, ImageFont`）。
 `gap_px()` 与 `GAP_MAX_PX = 99` ↔ `kMaxGapPx` 与标记能写的四位数；
 `group_start()` 把一组元素量成一个整体再按左/中/右放到文字列上，放不下就退化成靠左。
 
-**没模拟**（都在产品侧有断言，要确认请跑 `test-layout.cpp`）：
+**没模拟**（都在产品侧有断言，要确认请跑 `.tool/regress/test-layout.cpp`）：
 
 - **宽度用 PIL 量，不是 GDI+ 量**。组的居中/靠右位置因此会和真机差几个像素，
   这看的是一组的**相对位置**，不是逐像素对齐。
@@ -92,8 +92,8 @@ Python 与 **Pillow**（`from PIL import Image, ImageDraw, ImageFont`）。
   也只建了一个字号的对象。所以**"图标跟随它自己所在的那一段字号"这条在图上看不出来**——
   预览里没有 `[[size:…]]`，每个图标都按全局 `FONT_SIZE` 算直径。
   这条关系由宿主的断言守着（`two icons in one row at two sizes have two diameters` /
-  `and the second is the run's size`），要确认它请跑 `test-layout.cpp`，不要看这张图。
+  `and the second is the run's size`），要确认它请跑 `.tool/regress/test-layout.cpp`，不要看这张图。
 - **图片图标（`[[icon:file=…]]`）只解析路径、不载入文件**：预览画的是回退字形
   （`IMAGE_FALLBACK_GLYPH`，对应 `kIconImageFallbackGlyph`），因为载图需要真文件与 GDI+。
-  想验证图片本身的缩放/重采样，用 `test-gdiplus-scale.cpp`。
+  想验证图片本身的缩放/重采样，用 `.tool/probe/test-gdiplus-scale.cpp`。
 - **预览不画动画**：没有入场缩放、没有涟漪，`:ripple` / `:noripple` 只被解析、不影响这张静态图。

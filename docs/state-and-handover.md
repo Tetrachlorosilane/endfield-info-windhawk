@@ -18,22 +18,22 @@
   16 位、隔行 PNG）。
 - 外部数据（M1）：编译只剩上面那两条已知警告；回归 **478 条断言**全绿（M1、M2、M3 与 CPU 频率共新增 318 条）；
   并做了**负对照**——把展开改成递归后，注入断言确实变红（不是"看着像在守"）。
-- 设置块 46 项 / 10 个选项组，`_settings.py` 报 `no structural problems found`。
+- 设置块 46 项 / 10 个选项组，`.tool/checks/_settings.py` 报 `no structural problems found`。
 - **mod 的日志格式串**：`-Wformat` **从来没有检查过它们**（2026-10-14 更正）✗。
   宿主打的 `Wh_Log` 桩是自造变参函数，没有 format 属性，clang 不会检查；实测同一文件里
-  `printf` 的两处错型各报 1 条、自造桩 0 条。改用 `python _logfmt.py` 审计：105 个调用点、
+  `printf` 的两处错型各报 1 条、自造桩 0 条。改用 `python .tool/checks/_logfmt.py` 审计：105 个调用点、
   0 处元数/错型问题（负对照实测会红）。详见 AGENTS §3 的方框。
 - 外部数据的**服务端路径**（`ExtHandleLine`：HELLO → SET → 存储 → 查找、换行框架与边缘空格裁剪、
   允许名单拒绝）有断言覆盖（总数见上文，不再重复一个会过期的数字）。
 - **真机整链验证（用户环境，2026-10-13）**：mod 的开机自检两帧被服务端完整收到
   （`self-test sent 2 frames` → `recv bytes=17/33` → `hello provider=selftest` → `set … key=ok`），
   且自检值在行里**显示了出来**——传输、存储、展开、绘制四段都成立；随后用
-  `_extclient.ps1`（.NET）发布的值也**在面板上显示**。管道参数同时被记录：
+  `.tool/pipe/_extclient.ps1`（.NET）发布的值也**在面板上显示**。管道参数同时被记录：
   `flags=0xd`（服务端 + message 类型 + 拒绝远程）、`curInstances=4`（4 个实例都是本进程的，
   没有第二个进程抢同名管道）。
-- **`_extclient.py` 尚未在真机上被观察到写入**：那个环境里它连上后同一毫秒即断开、零帧，
+- **`.tool/pipe/_extclient.py` 尚未在真机上被观察到写入**：那个环境里它连上后同一毫秒即断开、零帧，
   而脚本自身的时序（写完两行后至少 1 秒才关闭）与之不符——怀疑当时跑的并非本仓库这一份。
-  要用客户端验证时**优先用 `_extclient.ps1`**，或先确认 `python -c "import os;print(os.path.abspath('_extclient.py'))"`
+  要用客户端验证时**优先用 `.tool/pipe/_extclient.ps1`**，或先确认 `python -c "import os;print(os.path.abspath('_extclient.py'))"`
   指向本仓库的文件。
 - **`_netease-bridge.ps1`（示例发布器）**：**只有离线部分被验证过**——LRC 解析（元信息行、纯时间戳行、
   `.xx` 与 `.xxx` 两种小数、一行多标签）与按位置选行，9 条自检全绿；参数解析干净；
@@ -233,7 +233,7 @@
    **负对照实测：把修复改回去，恰好这一条变红**（当时 326 条断言 → 旧代码 FAILED 1）。
 2. **"宿主会检查日志格式串"是错的（已更正文档 + 新工具）**：见上文与 AGENTS §3 的方框。
    属性 / `ms_printf` / `wprintf` / `-fms-compatibility` 四条路实测全堵，MinGW 的 `swprintf`
-   同样不检查 → 新增 `_logfmt.py`（105 个调用点、0 问题；负对照会红）。
+   同样不检查 → 新增 `.tool/checks/_logfmt.py`（105 个调用点、0 问题；负对照会红）。
 3. **bridge 把 DOM 位置清成 null（已修；很可能是待办 #1 的成因）**：`_netease-bridge.ps1` 里
    `$positionMs = $null` 出现两次，第二次紧跟在 DOM 取值之后 → 位置退回 store 的 `lineTimeSec`
    （= 冻结的 `playingLyricLineNumber` 那一行）→ 选行永远选回同一行 → **歌词不换行**。
@@ -259,7 +259,7 @@
 | :-- | :-- |
 | **`PlanDownscale` 的不动点**：去掉"把短边钳回目标"的比例钳位（它让 `200x20` 这类横幅做十几次 1:1 空转、随后一次性压 8.7 倍；`4000x20` 末级 173 倍），改为纯按比例折半、短边允许降到 1px | `no stage reduces the long edge by more than 2x`、`the short side is the exact fit, rounded up by at most a pixel`；把钳位改回去 → 红 |
 | **图片-only 槽的字形回退**：借"第一个已配置的字形"（一个都没有则 `Memory`）现在对**任何**图片槽生效，不再只在"全工程都没有字形"时才借 | `an image-only slot borrows the configured glyph`、`with no glyph anywhere an image-only slot falls back to Memory`；把回退改回旧条件 → 红 |
-| **`_settings.py` 的两条漏检（待办 #6）**：新增"序列项缩进一致性（顶层 0 列 / 选项 4 空格）"与"每条目恰好一个 `$name` / `$description`"，外加顶层键不重复、同组选项不重复、选项必须在 `$options:` 之后 | 逐条注入实测：5 空格缩进、重复 `$name`、重复键、重复选项各自报错并 exit 1；未改动的块仍 `no structural problems found`，`--write` 幂等（字节不变） |
+| **`.tool/checks/_settings.py` 的两条漏检（待办 #6）**：新增"序列项缩进一致性（顶层 0 列 / 选项 4 空格）"与"每条目恰好一个 `$name` / `$description`"，外加顶层键不重复、同组选项不重复、选项必须在 `$options:` 之后 | 逐条注入实测：5 空格缩进、重复 `$name`、重复键、重复选项各自报错并 exit 1；未改动的块仍 `no structural problems found`，`--write` 幂等（字节不变） |
 
 **第四批（用户要求实现 `IconPath`，2026-10-14；含一个附带缺陷，五处负对照共红 12 条）**：
 
@@ -268,7 +268,7 @@
 > （见 [inline-markup-design.md](inline-markup-design.md) §7 第 4 步、CHANGELOG「删除的与不兼容的」）。
 > 下表里的断言**已经随功能一起删除**，`ModSettings` 里也不再有任何图标字段——
 > 不要照着它去找那些断言。行内图标的不变量与断言现在记在 AGENTS §5.3 与
-> `test-layout.cpp` 的 `=== inline icons: the tag, the glyph and the ripple switch ===` /
+> `.tool/regress/test-layout.cpp` 的 `=== inline icons: the tag, the glyph and the ripple switch ===` /
 > `=== inline icon images: one cache entry per file, bounded ===` 两节。
 > 下面这段留着是因为其中的**教训**仍然成立：一个"有设置项、却从来没被读取"的死设置项
 > （它当时的表现就是"填了没效果"），以及"空行的槽位被顺手丢掉"这类因继承规则而起的错位。
@@ -375,8 +375,8 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 **已验证（有证据）**：
 
 - mod 编译：**恰好 2 条已知警告**，DLL **182272** 字节；回归 **478 断言**全绿（2026-10-14 七批修复后为 478，含 1 条环境性 SKIP）。
-- 设置块：`_settings.py` → `no structural problems found`；独立结构检查 49 条目、顶层 dash 缩进唯一为 0、每条目恰好一个 `$name`/`$description`。
-- 真实管道链：mod 开机自检两帧被服务端完整收到；`_extclient.ps1` 的值**显示在面板上**。
+- 设置块：`.tool/checks/_settings.py` → `no structural problems found`；独立结构检查 49 条目、顶层 dash 缩进唯一为 0、每条目恰好一个 `$name`/`$description`。
+- 真实管道链：mod 开机自检两帧被服务端完整收到；`.tool/pipe/_extclient.ps1` 的值**显示在面板上**。
 - `{cpu.ghz}`：用户确认显示**正确**，标称取电源 API 的 **2.20 GHz**（注册表 2.42 被正确忽略）。⚠️ 但**保存过任何设置之后**它曾回退到注册表值（2026-10-14 修，见 §10.y 头条 1）。
 - 看门狗：日志出现 `EXT publisher: started pid=…`，命令行按 `CreateProcessW` 约定正确拆分。
 - 歌词来源（部分打通）：`async:lyric.lyricLines`（实测 **64 / 67** 行）与 `tlyricLines`；**真 currentTime** 来自 `#page_pc_mini_bar` 的 `mm:ss / mm:ss`。
@@ -447,7 +447,7 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 3. 作业对象是否收掉**孙进程**、`CREATE_NO_WINDOW` 是否不闪窗、重载无孤儿 —— 三条只能真机看进程列表。
 4. 客户端**升级后** store 自寻址是否仍可用（跑一次 `-ProbeCdp`，它会自寻址并列出可见字段）。
 5. `playingState` 在**暂停**时的取值仍未知（目前不拿它判暂停）。
-6. ~~`_settings.py` 补两条漏检~~ —— **2026-10-14 已补**（缩进一致性、每条目单个 `$name`，外加重复键/重复选项），四条检查都有注入式负对照，见 §10.y 第三批。
+6. ~~`.tool/checks/_settings.py` 补两条漏检~~ —— **2026-10-14 已补**（缩进一致性、每条目单个 `$name`，外加重复键/重复选项），四条检查都有注入式负对照，见 §10.y 第三批。
 7. `ApplyPanelTransform` 的 `unused function` 警告（加 `__attribute__((unused))` 或挪进测试文件）。
 8. 设计文档里 M3 剩下的部分：`ComputeIslandRect` 接管窗口定位。
 9. AGENTS 的章节顺序：`### 10.x` 那段是追加在 §11 之后的，若在意次序可挪进 §10 末尾。
@@ -457,7 +457,7 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 
 | 错误 | 原因 | 防范 |
 | :-- | :-- | :-- |
-| 设置块缩进错，Windhawk 报 `bad indentation of a sequence entry` | 凭感觉写缩进，而 `_settings.py` 不查这一项 | 抄相邻条目的风格；给 `_settings.py` 补检查（2026-10-14 已补：它现在查缩进一致性） |
+| 设置块缩进错，Windhawk 报 `bad indentation of a sequence entry` | 凭感觉写缩进，而 `.tool/checks/_settings.py` 不查这一项 | 抄相邻条目的风格；给 `.tool/checks/_settings.py` 补检查（2026-10-14 已补：它现在查缩进一致性） |
 | 条目插在"键"与它自己的 `$name` 之间 → `duplicated mapping key` | 锚点选在 `$name` 上，而它属于**上一行**的条目 | 条目边界是**下一条 `- Key:`**；结构检查保证每条目单 `$name`（已实现） |
 | 断言里凭空写 `Check` → 自检中断数轮 | 凭记忆用辅助函数名（真实失败计数是 `$bad`） | 插入前先 `Select-String` 找**真正的汇总行**；残留块要整段删除并复核 |
 | 日志清理**误删活代码**（两次，共 6 个编译错误） | 日志与其专用计数器绑定；按**文本**删命中别的函数，按**行号**删又算错一位 | **静默优于删除**（`DBG` 宏保留语句）；删前先编译，只删编译器点名的行 |
@@ -493,7 +493,7 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 | 图片载入失败不回退字形 | 只剩空盘，像"图标变纯白" | 失败必须回退字形 |
 | 行 `StringFormat` 少了 `NoWrap` | **第一行文字不在一条直线上**（该段首行上浮） | 超宽文本仍是 1 行；真 GDI+ 断言 |
 | 关掉换行后文本不截断 | 文字压到后面的环上 | 每段都落在自己的预算内 |
-| 管道 DACL 写成 `CO`（creator owner） | **每个客户端都被拒绝**（`PermissionError` / `ERROR_ACCESS_DENIED`），连启动 mod 的用户自己都连不上 | 用同一个 SD 建管道、让当前用户连上：`test-layout.cpp` 的 "the pipe DACL admits the user running the mod" |
+| 管道 DACL 写成 `CO`（creator owner） | **每个客户端都被拒绝**（`PermissionError` / `ERROR_ACCESS_DENIED`），连启动 mod 的用户自己都连不上 | 用同一个 SD 建管道、让当前用户连上：`.tool/regress/test-layout.cpp` 的 "the pipe DACL admits the user running the mod" |
 | 提供者名从帧行拷贝时未按长度截断 | 客户端连上、`SET` 被接受，行**永远显示 `--`**；且每次重连占一个新槽位，8 次后 `HELLO` 开始回 403 | 用**带换行**的 `HELLO`/`SET` 驱动 handler，断言 `{ext.provider.key}` 查得到（旧代码下红两条） |
 | `CreateNamedPipe` 的 `nMaxInstances` 传 1 而线程数是 4 | 日志写着 `serving 4 pipe instance(s)`，实际 3 个线程以 `CreateNamedPipe failed: 231` 当场退出，只支持 1 个并发客户端 | **没有断言能覆盖**（这是 API 调用点的常量错，宿主里没有真管道）；判别依据是错误码语义——**断言覆盖不到的地方，日志就是防线** |
 | 读用 `INFINITE` 等完成事件，完成事件一旦丢失线程就永久停住 | 客户端**连上了**（`ExtLogClient` 有），之后日志**完全静默**——连 `client done` 都没有，行永远 `--` | 等待加 500 ms 上界 + `PeekNamedPipe` 判定；缓冲有数据却没完成就重投。判别日志：`EXT read#1 result=… got=…`、`read completion never arrived with N bytes queued`、`no frame for 2s and the pipe buffer is empty` |
@@ -545,7 +545,7 @@ README 的图标一节与设置表、AGENTS §5.3/§6、以及 `IconPath` 的 `$
 ### 14.1 宿主栈溢出会伪装成一次干净运行
 
 `ModSettings` 现在约 35 KB（行文本 + 图标配置 + 编译出来的部件程序 4 份）。宿主
-`test-layout.cpp` 的 `main` 里曾有 ~30 个块作用域的 `ModSettings` 局部量，帧 1.26 MB，
+`.tool/regress/test-layout.cpp` 的 `main` 里曾有 ~30 个块作用域的 `ModSettings` 局部量，帧 1.26 MB，
 超过这个工具链给宿主的 1 MB 栈 → `STATUS_STACK_OVERFLOW`，**进程直接死、一行输出都没有**。
 只 `grep FAIL` 的话，这和"全部通过"长得一模一样。
 
@@ -601,9 +601,9 @@ PowerShell 只用来读、测量、跑门禁。判据：任何把源文件当管
 | :-- | :-- |
 | **恒真断言又出现了一次（第五处）**：帧内宽度断言在 `ComputeGeometry()` 之后把解析宽度**重新写回** `g_panelWidth`（本意是"恢复"），于是无论产品做什么，后面比的都是测试自己刚写进去的值——负对照（让绘制路径读配置宽度）**实测照样全绿**。修法是两半：产品侧 `ComputeGeometry` 只在**未设置**时播种（`if (g_panelWidth <= 0)`，它会在展开/收起/改设置时被调到）；测试侧按产品的顺序走一遍、中间不补写 | `ComputeGeometry leaves a resolved width alone (it only seeds an unset one)`；负对照实测 3 条红（另两条：`the window and the bitmap agree, and the width is the resolved one`、`which is not the configured Panel width (900)`）。与 §7.13 / 第七批那条"看着在守，其实没有"是同一类 |
 | **"每帧重算"与"逐帧变化"是两件事**：去掉 `EnsurePanelWidth` 的缓存（每帧重算）只红一条（`and the next two frames resolve it zero more times`）——宽度**仍然是同一个数**，因为它本来就是那个状态的纯函数。要红到 `so all three frames of that state have the same width` / `and the same state still produces the same width`，必须让宽度真的**随帧变化**（负对照把解析次数掺进宽度：实测 3 条红）。判据：断言要指向**要防的那个性质**（变化），而不是指向一个恰好也能防住它的代理（重算） |
-| **只写不读的文件级 static 是 `_deadcode.py` 的盲区**：该工具只扫**结构体字段**（`x.field` / `x->field`），不看文件作用域的 `static` 变量。这次带了两个进来：`g_panelWidthClamp`（写两次、一次没读）与 `g_lastBitmapWidth`（只写）。处理：删掉前者，把 clamp 记进解析点的日志（`Panel width: fit content=… clamp=…`，判别性数值）；后者保留并由宿主真读一次（`and the window rectangle is the width of the bitmap being submitted`）。**判据：新增文件级 static 时自己数一遍读点**，别指望门禁报出来 |
+| **只写不读的文件级 static 是 `.tool/checks/_deadcode.py` 的盲区**：该工具只扫**结构体字段**（`x.field` / `x->field`），不看文件作用域的 `static` 变量。这次带了两个进来：`g_panelWidthClamp`（写两次、一次没读）与 `g_lastBitmapWidth`（只写）。处理：删掉前者，把 clamp 记进解析点的日志（`Panel width: fit content=… clamp=…`，判别性数值）；后者保留并由宿主真读一次（`and the window rectangle is the width of the bitmap being submitted`）。**判据：新增文件级 static 时自己数一遍读点**，别指望门禁报出来 |
 
 **验证**：宿主 **1059 检查**、`PASSED (0 failure(s), 1 skipped)`（跳过的仍是受限沙箱里的管道 DACL）；
-`build.ps1` 1 条已知警告、DLL **201,216 B**；`_settings.py` / `_logfmt.py` / `_deadcode.py` 全绿；
+`build.ps1` 1 条已知警告、DLL **201,216 B**；`.tool/checks/_settings.py` / `.tool/checks/_logfmt.py` / `.tool/checks/_deadcode.py` 全绿；
 `.data` raw **1024 B**（与父提交 `fdf5806` 的 196,608 B / `.data` 1024 B 相比，宽度这次改动
 没有把任何静态数组拖进文件镜像——§5.1 那条"非零默认值"的判据继续成立）。

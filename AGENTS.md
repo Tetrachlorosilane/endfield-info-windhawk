@@ -14,7 +14,7 @@
 1. **不要"修一个、猜一个"。** 本项目大量缺陷的症状是**屏幕上某个东西消失或位置不对**，
    而原因可能在采样、布局、变换、配色解析、文件载入中的任意一层。
    已经有多次"我以为是 A，实际是 B"的记录（见 §6）。**先取证据，再改代码。**
-2. **可断言的行为必须写进 `test-layout.cpp`。** 这个 mod 无法自动化 UI 测试，
+2. **可断言的行为必须写进 `.tool/regress/test-layout.cpp`。** 这个 mod 无法自动化 UI 测试，
    回归测试是唯一的自动防线。凡是"编译通过但屏幕上看得出错"的逻辑，都必须有断言。
 3. **偏离原项目时，把偏离和理由写进注释与 README。** 本移植有意偏离原 Avalonia 实现的
    地方不止一处（动画时序、过冲强度、波纹升起）。静默偏离会在下次有人"对齐原项目"时被改回去。
@@ -38,20 +38,16 @@ endfield-info-windhawk/
 │   ├── inline-markup-design.md        设计：行内图标 + 留白/对齐（**§7 第 3、4、5 步均已实现**）+ 一次性编译（**已实现**）
 │   └── state-and-handover.md          验证状态、真机更正、犯错档案、待办
 │
-├── 开发工具（不随 mod 交付）——**每个都有自己的 .md，讲怎么跑/要什么/输出什么/坑在哪**
-├── build.ps1                  + build.md
-├── test-layout.cpp            + test-layout.md
-├── test-gdiplus-scale.cpp     + test-gdiplus-scale.md
-├── _settings.py               + _settings.md
-├── _logfmt.py                 + _logfmt.md
-├── _deadcode.py               + _deadcode.md
-├── _preview.py                + _preview.md
-├── _extclient.py              + _extclient.md
-├── _extclient.ps1             + _extclient.md（与上面同一个文件：两个客户端一起讲）
-├── _netease-bridge.ps1        + _netease-bridge.md
-├── _netease-position.ps1      + _netease-position.md
-├── _netease-lyric-scan.ps1    + _netease-lyric-scan.md
-├── _netease-lyric-probe.ps1   + _netease-lyric-probe.md
+├── 开发工具（不随 mod 交付）——**每个都有自己的 .md**（怎么跑/要什么/坑在哪）
+│   ├── build.ps1              + build.md              编译（唯一"怎么构建"入口，故留在根）
+│   ├── _netease-*.ps1（4 个）+ 各自 .md              桥运行期按 `$PSScriptRoot` 调用，不能搬
+│   └── .tool/                 其余工具按用途分组；都从**自身位置**解析仓库根
+│       ├── checks/   _settings.py（设置块）· _logfmt.py（宽格式日志）· _deadcode.py（死代码）
+│       ├── regress/  test-layout.cpp                  回归宿主：打桩 Windhawk API + `#include "../../产品"`
+│       ├── preview/  _preview.py                      版面预览（**需要 Pillow**），写 assets/panel-preview.png
+│       ├── probe/    test-gdiplus-scale.cpp           缩放探针：`<图片路径>` 为参数
+│       └── pipe/     _extclient.py + _extclient.ps1   外部管道冒烟客户端（共用一个 .md）
+│       （例：`python .tool/checks/_settings.py`；三个 checks 只要 Python 标准库）
 └── assets/panel-preview.png           版面预览（README 引用）
 ```
 
@@ -62,9 +58,7 @@ endfield-info-windhawk/
 分工：**README 讲用户怎么用**，**脚本的 `.md` 讲这个脚本怎么跑**，**AGENTS（本文）讲实现、
 不变量与踩过的坑**。同一个事实不要在三处各写一遍——写在你改代码时需要看到的那一处。
 
-`test-layout.cpp` 与 `test-gdiplus-scale.cpp` 是**开发工具**，不随 mod 交付。
-`_settings.py` / `_logfmt.py` / `_deadcode.py` 只要 Python 标准库；**需要 Pillow 的是 `_preview.py`**
-（它自己重画一遍版面）。
+`.tool/` 下的工具都是**开发工具**，不随 mod 交付。
 
 > 本机 `python` 可能是 Windows Store 的占位程序；真跑不了就用 DSH 运行时的解释器：
 > `C:\Users\HP\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe`
@@ -108,7 +102,7 @@ libc++）编译，并打印导出符号表。
    而该文件第一行就是 `#include <windows.h>`。这是头顺序问题，不是代码问题。
 
 > 2026-10-14 之前还有第二条（`unused function 'ApplyPanelTransform'`）。它不是"可以消除的噪声"，
-> 而是**为测试而存在的产品函数**：主 mod 里没人调用它，只有 `test-layout.cpp` 调。
+> 而是**为测试而存在的产品函数**：主 mod 里没人调用它，只有 `.tool/regress/test-layout.cpp` 调。
 > 现已删除，断言改成直接打在产品**真正交给 GDI+ 的字段**上（`ComputePanelTransform` 的
 > `active` / `scale` / `dx` / `dy`，以及"面板中心是不动点"这个由两个函数共同保证的关系）。
 > **"只有测试在用"就是死代码**——它会让下一个人以为产品里有这么一条路径。见 §7.7。
@@ -122,12 +116,12 @@ libc++）编译，并打印导出符号表。
 > （"DLL 里没有新日志"其实什么也没证明）。去掉 `-DWH_EDITING` 也救不了：那会引用
 > `InternalWh_*`，而它们由 Windhawk 自己提供，本地链接不过。
 > **要检查日志格式串，别指望编译器**——宽格式它一条都查不了（原因与实测见下面的方框），
-> 用 `python _logfmt.py`。
+> 用 `python .tool/checks/_logfmt.py`。
 
 ### 设置块校验（改过设置项就跑）
 
 ```powershell
-python _settings.py
+python .tool/checks/_settings.py
 ```
 
 检查设置块结构并统一 `$name` / `$description` 的引号。期望输出含
@@ -160,7 +154,7 @@ $wc = 'D:\Program Files\Windhawk\Compiler'
   -DWINVER=0x0A00 -D_WIN32_WINNT=0x0A00 -DNTDDI_VERSION=0x0A000008 -D__USE_MINGW_ANSI_STDIO=0 `
   -Wno-pragma-pack `
   -luser32 -lgdi32 -lpdh -liphlpapi -lpsapi -ladvapi32 `
-  -o "$env:TEMP\layouttest.exe" test-layout.cpp
+  -o "$env:TEMP\layouttest.exe" .tool/regress/test-layout.cpp
 & "$env:TEMP\layouttest.exe"
 ```
 
@@ -184,13 +178,13 @@ $wc = 'D:\Program Files\Windhawk\Compiler'
 > 这三条原来都属于"看着有、其实没有"。
 
 > **mod 的日志格式串不在这里检查，而且编译器一条都查不了**（`Wh_Log` 是自造变参函数，宽格式没有 format 属性；
-> 四条路都实测堵死）。**替代检查是 `python _logfmt.py`**，实测记录与原因见 [_logfmt.md](_logfmt.md)。
+> 四条路都实测堵死）。**替代检查是 `python .tool/checks/_logfmt.py`**，实测记录与原因见 [_logfmt.md](.tool/checks/_logfmt.md)。
 > 宿主自己的 printf 已经能在 `-Wformat=2` 下零警告编译，多一条守得住的线。
 
 ### 死代码检查（改过结构体或脚本就跑）
 
 ```powershell
-python _deadcode.py
+python .tool/checks/_deadcode.py
 ```
 
 编译器只管**符号**（`build.ps1` 已开 `-Wunused-function` 等）。它管不了的三类是：
@@ -211,8 +205,8 @@ python _deadcode.py
 `Segment` / `EaseSmooth` / `kRippleOffsetY`（这几处编译器也报了）。**每次的判据都一样：
 先看它报什么，再决定是删还是加豁免——豁免要写理由。**
 
-**宿主原理**：`test-layout.cpp` 把 Windhawk API（`Wh_GetIntSetting` / `Wh_GetStringSetting` /
-`Wh_Log` / `Wh_SetFunctionHook`）打桩，然后 `#include "endfield-info-windhawk.wh.cpp"`。
+**宿主原理**：`.tool/regress/test-layout.cpp` 把 Windhawk API（`Wh_GetIntSetting` / `Wh_GetStringSetting` /
+`Wh_Log` / `Wh_SetFunctionHook`）打桩，然后 `#include "../../endfield-info-windhawk.wh.cpp"`。
 因此它能直接调用 mod 的**内部静态函数**——这是本测试的价值所在，
 也是为什么布局计算要**抽成独立纯函数**（见 §4）。
 
@@ -233,10 +227,10 @@ python _deadcode.py
 ### 预览图
 
 ```powershell
-python _preview.py
+python .tool/preview/_preview.py
 ```
 
-`_preview.py` 是 GDI+ 绘制逻辑的**独立 Python 复刻**（PIL）。
+`.tool/preview/_preview.py` 是 GDI+ 绘制逻辑的**独立 Python 复刻**（PIL）。
 
 > **重要**：预览与真实实现**曾经不一致**——预览每行画图标，而 C++ 当时只画一个，
 > 导致我长期没发现问题。**改绘制逻辑后要同步改预览，或至少确认两者一致。**
@@ -245,7 +239,7 @@ python _preview.py
 
 ```powershell
 & "$wc\bin\clang++.exe" -target x86_64-w64-mingw32 -std=c++23 -O0 -DUNICODE -D_UNICODE `
-  -luser32 -lgdi32 -o "$env:TEMP\gdiplus-probe.exe" test-gdiplus-scale.cpp
+  -luser32 -lgdi32 -o "$env:TEMP\gdiplus-probe.exe" .tool/probe/test-gdiplus-scale.cpp
 & "$env:TEMP\gdiplus-probe.exe" <图片路径>
 ```
 
@@ -674,7 +668,7 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
    肉眼无法区分。要区分就必须**测量像素**（`GdipBitmapGetPixel` 采样）。
 4. **测试脚本要防旧产物。** 编译失败时若仍执行上一次的 exe，会得出"改了没效果"的
    错误结论。见 §3 的 `Test-Path` 守卫。
-5. **预览与实现会漂移。** `_preview.py` 每行画图标、C++ 当时只画一个，
+5. **预览与实现会漂移。** 预览每行画图标、C++ 当时只画一个，
    预览让我以为实现是对的。**两者必须同步核对。**
 6. **断言要断言"关系"，不是"数字"。** 例如收回时长按 `kCollapseDurationRatio` 断言
    而非硬编码 600ms，这样改默认时长后断言依然成立。
@@ -683,8 +677,7 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
    **同样适用于"只有测试在用"的函数**：`ApplyPanelTransform` 在主 mod 里没有调用者，
    只为让宿主能断言变换而存在——它让下一个人以为产品里有这条路径。删掉之后，
    断言改打在产品真正交给 GDI+ 的字段上（见 §3 的方框），mod 的已知警告从 2 条降到 1 条。
-   **字段级的同类问题编译器看不见**（只写不读、从没被碰过），那是 `python _deadcode.py`
-   的活；2026-10-14 它一次找出 5 处，其中 4 处是纯粹的"算完就扔"。
+   **字段级的同类问题编译器看不见**（只写不读），那是 `.tool/checks/_deadcode.py` 的活。
 8. **断言必须打在"产品代码"上，不是打在测试自己复刻的那份上。** 修"第一行不在一条直线"
    时，我第一版断言在测试里自己调 `CreateStringFormat(kStringFormatNoWrap, …)` 建格式，
    于是把 mod 的 flag 改回 `0` 做负对照时，测试**照样全绿**——它测的是自己。
@@ -767,7 +760,7 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
    **`$name` / `$description` 用单引号**；数值项**不加引号**。
 2. 在 `ModSettings` 结构体加字段（给默认值）。
 3. 在 `ReadSettings()` 里读取并 `ClampInt` / 校验。
-4. 跑 `python _settings.py`，确认 `no structural problems found`。
+4. 跑 `python .tool/checks/_settings.py`，确认 `no structural problems found`。
 5. 更新 README 的「全部设置项」表。
 
 ### 新增一个变量
@@ -777,22 +770,22 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 2. 在 `LookupRaw`（格式化字符串）或 `LookupNumber`（数值）里实现。
 3. 若是数值变量，加进 `IsKnownNumberVariable`，这样"本机取不到"时会渲染 `--`
    而不是字面文本。
-4. 更新 `test-layout.cpp` 时**不需要**再维护第二份 token 列表：那一节现在直接遍历
+4. 更新 `.tool/regress/test-layout.cpp` 时**不需要**再维护第二份 token 列表：那一节现在直接遍历
    `kVariables[]`，注册了却不实现（或没给采集组）会当场变红。README 的「变量速查」表
    仍要手改——它是给用户看的，没有任何东西比对它。
 5. 更新 README 的「变量速查」表。
 
 > `{ext.*}` 是**运行期**变量，**不要**注册进 `kVariables[]`：那张表是编译期的采集通路清单，
 > 外部变量的组由 `RequiredGroups()` 里的前缀判断给出（[1343]），注册进去只会误导下一个人。
-> 它的断言写在 `test-layout.cpp` 末尾的 "external data" 一节。
+> 它的断言写在 `.tool/regress/test-layout.cpp` 末尾的 "external data" 一节。
 
 ### 改动绘制/布局/几何
 
 1. **先把要断言的关系抽成纯函数**（见 §4）。
-2. 在 `test-layout.cpp` 加断言，并**先确认它在旧代码下会失败**——
+2. 在 `.tool/regress/test-layout.cpp` 加断言，并**先确认它在旧代码下会失败**——
    否则你不知道这个断言有没有意义。
 3. 改实现，跑到 `PASSED (0 failure(s))`。
-4. 同步 `_preview.py`（若涉及版面）。
+4. 同步 `.tool/preview/_preview.py`（若涉及版面）。
 5. 若偏离了原项目，把偏离与理由写进注释。
 
 ### 收尾检查（任何改动之后）
@@ -800,9 +793,9 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
 改完跑这三条，它们各自守一类编译器看不见的东西：
 
 ```powershell
-python _settings.py     # 设置块结构（改了设置项就必须跑）
-python _logfmt.py       # 宽格式日志的元数与错型（编译器一条都查不了）
-python _deadcode.py     # 死代码：只写不读的字段、#if 0、注释掉的代码、脚本死函数
+python .tool/checks/_settings.py     # 设置块结构（改了设置项就必须跑）
+python .tool/checks/_logfmt.py       # 宽格式日志的元数与错型（编译器一条都查不了）
+python .tool/checks/_deadcode.py     # 死代码：只写不读的字段、#if 0、注释掉的代码、脚本死函数
 ```
 
 **改了结构体字段尤其要跑第三条**：删掉一个字段的写者之后，它可能变成"从没被碰过"，

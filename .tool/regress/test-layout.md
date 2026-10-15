@@ -10,7 +10,7 @@ $wc = 'D:\Program Files\Windhawk\Compiler'
   -DWINVER=0x0A00 -D_WIN32_WINNT=0x0A00 -DNTDDI_VERSION=0x0A000008 -D__USE_MINGW_ANSI_STDIO=0 `
   -Wno-pragma-pack `
   -luser32 -lgdi32 -lpdh -liphlpapi -lpsapi -ladvapi32 `
-  -o "$env:TEMP\layouttest.exe" test-layout.cpp
+  -o "$env:TEMP\layouttest.exe" .tool/regress/test-layout.cpp
 & "$env:TEMP\layouttest.exe"
 ```
 
@@ -41,4 +41,4 @@ Windhawk 的 clang++ 与 Windows，不需要管理员权限。最后一段会真
   `if (-not (Test-Path $out)) { exit 1 }` 守卫。
 - 宿主**测不了**管道读写（客户端要写，沙箱/宿主都做不到）。这里的 `Wh_Log` 桩也**不检查格式串**：
   clang 只查带 format 属性的函数，而这个工具链上宽字符 format 属性是硬错误、`ms_printf` / `wprintf`
-  又不受支持——宽格式要用 `python _logfmt.py` 查。
+  又不受支持——宽格式要用 `python .tool/checks/_logfmt.py` 查。

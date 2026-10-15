@@ -155,7 +155,7 @@ A 是 B 的数据底座：先有 `{ext.…}` 这种变量，B 的"事件"才有�
 **交替可见**（真机表现：标题在"歌名"与"歌名 - 歌手"之间闪、歌词在正确行与冻结行之间跳）。
 现在连续**两次**应答超时就认定该客户端不读（`ExtReplyTimeoutsAfter`，纯函数 + 断言），
 此后这条连接**不再收到应答**：`OK`/`ERR` 是"可选的通知"，不是协议的正确性前提。
-读应答的客户端（`_extclient.*`）永远碰不到那两次超时，因此行为不变。
+读应答的客户端（`.tool/pipe/_extclient.*`）永远碰不到那两次超时，因此行为不变。
 
 ### 4.3 字段语法（解析器必须严格照此实现，并作为纯函数测试）
 
@@ -272,7 +272,7 @@ struct ExtProvider {
 | `IsKnownNumberVariable`（[2235](../endfield-info-windhawk.wh.cpp#L2235)） | **不动**。它是无设置依赖的纯结构判断（23 个 `MATCH`）；把 `ext.` 混进去会把 `{ext.}` 这类**拼错**也吞成 `--`，与 §5.2 的规则矛盾 |
 | `LookupRaw` / `LookupNumber`（[1857](../endfield-info-windhawk.wh.cpp#L1857) / [1878](../endfield-info-windhawk.wh.cpp#L1878)） | **不动**。它们只服务内置变量；`ext.*` 的文本与数值都在 `ResolveToken` 的新分支里直接产出 |
 
-> 测试注意：`test-layout.cpp` 的 token 覆盖列表断言"32 个变量全部能解析"。
+> 测试注意：`.tool/regress/test-layout.cpp` 的 token 覆盖列表断言"32 个变量全部能解析"。
 > `ext.*` 是运行期的，**不能**加进那张静态表；要另写一组断言（§12）。
 
 ### 5.4 与快照的关系
@@ -566,7 +566,7 @@ IslandRect ComputeIslandRect(const IslandState &s, const ContentMetrics &m,
 | 提供者静默 | ttl 到期 → `--`（复用 `LR_UNAVAILABLE` 语义，[2313](../endfield-info-windhawk.wh.cpp#L2313)） |
 | 模板写了非法 `{ext.}` | `LR_UNKNOWN` → 保留字面（拼错可见） |
 | 设置里关掉 `Enable external data` | 不建管道；已连接的客户端收到 `ERR 405` 后被断开 |
-| mod 重载 | 客户端会拿到 `ERROR_BROKEN_PIPE`，应自行重连（写进协议文档；提供 `_extclient.py` 做示例） |
+| mod 重载 | 客户端会拿到 `ERROR_BROKEN_PIPE`，应自行重连（写进协议文档；提供 `.tool/pipe/_extclient.py` 做示例） |
 
 ---
 
@@ -587,7 +587,7 @@ IslandRect ComputeIslandRect(const IslandState &s, const ContentMetrics &m,
 
 按 AGENTS 铁律 2：**凡是"编译通过但屏幕上看得出错"的逻辑都要抽成纯函数**。本设计的纯函数：
 
-| 纯函数 | 断言（`test-layout.cpp`） |
+| 纯函数 | 断言（`.tool/regress/test-layout.cpp`） |
 | :-- | :-- |
 | `ExtParseLine` | 命令/参数切分；缺参 → 400；未知命令 → 400；`SET p k - 含 空格 的文本` 文本完整保留；`#` 注释；空行 |
 | `ExtSanitize` | 去 `\r\n`、`\t`→空格、去 C0/C1；截断到上限且**末尾加 `…`**；`{cpu}` **原样保留**（负对照：若实现里加了展开，此断言必须变红） |
@@ -600,7 +600,7 @@ IslandRect ComputeIslandRect(const IslandState &s, const ContentMetrics &m,
 | `ComputeIslandRect` | 各状态下矩形正确；**超宽文本不引起宽度无界增长**（必须钳到屏宽上限） |
 | `HitTestIsland` | 圆角外 `HTTRANSPARENT`；按钮区域内命中对应 actionId；动画期间用并集 |
 
-端到端冒烟：新增 `_extclient.py`（几十行，`NamedPipeClientStream` / `open(r'\\.\pipe\…')`）
+端到端冒烟：新增 `.tool/pipe/_extclient.py`（几十行，`NamedPipeClientStream` / `open(r'\\.\pipe\…')`）
 发几条 `SET`/`EVENT`，人工确认屏幕；再发畸形帧确认 `ERR` 码与**没把值写进日志**。
 日志判别性字段：`EXT connect provider=… inst=…`、`EXT set provider=… keyLen=… bytes=…`、
 `EXT drop reason=overlong|rate|capacity count=…`、`EXT expire provider=… keys=…`。
@@ -611,10 +611,10 @@ IslandRect ComputeIslandRect(const IslandState &s, const ContentMetrics &m,
 
 | 里程碑 | 内容 | 验收 |
 | :-- | :-- | :-- |
-| **M1 数据面** | **已实现**：`G_EXT` + 槽位表 + 管道线程 + `{ext.p.k}` + ttl/消毒/限速 + 设置项 + §5.6.3 的 R1/R1b/R3/R7 | 关掉开关时空闲成本为 0；`{ext.p.k}` 能显示；提供者退出后 **≤100 ms** 变 `--`（§5.6.2）；推 100 条 `SET` 后 `[perf]` 里 `paints` 只涨 1–2（合并生效）；`test-layout.cpp` 全绿 + `_settings.py` `no structural problems found` + `build.ps1` 只剩那 2 条已知警告 |
+| **M1 数据面** | **已实现**：`G_EXT` + 槽位表 + 管道线程 + `{ext.p.k}` + ttl/消毒/限速 + 设置项 + §5.6.3 的 R1/R1b/R3/R7 | 关掉开关时空闲成本为 0；`{ext.p.k}` 能显示；提供者退出后 **≤100 ms** 变 `--`（§5.6.2）；推 100 条 `SET` 后 `[perf]` 里 `paints` 只涨 1–2（合并生效）；`.tool/regress/test-layout.cpp` 全绿 + `.tool/checks/_settings.py` `no structural problems found` + `build.ps1` 只剩那 2 条已知警告 |
 | **M2 事件面** | **已实现**：`EVENT` + 队列/优先级/合并 + `Popping/Card/Collapsing` + 卡片绘制（accent/主行/副行/重复徽标）+ 由卡片自身相位驱动的淡入淡出。**与本文的偏离，三处**：① 宽度由纯函数 `ComputeIslandCardWidth`（用户可配的最小宽度，上限取"屏宽 − 24"与 640 中较小者）给出**静态宽度**，而不是完整的 `ComputeIslandRect`——位置与高度仍由既有静止几何给出；② **宽度动画被移除**：只要窗口宽度会在帧间变化，就必然存在"窗口已改、位图未提"的那一帧（真机实测为极短闪烁，四轮调参都无法消除），现在宽度由 `PaintPanel` 在创建位图**之前**一次性设定，任一帧内窗口与提交的位图尺寸恒等（同 AGENTS §5.4）；③ "动画期间取两态并集"这条规则**未落代码**，随宽度动画一起推迟到 M3，与区域表、本地按钮一并实现（那时它才有真实用武之地） | 连点同 provider 只弹一次（✓ 断言）；critical 抢 info（✓ 断言）；ttl 到期收回（✓ 断言）；收回后基础面板仍可点（✓ 命中仍用静止几何）。真机已验证：收起闪烁修复后无闪烁、文字与底色一起淡出 |
 | **M3 卡片与交互** | **第一片已落地**：`ComputeIslandRect`（矩形与宽度同源，绘制与命中都从它取）、`ComputeIslandCloseRect`（由卡片矩形派生，且钳在卡片内）、区域表（后写在上）+ `IslandHitTest`（取最后一个命中）+ `IslandDismiss`（与 ttl 到期同一条路、幂等）+ 卡片右上角 × 的绘制与点击。**已落地**：悬停（`WM_MOUSEMOVE` 驱动 + `WM_MOUSELEAVE` 收尾，只占消息不占定时器，高亮矩形与点击矩形同源）、帧率决策（`DesiredTickMs` / `ApplyTickRate`：只有面板高度动画或岛上相位在跑时才是 16 ms，其余时间 40 ms 廉价轮询）。**待做**：`ComputeIslandRect` 进一步接管窗口定位（目前窗口定位仍走既有 `PlaceWindow` 的居中公式）；以及"两态并集"是否还需要——现在没有动画窗口期，倾向前者不需要 | 可见即可点（✓ 断言：逐像素遍历卡片，无 `IR_NONE`）；圆角外仍穿透（未变）；**不**出现"窗口缩到 8px"回归（✓ 区域表不含窗口尺寸）；命中不许另算一套几何（✓ 同一批纯函数） |
-| **M4 打磨** | 提供者图标（内置字形白名单）、每提供者配色档、诊断页 | 文档与 AGENTS 更新；`_extclient.py` 进仓库 |
+| **M4 打磨** | 提供者图标（内置字形白名单）、每提供者配色档、诊断页 | 文档与 AGENTS 更新；`.tool/pipe/_extclient.py` 进仓库 |
 
 **M1 与 M2 之间是可交付的独立状态**：M1 完成后即使不做灵动岛，也已经解决了"显示外部文本"这个原始需求。
 
@@ -736,7 +736,7 @@ with open(r'\\.\pipe\endfield-info-windhawk', 'wb', buffering=0) as h:
 | 圆角 alpha 掩码 | [3640](../endfield-info-windhawk.wh.cpp#L3640) | 已参数化，变形无需重写 |
 | `WM_NCHITTEST` 圆角判定 | [3987](../endfield-info-windhawk.wh.cpp#L3987) | 扩成区域表；圆角外穿透不变 |
 | `ReadSettings` + `ClampInt` | [1089](../endfield-info-windhawk.wh.cpp#L1089) | 新增设置项照此校验 |
-| `test-layout.cpp` 打桩宿主 | — | 所有纯函数直接进断言 |
+| `.tool/regress/test-layout.cpp` 打桩宿主 | — | 所有纯函数直接进断言 |
 
 ---
 
@@ -755,7 +755,7 @@ with open(r'\\.\pipe\endfield-info-windhawk', 'wb', buffering=0) as h:
 | 采样循环 `g_extDirty` + deadline | [4177](../endfield-info-windhawk.wh.cpp#L4177) | 见 §5.6.2 |
 | tick 到期分支 | `WM_TIMER` 的 `kTimerTick`（[3911](../endfield-info-windhawk.wh.cpp#L3911)） | 见 §5.6.2 |
 | 启停 | [4206](../endfield-info-windhawk.wh.cpp#L4206) / [4292](../endfield-info-windhawk.wh.cpp#L4292) | 顺序见 §5.6.4 |
-| 断言 | `test-layout.cpp` | 见 §12 |
+| 断言 | `.tool/regress/test-layout.cpp` | 见 §12 |
 
 `kVariables[]`（[1318](../endfield-info-windhawk.wh.cpp#L1318)）**一个字都不改**：静态表 + 运行期槽位表双轨。
 
@@ -829,7 +829,7 @@ static bool      ExtProviderAllowed(const ModSettings &s, const WCHAR *name, int
 **为什么开关用字符串枚举而不是 `0/1`**：这个 mod 的设置块里所有非数值选择都是字符串枚举
 （`Theme` / `ClickAction` / `Monitor` / `IntroStyle`），代码侧也全是 `Wh_GetStringSetting` + `wcscmp`
 （[1104](../endfield-info-windhawk.wh.cpp#L1104)）。跟着既有风格走，就不必赌 Windhawk 的布尔类型怎么解析。
-`_settings.py` 的规则同时满足：`$name` / `$description` 单引号，数值项不加引号。
+`.tool/checks/_settings.py` 的规则同时满足：`$name` / `$description` 单引号，数值项不加引号。
 
 ### C.4 三处接线的精确形状
 
@@ -862,7 +862,7 @@ if (ExtIsExtToken(name, nameLen)) {
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -File build.ps1   # 只剩那 2 条已知警告
-python _settings.py                                       # no structural problems found
+python .tool/checks/_settings.py                          # no structural problems found
 # 回归宿主：编译 + 运行 → PASSED (0 failure(s))，断言数从 193 增加
 ```
 
@@ -887,7 +887,7 @@ python _settings.py                                       # no structural proble
   40 ms 的 tick 到期时只是**再要一次采样**。
 - **外部文本不被二次展开**（注入不成立）。这条由结构保证——`ExpandTokens` 只对模板做单向扫描，
   替换出来的文本不会被重新扫描——并且有断言钉住：把展开改成递归，
-  `test-layout.cpp` 里 "a pushed value that looks like a token stays literal" 必须变红（已实测）。
+  `.tool/regress/test-layout.cpp` 里 "a pushed value that looks like a token stays literal" 必须变红（已实测）。
 - **停机顺序：IPC 先于 sampler**（写者先于读者），最后才 `DeleteCriticalSection(&g_extLock)`。
   同理，**删 `g_valuesLock` 之前必须确认 sampler 真的停了**：等待结果不能丢
   （`ValuesLockCanBeReleased` 只认 `WAIT_OBJECT_0`）。超时就把锁留给进程退出——

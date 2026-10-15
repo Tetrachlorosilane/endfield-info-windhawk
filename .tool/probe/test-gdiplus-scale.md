@@ -7,7 +7,7 @@
 
 ```powershell
 & "$wc\bin\clang++.exe" -target x86_64-w64-mingw32 -std=c++23 -O0 -DUNICODE -D_UNICODE `
-  -luser32 -lgdi32 -o "$env:TEMP\gdiplus-probe.exe" test-gdiplus-scale.cpp
+  -luser32 -lgdi32 -o "$env:TEMP\gdiplus-probe.exe" .tool/probe/test-gdiplus-scale.cpp
 & "$env:TEMP\gdiplus-probe.exe" <图片路径>
 ```
 

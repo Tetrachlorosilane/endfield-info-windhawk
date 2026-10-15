@@ -392,8 +392,10 @@ for index, (text, rings, inline) in enumerate(ROWS):
         centre_x -= ((RING_SIZE / 2) + 4) * SCALE
 
 canvas.alpha_composite(layer)
-out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        "assets", "panel-preview.png")
+# The image is a repository deliverable (README references it), so it goes to
+# <root>/assets/ however this script was invoked: two levels up from .tool/preview/.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+out_path = os.path.join(REPO_ROOT, "assets", "panel-preview.png")
 canvas.convert("RGB").save(out_path)
 print(f"wrote {out_path}  {W}x{H}  ({len(ROWS)} rows, "
       f"{sum(len(r[1]) for r in ROWS)} rings, "

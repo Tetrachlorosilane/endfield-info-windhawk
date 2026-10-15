@@ -6,11 +6,11 @@
 ## 怎么跑
 
 ```powershell
-python _settings.py            # 只检查
-python _settings.py --write    # 顺带把两个显示串规整成单引号
+python .tool/checks/_settings.py            # 只检查
+python .tool/checks/_settings.py --write    # 顺带把两个显示串规整成单引号
 ```
 
-源文件按脚本自身位置定位（同目录的 `endfield-info-windhawk.wh.cpp`），因此在任何目录下跑都一样。
+源文件按**脚本自身位置**定位（`__file__` 往上两级是仓库根，产品在根上），因此在任何目录下跑都一样。
 
 ## 需要什么
 

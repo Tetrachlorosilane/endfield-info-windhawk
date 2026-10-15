@@ -9,11 +9,11 @@ PowerShell（**真机验证过的是这一个**）与 Python 版（参数同义�
 `-` 用设置里的值、`0` 表示删除，另有 `--event` / `--raw` / `--quiet`）：
 
 ```powershell
-pwsh -ExecutionPolicy Bypass -File _extclient.ps1
-pwsh -ExecutionPolicy Bypass -File _extclient.ps1 -Key progress -Ttl 60000 -Text 0.42
-pwsh -ExecutionPolicy Bypass -File _extclient.ps1 -Raw 'GARBAGE'      # 看错误码
-python _extclient.py "Now Playing: Blue Hour"
-python _extclient.py --key progress --ttl 60000 0.42
+pwsh -ExecutionPolicy Bypass -File .tool/pipe/_extclient.ps1
+pwsh -ExecutionPolicy Bypass -File .tool/pipe/_extclient.ps1 -Key progress -Ttl 60000 -Text 0.42
+pwsh -ExecutionPolicy Bypass -File .tool/pipe/_extclient.ps1 -Raw 'GARBAGE'   # 看错误码
+python .tool/pipe/_extclient.py "Now Playing: Blue Hour"
+python .tool/pipe/_extclient.py --key progress --ttl 60000 0.42
 ```
 
 参数：`-Provider`（默认 `music`）、`-Key`（`title`）、`-Ttl`（`600000`，`[int]`）、`-Text`、`-Raw`、

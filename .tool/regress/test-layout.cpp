@@ -95,7 +95,10 @@ static void Wh_Log(const WCHAR *fmt, ...) {
 }
 static bool Wh_SetFunctionHook(void *, void *, void **) { return true; }
 
-#include "endfield-info-windhawk.wh.cpp"
+// Two levels up: this host lives in .tool/regress/, and a quoted include is resolved
+// against the including file first, so the product at the repository root is found
+// regardless of the working directory the compiler is invoked from.
+#include "../../endfield-info-windhawk.wh.cpp"
 
 static int g_failures = 0;
 static int g_skips = 0;

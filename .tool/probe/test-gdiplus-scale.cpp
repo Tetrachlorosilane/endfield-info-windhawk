@@ -4,6 +4,9 @@
 // white result can be told apart from a correct one. Run against a real image.
 //
 //   gdiplus-probe.exe <image path>
+//
+// Location-independent: it reads no repository file and writes none, so the only
+// input is the image path on the command line.
 #include <windows.h>
 #include <stdio.h>
 #include <math.h>

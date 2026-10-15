@@ -6,7 +6,7 @@
 两个需求、两批实现（分开提交，各自带断言）：
 
 * **A 批：字体**——全局回退链 + 按段覆盖，**未配置时零成本**。**已实现**
-  （2026-10-14，`test-layout.cpp` 的 "font chains and the multi-font cost gate" 一节，102 条断言；
+  （2026-10-14，`.tool/regress/test-layout.cpp` 的 "font chains and the multi-font cost gate" 一节，102 条断言；
   实现与本文的差异都记在下面的方框里）。
 * **B 批：按行字号与高度**——设置项 + 行首标签两套，标签覆盖设置项。**已实现**
   （2026-10-14，"per-row font size and height" 一节，82 条断言）。
@@ -182,7 +182,7 @@
 
 ---
 
-## 6. 断言清单（写进 `test-layout.cpp`）
+## 6. 断言清单（写进 `.tool/regress/test-layout.cpp`）
 
 **A 批——已实现，102 条断言落在 "font chains and the multi-font cost gate" 一节**
 

@@ -9,18 +9,18 @@ Single quotes are used because they have no escape sequences in YAML: only a
 literal apostrophe needs doubling. Values, ids and numeric settings are left
 exactly as written, because Windhawk has to read numbers back as numbers.
 
-Run:  python _settings.py            # check only
-      python _settings.py --write    # normalise the display strings
+Run:  python .tool/checks/_settings.py            # check only
+      python .tool/checks/_settings.py --write    # normalise the display strings
 """
 
 import os
 import re
 import sys
 
-# Resolve the source next to this script so the tool works from any directory.
-SOURCE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "endfield-info-windhawk.wh.cpp"
-)
+# The product is at the repository root, two levels above .tool/checks/. Resolving it from
+# this file (not from the current directory) is what lets the tool run from anywhere.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+SOURCE = os.path.join(REPO_ROOT, "endfield-info-windhawk.wh.cpp")
 BEGIN = "// ==WindhawkModSettings=="
 END = "// ==/WindhawkModSettings=="
 

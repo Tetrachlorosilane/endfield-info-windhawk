@@ -6,8 +6,8 @@
 ## 怎么跑
 
 ```powershell
-python _logfmt.py                                  # 默认查同目录的 endfield-info-windhawk.wh.cpp
-python _logfmt.py path\to\other.wh.cpp             # 或指定文件
+python .tool/checks/_logfmt.py                      # 默认查仓库根的 endfield-info-windhawk.wh.cpp
+python .tool/checks/_logfmt.py path\to\other.wh.cpp  # 或指定文件
 ```
 
 ## 需要什么
@@ -52,6 +52,6 @@ Python 即可（只 import `re` / `sys` / `pathlib`）。本机 `python` 若是 
 > `-fms-compatibility` 会把编译器自己的头文件打崩；连 MinGW 的 `swprintf` 也不查
 > （`swprintf(b,0,L"%s",1)` 无任何诊断，所以 mod 自己的缓冲格式化同样无人检查）。
 > 那次实测还证明：同一文件里 `printf` 的两处错型各报 1 条，而自造桩的错型 **0 条**。
-> **替代检查**：`python _logfmt.py`（105 个调用点/元数 + 可判定的错型；负对照实测会红）。
+> **替代检查**：`python .tool/checks/_logfmt.py`（105 个调用点/元数 + 可判定的错型；负对照实测会红）。
 > 宿主**自己的** printf 现在也是干净的：那 15 条 `%08X` 收 `DWORD` 的警告（它在 MinGW 上是
 > `unsigned long`）已经改成 `%08lX`，所以宿主可以在 `-Wformat=2` 下零警告编译——多一条守得住的线。

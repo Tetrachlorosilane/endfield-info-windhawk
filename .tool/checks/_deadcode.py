@@ -21,14 +21,18 @@ C++ files given (the regression host includes the mod and reads fields the mod
 only writes), comments are stripped before anything is counted, and a short
 allowlist covers fields that something *outside* this repository reads.
 
-Usage:  python _deadcode.py [paths...]        (default: this repository)
+Usage:  python .tool/checks/_deadcode.py [paths...]   (default: this repository)
 Exit:   0 = nothing found, 1 = at least one finding.
 """
 import re
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+# This script lives in .tool/checks/, so the repository root is two levels up. The default
+# target set is the whole tree -- the host under .tool/regress/ and the product at the root
+# have to land in the *same* read-count pass, or a field the host reads looks write-only.
+ROOT = Path(__file__).resolve().parents[2]
+SKIP_DIRS = {".git", "__pycache__", ".Trash", "dist", "node_modules"}
 
 # Fields our code only writes (or never touches) but that *another* component reads:
 # a Win32 / GDI+ structure we declare ourselves, where the API requires the field to
@@ -177,13 +181,30 @@ def check_script(path, findings, func_re, label):
             findings.append(f"unreferenced {label}")
 
 
+def discover():
+    """Every .cpp / .ps1 / .py in the tree, once, skipping .git and byproduct folders.
+
+    The tools used to sit flat in the root, so a single iterdir() was the whole set. Now
+    that they live under .tool/, the walk has to be recursive: the host (which #includes
+    the product) and the product both have to be in this list, and nothing may be picked
+    up twice -- a duplicate would double every read count and hide a write-only field.
+    """
+    out = []
+    for path in ROOT.rglob("*"):
+        if path.suffix not in (".cpp", ".ps1", ".py") or not path.is_file():
+            continue
+        if any(part in SKIP_DIRS for part in path.relative_to(ROOT).parts[:-1]):
+            continue
+        if path.name == Path(__file__).name:
+            continue
+        out.append(path)
+    return sorted(set(out))
+
+
 def main(argv):
     targets = [Path(a) for a in argv[1:]]
     if not targets:
-        targets = sorted(
-            p for p in ROOT.iterdir()
-            if p.suffix in (".cpp", ".ps1", ".py") and p.name != Path(__file__).name
-        )
+        targets = discover()
 
     cpp = [p for p in targets if p.suffix == ".cpp"]
     ps = [p for p in targets if p.suffix == ".ps1"]

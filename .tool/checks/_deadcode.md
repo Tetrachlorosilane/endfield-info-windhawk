@@ -6,8 +6,8 @@
 ## 怎么跑
 
 ```powershell
-python _deadcode.py                 # 默认扫本仓库的 .cpp / .ps1 / .py（跳过脚本自己）
-python _deadcode.py test-layout.cpp _preview.py    # 也可以只扫指定文件
+python .tool/checks/_deadcode.py      # 默认递归扫本仓库的 .cpp / .ps1 / .py（跳过脚本自己）
+python .tool/checks/_deadcode.py .tool/regress/test-layout.cpp   # 也可以只扫指定文件
 ```
 
 ## 需要什么

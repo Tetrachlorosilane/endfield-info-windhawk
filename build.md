@@ -38,7 +38,7 @@ pwsh -ExecutionPolicy Bypass -File build.ps1
 - **本地编不出"安装版"。** 参数里带 `-DWH_EDITING`，在该宏下 `Wh_Log` 是空的内联函数，
   日志调用连同格式串一起被编译掉。所以**在 DLL 里搜不到某条日志字符串，什么也证明不了**
   （去掉 `-DWH_EDITING` 也救不了：那会引用只有 Windhawk 自己提供的 `InternalWh_*`，本地链接不过）。
-  要检查日志格式串用 `python _logfmt.py`。
+  要检查日志格式串用 `python .tool/checks/_logfmt.py`。
 - 脚本刻意不用 `new` / `delete` / `std::*` / 异常 —— 这是**体积**决定，不是"堆分配不可用"：
   Windhawk 会自带并注入 `libc++.whl`。避开堆分配让 DLL 停在约 178 KB，
   换成 `-static-libstdc++ -static-libgcc` 会涨到约 578 KB。

@@ -9,9 +9,9 @@
 # Windhawk log as "EXT hello ...", "EXT set ..." or "EXT err code=...".
 #
 # Usage:
-#   pwsh -File _extclient.ps1
-#   pwsh -File _extclient.ps1 -Key progress -Ttl 60000 -Text 0.42
-#   pwsh -File _extclient.ps1 -Raw 'GARBAGE'          # to see an error code
+#   pwsh -File .tool/pipe/_extclient.ps1
+#   pwsh -File .tool/pipe/_extclient.ps1 -Key progress -Ttl 60000 -Text 0.42
+#   pwsh -File .tool/pipe/_extclient.ps1 -Raw 'GARBAGE'   # to see an error code
 
 param(
     [string]$Provider = 'music',

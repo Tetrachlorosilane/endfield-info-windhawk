@@ -9,11 +9,11 @@ Without them the mod never creates the pipe, and this script fails with
 FileNotFoundError. That is the on-demand design working, not a bug.
 
 Usage:
-    python _extclient.py "Now Playing: Blue Hour"
-    python _extclient.py --key progress --ttl 60000 0.42
-    python _extclient.py --event "Track changed"     (answers ERR 501 for now)
-    python _extclient.py --raw "SET music title 5000 hello"   (no HELLO first)
-    python _extclient.py --raw "GARBAGE"             (to see an error code)
+    python .tool/pipe/_extclient.py "Now Playing: Blue Hour"
+    python .tool/pipe/_extclient.py --key progress --ttl 60000 0.42
+    python .tool/pipe/_extclient.py --event "Track changed"     (answers ERR 501)
+    python .tool/pipe/_extclient.py --raw "SET music title 5000 hello"   (no HELLO first)
+    python .tool/pipe/_extclient.py --raw "GARBAGE"             (error code)
 
 Replies are read on a thread so a client that only writes still works: the
 server tolerates a client that never reads, which is why this cannot hang.

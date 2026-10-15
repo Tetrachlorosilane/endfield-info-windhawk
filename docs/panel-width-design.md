@@ -189,7 +189,7 @@ frames`）。
 
 ---
 
-## 7. 断言清单（`test-layout.cpp`）
+## 7. 断言清单（`.tool/regress/test-layout.cpp`）
 
 按节列出。**括号里是负对照**——把对应的改动回去各红几条，2026-10-15 实测。
 

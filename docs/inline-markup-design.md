@@ -28,7 +28,7 @@
 **保留**的底层设施（它们与"图标是什么"无关）：图片解码与重采样
 （`PlanDownscale` / `DownscaleToFit`）、`kIconPlateRatio` 与字形绘制。
 
-设置块从 58 项降到 **49 项**（实测：`python _settings.py` 报 `settings entries: 49`）。
+设置块从 58 项降到 **49 项**（实测：`python .tool/checks/_settings.py` 报 `settings entries: 49`）。
 
 ---
 
@@ -156,7 +156,7 @@ struct RowProgram {          // 每行一个，定长数组，零堆分配
 1. 编译是纯函数：`CompileRowText(raw) → RowProgram`，同输入两次产出逐字段相等，
    且 `RowProgramEqual` 能识别"只有一个字形变了"（否则该重编译时不会重编译）；
 2. 部件表里**没有** `{}` 残留，也没有任何 GDI+ 句柄（后者由"结构体里只有 POD 字段"保证，
-   `_deadcode.py` 的字段扫描顺带守住）；
+   `.tool/checks/_deadcode.py` 的字段扫描顺带守住）；
 3. 标签容错：坏标签留下的原文进的是 TEXT 部件（与今天的断言同形）；
 4. **每帧解析次数为 0**：把解析入口计数器包住，连画三帧（期间只改动画相位）后计数不变；
    负对照——把 `PaintPanel` 改回每帧调用解析，断言必须变红；
@@ -212,7 +212,7 @@ struct RowMetrics {
 | `ExpandTokensAndRings` | 被 `InstantiateRowProgram` 取代（它今天既展开又编码标记） |
 | `BuildRowLayout` | 被"实例化 + 测量"取代；`TextSeg` 扩成"元素"（文字/图标/环/占位） |
 | `PaintPanel` | 行绘制改为"读常驻部件表 + 当前值"（仍然每帧完整绘制）；图标在行内画（不再有行首盘与共享内缩） |
-| `_preview.py` | 要跟着改（它今天是"每行左端一个盘"的复刻） |
+| `.tool/preview/_preview.py` | 要跟着改（它今天是"每行左端一个盘"的复刻） |
 | README | 「左侧图标」一节重写为「行内图标与对齐」；设置表删 9 行 |
 | 岛上的卡片 | **不受影响**（它有自己的几何） |
 
@@ -296,7 +296,7 @@ struct RowMetrics {
    >   它保证的是"run 的预算永远来自它不能越过的边"，而不是"它一定会被组截断"。
    >   真正的约束在相位 A（面板列），组的内层约束由图标/环这些固定尺寸元素承担。
 
-6. 文档、`_preview.py`、CHANGELOG、缺陷表。
+6. 文档、`.tool/preview/_preview.py`、CHANGELOG、缺陷表。
 
 第 3 步是风险最大的一步（它换掉行绘制的数据来源），也是唯一无法"只加不改"的一步；
 它的验收标准就一条：**默认配置的屏幕输出与今天逐值一致**（用现有的 745 条断言当护栏，

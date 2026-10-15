@@ -872,7 +872,7 @@ static const double kCueContentIn = 0.38;  // TNumIn
 static const double kCueContentReady = 0.66;  // text fully surfaced (Fade style)
 
 // The stepped content fade: the span it has at speed 1.0 (which is exactly the
-// distance to kCueContentReady, see the assertion in test-layout.cpp), the
+// distance to kCueContentReady, see the assertion in .tool/regress/test-layout.cpp), the
 // multiplier that compresses it, and the four stages inside it. Deriving every cue
 // from those two constants is what makes "how fast do the numbers surface" a
 // one-constant edit, and the stages are fractions *within* the span, so compressing
@@ -3396,7 +3396,7 @@ static int ComputeIslandCardWidth(const IslandMetrics &m, const ModSettings &cfg
 // resolver lives next to the measurement and why `ModSettings::panelWidth` is only the
 // *fixed-mode* width and the reference width the measurement pass measures at.
 //
-// Three invariants, all of them asserted in test-layout.cpp:
+// Three invariants, all of them asserted in .tool/regress/test-layout.cpp:
 //
 //   1. the resolved width is what the DIB, the window rect, the hit test and the row text
 //      column all use -- one owner, so the window and its bitmap cannot disagree;
