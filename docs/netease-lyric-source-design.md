@@ -309,12 +309,27 @@ artist → [data-testid=tid_tracktitle_artist] span[title]
 **它不参与"位置"**：位置只来自 `data-time`。这正是把它与已删除的 `storeline` 区分开的地方 ——
 `storeline` 当年是拿"冻结行号的起始时间"当**位置**用，于是把后面会前进的来源全遮住了。
 
-### 5.3 不变的东西：管道协议
+### 5.3 变过的东西：`title` 拆出 `artist`（协议 v1 现在是五个 key）
 
-发布的 key **一个都没变**：`title`、`lyric`、`translation`、`pos`（顺序由
-`Get-PublishPlan` 的有序字典保证，同一轮同一个 key 只出现一次）。产品侧读的
-`{ext.netease.*}` 因此不需要任何改动（`.cpp` 这一轮没碰）。
-`-SelfTest` 里"整轮恰好 title/lyric/translation/pos 四个 key"那条断言就是守着这件事的。
+`title` 曾经是拼好的 `歌名 - 歌手`，**2026-10-16 起它是纯歌名**，歌手走自己的 `artist` key。
+发布的 key 因此是五个：`title`、`artist`、`lyric`、`translation`、`pos`（顺序由
+`Get-PublishPlan` 的有序字典保证，同一轮同一个 key 只出现一次）。
+`-SelfTest` 里"整轮恰好 title/artist/lyric/translation/pos 五个 key、顺序固定"那条断言
+就是守着这件事的；另外还有一条**对照**断言，把旧协议（四 key、title 拼歌手）拼出来与它比对，
+证明这一组描述的不是一个恒真的形状。运行时负对照（把歌手拼回 `title`）实测红 2 条。
+
+为什么拆：拼接把两件事绑在一个 key 上——歌名里本来就可能带「 - 」，一旦要分开摆就再也分不开；
+而且拼接会把"歌手缺失"和"歌手为空"写成同一个字符串，`artist` 便无从"清掉上一首的歌手"。
+
+**这是用户可见的不兼容**：依赖旧写法的面板行要补 `{ext.netease.artist}`，
+只写 `{ext.netease.title}` 的配置从此看不到歌手。产品侧读的 `{ext.<provider>.<key>}` 是通用的，
+所以 `.cpp` 这一轮**没有碰**（已核对：`build.ps1` 产物与改动前同为 203776 B）。
+
+### 5.4 不变的东西：其余三个 key 的缺席语义
+
+`lyric` / `pos` 仍然**一条都没变**：读不到就整条 key 缺席（不是发空串）。
+`translation` 照旧总是出现，空串 = "这一行没有翻译，清掉上一行的"。
+`-SelfTest` 里那两条（"取不到歌词时不发 lyric" / "翻译总是出现"）就是守着这件事的。
 
 ---
 
@@ -325,8 +340,12 @@ artist → [data-testid=tid_tracktitle_artist] span[title]
 * 端口 9229 活着，`/json/list` 只有一个 page 目标（§2.1）；
 * **托盘模式**（4 个 cloudmusic 窗口全部 `IsWindowVisible=0`，§2.2）下，
   `li.line.current` 的原文/翻译与 `data-time` 都在、并且在往前走（§2.4）；
-* `-ProbeVinyl` 四条候选全部命中 ①/② 档；`-DryRun` 打出四个 key 的正确值；
-* `-SelfTest` 全绿（**100 项**，构成见 §7）。
+* `-ProbeVinyl` 四条候选全部命中 ①/② 档；
+* 发布计划拆成五个 key 后的**帧文本**已核对（2026-10-16）：用只加载桥的纯函数（截掉主循环）
+  的临时驱动打出的帧是 `SET netease title 600000 铁花飞` / `SET netease artist 600000 Mili / 塞壬唱片-MSR`
+  / `lyric` / `translation` / `pos`，歌手为空时是 `SET netease artist 600000 `（值为空串）；
+  ⚠️ 本机没有音乐客户端，所以**没有**跑过连真页面的 `-DryRun`；
+* `-SelfTest` 全绿（**103 项**，构成见 §7）。
 
 **2026-10-15 用户真机确认**（这三条是**用户在他自己的机器上跑出来**的结果，不是我们测的；
 原样记下来是因为它们正是这条来源的失效条件，而本机当时只拿到了"已经处在那个状态"的快照）：
@@ -355,7 +374,7 @@ artist → [data-testid=tid_tracktitle_artist] span[title]
 
 ## 7. 自检覆盖的是哪些"看着有、其实没有"，以及它**不**证明什么
 
-这一节是**为下一个人写的**：桥的自检有 100 项，但它的覆盖面**不是整个桥**。
+这一节是**为下一个人写的**：桥的自检有 103 项，但它的覆盖面**不是整个桥**。
 下面四组是"胶水路径"——最容易看着有、其实没有的地方。
 
 ### 7.1 `Get-CdpReplyVerdict`：回包解析（组 1）

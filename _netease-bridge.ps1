@@ -268,7 +268,8 @@ function Connect-PipeClient {
 function Publish {
     param($Writer, [string]$Key, [string]$Text)
     # 一轮里同一个 key 被写两次 = 面板会在两个值之间闪。真机踩到过（store 的曲名没有作者，
-    # 和最后拼好的"歌名 - 作者"抢同一个 key），所以这里点名；结构上的保证是 Get-PublishPlan
+    # 和最后拼好的"歌名 - 作者"抢同一个 key——`title`/`artist` 拆成两个 key 之后，那两处
+    # 发布者各自只有一个了），所以这里点名；结构上的保证是 Get-PublishPlan
     # 返回有序字典——字典不可能有重复键，两处发布者从此写不出来。
     if ($script:IterationKeys.ContainsKey($Key)) {
         if ($script:DuplicateKeys -lt 8) {
@@ -288,12 +289,22 @@ function Publish {
 # 于是"同一个 key 有两个发布者"这件事在结构上不可能发生——那正是真机上"作者忽隐忽现、
 # 歌词跳回旧行"的成因（store 的 resourceName 与拼好的标题抢 title；store 那个会冻结的
 # 当前行与按位置选出的行抢 lyric）。自检直接断言这个形状。
-# 空值不发：lyric/pos 取不到时整条 key 缺席（而不是发空串把上一轮的值盖掉）；
-# translation 例外——它总是出现，空串的含义是"这一行没有翻译，清掉上一行的"。
+#
+# **`title` 只有歌名、`artist` 只有歌手**（两个 key，不再拼成 `歌名 - 歌手` 一条）。
+# 拆开是因为"拼好的一条"把两件事绑在一个 key 上：歌名里本来就可能带「 - 」，一旦要在
+# 面板上分开摆（歌名一行、歌手一行、或者只显示歌手），拼接形式就再也分不开了；而且
+# 拼接会把歌手缺失与歌手为空写成同一个字符串。
+#
+# 空值不发：lyric/pos 取不到时整条 key 缺席（而不是发空串把上一轮的值盖掉）。
+# **title / artist / translation 三个例外——它们总是出现**：这三者都是"这一首歌/这一行
+# 的身份"，空串的含义是"这一拍没有它，清掉上一轮的值"。artist 尤其不能省：歌手是曲目
+# 身份的一部分，漏发会让**上一首的歌手**留在面板上；而 lyric/pos 只是"读miss"，用缺席
+# 表达才不会因为一次瞬时的读失败把好行打空。
 function Get-PublishPlan {
     param([string]$Title, [string]$Artist, [string]$Line, [string]$Translation, [string]$Pos)
     $plan = [ordered]@{}
-    $plan['title'] = if ($Artist) { '{0} - {1}' -f $Title, $Artist } else { $Title }
+    $plan['title'] = $Title
+    $plan['artist'] = $Artist
     if ($Line) { $plan['lyric'] = $Line }
     $plan['translation'] = $Translation
     if ($Pos) { $plan['pos'] = $Pos }
@@ -1496,6 +1507,11 @@ if ($SelfTest) {
         -Translation $script:FrameMissAll.Translation `
         -Pos $(if ($null -ne $script:FrameMissAll.PositionMs) { 'p' } else { '' })
 
+    # 拆分协议那组断言用的两个对象：旧协议（title 里拼歌手、四个 key）与新协议，
+    # 断言放在 $checks 里（见"旧协议…与新协议不同"那条）。
+    $legacyPlan = [ordered]@{ title = 'A - B'; lyric = 'x'; translation = 't'; pos = 'p' }
+    $newPlan = Get-PublishPlan -Title 'A' -Artist 'B' -Line 'x' -Translation 't' -Pos 'p'
+
     $checks = @(
         # ---- 候选表顺序（"通用准确"的胜负手）--------------------------------------------
         @{ Name = '黑胶页根候选：**第一条必须是稳定 id**（真机实测它就是 #VINYL_COVER_ELEMENT_ID）'; Ok = ($script:RootCands[0] -eq '#VINYL_COVER_ELEMENT_ID') }
@@ -1568,7 +1584,7 @@ if ($SelfTest) {
         @{ Name = '落空：候选全落空 → Guard=no-line、位置为空、原文为空'; Ok = ($script:FrameMissAll.Guard -eq 'no-line') -and ($null -eq $script:FrameMissAll.PositionMs) -and ($script:FrameMissAll.Line -eq '') }
         @{ Name = '落空：Why 里有判别性数值（指出根候选也是 (none)）'; Ok = ($script:FrameMissAll.Why -like '*行候选全部落空*') -and ($script:FrameMissAll.Why -like '*root=''*') -and ($script:FrameMissAll.LineHit -eq '(none)') }
         @{ Name = '落空：候选全落空时**发布计划里没有 lyric、也没有 pos**（正是"不发"而不是发旧值）'; Ok = (-not $script:PlanMissAll.Contains('lyric')) -and (-not $script:PlanMissAll.Contains('pos')) }
-        @{ Name = '落空：候选全落空时 title/translation 照旧发（只有位置与歌词受影响，别把整行打没）'; Ok = ($script:PlanMissAll.Contains('title')) -and ($script:PlanMissAll.Contains('translation')) -and ($script:PlanMissAll['title'] -eq 'A - B') }
+        @{ Name = '落空：候选全落空时 title/artist/translation 照旧发（只有位置与歌词受影响，别把整行打没）'; Ok = ($script:PlanMissAll.Contains('title')) -and ($script:PlanMissAll.Contains('artist')) -and ($script:PlanMissAll.Contains('translation')) -and ($script:PlanMissAll['title'] -eq 'A') -and ($script:PlanMissAll['artist'] -eq 'B') }
         @{ Name = '落空：没有页面（Get-CdpVinyl 返回 $null）→ 同样 no-line 且不发'; Ok = ($script:FrameNoPage.Guard -eq 'no-line') -and ($null -eq $script:FrameNoPage.PositionMs) -and (-not (Get-PublishPlan -Title 'A' -Artist 'B' -Line $script:FrameNoPage.Line -Translation $script:FrameNoPage.Translation -Pos '').Contains('lyric')) }
         @{ Name = '落空：页面内报错（DOM 变了导致表达式抛异常）时，**页面自己的错误文本被带出来**（比"落空"更有信息量）'; Ok = ($script:FramePageErr.Guard -eq 'no-line') -and ($script:FramePageErr.Why -like '*页面内报错*getAttribute*') }
         @{ Name = '陈旧：命中了别的节点（恒为 29.5 s）时，判 stale 并且**不发那一句错的歌词**'; Ok = ($script:SeqFrozen[4].Guard -eq 'stale') -and ($null -eq $script:SeqFrozen[4].PositionMs) -and ($script:SeqFrozen[4].Line -eq '') }
@@ -1609,13 +1625,21 @@ if ($SelfTest) {
         @{ Name = '岛事件：间隔不足时不发（密集歌词不刷屏）'; Ok = (-not (Test-EventAllowed -Now $stamp.AddMilliseconds(3999) -LastAt $stamp -MinMs 4000)) }
         @{ Name = '岛事件：达到最小间隔才发'; Ok = (Test-EventAllowed -Now $stamp.AddMilliseconds(4000) -LastAt $stamp -MinMs 4000) }
         @{ Name = '岛事件：间隔设为 0 表示不节流'; Ok = (Test-EventAllowed -Now $stamp -LastAt $stamp -MinMs 0) }
-        @{ Name = '发布计划：标题带作者'; Ok = ((Get-PublishPlan -Title 'A' -Artist 'B' -Line 'x' -Translation '' -Pos 'p')['title'] -eq 'A - B') }
-        @{ Name = '发布计划：没有作者时不留下悬空的分隔符'; Ok = ((Get-PublishPlan -Title 'A' -Artist '' -Line 'x' -Translation '' -Pos 'p')['title'] -eq 'A') }
-        @{ Name = '发布计划：整轮恰好 title/lyric/translation/pos 四个 key（协议没变）'; Ok = (((Get-PublishPlan -Title 'A' -Artist 'B' -Line 'x' -Translation 't' -Pos 'p').Keys -join ',') -eq 'title,lyric,translation,pos') }
+        # title 与 artist 是**两个 key、两个值**：`title` 里不许再有歌手，`artist` 不许缺。
+        # 这组是这次拆分协议的判据，负对照（把歌手拼回 title）在下面 1616 那条上。
+        @{ Name = '发布计划：title 只有歌名（歌手的名字不出现在 title 里，也不留分隔符）'; Ok = ((Get-PublishPlan -Title '铁花飞' -Artist 'Mili' -Line 'x' -Translation '' -Pos 'p')['title'] -eq '铁花飞') }
+        @{ Name = '发布计划：artist 只有歌手（歌名不出现在 artist 里）'; Ok = ((Get-PublishPlan -Title '铁花飞' -Artist 'Mili' -Line 'x' -Translation '' -Pos 'p')['artist'] -eq 'Mili') }
+        @{ Name = '发布计划：歌手为空时 artist 仍然出现且为空串（清掉上一首的歌手，不是留着不动）'; Ok = ((Get-PublishPlan -Title 'A' -Artist '' -Line 'x' -Translation '' -Pos 'p').Contains('artist')) -and ((Get-PublishPlan -Title 'A' -Artist '' -Line 'x' -Translation '' -Pos 'p')['artist'] -eq '') }
+        @{ Name = '发布计划：歌手为空也不会在 title 尾部留下「 - 」（旧拼接写法在这里留下「A - 」）'; Ok = ((Get-PublishPlan -Title 'A' -Artist '' -Line 'x' -Translation '' -Pos 'p')['title'] -eq 'A') -and ($null -ne (Get-PublishPlan -Title 'A' -Artist '' -Line 'x' -Translation '' -Pos 'p')['title']) -and (-not ((Get-PublishPlan -Title 'A' -Artist '' -Line 'x' -Translation '' -Pos 'p')['title'] -like 'A -*')) }
+        @{ Name = '发布计划：整轮恰好 title/artist/lyric/translation/pos 五个 key、顺序固定（协议 v1）'; Ok = (((Get-PublishPlan -Title 'A' -Artist 'B' -Line 'x' -Translation 't' -Pos 'p').Keys -join ',') -eq 'title,artist,lyric,translation,pos') }
         @{ Name = '发布计划：取不到歌词时不发 lyric（而不是发空串盖掉上一行）'; Ok = (-not (Get-PublishPlan -Title 'A' -Artist 'B' -Line '' -Translation '' -Pos 'p').Contains('lyric')) }
         @{ Name = '发布计划：翻译总是出现（空串 = 这一行没有翻译，清掉上一行的）'; Ok = ((Get-PublishPlan -Title 'A' -Artist 'B' -Line 'x' -Translation '' -Pos '').Contains('translation')) }
         @{ Name = '发布计划：没有位置时不发 pos'; Ok = (-not (Get-PublishPlan -Title 'A' -Artist 'B' -Line 'x' -Translation '' -Pos '').Contains('pos')) }
         @{ Name = '发布计划：每个 key 只出现一次（同一轮一个 key 一个发布者）'; Ok = ((Get-PublishPlan -Title 'A' -Artist 'B' -Line 'x' -Translation 't' -Pos 'p').Count -eq (((Get-PublishPlan -Title 'A' -Artist 'B' -Line 'x' -Translation 't' -Pos 'p').Keys | Select-Object -Unique).Count)) }
+        # 上面那几条的**对照**：按**旧协议**（四个 key，title 里拼歌手）拼一个对象，断言它与
+        # 新协议**不同**。不这样做的话，"五 key 顺序固定""title 纯歌名"这几条有可能只是在
+        # 描述一个恒真的形状（§7.13：看着在守、其实没有）。
+        @{ Name = '发布计划：旧协议（四 key、title 拼歌手）与新协议不同 —— 上面那几条不是恒真'; Ok = ((($legacyPlan.Keys -join ',') -ne ($newPlan.Keys -join ',')) -and ($legacyPlan['title'] -ne $newPlan['title'])) }
     )
     $bad = 0
     # 活体证据：**窗口枚举现在只服务兜底③**，所以它空着不再是"桥坏了"的信号——托盘模式
@@ -1735,9 +1759,10 @@ if (-not $DryRun) {
     Write-Host ("已连上管道 {0}" -f $Pipe)
 }
 
-# 换歌检测用**曲目身份**（标题 + 歌手），不再用窗口标题：托盘模式下窗口标题根本没有值。
+# 换歌检测用**曲目身份比较键**（标题 + 歌手），不再用窗口标题：托盘模式下窗口标题根本没有值。
+# 变量名说的是"键"而不是"给人看的串"——两者的写法不同（见主循环里 trackKey 的注释）。
 # 上一轮见到的当前行 data-time（毫秒，-1 = 还没见到）——`Resolve-VinylFrame` 的输入。
-$lastRaw = ''
+$lastKey = ''
 $announced = $false
 $script:LastEventAt = [datetime]::MinValue
 $prevLineMs = -1
@@ -1776,14 +1801,19 @@ try {
                 $(if ($vinyl) { $vinyl.TitleHit } else { '-' }))
         }
         else {
-            $trackRaw = '{0} - {1}' -f $ident.Title, $ident.Artist
-            if ($trackRaw -ne $lastRaw) {
+            # 曲目身份的**比较键**（不是给人看的字符串）：换成用「\」分隔是因为它不可能
+            # 出现在歌名/歌手里，于是不可能把两首不同的歌拼成同一个键。**不能**改回
+            # `'{0} - {1}'`：旧写法在歌手为空时给出 `A - `，与另一首真叫 `A - ` 的歌撞键
+            # （面板只会显示第一首），而且歌手从有到无的一拍不会触发"换歌"。
+            $trackKey = '{0}\{1}' -f $ident.Title, $ident.Artist
+            if ($trackKey -ne $lastKey) {
                 # 换歌：清掉"已经发过"的缓存，位置守卫的基准也一起复位（新歌从 0 开始）。
-                $lastRaw = $trackRaw
+                $lastKey = $trackKey
                 $script:Sent.Clear()
                 $prevLineMs = -1
                 $sameLineMs = 0
-                Write-Host ("换歌：{0}（身份来源 {1}）" -f $trackRaw, $ident.Source)
+                $who = if ($ident.Artist) { '{0} - {1}' -f $ident.Title, $ident.Artist } else { $ident.Title }
+                Write-Host ("换歌：{0}（身份来源 {1}）" -f $who, $ident.Source)
             }
 
             # 位置与当前行：**同一次读**（都在 li.line.current 上），判定只在
@@ -1834,8 +1864,14 @@ try {
             foreach ($key in $plan.Keys) { [void](Publish $writer $key $plan[$key]) }
             if ($Event -and -not $announced) {
                 # 只有真的发出去了才算"播报过"：被节流掉的话，下一拍还有机会。
+                # **卡片的两行就是曲目的两半**：第一行歌名、第二行歌手。`title`/`artist`
+                # 拆成两个 key 之后，岛卡片没有第三个字段可放第三件东西，而"换歌播报"
+                # 要说的正是"现在是哪首歌"——所以这里给身份，不再给第一句歌词（歌词随
+                # 后一拍就进面板的 lyric 行，卡片只是换歌那一下的通知；卡片自己也只画
+                # 得下两行，`plan.lines` 见 EvaluateIslandCard）。歌手为空时正文留空，
+                # 卡片自动只画一行（mod 侧 `ev.body[0] ? 2 : 1`）。
                 if (Write-IslandEvent -Writer $writer -Provider $Provider -CardMs $EventTtlMs `
-                        -Title $trackRaw -Body $line) {
+                        -Title $ident.Title -Body $ident.Artist) {
                     $announced = $true
                 }
             }

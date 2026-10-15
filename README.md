@@ -656,7 +656,8 @@ Windhawk 不支持动态下拉框，所以字体需要手输。拼错了就去�
 送进面板与灵动岛。它只读**客户端自己的页面**（需要你给快捷方式加一个调试端口参数），
 曲名、歌手、当前歌词行、播放位置全从那里来：
 
-1. **曲名 / 歌手**：读页面上标题与歌手行的 `title` 属性。
+1. **曲名 / 歌手**：读页面上标题与歌手行的 `title` 属性，**分别**发布成 `{ext.netease.title}`
+   与 `{ext.netease.artist}` 两个变量（`title` 里**不含**歌手）。
 2. **歌词**：读**客户端自己标出来的那一行**（`li.line.current`）——**原文与翻译都在那一个
    元素里**，所以要和界面上显示的完全一致；位置是同一个元素上的 `data-time`（十分之一秒），
    所以**拖动进度条、暂停、切歌天然正确**，不需要任何推算。
@@ -673,7 +674,7 @@ Windhawk 不支持动态下拉框，所以字体需要手输。拼错了就去�
 
 ```powershell
 # 离线自检：CDP 回包解析、候选表与发出去的 JS 是否一致、原文/翻译切分、
-# data-time 解析、新鲜度与恢复判据、帧格式（100 项，不连页面、不连管道）
+# data-time 解析、新鲜度与恢复判据、帧格式（103 项，不连页面、不连管道）
 pwsh -File _netease-bridge.ps1 -SelfTest
 
 # 这台机器有没有 CDP 调试端口（决定歌词能不能工作），并打印改快捷方式的步骤
@@ -690,10 +691,10 @@ pwsh -File _netease-bridge.ps1 -ProbeVinyl -ProbeRounds 10
 # 先看不发：把要发的帧打印出来
 pwsh -File _netease-bridge.ps1 -DryRun -Once
 
-# 真发：{ext.netease.title} / {ext.netease.lyric}
+# 真发：{ext.netease.title} / {ext.netease.artist} / {ext.netease.lyric}
 pwsh -File _netease-bridge.ps1 -Ttl 600000
 
-# 换歌时顺带弹一次岛（正文就是第一句歌词）
+# 换歌时顺带弹一次岛（卡片两行 = 歌名 / 歌手）
 pwsh -File _netease-bridge.ps1 -Event -Ttl 600000
 ```
 
@@ -721,20 +722,26 @@ pwsh -File _netease-bridge.ps1 -Event -Ttl 600000
 | `-Provider` | 提供者名，默认 `netease`（面板里写 `{ext.netease.title}`） |
 | `-ProcessName` | 进程名匹配，默认 `cloudmusic`。**只在完全没有调试端口时**用于最后的曲名兜底 |
 | `-TtlMs` | 推过去的值的寿命，默认 600000（歌在播，给长一点，别让行里闪 `--`） |
-| `-Event` | 换歌时发一条 `EVENT`，让灵动岛弹一次 |
+| `-Event` | 换歌时发一条 `EVENT`，让灵动岛弹一次（卡片两行 = 歌名 / 歌手） |
 | `-EventTtlMs` | **卡片**在屏时长，默认 6000。⚠️ 别用 `-TtlMs`（那是**值的**寿命，默认 10 分钟）：把它当卡片时长发过去，一张卡就占住岛十分钟 |
 | `-EventMinIntervalMs` | 两条岛事件之间的最小间隔，默认 4000。歌词很密时不许刷屏；被节流掉的事件下一拍还有机会发 |
 | `-LeadMs` | 换行的"**负延迟**"（毫秒）：把**选行用的位置**提早这么多，用来抵消"歌词比声音晚一点"。默认 `-1` = 自动（半个 `-IntervalMs` = 默认 **500 ms**）；`0` = 关掉；给正数用自己的值（`1000` 更早、`250` 更保守）。发出去的 `pos` 会带出提早量，方便看有没有过头 |
 | `-ProbeCdp` | 探测 CDP 调试端口是否可用，并打印改快捷方式的步骤（需要你手动给快捷方式加 `--remote-debugging-port=9229`） |
 | `-ProbeVinyl` | 只读探针：每轮打印四条候选各自命中哪一条、`data-time`、新鲜度判定、曲名/歌手、原文与翻译。**排查托盘模式就靠它** |
 | `-ProbeStore` | 只读探针：把黑胶页的当前行与客户端 store 自己报的行并排打出来（核对两者是否同一行） |
-| `-DryRun` / `-SelfTest` | 不发送 / 离线自检（100 项，不需要网络、不需要客户端） |
+| `-DryRun` / `-SelfTest` | 不发送 / 离线自检（103 项，不需要网络、不需要客户端） |
 
 **它只在内容变化时才发**：一秒一次地重复同一句歌词没有意义，管道限速会丢，但更好的做法是根本不发。
 
+> **不兼容（2026-10-16）**：`title` 以前是拼好的 `歌名 - 歌手`，现在是**纯歌名**。
+> 仍然只写 `{ext.netease.title}` 的行**不会报错，只是看不到歌手**——要显示歌手就在那一行
+> 加上 `{ext.netease.artist}`（例如 `{ext.netease.title} - {ext.netease.artist}`）。
+>
 > 面板侧要做的只有两件事：设置里 `External data` 打开，然后**在一行里引用** `{ext.netease.title}`
-> 或 `{ext.netease.lyric}`（没有引用就不会建管道，这是刻意的）。排错时可以再加一个
-> `{ext.netease.pos}`：它显示当前歌词用的位置来自哪一条来源（见上面那一段）。
+> 或 `{ext.netease.lyric}`（没有引用就不会建管道，这是刻意的）。**歌名与歌手是两个变量**：
+> `title` **只有歌名**（不含歌手、不含分隔符），歌手在 `{ext.netease.artist}` 里；
+> 取不到歌手时它是**空串**（清掉上一首的歌手，而不是在 `title` 后面留一个「 - 」）。
+> 排错时可以再加一个 `{ext.netease.pos}`：它显示当前歌词用的位置来自哪一条来源（见上面那一段）。
 > `{ext.netease.translation}` 是当前行的**翻译**（这一行没有翻译时发空串，会清掉上一行的）。
 
 ---
