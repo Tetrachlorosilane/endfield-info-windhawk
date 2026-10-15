@@ -913,6 +913,218 @@ int main() {
                   "a group can hold text, an icon and a gap at once");
         }
 
+        // --- [[/]]: the generic close ---------------------------------------------------------
+        //
+        // The feature is a *compile-time desugaring*: `[[/]]` has to instantiate to exactly the
+        // marker sequence the explicit form writes, so nothing downstream -- BuildRowLayout,
+        // BuildRowPlan, the paint path -- knows the tag exists. Every assertion below therefore
+        // compares two marked strings produced by the product, rather than spelling out a marker
+        // sequence: the property is "same as the explicit form", and a hardcoded expectation would
+        // only agree with whichever of the two the test happened to be written against.
+        {
+            LOCAL_SETTINGS(anyS, g_gapLayout);
+            anyS.fontSize = 15;
+            anyS.rowHeight = 30;
+            anyS.rowCount = 1;
+            // The font run cases need a registered chain: `[[font:Arial]]` that was never
+            // registered is ordinary text, so a comparison against it would compare two literals.
+            wcscpy(anyS.tagFonts[0].key, L"Arial");
+            wcscpy(anyS.tagFonts[0].chain.names[0], L"Arial");
+            anyS.tagFonts[0].chain.count = 1;
+            anyS.tagFontCount = 1;
+
+            struct CloseCase {
+                const WCHAR *generic;
+                const WCHAR *explicitForm;
+            };
+            const CloseCase cases[] = {
+                // Each block kind on its own, and the mixed case the brief calls out: the generic
+                // close takes the *innermost* block, so the group goes before the size run.
+                {L"[[size:24]]hi[[/]]", L"[[size:24]]hi[[/size]]"},
+                {L"[[font:Arial]]hi[[/]]", L"[[font:Arial]]hi[[/font]]"},
+                {L"[[center]]hi[[/]]", L"[[center]]hi[[/center]]"},
+                {L"[[size:24]][[center]]X[[/]][[/]]",
+                 L"[[size:24]][[center]]X[[/center]][[/size]]"},
+                {L"[[font:Arial]][[size:24]]ab[[/]][[/]]",
+                 L"[[font:Arial]][[size:24]]ab[[/size]][[/font]]"},
+                // A generic close and an explicit one in the same row, in both orders.
+                {L"[[size:24]]a[[/]][[center]]b[[/]]",
+                 L"[[size:24]]a[[/size]][[center]]b[[/center]]"},
+                {L"[[size:24]]a[[/size]][[center]]b[[/]]",
+                 L"[[size:24]]a[[/size]][[center]]b[[/center]]"},
+                // The flat-group rule: a second opener *replaces* the group, so the generic close
+                // after it closes the newer group, not the older one.
+                {L"[[left]]a[[center]]b[[/]]", L"[[left]]a[[center]]b[[/center]]"},
+                {L"[[left]]a[[center]]b[[/]][[/]]",
+                 L"[[left]]a[[center]]b[[/center]][[/left]]"},
+                // A close followed by an element. The second `[[/]]` here is a *stray* (the first
+                // one closed the size run), so the two sides are written with the same text and
+                // what is asserted is the row's own shape, not a generic-vs-explicit pair.
+                {L"[[size:24]]a[[/]] [[icon:CPU]][[/]]",
+                 L"[[size:24]]a[[/]] [[icon:CPU]][[/]]"},
+                // Runs do not nest, so a size tag written inside a size run replaces the size in
+                // force; the generic close ends the run either way.
+                {L"[[size:24]]a[[size:20]]b[[/]]",
+                 L"[[size:24]]a[[size:20]]b[[/size]]"},
+                // Text that only looks like the tag is text, on both sides of the comparison.
+                {L"a[[/]]]", L"a[[/]]]"},
+                // A close in front of a same-kind run: `[[/]]` takes the *innermost* frame off, so
+                // the size run the second `[[/]]` closes is the one underneath the font run, not the
+                // one the first close already ended. A close that looked the innermost block up by
+                // *kind* instead of taking the top frame off gets this pair wrong -- it finds the
+                // font frame, drops the size frame with it, and then has nothing left for the second
+                // `[[/]]` (which the explicit form writes a marker for).
+                {L"[[size:9]][[font:Arial]][[/]][[/]]",
+                 L"[[size:9]][[font:Arial]][[/font]][[/size]]"},
+                {L"[[size:9]][[font:Arial]][[/]]x[[/]]",
+                 L"[[size:9]][[font:Arial]][[/font]]x[[/size]]"},
+            };
+            for (const CloseCase &c : cases) {
+                WCHAR generic[640], explicitForm[640];
+                RingSpec genericRings[kMaxRingsPerRow], explicitRings[kMaxRingsPerRow];
+                int genericCount = 0, explicitCount = 0;
+                MarkRow(c.generic, Values(), anyS, generic, 640, genericRings, &genericCount,
+                        kMaxRingsPerRow);
+                MarkRow(c.explicitForm, Values(), anyS, explicitForm, 640, explicitRings,
+                        &explicitCount, kMaxRingsPerRow);
+                wprintf(L"    %ls\n      -> ", c.generic);
+                for (const WCHAR *p = generic; *p; p++) {
+                    if (*p >= 0x20 && *p < 0x7F) wprintf(L"%lc", (wint_t)*p);
+                    else wprintf(L"{%04X}", (unsigned)*p);
+                }
+                wprintf(L"\n");
+                Check(wcscmp(generic, explicitForm) == 0,
+                      "[[/]] closes what the explicit close would have closed");
+            }
+
+            // The stray forms. A `[[/]]` with nothing open has no block to close, and the rule is
+            // the one the explicit closes already follow: the tag is consumed and writes no marker
+            // (it does *not* become literal text -- a well-formed tag with no job has never been
+            // printed at the user). Each row is paired with the same text written without the stray
+            // tag, which is what "no marker and no text" means. The pairs that also contain an
+            // *honoured* close keep it on both sides: only the stray one is being taken out.
+            struct StrayCase {
+                const WCHAR *withStray;
+                const WCHAR *without;
+            };
+            const StrayCase strays[] = {
+                {L"[[/]]abc", L"abc"},
+                {L"abc[[/]]def", L"abcdef"},
+                {L"[[/]][[/]]abc", L"abc"},
+                {L"[[size:24]]a[[/size]]b[[/]]", L"[[size:24]]a[[/size]]b"},
+                {L"[[size:24]]a[[/]]b[[/]]c", L"[[size:24]]a[[/]]bc"},
+                {L"[[font:Arial]]a[[/font]]b[[/]]", L"[[font:Arial]]a[[/font]]b"},
+            };
+            for (const StrayCase &c : strays) {
+                WCHAR generic[640], asText[640];
+                RingSpec ring1[kMaxRingsPerRow], ring2[kMaxRingsPerRow];
+                int count1 = 0, count2 = 0;
+                MarkRow(c.withStray, Values(), anyS, generic, 640, ring1, &count1,
+                        kMaxRingsPerRow);
+                MarkRow(c.without, Values(), anyS, asText, 640, ring2, &count2, kMaxRingsPerRow);
+                wprintf(L"    stray %ls -> ", c.withStray);
+                for (const WCHAR *p = generic; *p; p++) {
+                    if (*p >= 0x20 && *p < 0x7F) wprintf(L"%lc", (wint_t)*p);
+                    else wprintf(L"{%04X}", (unsigned)*p);
+                }
+                wprintf(L"\n      without it -> ");
+                for (const WCHAR *p = asText; *p; p++) {
+                    if (*p >= 0x20 && *p < 0x7F) wprintf(L"%lc", (wint_t)*p);
+                    else wprintf(L"{%04X}", (unsigned)*p);
+                }
+                wprintf(L"\n");
+                Check(wcscmp(generic, asText) == 0,
+                      "a stray [[/]] is a no-op: no marker, and no text either");
+            }
+
+            // The markup that must *not* be recognised. `[[/ ]]` is not the tag (the body is
+            // exactly "/", the way `[[left ]]` is not the left tag), and neither is a close with a
+            // word in it: strict and documented, no whitespace trimming.
+            const WCHAR *notTags[] = {L"[[/ ]]", L"[[ /]]", L"[[/x]]", L"[[//]]", L"[[/size ]]",
+                                      L"[[/size", L"[[/"};
+            for (const WCHAR *text : notTags) {
+                WCHAR marked[640];
+                RingSpec ringBuf[kMaxRingsPerRow];
+                int ringCount2 = 0;
+                MarkRow(text, Values(), anyS, marked, 640, ringBuf, &ringCount2, kMaxRingsPerRow);
+                wprintf(L"    not a tag %ls -> ", text);
+                for (const WCHAR *p = marked; *p; p++) {
+                    if (*p >= 0x20 && *p < 0x7F) wprintf(L"%lc", (wint_t)*p);
+                    else wprintf(L"{%04X}", (unsigned)*p);
+                }
+                wprintf(L"\n");
+                Check(MarkedEquals(marked, text),
+                      "a tag this code cannot read stays exactly as it was written");
+            }
+
+            // A *chain* of closes: each round opens a size run and a font run and then closes both,
+            // so every close has a block to take off (six opens in a row would be two blocks and ten
+            // strays). This is where a memoiser that resolved a `[[/]]` at the wrong position, or a
+            // close that looked the innermost block up by kind instead of taking it off the top,
+            // shows up as a missing marker -- both mistakes were made here and both made this case
+            // shorter than the explicit one.
+            const WCHAR *chainGeneric =
+                L"[[size:9]][[font:Arial]][[/]][[/]]"
+                L"[[size:9]][[font:Arial]][[/]][[/]]"
+                L"[[size:9]][[font:Arial]][[/]][[/]]";
+            const WCHAR *chainExplicit =
+                L"[[size:9]][[font:Arial]][[/font]][[/size]]"
+                L"[[size:9]][[font:Arial]][[/font]][[/size]]"
+                L"[[size:9]][[font:Arial]][[/font]][[/size]]";
+            {
+                WCHAR generic[640], explicitForm[640];
+                RingSpec genericRings[kMaxRingsPerRow], explicitRings[kMaxRingsPerRow];
+                int genericCount = 0, explicitCount = 0;
+                MarkRow(chainGeneric, Values(), anyS, generic, 640, genericRings, &genericCount,
+                        kMaxRingsPerRow);
+                MarkRow(chainExplicit, Values(), anyS, explicitForm, 640, explicitRings,
+                        &explicitCount, kMaxRingsPerRow);
+                printf("    3 x (size+font) opens and closes: generic %d char(s), explicit %d\n",
+                       (int)wcslen(generic), (int)wcslen(explicitForm));
+                if (wcscmp(generic, explicitForm) != 0) {
+                    DumpWide("      generic ", generic);
+                    DumpWide("      explicit", explicitForm);
+                }
+                Check(wcscmp(generic, explicitForm) == 0,
+                      "a chain of generic closes matches the explicit chain");
+                Check(wcschr(generic, L'[') == nullptr,
+                      "and no tag text is left on screen in that chain");
+            }
+        }
+
+        // --- [[/]] across the whole font-size range -------------------------------------------
+        //
+        // The desugaring runs at compile time and writes *digits* into the size marker, so a
+        // one-size sweep would not see a size-dependent mistake. This walks the real range and
+        // compares the generic form against the explicit one at every size, which is the property
+        // a regression would break.
+        {
+            bool allSame = true;
+            int checkedSizes = 0;
+            ModSettings &sizeS = g_gapLayout;
+            sizeS = kDefaultSettings;
+            sizeS.rowCount = 1;
+            for (int sizePx = kMinRowFontSize; sizePx <= kMaxRowFontSize; sizePx++) {
+                sizeS.rowFontSize[0] = sizePx;
+                sizeS.rowHeightPx[0] = sizePx + 15;
+                sizeS.rowMaxFontSize[0] = sizePx;
+                WCHAR generic[640], explicitForm[640];
+                RingSpec genericRings[kMaxRingsPerRow], explicitRings[kMaxRingsPerRow];
+                int genericCount = 0, explicitCount = 0;
+                MarkRow(L"a[[size:20]]b[[/]]c", Values(), sizeS, generic, 640, genericRings,
+                        &genericCount, kMaxRingsPerRow);
+                MarkRow(L"a[[size:20]]b[[/size]]c", Values(), sizeS, explicitForm, 640,
+                        explicitRings, &explicitCount, kMaxRingsPerRow);
+                if (wcscmp(generic, explicitForm) != 0) allSame = false;
+                checkedSizes++;
+            }
+            printf("    %d font size(s) from %d to %d\n", checkedSizes, kMinRowFontSize,
+                   kMaxRowFontSize);
+            Check(checkedSizes == kMaxRowFontSize - kMinRowFontSize + 1 && checkedSizes > 1,
+                  "the sweep covers the real font-size range, not one size");
+            Check(allSame, "the generic close is the explicit one at every font size");
+        }
+
         // --- the zero-cost property: no tag, no new elements, no new markers ---
         {
             const WCHAR plainRow[] = L"CPU 12%  RAM 73%";

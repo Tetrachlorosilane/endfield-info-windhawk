@@ -403,6 +403,9 @@ SamplerThread ──(采样)──> g_values (临界区保护) ──> PaintPane
   于是 100 px 以上的 gap 前两位被换位。**改上限就要同时看 `kGapMarkerMaxValue`。**
   `[[gap:0]]` 合法（零推进，不许变负或 NaN）；读不出来的（`[[gap:]]` / `abc` / 负数 /
   `100px` / `655.36px`）一律**留下原文**。
+- **`[[/]]`（不用写名字的收尾）是编译期脱糖，不许让布局或绘制认识它**：
+  `CompileRowSuffix` / `InstantiateRowProgram` 各一份**同规则的开块栈**（三种 kind 各最多一帧、收尾弹栈顶），
+  标记一律经 `WriteBlockClose`；**memo 键要带开块状态**（只按位置会少标记）。
 - **对齐组是标记 + 段上的 `group` 号，不是编译期的树。** `[[left]]`/`[[center]]`/`[[right]]`
   在实例化时写成一对标记（开 = 标记+对齐数字+结束符，关 = 标记+结束符），
   `BuildRowLayout` 按位置切成 `TextSeg::group`；`BuildRowPlan` 分三段做：

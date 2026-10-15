@@ -95,6 +95,14 @@ left, middle or right of that row's text column. Any content can go inside - tex
 tag ends the first group and starts another, and a missing closing tag runs to the end
 of the row.
 
+`[[/]]` closes whatever is open innermost, so you do not have to name the kind:
+`[[size:24]]big[[/]]` is `[[size:24]]big[[/size]]`, `[[center]]x[[/]]` is
+`[[center]]x[[/center]]`, and `[[size:24]][[center]]x[[/]][[/]]` ends the group first
+and the size run second, innermost first. It emits exactly the closing tag the explicit
+form would have written. Like the explicit closes, a `[[/]]` with nothing open vanishes
+rather than showing up as text; it is strict about its spelling, so `[[/ ]]` and
+`[[/x]]` are not the tag and stay as written.
+
 ## Panel width
 
 `Panel sizing` chooses between a width you fix (`Fixed`, taken from `Panel width`) and
@@ -403,6 +411,18 @@ static const int kMaxRingsPerRow = 4;
 // characters, so the two cannot be sized independently without one silently truncating what
 // the other can address.
 static const int kRowTextCap = 256;
+// How many blocks a row may have open at once -- the fixed cap on the compiler's open-block
+// stack and on the instantiator's twin of it. It bounds a *nesting depth*, not a count of tags,
+// and a 256-character row can only nest about 22 of them (the shortest open and close pair is
+// `[[size:9]]` + `[[/size]]` = 17 characters, and every frame needs one character of content
+// between the two), so this cap is not reachable from settings: it is what makes the open-block
+// stack a fixed array instead of an unbounded one. An open past the cap is not honoured and
+// keeps its tag text on screen (see RowOpenBlockFits).
+static const int kMaxOpenBlocks = 64;
+// The number of distinct open-block states a row can be in, as a memoiser key: one per subset of
+// {a size run, a font run, an aligned group}. Three kinds that cannot nest means a state *is* a
+// subset, so this is the whole of it (see RowStackKey).
+static const int kRowStackKeyCount = 8;
 static const int kCursorPollMs = 40;       // proximity responsiveness vs. cost
 static const int kMaxMonitors = 8;
 
@@ -1639,6 +1659,7 @@ enum RowPartKind : unsigned char {
     kPartGap,          // [[gap:...]]: empty horizontal space, in em or in px
     kPartAlignOpen,    // [[left]] / [[center]] / [[right]]: opens a group
     kPartAlignClose,   // [[/left]] / [[/center]] / [[/right]]: closes one
+    kPartAnyClose,     // [[/]]: closes the innermost open block, whatever kind it is
 };
 
 // An icon's own two attributes, packed into the single byte `RowPart::glyphFlags`. They are
@@ -1792,10 +1813,17 @@ struct RowCompiler {
     const FontTag *tags;
     int tagCount;
     RowProgram *program;
-    // Position -> the first element of the program compiled from it, -1 for "only the end of
-    // the row is left", or kRowNotCompiled. A position is compiled at most once, which is what
-    // keeps the graph finite and lets the suffixes share their tails.
-    int memo[kRowTextCap + 1];
+    // Position + open-block state -> the first element of the program compiled from there, -1 for
+    // "only the end of the row is left", or kRowNotCompiled.
+    //
+    // The state is part of the key because the program that starts at a position is not a function
+    // of the position alone once a tag can read the stack: a `[[/]]` resolves against what is open
+    // around it, so the *same* characters mean different things on different paths, and a suffix
+    // compiled with a size run open must not be handed to a path where nothing is open. That
+    // mistake cost one close marker out of a long chain (six opens and twelve closes produced two
+    // markers instead of six), which is exactly the kind of "looks right, is short" failure the
+    // equivalence assertions exist to catch.
+    int memo[kRowStackKeyCount][kRowTextCap + 1];
 };
 
 // -1 is a real answer ("nothing left"), so "not compiled yet" needs a value of its own.
@@ -2035,6 +2063,14 @@ static RowTag ClassifyRowTag(const WCHAR *raw, int at, const FontTag *tags, int 
         tag.kind = kPartAlignClose;
         return tag;
     }
+    // The generic close. A body of exactly "/" -- no spaces, no word: `[[/ ]]` is not this tag
+    // and stays ordinary text, the same way `[[left ]]` is not the left tag. What it closes is
+    // not in the tag at all (see the open-block stack), so this is a kind of its own rather than
+    // one of the closes above: the instantiator has to look at what is open when it gets here.
+    if (bodyLen == 1 && body[0] == L'/') {
+        tag.kind = kPartAnyClose;
+        return tag;
+    }
     return tag;
 }
 
@@ -2052,11 +2088,179 @@ static int NewRowPart(RowProgram &program, RowPartKind kind) {
     return index;
 }
 
-static int CompileRowSuffix(RowCompiler &c, int at, int chain, int size) {
-    if (at < 0 || at >= kRowTextCap) return -1;
-    const int compiled = c.memo[at];
-    if (compiled != kRowNotCompiled) return compiled;
+// ---------------------------------------------------------------------------
+// The open-block stack [[/]] resolves against
+//
+// `[[/]]` closes *the innermost open block*, and at compile time the open/close keywords only
+// tell us which marker the explicit form would have emitted -- they do not tell us which block a
+// later `[[/]]` means. That is a positional question (`[[size:24]][[center]]X[[/]][[/]]` closes
+// the group first), so the answer has to be derived from the position of the opens and closes,
+// exactly as `BuildRowLayout` derives group membership from marker order.
+//
+// What can be open at once is small, because **none of the three block kinds nests**:
+//
+//   kBlockSize  -- a size run. `[[/size]]` returns to the row's own size, so a second
+//       `[[size:NN]]` does not open a run inside a run: it *replaces* the size in force.
+//   kBlockFont  -- a font run, by the same rule (`[[/font]]` returns to the main font).
+//   kBlockAlign -- an aligned group. Groups are flat on purpose: opening one while another is
+//       open *replaces* it (there is no group stack, AGENTS 5.1).
+//
+// So the stack holds **at most one frame per kind**, ordered by which was opened most recently --
+// which is the whole of "the innermost open block", the thing `[[/]]` closes. A tag of a kind that
+// is already open removes that frame and appends the new one (the block just opened is the
+// innermost). Treating that as a plain push is wrong in a way that only shows up *later*: the
+// stale frame outlives the run it belongs to, and a `[[/]]` after a `[[/size]]` then closes a run
+// that is already closed -- one close marker for two tags.
+//
+// Both `CompileRowSuffix` and `InstantiateRowProgram` maintain a stack with these rules, so the
+// two are the same stack: same length after every tag, same frame on top, and therefore the same
+// answer to "what can be honoured here" and to "what does this `[[/]]` close". That is what makes
+// `[[/]]` a compile-time desugaring rather than a second interpretation of the text at
+// instantiation: the compiler resolves the tag, writes the resolved kind into it, and the
+// instantiator only spells that kind out as the marker the explicit close would have written.
+//
+// The one thing that had to be got right is what a close does to this stack, and the answer is
+// "it takes the closed block off". That is not a claim about what is still "in force" afterwards:
+// an explicit close has always been a *reset* marker (`[[/size]]` returns to the row's own size
+// whether or not a run was open), and the old expander kept no stack at all. What the frame has to
+// model is the thing a `[[/]]` reads -- which block is innermost when the reader reaches that tag
+// -- and the only rule that makes the two sides agree is that both take the frame off:
+//
+//   * the *compiler* takes it off so a later `[[/]]` on the same path resolves the same way;
+//   * the *instantiator* takes it off so a later `[[/]]` in the marked string resolves the same way.
+//
+// A rule where an explicit close leaves the frame (which this code had for a while) breaks it in
+// both directions at once: `[[size:24]]a[[/size]]b[[/]]` then closes a run the explicit form has
+// already reset -- one marker where the explicit form writes two -- while
+// `[[size:24]]a[[/size]]b[[/size]]` leaves a frame that makes the *next* `[[/]]` write a marker
+// the explicit form does not write. The equivalence the feature promises is "same marker sequence
+// as the explicit form", and this rule is what delivers it.
+// ---------------------------------------------------------------------------
+enum RowBlockKind : unsigned char {
+    kBlockNone = 0,   // no block (a `[[/]]` with nothing open); 0 so that a static array of
+                      // frames is `.bss` rather than file image (AGENTS 5.1)
+    kBlockSize,       // kPartSizeOpen
+    kBlockFont,       // kPartFontOpen
+    kBlockAlign,      // kPartAlignOpen
+};
 
+struct OpenBlock {
+    RowBlockKind kind;
+    unsigned char size;   // kBlockSize: the run's size
+    unsigned char chain;  // kBlockFont: the 1-based chain index
+    unsigned char align;  // kBlockAlign: kAlignSegLeft / Center / Right
+};
+
+// Whether the innermost open block is a group.
+static bool OpenBlockIsAlign(const OpenBlock *stack, int count) {
+    return count > 0 && stack[count - 1].kind == kBlockAlign;
+}
+
+// Whether one more block can be opened. `kMaxOpenBlocks` is the fixed-array bound, not a nesting
+// rule: the three kinds above cannot nest, so a reachable stack never holds more than three
+// frames and this cap is the guard that keeps the array an array. A `false` means the tag is not
+// honoured and keeps its text.
+static bool RowOpenBlockFits(const OpenBlock *stack, int count) {
+    (void)stack;
+    return count < kMaxOpenBlocks;
+}
+
+// Drops the frame of one kind, if it is open, and everything above it -- the blocks opened inside
+// a run that a close ends. The stack stays ordered by recency, so what is left under it was
+// opened before it. Dropping the frames above is not a choice: a marked string may not keep a run
+// open past the marker that ends the run it sits in.
+static void RemoveOpenBlock(OpenBlock *stack, int *count, RowBlockKind kind) {
+    int at = -1;
+    for (int i = 0; i < *count; i++) {
+        if (stack[i].kind != kind) continue;
+        at = i;
+        break;
+    }
+    if (at < 0) return;
+    *count = at;
+}
+
+// Opens a block (or re-opens one of the same kind). The stack is ordered by *how recently each
+// block was opened*, because "the innermost open block" is what `[[/]]` closes and a block that
+// was just re-opened is the last one opened. So a kind that is already open loses its frame and
+// the new one goes on top: `[[size:24]][[font:A]]x[[size:20]]` leaves "font, then size" -- the
+// first size tag is no longer the innermost block, and a stack that left it underneath the font
+// would make a later `[[/]]` close the font instead of the run the writer just opened.
+static void PushOpenBlock(OpenBlock *stack, int *count, const OpenBlock &block) {
+    RemoveOpenBlock(stack, count, block.kind);
+    if (*count < kMaxOpenBlocks) {
+        stack[*count] = block;
+        (*count)++;
+    }
+}
+
+// Which blocks are open, as a small integer: the memoiser key that goes with a position. It has to
+// be **exact** -- a key that merged two different stacks would hand one path's program to the other,
+// and the symptom is a `[[/]]` that closes the wrong thing (or nothing) depending on which path got
+// there first. Three kinds that cannot nest means the state is a subset of {size, font, align}, so
+// there are exactly eight of them and the mask is the whole state.
+static int RowStackKey(const OpenBlock *stack, int count) {
+    int mask = 0;
+    for (int i = 0; i < count; i++) {
+        switch (stack[i].kind) {
+            case kBlockSize: mask |= 1; break;
+            case kBlockFont: mask |= 2; break;
+            case kBlockAlign: mask |= 4; break;
+            default: break;
+        }
+    }
+    return mask;
+}
+
+// The innermost open block, taken off the stack: what a `[[/]]` closes. `kBlockNone` when there is
+// nothing open, and then the tag writes no marker and vanishes like any other stray close.
+//
+// An explicit close does *not* call this -- see the banner: `[[/size]]` is a reset that leaves the
+// block on the stack, so `[[size:24]]a[[/size]]b[[/]]` still has a size run for the `[[/]]` to
+// close, exactly as `[[size:24]]a[[/size]]b[[/size]]` writes a marker there. Taking the frame off
+// here is what makes `[[/]]` mean "close this one and move on" rather than "close this one again
+// and again".
+static RowBlockKind PopInnermostBlock(OpenBlock *stack, int *count) {
+    if (*count <= 0) return kBlockNone;
+    const RowBlockKind kind = stack[*count - 1].kind;
+    (*count)--;
+    return kind;
+}
+
+// The recursive half of the compiler, forward-declared because the literal-tag helper below
+// continues a walk through it.
+static int CompileRowSuffix(RowCompiler &c, int at, int chain, int size, OpenBlock *openBlocks,
+                            int openCount);
+
+// Emits a whole tag as ordinary text: the characters from `tagAt` to `tagEnd` (exclusive) become
+// one TEXT element, in the run that is in force, and the walk continues after the tag. This is
+// how every tag the compiler cannot honour stays on screen (AGENTS 5.7), and it is deliberately
+// one element rather than the "resume inside the tag" path a refused [[ring:...]] takes: these
+// tags are refused because the *stack* is full, not because their body was unreadable, so there
+// is no inner markup worth looking for again.
+//
+// `head` is returned rather than linked here, because the caller knows whether this element is
+// the first of the program (head was still -1) or the tail of the literal run in front of it.
+static int CompileLiteralTag(RowCompiler &c, int tagAt, int tagEnd, int chain, int size,
+                             OpenBlock *openBlocks, int openCount, int head) {
+    const int index = NewRowPart(*c.program, kPartText);
+    RowPart &part = c.program->parts[index];
+    part.offset = (short)tagAt;
+    part.length = (short)(tagEnd - tagAt);
+    part.tagChain = (unsigned char)chain;
+    part.runFontSize = (unsigned char)size;
+    part.next = (short)CompileRowSuffix(c, tagEnd, chain, size, openBlocks, openCount);
+    if (head < 0) return index;
+    c.program->parts[head].next = (short)index;
+    return head;
+}
+
+static int CompileRowSuffix(RowCompiler &c, int at, int chain, int size,
+                            OpenBlock *openBlocks, int openCount) {
+    if (at < 0 || at >= kRowTextCap) return -1;
+    const int stackKey = RowStackKey(openBlocks, openCount);
+    const int compiled = c.memo[stackKey][at];
+    if (compiled != kRowNotCompiled) return compiled;
     // Where the literal run ends. Everything the scan walks over belongs to it: characters,
     // {...} token spans (a tag inside one is never markup -- the expander consumes the token
     // first, so its characters are copied as text), and every tag this code does *not* honour,
@@ -2097,42 +2301,123 @@ static int CompileRowSuffix(RowCompiler &c, int at, int chain, int size) {
     }
 
     if (foundTag) {
-        const int index = NewRowPart(*c.program, tag.kind);
-        RowPart &part = c.program->parts[index];
+        // ---- the stack this tag leaves behind for a later [[/]] -----------------------------
+        //
+        // A local copy, because a refused tag keeps its text: the ordinary continuation sees the
+        // block this tag opens, the failNext continuation and any tag that is not honoured see
+        // the stack exactly as it is now, and the memoiser may only remember the program that
+        // starts *at* this position (a refused tag's program starts one character further in, and
+        // is emitted as a TEXT element of its own).
+        //
+        // An array of 64 frames on a recursive function's frame is ~512 bytes per level, and the
+        // depth is bounded by the open-block cap rather than by the row's length. It cannot be a
+        // member of RowCompiler: that struct is memoiser state, and a suffix reached twice must
+        // not learn a stack from the first visit -- the recursion is compiled per reached position,
+        // and the frame belongs to the path, not to the position.
+        OpenBlock nextOpenBlocks[kMaxOpenBlocks];
+        int nextOpenCount = openCount;
+        for (int i = 0; i < openCount; i++) nextOpenBlocks[i] = openBlocks[i];
+
+        // Whether an open of this kind may be honoured at all. This is the same question, with
+        // the same answer, as the instantiator asks before it writes the marker: is there room
+        // for the frame under the cap (see RowOpenBlockFits). A `false` here means the tag is
+        // *not* honoured -- it keeps its text, which is the rule the compiler follows for every
+        // tag it cannot honour.
+        const bool fits = RowOpenBlockFits(openBlocks, openCount);
         switch (tag.kind) {
-            case kPartRing:
+            case kPartRing: {
+                const int index = NewRowPart(*c.program, kPartRing);
+                RowPart &part = c.program->parts[index];
                 part.offset = (short)tag.payload;
                 part.length = (short)tag.payloadLen;
-                part.next = (short)CompileRowSuffix(c, tag.close + 2, chain, size);
+                part.next = (short)CompileRowSuffix(c, tag.close + 2, chain, size, openBlocks,
+                                                    openCount);
                 // The tag stays literal text starting with the '[' it was recognised at, so
                 // the scan resumes at the character after *that* one -- not after the tag.
-                part.failNext = (short)CompileRowSuffix(c, textEnd + 1, chain, size);
+                part.failNext = (short)CompileRowSuffix(c, textEnd + 1, chain, size, openBlocks,
+                                                        openCount);
+                if (head < 0) head = index;
+                else c.program->parts[head].next = (short)index;
                 break;
+            }
             case kPartFontOpen:
-                part.tagChain = (unsigned char)tag.chain;
-                part.next = (short)CompileRowSuffix(c, tag.close + 2, tag.chain, size);
+            case kPartSizeOpen: {
+                // A [[size:NN]] or [[font:...]] run opens a block. Written this way round
+                // because the two differ only in what the text switches to (the size, or the
+                // chain) and in what they push: both leave the row's own size / the main font at
+                // their close, so both continuations are the same shape.
+                if (!fits) {
+                    head = CompileLiteralTag(c, textEnd, tag.close + 2, chain, size, openBlocks,
+                                             openCount, head);
+                    break;
+                }
+                OpenBlock block = {};
+                block.size = (unsigned char)tag.size;
+                block.chain = (unsigned char)tag.chain;
+                block.kind = tag.kind == kPartSizeOpen ? kBlockSize : kBlockFont;
+                PushOpenBlock(nextOpenBlocks, &nextOpenCount, block);
+
+                const int index = NewRowPart(*c.program, tag.kind);
+                RowPart &part = c.program->parts[index];
+                if (tag.kind == kPartSizeOpen) part.runFontSize = (unsigned char)tag.size;
+                else part.tagChain = (unsigned char)tag.chain;
+                part.next = (short)CompileRowSuffix(
+                    c, tag.close + 2, tag.kind == kPartSizeOpen ? chain : tag.chain,
+                    tag.kind == kPartSizeOpen ? tag.size : size, nextOpenBlocks, nextOpenCount);
+                if (tag.kind == kPartSizeOpen) {
+                    // A size marker that does not fit in the output buffer stays literal, so the
+                    // tag has a second continuation. A font marker has no such case: it is
+                    // three characters and the walk guarantees four.
+                    part.failNext = (short)CompileRowSuffix(c, textEnd + 1, chain, size,
+                                                            openBlocks, openCount);
+                }
+                if (head < 0) head = index;
+                else c.program->parts[head].next = (short)index;
                 break;
+            }
             case kPartFontClose:
-                part.next = (short)CompileRowSuffix(c, tag.close + 2, 0, size);
+            case kPartSizeClose: {
+                // An explicit close always compiles to a close element, whether or not a run is
+                // open: this tag vanishing when nothing is open is the behaviour it has always
+                // had (a well-formed tag with no job is not a reason to print markup at the
+                // user), so the compiler must not turn it into text now that it keeps a stack.
+                //
+                // And it ends the run: the frame comes off, in the compiler and in the runtime
+                // alike (one stack, one rule). That is not a claim about what is "really" open --
+                // an explicit close has always been only a reset marker -- it is what keeps the
+                // `[[/]]` resolution of the two sides the same, so a program compiled on one path
+                // still means the same thing on the other. See the banner.
+                RemoveOpenBlock(nextOpenBlocks, &nextOpenCount,
+                                tag.kind == kPartFontClose ? kBlockFont : kBlockSize);
+                const int index = NewRowPart(*c.program, tag.kind);
+                RowPart &part = c.program->parts[index];
+                part.next = (short)CompileRowSuffix(
+                    c, tag.close + 2,
+                    tag.kind == kPartFontClose ? 0 : chain,
+                    tag.kind == kPartSizeClose ? 0 : size, nextOpenBlocks, nextOpenCount);
+                if (head < 0) head = index;
+                else c.program->parts[head].next = (short)index;
                 break;
-            case kPartSizeOpen:
-                part.runFontSize = (unsigned char)tag.size;
-                part.next = (short)CompileRowSuffix(c, tag.close + 2, chain, tag.size);
-                part.failNext = (short)CompileRowSuffix(c, textEnd + 1, chain, size);
-                break;
-            case kPartSizeClose:
-                part.next = (short)CompileRowSuffix(c, tag.close + 2, chain, 0);
-                break;
-            case kPartIcon:
+            }
+            case kPartIcon: {
+                const int index = NewRowPart(*c.program, kPartIcon);
+                RowPart &part = c.program->parts[index];
                 // The glyph and the ripple override are known here; the path is a slice of the
                 // row, so nothing has to be copied into the part table.
                 part.glyphFlags = (unsigned char)(tag.glyph | tag.ripple);
                 part.offset = (short)tag.payload;
                 part.length = (short)tag.payloadLen;
-                part.next = (short)CompileRowSuffix(c, tag.close + 2, chain, size);
-                part.failNext = (short)CompileRowSuffix(c, textEnd + 1, chain, size);
+                part.next = (short)CompileRowSuffix(c, tag.close + 2, chain, size, openBlocks,
+                                                    openCount);
+                part.failNext = (short)CompileRowSuffix(c, textEnd + 1, chain, size, openBlocks,
+                                                        openCount);
+                if (head < 0) head = index;
+                else c.program->parts[head].next = (short)index;
                 break;
-            case kPartGap:
+            }
+            case kPartGap: {
+                const int index = NewRowPart(*c.program, kPartGap);
+                RowPart &part = c.program->parts[index];
                 // The unit rides in the icon byte's spare bits and the number in `gap`; the
                 // pixel value is *not* computed here (see GapPixels): the size in effect is
                 // only known when the program is instantiated. The run size is carried the way
@@ -2140,27 +2425,86 @@ static int CompileRowSuffix(RowCompiler &c, int at, int chain, int size) {
                 part.glyphFlags = tag.gapUnit;
                 part.runFontSize = (unsigned char)size;
                 part.gap = (short)tag.gap;
-                part.next = (short)CompileRowSuffix(c, tag.close + 2, chain, size);
+                part.next = (short)CompileRowSuffix(c, tag.close + 2, chain, size, openBlocks,
+                                                    openCount);
                 // A gap the instantiator cannot emit (no room for the marker) stays literal,
                 // like the other tags that carry a payload.
-                part.failNext = (short)CompileRowSuffix(c, textEnd + 1, chain, size);
+                part.failNext = (short)CompileRowSuffix(c, textEnd + 1, chain, size, openBlocks,
+                                                        openCount);
+                if (head < 0) head = index;
+                else c.program->parts[head].next = (short)index;
                 break;
-            case kPartAlignOpen:
+            }
+            case kPartAlignOpen: {
+                if (!fits) {
+                    head = CompileLiteralTag(c, textEnd, tag.close + 2, chain, size, openBlocks,
+                                             openCount, head);
+                    break;
+                }
+                // A group does not nest: opening one while another is open is the *close* of the
+                // previous group at that point (AGENTS 5.1), so the new group takes the old one's
+                // frame rather than being stacked on it -- PushOpenBlock re-opens a block of the
+                // same kind. Only the frame moves here; the close marker for the group being
+                // replaced is written by the instantiator, which is where "a group is open" is a
+                // fact about the output rather than about the stack.
+                OpenBlock block = {};
+                block.kind = kBlockAlign;
+                block.align = (unsigned char)tag.align;
+                PushOpenBlock(nextOpenBlocks, &nextOpenCount, block);
+
+                const int index = NewRowPart(*c.program, kPartAlignOpen);
+                RowPart &part = c.program->parts[index];
                 part.align = (unsigned char)tag.align;
-                part.next = (short)CompileRowSuffix(c, tag.close + 2, chain, size);
-                part.failNext = (short)CompileRowSuffix(c, textEnd + 1, chain, size);
+                part.next = (short)CompileRowSuffix(c, tag.close + 2, chain, size, nextOpenBlocks,
+                                                    nextOpenCount);
+                part.failNext = (short)CompileRowSuffix(c, textEnd + 1, chain, size, openBlocks,
+                                                        openCount);
+                if (head < 0) head = index;
+                else c.program->parts[head].next = (short)index;
                 break;
-            case kPartAlignClose:
-                part.next = (short)CompileRowSuffix(c, tag.close + 2, chain, size);
+            }
+            case kPartAlignClose: {
+                // An explicit group close *does* end the group: groups do not nest and there is no
+                // "the enclosing group" to fall back to (AGENTS 5.1), so a `[[/]]` after it closes
+                // the run around the group, not the group again. The run closes above are resets
+                // because a run can be re-opened by a later tag and the block the writer opened is
+                // still the innermost one; a group has no such continuation.
+                RemoveOpenBlock(nextOpenBlocks, &nextOpenCount, kBlockAlign);
+                const int index = NewRowPart(*c.program, kPartAlignClose);
+                RowPart &part = c.program->parts[index];
+                // A stray close -- one with no group open -- cuts nothing and vanishes. It has
+                // no failNext for the same reason: it was not refused, it simply has no job.
+                part.next = (short)CompileRowSuffix(c, tag.close + 2, chain, size, nextOpenBlocks,
+                                                    nextOpenCount);
+                if (head < 0) head = index;
+                else c.program->parts[head].next = (short)index;
                 break;
+            }
+            case kPartAnyClose: {
+                // `[[/]]` closes the innermost open block, and *which* block that is is decided
+                // here, once, from the stack -- the same frame the instantiator's own stack will
+                // have on top when it reaches this tag, because it is the same stack. That is the
+                // whole of the desugaring: the element records the kind the explicit close would
+                // have had, and the instantiator only spells that kind out as its marker.
+                //
+                // Nothing open: the element records "no block", the instantiator writes no marker,
+                // and the tag vanishes -- a stray close, which is what it always was.
+                const RowBlockKind blockKind = PopInnermostBlock(nextOpenBlocks, &nextOpenCount);
+                const int index = NewRowPart(*c.program, kPartAnyClose);
+                RowPart &part = c.program->parts[index];
+                part.align = (unsigned char)blockKind;
+                part.next = (short)CompileRowSuffix(c, tag.close + 2, chain, size, nextOpenBlocks,
+                                                    nextOpenCount);
+                if (head < 0) head = index;
+                else c.program->parts[head].next = (short)index;
+                break;
+            }
             default:
                 break;
         }
-        if (head < 0) head = index;
-        else c.program->parts[head].next = (short)index;
     }
 
-    c.memo[at] = head;
+    c.memo[stackKey][at] = head;
     return head;
 }
 
@@ -2266,12 +2610,16 @@ static void CompileRowText(const ModSettings &settings, const WCHAR *raw, RowPro
     c.tags = settings.tagFonts;
     c.tagCount = settings.tagFontCount;
     c.program = &out;
-    for (int i = 0; i <= kRowTextCap; i++) c.memo[i] = kRowNotCompiled;
+    for (int key = 0; key < kRowStackKeyCount; key++) {
+        for (int i = 0; i <= kRowTextCap; i++) c.memo[key][i] = kRowNotCompiled;
+    }
 
     // first stays -1 when the row is empty, and RowProgram's other default is partCount = 0:
     // a settings object that was never compiled therefore instantiates to nothing instead of
-    // walking parts it never filled in.
-    out.first = CompileRowSuffix(c, 0, 0, 0);
+    // walking parts it never filled in. Both block stacks start empty: nothing is open at the
+    // start of a row, and no marker of the program will be either.
+    OpenBlock openBlocks[kMaxOpenBlocks];
+    out.first = CompileRowSuffix(c, 0, 0, 0, openBlocks, 0);
 }
 
 // The font size one row is drawn at, and the height its box gets. The height never falls
@@ -4979,6 +5327,39 @@ static const WCHAR kGapMarkStart = 0xE007;
 // its close. A `[[/left]]` with nothing open has no marker at all and cuts nothing.
 static const WCHAR kAlignMarkStart = 0xE008;
 
+// ---------------------------------------------------------------------------
+// The open-block stack, at instantiation
+//
+// The mirror of the compiler's stack (`OpenBlock`), maintained with the same rules so that the two
+// are the same stack: `PushOpenBlock` / `RemoveOpenBlock` / `PopInnermostBlock` are shared, and an
+// open refuses on the same `RowOpenBlockFits`, so the instantiator never *decides* anything with
+// it. What it does is:
+//
+//   open        -> the frame goes on the stack only when the marker was actually written (a
+//                  marker that did not fit keeps the tag as text, so no block was opened)
+//   explicit    -> the marker is written whatever the stack says (it is a reset), and the stack is
+//   close          left exactly as it was -- see the two-marker note in the compiler's banner
+//   [[/]]       -> the kind was resolved at compile time and rides in the element; the marker
+//                  written is the same one the explicit close would have written, by construction,
+//                  and the frame it resolved to -- its own marker's worth -- comes off
+// ---------------------------------------------------------------------------
+
+// The close marker one open block ends with: `[[/size]]` is kSizeMarkEnd, `[[/font]]` is
+// kFontMarkEnd, and a group's close is the *bare* kAlignMarkStart (start marker, no digit, end
+// marker). Writing it down once is what makes "the generic close emits exactly what the explicit
+// one would have" true by construction rather than by two copies of the branching.
+static void WriteBlockClose(WCHAR *out, size_t outCount, size_t *written, RowBlockKind blockKind) {
+    if (blockKind == kBlockAlign) {
+        if (*written + 2 >= outCount) return;
+        out[(*written)++] = kAlignMarkStart;
+        out[(*written)++] = kRingMarkEnd;
+        return;
+    }
+    if (blockKind == kBlockNone) return;   // nothing to close
+    if (*written + 1 >= outCount) return;
+    out[(*written)++] = blockKind == kBlockSize ? kSizeMarkEnd : kFontMarkEnd;
+}
+
 // Instantiates a compiled row against the current values: expands the {tokens} left in each
 // TEXT template, turns a [[ring:...]] the values allow into a gauge, and writes the same marked
 // string and RingSpec array the row used to be scanned into on every publish. The markers --
@@ -5007,10 +5388,16 @@ static void InstantiateRowProgram(const ModSettings &settings, int row, const Va
     const RowProgram &program = settings.rowProgram[row];
     size_t written = 0;
     int node = program.first;
-    // Whether an alignment group is open right now. This is the whole of the state the group
-    // markers need: groups do not nest, and a close is a marker at a position (see
-    // kAlignMarkStart).
-    bool groupOpen = false;
+    // The blocks that are open right now. A frame is here exactly while its open marker has been
+    // written and its block has not been closed -- the compiler keeps the same stack under the
+    // same rule, so the same tag is honoured on both sides (a marker that did not fit is not an
+    // open), and what a `[[/]]` closes is the same block on both sides.
+    //
+    // A close -- explicit or generic -- takes the frame off, and that is the one rule both sides
+    // follow (see the stack banner): an explicit close is a reset that writes its marker anyway,
+    // so it is not a claim about what is "really" open, only about which marker is written.
+    OpenBlock openBlocks[kMaxOpenBlocks];
+    int openCount = 0;
 
     while (node >= 0 && node < program.partCount) {
         // The old expander tested this before every character, and every marker write below
@@ -5090,17 +5477,25 @@ static void InstantiateRowProgram(const ModSettings &settings, int row, const Va
         if (part.kind == kPartFontOpen) {
             // The chain was resolved while compiling, so nothing here re-validates a family
             // name. The old expander also re-tested the walk's own head condition at this
-            // point; nothing had been written since that test, so it could not fail.
+            // point; nothing had been written since that test, so it could not fail. The block
+            // goes on the stack, which is what makes a later `[[/]]` close *this* run.
             out[written++] = kFontMarkStart;
             out[written++] = (WCHAR)(L'0' + part.tagChain);
             out[written++] = kRingMarkEnd;
+            OpenBlock block = {};
+            block.kind = kBlockFont;
+            block.chain = part.tagChain;
+            PushOpenBlock(openBlocks, &openCount, block);
             node = part.next;
             continue;
         }
         if (part.kind == kPartFontClose) {
             // The old expander asked for two spare characters here where the walk asks for
-            // four, so the stricter test has already passed.
+            // four, so the stricter test has already passed. The marker is written whatever the
+            // stack says: this tag is a reset, and it has always been one -- and like every other
+            // explicit close it leaves the stack exactly as it was (see the stack banner).
             out[written++] = kFontMarkEnd;
+            RemoveOpenBlock(openBlocks, &openCount, kBlockFont);
             node = part.next;
             continue;
         }
@@ -5110,10 +5505,16 @@ static void InstantiateRowProgram(const ModSettings &settings, int row, const Va
                 out[written++] = (WCHAR)(L'0' + part.runFontSize / 10);
                 out[written++] = (WCHAR)(L'0' + part.runFontSize % 10);
                 out[written++] = kRingMarkEnd;
+                OpenBlock block = {};
+                block.kind = kBlockSize;
+                block.size = (unsigned char)part.runFontSize;
+                PushOpenBlock(openBlocks, &openCount, block);
                 node = part.next;
             } else {
                 // Exactly the case the old expander's extra test singled out: one character
                 // less headroom than the marker needs, so the tag is copied as text instead.
+                // No frame: the tag was not honoured, and the compiler did not push one either
+                // (it refused this open at the same point), so its close keeps its text too.
                 out[written++] = L'[';
                 node = part.failNext;
             }
@@ -5121,6 +5522,7 @@ static void InstantiateRowProgram(const ModSettings &settings, int row, const Va
         }
         if (part.kind == kPartSizeClose) {
             out[written++] = kSizeMarkEnd;
+            RemoveOpenBlock(openBlocks, &openCount, kBlockSize);
             node = part.next;
             continue;
         }
@@ -5174,35 +5576,73 @@ static void InstantiateRowProgram(const ModSettings &settings, int row, const Va
         if (part.kind == kPartAlignOpen) {
             // An alignment group. Groups do not nest, so opening one while another is open is
             // the *close* of the previous group -- that is the "an alignment tag inside a group
-            // closes the outer one and opens a new one at that point" rule, and it is why one
-            // `groupOpen` flag is the whole of the state. Each marker is start + payload +
-            // terminator, the terminator being the same kRingMarkEnd every other marker uses.
+            // closes the outer one and opens a new one at that point" rule. Each marker is
+            // start + payload + terminator, the terminator being the same kRingMarkEnd every
+            // other marker uses.
             if (written + 5 < outCount) {
-                if (groupOpen) {
+                if (OpenBlockIsAlign(openBlocks, openCount)) {
                     out[written++] = kAlignMarkStart;
                     out[written++] = kRingMarkEnd;
                 }
                 out[written++] = kAlignMarkStart;
                 out[written++] = (WCHAR)(L'0' + part.align);
                 out[written++] = kRingMarkEnd;
-                groupOpen = true;
+                // The group being replaced (if any) leaves the stack with the new group taking
+                // its place: a group does not stack (PushOpenBlock re-opens a block of the same
+                // kind). This is the same rule the compiler applies, so the two stacks stay the
+                // same stack.
+                OpenBlock block = {};
+                block.kind = kBlockAlign;
+                block.align = (unsigned char)part.align;
+                PushOpenBlock(openBlocks, &openCount, block);
                 node = part.next;
             } else {
                 // No room for the marker: the tag stays literal text, and the scan resumes after
-                // its own '[' so a tag written inside it can still be recognised.
+                // its own '[' so a tag written inside it can still be recognised. The group that
+                // was open stays open -- an unhonoured tag is not a group boundary.
                 out[written++] = L'[';
                 node = part.failNext;
             }
             continue;
         }
         if (part.kind == kPartAlignClose) {
-            // A close tag is a marker only when something is open. A stray `[[/left]]` therefore
+            // A close tag is a marker only when a group is open. A stray `[[/left]]` therefore
             // disappears -- it is a well-formed tag with nothing to do, and leaving it on screen
             // would be the one case where markup text reaches the panel without saying why.
-            if (groupOpen && written + 3 < outCount) {
+            // Like the run closes, it is a reset: what it ends is the group, and it leaves the
+            // state (including any enclosing run) exactly as it was.
+            if (OpenBlockIsAlign(openBlocks, openCount) && written + 3 < outCount) {
                 out[written++] = kAlignMarkStart;
                 out[written++] = kRingMarkEnd;
-                groupOpen = false;
+                // An explicit group close ends the group, unlike the run closes above: a group has
+                // no continuation to fall back to, so the frame comes off here as well -- otherwise
+                // the row's end would find it still open and write a second close marker (the
+                // compiler takes it off too, see `kPartAlignClose`).
+                RemoveOpenBlock(openBlocks, &openCount, kBlockAlign);
+            }
+            node = part.next;
+            continue;
+        }
+        if (part.kind == kPartAnyClose) {
+            // `[[/]]`: close the innermost open block. The block was resolved while the row was
+            // compiled and rides in the element's `align` byte, so the marker written here is the
+            // very same one the explicit close would have written -- both come out of
+            // WriteBlockClose. `kBlockNone` means the tag had nothing to close, and then it
+            // vanishes like every other stray close.
+            //
+            // The frame comes off, unlike at an explicit close: this tag *is* the block ending, and
+            // a second `[[/]]` closes what was underneath rather than the same block again.
+            const RowBlockKind blockKind = (RowBlockKind)part.align;
+            if (blockKind != kBlockNone) {
+                WriteBlockClose(out, outCount, &written, blockKind);
+                // Off the *top*, not "the innermost of this kind": the frame this element resolved
+                // to was the innermost block, and the stack can hold different kinds (a size run
+                // inside a font run), so looking the kind up again would drop the frames the tag was
+                // not about -- `[[size:9]][[font:Arial]][[/]][[/]]` then closed both blocks with its
+                // first `[[/]]` and left the second one nothing to do.
+                int popCount = openCount;
+                PopInnermostBlock(openBlocks, &popCount);
+                openCount = popCount;
             }
             node = part.next;
             continue;
@@ -5213,16 +5653,22 @@ static void InstantiateRowProgram(const ModSettings &settings, int row, const Va
         break;
     }
 
-    // An unclosed group ends where the row ends: the close marker is written here rather than
-    // left implicit, so "the group stops at the row's end" is one fact with one owner -- this
-    // line and the alignment markers BuildRowLayout reads. A group left open by a row that ran
-    // out of buffer is closed the same way, which is what keeps the layout from having to treat
-    // "the marked string ends" as a third kind of group end.
-    if (groupOpen && written + 3 < outCount) {
+    // Only the open *group* is closed here, and size and font frames deliberately get no marker:
+    // BuildRowLayout reads a marked string that ends inside a run as a run that ends with the
+    // row, which is the behaviour those tags have always had, and a close marker at the end of
+    // the row would be one the old expander never wrote. The stack is dropped either way -- the
+    // row is over, so nothing is open any more.
+    //
+    // An unclosed group ends where the row ends. A size or font run does not need that treatment
+    // and must not get it: BuildRowLayout reads a marked string that ends inside a run as a run
+    // that ends with the row, which is what those tags have always done, and a close marker at the
+    // end of the row would be one the old expander never wrote. This is the same marker `[[/]]`
+    // would write for the group, so the two cannot drift apart.
+    if (OpenBlockIsAlign(openBlocks, openCount) && written + 3 < outCount) {
         out[written++] = kAlignMarkStart;
         out[written++] = kRingMarkEnd;
-        groupOpen = false;
     }
+    openCount = 0;   // the row is over: nothing is open any more
 
     out[written] = L'\0';
 }
