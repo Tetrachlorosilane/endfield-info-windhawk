@@ -775,13 +775,6 @@ function Test-VinylJumpPlausible {
     if ($ToMs -ge $FromMs) { return (($ToMs - $FromMs) -le $ForwardToleranceMs) }
     return (($FromMs - $ToMs) -le $BackToleranceMs)
 }
-function Test-VinylJumpPlausible {
-    param([int]$FromMs, [int]$ToMs, [int]$BackToleranceMs = 1000, [int]$ForwardToleranceMs = 30000)
-    if ($ToMs -lt 0) { return $false }
-    if ($FromMs -lt 0) { return $true }                      # 第一次见到：当引导值
-    if ($ToMs -ge $FromMs) { return (($ToMs - $FromMs) -le $ForwardToleranceMs) }
-    return (($FromMs - $ToMs) -le $BackToleranceMs)
-}
 # 纯函数：页面是不是**不再更新**了。判据只有"连续读到同一个数到顶"这一条，而调用方
 # **必须同时**确认"还是同一个数"（见 `Resolve-VinylFrame` 里的警告）——所以这里只管计数，
 # 不碰值：把它写成 `SameReads >= Limit` 而不管值，正是那条"永久卡住"缺陷的形状。
